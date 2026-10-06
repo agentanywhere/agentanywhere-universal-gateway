@@ -1,0 +1,134 @@
+
+services:
+  mcp-backend:
+    build:
+      context: ./mcp
+      dockerfile: Dockerfile
+    container_name: mcp_backend
+    ports:
+      - "8001:8001"
+    networks:
+      - backend-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  a2a-backend:
+    build:
+      context: ./a2a
+      dockerfile: Dockerfile
+    container_name: a2a_backend
+    ports:
+      - "8002:8002"
+    networks:
+      - backend-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  http-backend:
+    build:
+      context: ./http
+      dockerfile: Dockerfile
+    container_name: http_backend
+    ports:
+      - "8003:8003"
+    networks:
+      - backend-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8003/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  websocket-backend:
+    build:
+      context: ./websocket
+      dockerfile: Dockerfile
+    container_name: websocket_backend
+    ports:
+      - "8080:8080"
+    networks:
+      - backend-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  mqtt-broker:
+    image: eclipse-mosquitto:2.0
+    container_name: mqtt_broker
+    ports:
+      - "1883:1883"
+      - "9001:9001"
+    volumes:
+      - ./mqtt/config:/mosquitto/config
+      - ./mqtt/data:/mosquitto/data
+    networks:
+      - backend-network
+
+  grpc-backend:
+    build:
+      context: ./grpc
+      dockerfile: Dockerfile
+    container_name: grpc_backend
+    ports:
+      - "50051:50051"
+    networks:
+      - backend-network
+
+  agui-backend:
+    build:
+      context: ./agui
+      dockerfile: Dockerfile
+    container_name: agui_backend
+    ports:
+      - "8004:8004"
+    networks:
+      - backend-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8004/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  acp-backend:
+    build:
+      context: ./acp
+      dockerfile: Dockerfile
+    container_name: acp_backend
+    ports:
+      - "8005:8005"
+    networks:
+      - backend-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8005/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  graphql-backend:
+    build:
+      context: ./graphql
+      dockerfile: Dockerfile
+    container_name: graphql_backend
+    ports:
+      - "8006:8006"
+    networks:
+      - backend-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8006/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+networks:
+  backend-network:
+    driver: bridge
+
+

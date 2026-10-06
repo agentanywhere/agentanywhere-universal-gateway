@@ -1,0 +1,64 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+# Distribution name for the product "AgentAnywhere Universal Gateway".
+# The original `mcp-gateway` name is squatted on PyPI by an unrelated Lasso
+# Security package (pypi.org/project/mcp-gateway/). The canonical package name
+# is `agentanywhere-universal-gateway`; the shorter `agentanywhere-gateway`,
+# `agent-universal-gateway`, and `mcp-gateway` names are kept as CLI aliases below.
+name = "agentanywhere-universal-gateway"
+version = "1.0.0"
+description = "API gateway for agent and application traffic: one authentication, rate-limiting and logging layer in front of MCP, A2A, AG-UI, ACP, HTTP/REST, GraphQL and MQTT backends."
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+license = { text = "Apache-2.0" }
+authors = [{ name = "ShepHertz Technologies Pvt. Ltd." }]
+keywords = ["mcp", "a2a", "ag-ui", "acp", "gateway", "api-gateway", "ai", "fastapi", "agentanywhere"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+]
+dynamic = ["dependencies"]
+
+[project.urls]
+Homepage = "https://github.com/agentanywhere/universal-gateway"
+Documentation = "https://github.com/agentanywhere/universal-gateway/tree/main/docs"
+Repository = "https://github.com/agentanywhere/universal-gateway"
+Issues = "https://github.com/agentanywhere/universal-gateway/issues"
+Changelog = "https://github.com/agentanywhere/universal-gateway/blob/main/CHANGELOG.md"
+
+[project.scripts]
+# Canonical command.
+agentanywhere-gateway = "app.cli.main:main"
+# Aliases retained so existing scripts, Dockerfiles, and muscle memory keep working.
+agent-universal-gateway = "app.cli.main:main"
+mcp-gateway = "app.cli.main:main"
+
+[project.entry-points."mcp_gateway.plugins"]
+# Built-in plugins are auto-discovered via app.plugins.builtin, but we
+# also register them here so external `pip install` users can opt in.
+builtin = "app.plugins.builtin"
+
+[tool.setuptools]
+packages = [
+    "app",
+    "app.ai",
+    "app.cli",
+    "app.middleware",
+    "app.plugins",
+    "app.plugins.builtin",
+    "app.protocols",
+    "app.repositories",
+    "app.sdk",
+    "admin",
+]
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }

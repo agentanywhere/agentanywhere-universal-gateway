@@ -1,0 +1,327 @@
+version: '3.8'
+
+services:
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mcp_a2a_gateway
+    ports:
+      - "${PORT:-8000}:8000"
+    env_file:
+      - .env
+    environment:
+      # Override for Docker networking
+      - REDIS_URL=redis://redis:6379/0
+      - RATE_LIMIT_REDIS_URL=redis://redis:6379/1
+      - DATABASE_URL=${DATABASE_URL:-sqlite+aiosqlite:///./gateway.db}
+      # Backend URLs - use Docker service names when backends are running
+      - MCP_BACKEND_URL=${MCP_BACKEND_URL:-http://mcp-backend:8001}
+      - A2A_BACKEND_URL=${A2A_BACKEND_URL:-http://a2a-backend:8002}
+      - HTTP_BACKEND_URL=${HTTP_BACKEND_URL:-http://http-backend:8003}
+      - WEBSOCKET_BACKEND_URL=${WEBSOCKET_BACKEND_URL:-ws://websocket-backend:8080}
+      - MQTT_BROKER_URL=${MQTT_BROKER_URL:-mqtt://mqtt-broker:1883}
+      - GRPC_BACKEND_URL=${GRPC_BACKEND_URL:-grpc-backend:50051}
+      - GRAPHQL_BACKEND_URL=${GRAPHQL_BACKEND_URL:-http://http-backend:8003/graphql}
+      # Fallback values if .env doesn't exist
+      - ENVIRONMENT=${ENVIRONMENT:-production}
+      - DEBUG=${DEBUG:-false}
+      - SECRET_KEY=${SECRET_KEY:-change-me-in-production}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - LOG_FORMAT=${LOG_FORMAT:-json}
+    volumes:
+      - ./logs:/app/logs
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - gateway-network
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+    healthcheck:
+      # wget --spider sends HEAD; /health is registered as GET-only and would
+      # fall through to the catch-all proxy. Use GET instead.
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "-O", "/dev/null", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    container_name: gateway_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    restart: unless-stopped
+    networks:
+      - gateway-network
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 128M
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # PostgreSQL database (optional, for production)
+  postgres:
+    image: postgres:15-alpine
+    container_name: gateway_postgres
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB:-gateway}
+      - POSTGRES_USER=${POSTGRES_USER:-gateway_user}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-change-me-in-production}
+      - PGDATA=/var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    restart: unless-stopped
+    networks:
+      - gateway-network
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-gateway_user} -d ${POSTGRES_DB:-gateway}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    profiles:
+      - production
+
+  # Optional: Prometheus for metrics
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: gateway_prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    restart: unless-stopped
+    networks:
+      - gateway-network
+    profiles:
+      - monitoring
+
+  # Optional: Grafana for visualization
+  grafana:
+    image: grafana/grafana:latest
+    container_name: gateway_grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+    restart: unless-stopped
+    networks:
+      - gateway-network
+    depends_on:
+      - prometheus
+    profiles:
+      - monitoring
+
+  # Admin Console UI
+  admin-ui:
+    build:
+      context: ./admin-ui
+      dockerfile: Dockerfile
+      args:
+        # Local compose serves the SPA at http://localhost:3001/ (no path prefix).
+        # Set a path prefix here (for example /console/) to serve it under one.
+        VITE_BASE_PATH: /
+    container_name: gateway_admin_ui
+    ports:
+      - "3001:80"
+    depends_on:
+      - gateway
+    restart: unless-stopped
+    networks:
+      - gateway-network
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 128M
+
+  # Nginx reverse proxy with HTTPS/TLS
+  nginx:
+    build:
+      context: ./nginx
+      dockerfile: Dockerfile
+    container_name: gateway_nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - nginx_logs:/var/log/nginx
+    depends_on:
+      - gateway
+    restart: unless-stopped
+    networks:
+      - gateway-network
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+        reservations:
+          cpus: '0.1'
+          memory: 64M
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    profiles:
+      - production
+
+  # Sample Backends (optional - for testing)
+  mcp-backend:
+    build:
+      context: ./samples/backends/mcp
+      dockerfile: Dockerfile
+    container_name: mcp_backend
+    ports:
+      - "8001:8001"
+    networks:
+      - gateway-network
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+    profiles:
+      - backends
+
+  a2a-backend:
+    build:
+      context: ./samples/backends/a2a
+      dockerfile: Dockerfile
+    container_name: a2a_backend
+    ports:
+      - "8002:8002"
+    networks:
+      - gateway-network
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8002/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+    profiles:
+      - backends
+
+  http-backend:
+    build:
+      context: ./samples/backends/http
+      dockerfile: Dockerfile
+    container_name: http_backend
+    ports:
+      - "8003:8003"
+    networks:
+      - gateway-network
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8003/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+    profiles:
+      - backends
+
+  websocket-backend:
+    build:
+      context: ./samples/backends/websocket
+      dockerfile: Dockerfile
+    container_name: websocket_backend
+    ports:
+      - "8080:8080"
+    networks:
+      - gateway-network
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+    profiles:
+      - backends
+
+  mqtt-broker:
+    image: eclipse-mosquitto:2.0
+    container_name: mqtt_broker
+    ports:
+      - "1883:1883"
+      - "9001:9001"
+    volumes:
+      - ./samples/backends/mqtt/config:/mosquitto/config
+      - ./samples/backends/mqtt/data:/mosquitto/data
+    networks:
+      - gateway-network
+    restart: unless-stopped
+    profiles:
+      - backends
+
+  grpc-backend:
+    build:
+      context: ./samples/backends/grpc
+      dockerfile: Dockerfile
+    container_name: grpc_backend
+    ports:
+      - "50051:50051"
+    networks:
+      - gateway-network
+    restart: unless-stopped
+    profiles:
+      - backends
+
+volumes:
+  redis_data:
+  prometheus_data:
+  grafana_data:
+  postgres_data:
+  nginx_logs:
+
+networks:
+  gateway-network:
+    driver: bridge
+

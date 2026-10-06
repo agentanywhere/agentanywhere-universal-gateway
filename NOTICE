@@ -1,0 +1,29 @@
+AgentAnywhere Universal Gateway
+Copyright 2026 ShepHertz Technologies Pvt. Ltd.
+
+This product is licensed under the Apache License, Version 2.0 (the "License").
+You may obtain a copy of the License in the LICENSE file in this repository or at
+http://www.apache.org/licenses/LICENSE-2.0
+
+--------------------------------------------------------------------------------
+Third-party components
+--------------------------------------------------------------------------------
+
+This software depends on third-party packages, each distributed under its own
+license. Notable notices:
+
+* paho-mqtt (Eclipse Paho MQTT Python client) is dual-licensed under the
+  Eclipse Public License 2.0 and the Eclipse Distribution License 1.0
+  (BSD-3-Clause). This project uses it under the Eclipse Distribution
+  License 1.0.
+
+* gRPC (grpcio, grpcio-tools) and Protocol Buffers (protobuf) are distributed
+  under the Apache License 2.0 and BSD-3-Clause respectively. The files under
+  samples/backends/grpc/*_pb2*.py are generated from samples/backends/grpc/greeter.proto
+  by the protobuf/gRPC compilers; do not edit them by hand — regenerate instead.
+
+* certifi is distributed under the Mozilla Public License 2.0. It is used
+  unmodified, as published.
+
+All other runtime dependencies are distributed under permissive licenses
+(MIT, BSD, Apache-2.0, ISC, PSF). See each package's distribution for full terms.

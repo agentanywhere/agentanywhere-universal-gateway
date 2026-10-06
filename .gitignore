@@ -1,0 +1,87 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+ENV/
+env/
+.venv
+test_env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+logs/
+*.log.*
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+coverage.xml
+test_report.txt
+tests/results/
+*.log
+!logs/*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+docker-compose.override.yml
+
+# Application specific
+*.db
+*.sqlite
+
+
+# Node
+node_modules/
+admin-ui/dist/
+
+# Internal tooling (not for public repo)
+.cursor/
+.specify/
+
+# TLS material
+nginx/ssl/
+*.pem
+
+# Env backups
+.env.bak
+.env.*.bak
+
+# Linters
+.ruff_cache/
