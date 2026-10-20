@@ -141,7 +141,12 @@ SECTIONS: Dict[str, Sequence[str]] = {
         "datadog_source",
         "datadog_tags",
     ),
-    "metrics": ("metrics_enabled", "metrics_path", "health_check_path"),
+    "metrics": (
+        "metrics_enabled",
+        "metrics_path",
+        "health_check_path",
+        "ops_endpoints_require_admin",
+    ),
     "circuit_breaker": (
         "circuit_breaker_enabled",
         "circuit_breaker_failure_threshold",
@@ -337,8 +342,10 @@ class Settings(BaseSettings):
     access_token_expire_minutes: int = 30
     api_key_header: str = "X-API-Key"
 
-    # CORS
-    cors_origins: List[str] = ["*", "http://localhost:3001", "http://localhost:3000"]
+    # CORS. The default lists the admin console's local origins (Vite dev
+    # server and docker-compose both serve it on port 3001). A "*" entry turns
+    # credentials off; see cors_middleware_options().
+    cors_origins: List[str] = ["http://localhost:3001", "http://127.0.0.1:3001"]
     cors_allow_credentials: bool = True
     cors_allow_methods: List[str] = ["*"]
     cors_allow_headers: List[str] = ["*"]
@@ -439,6 +446,11 @@ class Settings(BaseSettings):
     # Metrics
     metrics_enabled: bool = True
     metrics_path: str = "/metrics"
+    # Opt-in: require the admin credential (Authorization: Bearer <ADMIN_TOKEN>,
+    # same check as the admin API) on the metrics path and /health/detailed.
+    # Off by default so an unauthenticated Prometheus scrape keeps working;
+    # when you turn it on, give Prometheus the token (see prometheus.yml).
+    ops_endpoints_require_admin: bool = False
 
     # Health Check
     health_check_path: str = "/health"
@@ -711,6 +723,36 @@ def _build_settings() -> Settings:
     return Settings()
 
 
+def cors_middleware_options(settings: "Settings") -> Tuple[Dict[str, Any], Optional[str]]:
+    """Keyword arguments for Starlette's ``CORSMiddleware``, plus a warning.
+
+    Browsers reject ``Access-Control-Allow-Origin: *`` together with
+    ``Access-Control-Allow-Credentials: true``, and Starlette works around
+    that by echoing whatever ``Origin`` the request sent, which lets any web
+    site make credentialed requests. So when the origin list contains ``*``,
+    credentials are switched off and a warning is returned for the caller to
+    log. An explicit origin list keeps ``cors_allow_credentials`` as set.
+    """
+    origins = list(settings.cors_origins or [])
+    allow_credentials = bool(settings.cors_allow_credentials)
+    warning = None
+    if "*" in origins and allow_credentials:
+        allow_credentials = False
+        warning = (
+            'CORS_ORIGINS contains "*" and CORS_ALLOW_CREDENTIALS is true; '
+            "credentials are disabled for cross-origin requests. List the "
+            "exact origins of your front ends in CORS_ORIGINS to allow "
+            "credentials."
+        )
+    options = {
+        "allow_origins": origins,
+        "allow_credentials": allow_credentials,
+        "allow_methods": settings.cors_allow_methods,
+        "allow_headers": settings.cors_allow_headers,
+    }
+    return options, warning
+
+
 @lru_cache()
 def get_settings() -> Settings:
     """Cached settings accessor. Use ``reload_settings()`` to refresh."""
@@ -901,6 +943,7 @@ __all__ = [
     "SENSITIVE_FIELDS",
     "Settings",
     "apply_runtime_changes",
+    "cors_middleware_options",
     "get_config_audit_log",
     "get_settings",
     "reload_settings",

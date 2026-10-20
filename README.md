@@ -134,16 +134,24 @@ This starts the gateway on port 8000, Redis, and the admin console on port
 backends. Before you start, check that nothing else is using ports 8000, 3001
 and 6379.
 
-Under Docker, `localhost` in a `*_BACKEND_URL` means the gateway container
-itself. See [Quick start: if something goes wrong](docs/QUICKSTART.md#if-something-goes-wrong).
+Under Compose the gateway's backend URLs point at the sample backends by
+service name (`http://http-backend:8003` and so on), whatever `.env` says for
+`*_BACKEND_URL`; set `DOCKER_HTTP_BACKEND_URL` and the other `DOCKER_` variants
+in `.env` to use your own backends. The SQLite database is kept on the
+`gateway_data` volume at `/app/data/gateway.db`, so API keys survive
+`docker compose down` and rebuilds (not `docker compose down -v`, which deletes
+the volume). See [Quick start: if something goes wrong](docs/QUICKSTART.md#if-something-goes-wrong)
+and, for backups, [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#backing-up-the-database-volume).
 
 **Security defaults in the Compose file.** Redis has no password and, like
-PostgreSQL, is published on `127.0.0.1` only. If you start the `monitoring`
-profile, Grafana's admin password is `admin` unless you set
-`GRAFANA_ADMIN_PASSWORD`. If you start the `production` profile, set
-`POSTGRES_PASSWORD`; the fallback is a public placeholder. `CORS_ORIGINS`
-allows every origin until you change it, and `/metrics` and `/health/detailed`
-need no credential. The full list, and what to change, is in
+PostgreSQL, is published on `127.0.0.1` only. The `monitoring` profile needs
+`GRAFANA_ADMIN_PASSWORD` and the `production` profile needs
+`POSTGRES_PASSWORD` in `.env`: those containers refuse to start while the value
+is empty or a placeholder. `CORS_ORIGINS` allows only the local admin console
+(`http://localhost:3001`) until you change it. `/metrics` and `/health/detailed`
+need no credential unless you set `OPS_ENDPOINTS_REQUIRE_ADMIN=true`; the nginx
+of the `production` profile serves them to private addresses only, but port
+8000 is published directly. The full list, and what to change, is in
 [docs/PRODUCTION_SETUP.md](docs/PRODUCTION_SETUP.md).
 
 ## Admin console
@@ -168,7 +176,7 @@ Configuration is read from environment variables and from `.env`.
 |---|---|---|
 | `SECRET_KEY` | Signs tokens. Also the admin credential when `ADMIN_TOKEN` is empty. | a placeholder that is refused |
 | `ADMIN_TOKEN` | Credential for the admin API and console. | empty |
-| `DATABASE_URL` | SQLAlchemy URL. PostgreSQL is supported through `asyncpg`. | `sqlite+aiosqlite:///./gateway.db` |
+| `DATABASE_URL` | SQLAlchemy URL. PostgreSQL is supported through `asyncpg`. `alembic upgrade head` uses the same URL ([docs/UPGRADING.md](docs/UPGRADING.md)). | `sqlite+aiosqlite:///./gateway.db`; under Docker Compose `sqlite+aiosqlite:////app/data/gateway.db` on the `gateway_data` volume |
 | `REDIS_URL`, `REDIS_ENABLED` | Shared rate-limit counters and the API-key cache. | `redis://localhost:6379/0`, `true` |
 | `MCP_BACKEND_URL`, `A2A_BACKEND_URL` | Backends for `/mcp/*` and `/a2a/*`. | `http://localhost:8001`, `http://localhost:8002` |
 | `HTTP_BACKEND_URL`, `AG_UI_BACKEND_URL`, `ACP_BACKEND_URL`, `GRAPHQL_BACKEND_URL`, `MQTT_BROKER_URL` | Backends for the other routes. | not set in code; `env.example` points some at the sample backends |

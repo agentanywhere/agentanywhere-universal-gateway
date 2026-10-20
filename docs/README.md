@@ -17,6 +17,6 @@ Please open an issue.
 - [TESTING.md](TESTING.md): running the tests, and what CI runs
 - [DEPLOYMENT.md](DEPLOYMENT.md): container, Compose, reverse proxy, more than one process
 - [PRODUCTION_SETUP.md](PRODUCTION_SETUP.md): production checklist, defaults to change, known limitations
-- [UPGRADING.md](UPGRADING.md): how the database schema is created, and what Alembic does and does not cover
+- [UPGRADING.md](UPGRADING.md): how the database schema is created, and how to run the Alembic migrations
 - [WEBHOOK_TESTING.md](WEBHOOK_TESTING.md): trying out webhooks
 - [PROJECT_STRUCTURE.md](PROJECT_STRUCTURE.md): where things live in the repository

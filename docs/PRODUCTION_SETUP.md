@@ -25,9 +25,11 @@ These are also in the [README](../README.md). Read them before you deploy.
 - **`SECRET_KEY` has three jobs.** It signs tokens, it is accepted as the admin
   credential when `ADMIN_TOKEN` is empty, and it is accepted as an API key. Set
   a separate `ADMIN_TOKEN` and treat both as secrets.
-- **`/metrics` and `/health/detailed` need no credential.** Anyone who can reach
-  the gateway can read them. The same is true of `/docs`, `/redoc` and
-  `/openapi.json`. See the list of public paths in
+- **`/metrics` and `/health/detailed` need no credential by default.** The
+  shipped `nginx/nginx.conf` limits them to loopback and private addresses,
+  but anyone who reaches the gateway's port 8000 directly can read them unless
+  you set `OPS_ENDPOINTS_REQUIRE_ADMIN=true`. `/docs`, `/redoc` and
+  `/openapi.json` are public too. See the list of public paths in
   [API_REFERENCE.md](API_REFERENCE.md#authentication).
 - **Tenant usage is counted after the response.** A burst of concurrent
   requests can pass a tenant quota by a few requests.
@@ -40,11 +42,12 @@ These are also in the [README](../README.md). Read them before you deploy.
 |---|---|---|
 | `SECRET_KEY` | A placeholder starting with `change-me`. The gateway refuses it as an admin credential. In `ENVIRONMENT=production` it prints a warning but still starts. | Run `python3 scripts/generate_secret_key.py --update-env`. |
 | `ADMIN_TOKEN` | Empty, so `SECRET_KEY` is the admin credential. | Set a separate random value. |
-| `CORS_ORIGINS` | Allows every origin (`env.example` ships `["*"]`, with `CORS_ALLOW_CREDENTIALS=true`). | Set it to the exact origins of your front ends, as a JSON array. |
-| `/metrics`, `/health/detailed` | Open to anyone who can reach the gateway. | Block them at your firewall or reverse proxy, or allow only your monitoring network. In `nginx/nginx.conf` the `/metrics` block has an IP allow-list that is commented out; `/health/detailed` is passed through by the catch-all `location /`. |
+| `CORS_ORIGINS` | The local admin console only: `["http://localhost:3001","http://127.0.0.1:3001"]`, with `CORS_ALLOW_CREDENTIALS=true`. A `"*"` entry makes the gateway turn credentials off and log a warning. | Set it to the exact origins of your front ends, as a JSON array. |
+| `/metrics`, `/health/detailed` | No credential (`OPS_ENDPOINTS_REQUIRE_ADMIN=false`). Through `nginx/nginx.conf`, loopback and private addresses only (403 for others); port 8000 directly, open. | Set `OPS_ENDPOINTS_REQUIRE_ADMIN=true` and give Prometheus the admin token, or firewall port 8000. Adjust the `allow` lines in `nginx/nginx.conf` to your monitoring network. |
 | Redis in `docker-compose.yml` | No password. Port 6379 is published on `127.0.0.1` only. | Keep it on the Compose network or localhost. If you need remote access, add a password and a firewall rule. |
-| PostgreSQL in `docker-compose.yml` (`production` profile) | `POSTGRES_PASSWORD` falls back to the public placeholder `change-me-in-production`. Port 5432 is published on `127.0.0.1` only. | Set `POSTGRES_PASSWORD` in `.env` before you start the profile. |
-| Grafana in `docker-compose.yml` (`monitoring` profile) | Admin user `admin`, password `admin` unless `GRAFANA_ADMIN_PASSWORD` is set. Port 3000 is published on all interfaces. | Set `GRAFANA_ADMIN_PASSWORD` in `.env`, and restrict port 3000. |
+| PostgreSQL in `docker-compose.yml` (`production` profile) | No password fallback: the container refuses to start while `POSTGRES_PASSWORD` is empty or starts with `change-me`. Port 5432 is published on `127.0.0.1` only. | Set a generated `POSTGRES_PASSWORD` in `.env` before you start the profile. PostgreSQL applies it only when the volume is first initialised; to change it later use `ALTER USER`. |
+| Grafana in `docker-compose.yml` (`monitoring` profile) | Admin user `admin`. No password fallback: the container refuses to start while `GRAFANA_ADMIN_PASSWORD` is empty or `admin`. Port 3000 is published on all interfaces. | Set `GRAFANA_ADMIN_PASSWORD` in `.env`, and restrict port 3000. |
+| Gateway database in `docker-compose.yml` | SQLite at `/app/data/gateway.db` on the `gateway_data` volume; it survives container recreation, not `docker compose down -v`. | Back the volume up (see [DEPLOYMENT.md](DEPLOYMENT.md#backing-up-the-database-volume)), or use PostgreSQL. |
 | Prometheus in `docker-compose.yml` (`monitoring` profile) | No authentication. Port 9090 is published on all interfaces. | Restrict port 9090. |
 | Admin console (port 3001) | Published on all interfaces; sign-in needs the admin credential. | Put it behind your reverse proxy and restrict who can reach it. |
 | Sample backends (`backends` profile) | No authentication; ports 8001-8003, 8080, 1883, 9001 and 50051 are published on all interfaces. | Use them for testing only. |
@@ -54,15 +57,19 @@ These are also in the [README](../README.md). Read them before you deploy.
 Tick these off yourself. Nothing in this repository checks them for you.
 
 - [ ] `SECRET_KEY` is a generated random value, and `ADMIN_TOKEN` is a different one.
-- [ ] `CORS_ORIGINS` lists your real origins and not `*`.
+- [ ] `CORS_ORIGINS` lists your real origins and not `*` (with `*`, the gateway
+      disables credentials and logs `cors_wildcard_credentials_disabled`).
 - [ ] TLS is terminated in front of the gateway (see below), with a real certificate.
-- [ ] `/metrics`, `/health/detailed` and, if you want them private, `/docs`,
-      `/redoc` and `/openapi.json` are blocked or restricted at the proxy or firewall.
+- [ ] `/metrics` and `/health/detailed` are not reachable from the internet:
+      `OPS_ENDPOINTS_REQUIRE_ADMIN=true`, or port 8000 firewalled and the nginx
+      allow-list matching your monitoring network. If you want them private,
+      `/docs`, `/redoc` and `/openapi.json` are blocked at the proxy or firewall.
 - [ ] The database is PostgreSQL, or you accept SQLite's limits (see [DEPLOYMENT.md](DEPLOYMENT.md)).
 - [ ] The database file or volume is backed up, and you know how to restore it.
       Remember it holds API keys in plaintext.
 - [ ] Redis and PostgreSQL are not reachable from outside the host or network.
-- [ ] Default passwords (Grafana, PostgreSQL) are changed.
+- [ ] Grafana and PostgreSQL passwords are generated values (the Compose file
+      refuses empty and placeholder values, but not weak ones).
 - [ ] Log rotation is set up.
 - [ ] You have read [UPGRADING.md](UPGRADING.md) and know how you will apply schema changes.
 - [ ] Health checks respond: `/health`, `/ready` and `/live`.
@@ -98,14 +105,14 @@ profile also starts the `postgres` service.
 
 ### PostgreSQL and Alembic
 
-- **Alembic**: `alembic/`, with two migrations, `001_initial_schema.py` and
-  `002_multi_tenant.py`.
+- **Alembic**: `alembic/`, with one baseline migration, `0001_baseline_schema.py`,
+  that creates the full schema. It is safe to run on a database the gateway has
+  already created; see [UPGRADING.md](UPGRADING.md).
 - **Setup script**: `scripts/setup_postgres.sh` creates the database if it does
   not exist and prints the `DATABASE_URL` to use.
 
-**Before you rely on `alembic upgrade head`, read [UPGRADING.md](UPGRADING.md).**
-The gateway creates its own tables when it starts, and the migrations do not
-describe the same schema.
+Alembic uses the same `DATABASE_URL` (and the same `asyncpg` driver) as the
+gateway, so no extra driver is needed.
 
 ```bash
 export POSTGRES_DB=gateway
@@ -114,8 +121,9 @@ export POSTGRES_PASSWORD=your-secure-password
 
 bash scripts/setup_postgres.sh
 
-# Update .env
-echo "DATABASE_URL=postgresql+asyncpg://gateway_user:your-secure-password@localhost:5432/gateway" >> .env
+# Update .env. Use host "postgres" when the gateway runs under docker-compose.yml,
+# "localhost" when it runs directly on this machine.
+echo "DATABASE_URL=postgresql+asyncpg://gateway_user:your-secure-password@postgres:5432/gateway" >> .env
 ```
 
 The `postgres` service in `docker-compose.yml` is part of the `production`
@@ -160,9 +168,8 @@ python3 scripts/generate_secret_key.py --update-env
 generate self-signed certificates if none exist, set up PostgreSQL if
 `USE_POSTGRES=true` and `POSTGRES_PASSWORD` are set, check for `logrotate`,
 check that `docker-compose.yml` has resource limits, and run `alembic upgrade
-head` if PostgreSQL is enabled. It does not set `ADMIN_TOKEN`, `CORS_ORIGINS` or
-any password other than `POSTGRES_PASSWORD`, and it does not restrict `/metrics`.
-Read [UPGRADING.md](UPGRADING.md) before you let it run the migrations.
+head` if PostgreSQL is enabled (it stops if the migration fails). It does not set `ADMIN_TOKEN`, `CORS_ORIGINS` or
+any password other than `POSTGRES_PASSWORD`.
 
 ```bash
 export POSTGRES_PASSWORD=your-secure-password
@@ -182,7 +189,8 @@ bash scripts/setup_production.sh
 
 ### Metrics
 
-- Gateway: `http://localhost:8000/metrics` (no credential; see above)
+- Gateway: `http://localhost:8000/metrics` (no credential unless
+  `OPS_ENDPOINTS_REQUIRE_ADMIN=true`; see above)
 - Prometheus: `http://localhost:9090` with `docker compose --profile monitoring up -d`
 
 ## Troubleshooting

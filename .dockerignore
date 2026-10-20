@@ -30,5 +30,10 @@ htmlcov/
 *.swp
 *.swo
 *~
-
-
+# Local databases and data directories never belong in the image (they hold
+# API keys).
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+data/

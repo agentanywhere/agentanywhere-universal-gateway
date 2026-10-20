@@ -107,16 +107,17 @@ You get the created user back. Without the `X-API-Key` header you get 401.
 **Requests through the gateway.**
 
 - **401 "API key required" or invalid key.** The `X-API-Key` header is missing,
-  or the key does not exist in the database. If you removed `gateway.db`, or are
-  running in Docker without a volume for it, the keys are gone; create a new one.
+  or the key does not exist in the database. If you removed `gateway.db` (or,
+  under Docker Compose, the `gateway_data` volume, for example with
+  `docker compose down -v`), the keys are gone; create a new one.
 - **502.** The gateway could not reach the backend for that route. Check that
   the backend is running and that the matching `*_BACKEND_URL` points at it.
-  Under Docker, `localhost` in a backend URL means the gateway container itself,
-  not your machine; `docker-compose.yml` uses the value from `.env` when one is
-  set, so replace the `localhost` URLs copied from `env.example` with service
-  names such as `http://http-backend:8003` (the sample backends need
-  `docker compose --profile backends up -d --build`) or with an address the
-  container can reach.
+  Under Docker Compose the gateway ignores the `*_BACKEND_URL` lines of `.env`
+  and uses the sample backends' service names (`http://http-backend:8003` and
+  so on), so start them with `docker compose --profile backends up -d --build`.
+  To use your own backend instead, set the `DOCKER_` variant in `.env`, for
+  example `DOCKER_HTTP_BACKEND_URL=http://10.0.0.5:8003`, with an address the
+  container can reach (inside the container `localhost` is the gateway itself).
 - **503 after several 502s.** The circuit breaker for that backend has opened.
   It closes again after `CIRCUIT_BREAKER_TIMEOUT` seconds.
 - **429.** The key or the tenant went over its limit. The response carries a

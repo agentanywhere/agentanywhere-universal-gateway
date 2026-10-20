@@ -73,9 +73,15 @@ echo ""
 # 6. Run database migrations (if PostgreSQL is enabled)
 if [ "${USE_POSTGRES:-false}" = "true" ] && [ -n "$POSTGRES_PASSWORD" ]; then
     echo "6️⃣  Running database migrations..."
+    # Uses DATABASE_URL (environment or .env), like the gateway. Safe on an
+    # empty database and on one the gateway already created; see docs/UPGRADING.md.
     if command -v alembic &> /dev/null; then
-        alembic upgrade head
-        echo "   ✅ Database migrations complete"
+        if alembic upgrade head; then
+            echo "   ✅ Database migrations complete"
+        else
+            echo "   ❌ alembic upgrade head failed; see the error above and docs/UPGRADING.md"
+            exit 1
+        fi
     else
         echo "   ⚠️  Alembic not found. Install with: pip install alembic"
     fi
