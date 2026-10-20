@@ -116,7 +116,13 @@ def example_http_request():
 
 
 def example_grpc_request():
-    """Example: Make a gRPC unary call through the gateway."""
+    """Example: Make a gRPC unary call through the gateway.
+
+    NOT WORKING: the gateway's JSON-to-gRPC bridge does not forward calls to a
+    backend. With the stock requirements it answers HTTP 200 with
+    "status": "unsupported". This shows the intended interface; see
+    docs/PROTOCOLS.md.
+    """
     print("\n=== gRPC Request Example ===")
 
     data = {

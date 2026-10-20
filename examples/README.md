@@ -35,6 +35,11 @@ node examples/javascript_example.js
 
 ## Protocol Examples
 
+> The gateway proxies everything under a protocol prefix to your backend.
+> `/mcp/query` and `/a2a/message` below are the paths served by the sample
+> backends in `samples/backends/`, and the request bodies are the samples'
+> shapes. Use the paths and bodies your own backend expects.
+
 ### MCP (Model Context Protocol)
 
 ```python
@@ -73,6 +78,10 @@ response = requests.post(
 
 ### WebSocket
 
+> **Not working.** The `/ws/*` route currently refuses every connection,
+> including ones that present a valid API key, and it has no relay to the
+> backend. The example describes the intended interface.
+
 ```javascript
 const ws = new WebSocket('ws://localhost:8000/ws/endpoint?api_key=your-key');
 ws.onmessage = (event) => console.log('Received:', event.data);
@@ -80,6 +89,10 @@ ws.send(JSON.stringify({message: 'Hello'}));
 ```
 
 ### gRPC
+
+> **Not working.** The JSON-to-gRPC bridge does not forward calls to a backend.
+> With the stock requirements the request below answers HTTP 200 with
+> `"status": "unsupported"`. The example describes the intended interface.
 
 ```python
 response = requests.post(
@@ -105,11 +118,13 @@ response = requests.post(
 
 ## Getting Your API Key
 
-1. Start the gateway: `docker-compose up -d`
-2. Access admin console: http://localhost:3001
-3. Navigate to API Keys section
-4. Create a new API key
-5. Copy the key and use it in examples
+1. Start the gateway (see the [README](../README.md) or
+   [quick start](../docs/QUICKSTART.md)); with Docker: `docker compose up -d --build`
+2. Open the admin console at http://localhost:3001 and sign in as `admin` with
+   your `ADMIN_TOKEN` (or `SECRET_KEY` if `ADMIN_TOKEN` is empty)
+3. Go to the API Keys section and create a key, or use
+   `POST /admin/api-keys` as in the quick start
+4. Copy the key and use it in the examples
 
 ## More Examples
 

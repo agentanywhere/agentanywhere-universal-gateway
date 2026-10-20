@@ -20,6 +20,7 @@ The CLI is shipped with the project. The package is not on PyPI yet, so
 install it from a checkout with `pip install -e .`:
 
 ```bash
+pip install -e .
 agentanywhere-gateway --help
 ```
 

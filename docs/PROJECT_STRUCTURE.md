@@ -9,7 +9,7 @@ This document describes the organization and structure of the AgentAnywhere Univ
 ## Directory Structure
 
 ```
-mcp_gateway/
+agentanywhere-universal-gateway/
 ├── admin/                    # Admin API endpoints
 │   ├── __init__.py
 │   └── api.py               # Admin API router

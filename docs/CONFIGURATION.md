@@ -42,30 +42,56 @@ This guide explains how to configure the AgentAnywhere Universal Gateway using e
 - `WORKERS`: Number of worker processes (default: 4)
 
 ### Security
-- `SECRET_KEY`: **REQUIRED** - Secret key for JWT tokens and encryption
-  - Generate with: `python3 scripts/generate_secret_key.py`
-  - Must be at least 32 characters
+- `SECRET_KEY`: Secret key for signing tokens. It has three jobs: it signs
+  tokens, it is accepted as the admin credential when `ADMIN_TOKEN` is empty,
+  and it is accepted as an API key. Set it to a random value.
+  - Generate with: `python3 scripts/generate_secret_key.py --update-env`
+  - No length is enforced. The only rule in the code is that a value starting
+    with `change-me` (the placeholder shipped in `env.example`) is treated as
+    unset: the admin API will not accept it as a credential, and with
+    `ENVIRONMENT=production` the gateway prints a warning to stderr at startup
+    but still starts. `scripts/generate_secret_key.py` produces a long random value.
+- `ADMIN_TOKEN`: The credential for the admin API (`Authorization: Bearer ...`)
+  and the admin console password. Empty by default. If it is empty, a
+  `SECRET_KEY` that is not the placeholder is used instead. If both are
+  missing or placeholder, the admin API answers 401 to everything. There is no
+  default password. Set a separate `ADMIN_TOKEN` rather than relying on
+  `SECRET_KEY`.
+- `ADMIN_USERNAME`: The user name the admin console's sign-in form expects
+  (default: "admin"). The password is `ADMIN_TOKEN` (or `SECRET_KEY`, as above).
 - `ALGORITHM`: JWT algorithm (default: "HS256")
 - `ACCESS_TOKEN_EXPIRE_MINUTES`: Token expiration time (default: 30)
 - `API_KEY_HEADER`: Header name for API keys (default: "X-API-Key")
 
 ### CORS Configuration
-- `CORS_ORIGINS`: Comma-separated list of allowed origins
-  - Example: `CORS_ORIGINS=http://localhost:3000,https://example.com`
-  - Use `["*"]` for all origins (development only)
-- `CORS_ALLOW_CREDENTIALS`: Allow credentials (true/false)
-- `CORS_ALLOW_METHODS`: Allowed HTTP methods
-- `CORS_ALLOW_HEADERS`: Allowed headers
+- `CORS_ORIGINS`: List of allowed origins, written as a JSON array
+  - Example: `CORS_ORIGINS=["http://localhost:3000","https://example.com"]`
+  - **The default allows every origin.** The built-in default is
+    `["*", "http://localhost:3001", "http://localhost:3000"]` and `env.example`
+    ships `["*"]`, together with `CORS_ALLOW_CREDENTIALS=true`. Replace it with
+    the exact origins of your front ends before you expose the gateway.
+- `CORS_ALLOW_CREDENTIALS`: Allow credentials (true/false; default: true)
+- `CORS_ALLOW_METHODS`: Allowed HTTP methods, as a JSON array (default: `["*"]`)
+- `CORS_ALLOW_HEADERS`: Allowed headers, as a JSON array (default: `["*"]`)
 
 ### Rate Limiting
 - `RATE_LIMIT_ENABLED`: Enable rate limiting (true/false)
 - `RATE_LIMIT_PER_MINUTE`: Requests per minute (default: 60)
 - `RATE_LIMIT_PER_HOUR`: Requests per hour (default: 1000)
 
+Counters are kept in Redis when `RATE_LIMIT_REDIS_URL` is set, and in the
+memory of each gateway process when it is not. With in-memory counters, every
+worker process (see `WORKERS`) and every replica counts separately, so the
+effective limit is higher than configured. Use Redis if you run more than one
+process.
+
 ### Redis Configuration
 - `REDIS_URL`: Redis connection URL (default: "redis://localhost:6379/0")
-- `REDIS_ENABLED`: Enable Redis (true/false)
-- `RATE_LIMIT_REDIS_URL`: Redis URL for rate limiting (default: "redis://localhost:6379/1")
+- `REDIS_ENABLED`: Enable Redis (true/false; default: true)
+- `RATE_LIMIT_REDIS_URL`: Redis URL for rate limiting (default: unset). When it
+  is unset, rate limiting uses in-memory counters. Note that `env.example` sets
+  it to `redis://localhost:6379/1`, so a `.env` copied from `env.example` has it
+  set; remove or comment out that line to use in-memory counters.
 
 ### Database Configuration
 - `DATABASE_URL`: Database connection string
@@ -108,7 +134,7 @@ buffered. The gateway detects streaming when the client sends
 - `LOG_EXPORT_ENABLED`: Enable log export to external systems (true/false)
 
 ### Log Export - Elasticsearch
-- `ELASTICSEARCH_URL`: Elasticsearch URL (default: "http://localhost:9200")
+- `ELASTICSEARCH_URL`: Elasticsearch URL (default: unset; `env.example` sets `http://localhost:9200`)
 - `ELASTICSEARCH_INDEX`: Index name (default: "gateway-logs")
 - `ELASTICSEARCH_ENABLED`: Enable Elasticsearch export (true/false)
 
@@ -161,15 +187,16 @@ CORS_ORIGINS=["*"]
 ENVIRONMENT=production
 DEBUG=false
 LOG_LEVEL=INFO
-CORS_ORIGINS=https://yourdomain.com
+CORS_ORIGINS=["https://yourdomain.com"]
 SECRET_KEY=<generate-strong-key>
+ADMIN_TOKEN=<generate-a-second-strong-value>
 ```
 
 ## Security Best Practices
 
 1. **Never commit `.env` file** - It's in `.gitignore`
 2. **Use strong secret keys** - Generate with the provided script
-3. **Restrict CORS origins** - Don't use `["*"]` in production
+3. **Restrict CORS origins** - The default and `env.example` allow every origin; set `CORS_ORIGINS` to your real origins before production
 4. **Use environment-specific values** - Different values for dev/staging/prod
 5. **Rotate secrets regularly** - Especially `SECRET_KEY` and database passwords
 
@@ -195,6 +222,16 @@ The configuration is validated using Pydantic Settings:
 
 ### List of all configuration options
 See `env.example` for the complete list of available configuration options.
+
+### Legacy `mcp-gateway` names
+
+The project was first called MCP Gateway. Some names still carry that spelling
+(`MCP_GATEWAY_PLUGIN_PATH`, `MCP_GATEWAY_PLUGIN_DISABLED`, `MCP_GATEWAY_URL`,
+`MCP_GATEWAY_TOKEN`, the `mcp_gateway.plugins` entry-point group, the
+`mcp-gateway` command and `scripts/mcp-gateway`, and example log paths and
+service names in `env.example`). They are compatibility aliases for existing
+installations and are kept on purpose; the code reads them under those exact
+names, so do not rename them.
 
 
 

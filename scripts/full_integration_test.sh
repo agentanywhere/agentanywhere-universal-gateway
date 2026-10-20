@@ -44,7 +44,7 @@ done
 if [ "$BACKENDS_OK" = false ]; then
     echo ""
     echo -e "${YELLOW}⚠${NC} Some backends are not running. Start them with:"
-    echo "  docker-compose --profile backends up -d"
+    echo "  docker compose --profile backends up -d"
     echo ""
 fi
 

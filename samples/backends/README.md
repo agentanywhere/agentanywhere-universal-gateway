@@ -9,7 +9,7 @@ This directory contains sample backend servers for each protocol supported by th
 ```bash
 # Using Docker Compose (recommended)
 cd samples/backends
-docker-compose up -d
+docker compose up -d
 
 # Or start individually
 python samples/backends/mcp/mcp_server.py &
@@ -201,7 +201,7 @@ A `docker-compose.yml` file is provided to start all backends at once:
 
 ```bash
 cd samples/backends
-docker-compose up -d
+docker compose up -d
 ```
 
 This will start:

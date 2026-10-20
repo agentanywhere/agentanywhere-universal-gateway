@@ -14,16 +14,43 @@ http://localhost:8000
 
 ## Authentication
 
-All endpoints (except `/health`, `/ready`, `/metrics`, `/docs`) require authentication.
+Every path requires authentication except the following, which the
+authentication middleware (`app/main.py`) lets through:
+
+| Path | Notes |
+|---|---|
+| `/health` | The default; it is the `HEALTH_CHECK_PATH` setting. |
+| `/metrics` | The default; it is the `METRICS_PATH` setting. Prometheus metrics. |
+| `/ready` | Readiness probe. |
+| `/live` | Liveness probe. |
+| `/health/detailed` | Per-dependency health. |
+| `/docs`, `/redoc`, `/openapi.json` | Interactive documentation and the OpenAPI schema. |
+| `/.well-known/agent-card.json`, `/.well-known/ag-ui.json` | Discovery documents. |
+| `/oauth2/*` | The gateway's OAuth2 endpoints, which clients use to obtain tokens. |
+| `/admin/*` | Not covered by API keys, but not open: the admin endpoints have their own check (see below). All but three answer 401 without the admin credential. |
+
+> **Warning.** `/metrics` and `/health/detailed` need no credential and expose
+> operational detail (Prometheus metrics, per-dependency health and the gateway
+> version) to anyone who can reach the gateway. In production, block them at
+> your firewall or reverse proxy, or expose them only to your monitoring
+> network. The same applies to `/docs`, `/redoc` and `/openapi.json` if you do
+> not want the API surface public.
+
+The admin credential is `ADMIN_TOKEN`, or `SECRET_KEY` when `ADMIN_TOKEN` is
+empty and `SECRET_KEY` is not the shipped placeholder. See
+[CONFIGURATION.md](CONFIGURATION.md).
 
 ### API Key Authentication
 
+The paths in these examples are placeholders for whatever your backend serves
+under the protocol prefix (see the note under "Protocol Endpoints").
+
 ```bash
 # Using X-API-Key header
-curl -H "X-API-Key: your-api-key" http://localhost:8000/mcp/query
+curl -H "X-API-Key: your-api-key" http://localhost:8000/api/users
 
 # Using Authorization header
-curl -H "Authorization: Bearer your-api-key" http://localhost:8000/mcp/query
+curl -H "Authorization: Bearer your-api-key" http://localhost:8000/api/users
 ```
 
 ## Gateway Endpoints
@@ -40,12 +67,13 @@ GET /health
   "status": "healthy",
   "version": "1.0.0",
   "timestamp": "2025-12-03T10:00:00Z",
-  "services": {
-    "mcp_backend": "healthy",
-    "a2a_backend": "healthy"
-  }
+  "services": {}
 }
 ```
+
+This is a fast liveness check. It makes no calls to backends, so `services` is
+empty. `/live` is a second liveness probe; `/health/detailed` runs the
+dependency probes.
 
 ### Readiness Check
 
@@ -53,10 +81,13 @@ GET /health
 GET /ready
 ```
 
+Returns 503 with `"status": "not_ready"` if the database check fails.
+
 **Response:**
 ```json
 {
-  "status": "ready"
+  "status": "ready",
+  "database": {...}
 }
 ```
 
@@ -70,9 +101,16 @@ Returns Prometheus metrics in text format.
 
 ## Protocol Endpoints
 
+The gateway does not define the paths below. It authenticates, limits and
+proxies anything under a protocol prefix (`/mcp/*`, `/a2a/*`, and so on) to the
+configured backend. `/mcp/query` and `/a2a/message` are the paths used by the
+sample backends in `samples/backends/`; the request and response bodies shown
+are the samples' shapes, and a real backend defines its own. See
+[PROTOCOLS.md](PROTOCOLS.md) for which protocols work today.
+
 ### MCP (Model Context Protocol)
 
-#### Query
+#### Example: query (sample backend path)
 
 ```http
 POST /mcp/query
@@ -99,7 +137,7 @@ POST /api/mcp/query
 
 ### A2A (Agent-to-Agent)
 
-#### Send Message
+#### Example: send message (sample backend path)
 
 ```http
 POST /a2a/message
@@ -178,6 +216,10 @@ POST /mqtt/subscribe
 
 ### WebSocket
 
+> **Not working.** The `/ws/*` route refuses every connection and has no relay
+> to a backend. See [PROTOCOLS.md](PROTOCOLS.md). The example shows the
+> intended interface.
+
 ```javascript
 const ws = new WebSocket('ws://localhost:8000/ws/endpoint?api_key=your-key');
 ws.onmessage = (event) => console.log('Received:', event.data);
@@ -185,6 +227,11 @@ ws.send(JSON.stringify({message: 'Hello'}));
 ```
 
 ### gRPC
+
+> **Not working.** The JSON-to-gRPC bridge does not forward calls to a
+> backend; with the stock requirements it answers HTTP 200 with
+> `"status": "unsupported"`. See [PROTOCOLS.md](PROTOCOLS.md). The example
+> shows the intended interface.
 
 ```http
 POST /grpc/call
@@ -448,13 +495,13 @@ GET /admin/logs?limit=100&offset=0&level=error
 #### Anomaly Detection
 
 ```http
-GET /admin/ai/anomalies?limit=10
+GET /admin/ai/anomalies?window_minutes=60
 ```
 
-#### Intelligent Rate Limiting
+#### Insights
 
 ```http
-GET /admin/ai/rate-limiting/{client_id}
+GET /admin/ai/insights
 ```
 
 #### Scaling Recommendations
@@ -594,10 +641,13 @@ Visit http://localhost:8000/docs for interactive Swagger/OpenAPI documentation.
 Generate SDKs for your preferred language:
 
 ```http
-GET /admin/sdk/preview/python
-GET /admin/sdk/generate/python
-GET /admin/sdk/generate/javascript
-GET /admin/sdk/generate/go
+GET  /admin/sdk/languages
+GET  /admin/sdk/preview/{language}
+POST /admin/sdk/generate/{language}
 ```
+
+`{language}` is `python`, `javascript` or `go`. `generate` is a POST and returns
+a zip file (`{language}_sdk.zip`); `preview` is a GET and returns the code.
+Both need the admin credential.
 
 
