@@ -54,32 +54,39 @@ flowchart LR
 Three HTTP middlewares wrap every request. Starlette runs the one registered
 last first, so the order is:
 
-1. **Authentication middleware** (`auth_middleware_handler` in `app/main.py`).
-   It lets `OPTIONS`, the health, metrics and documentation paths, `/admin/*`
-   and `/oauth2/*` through. For everything else it runs auth-provider plugins,
-   then validates the API key, applies IP rules and policies, checks the
-   per-key rate limit and the tenant quota. A failure is answered here, with
-   401, 403 or 429, and the request goes no further.
-2. **Logging middleware** (`logging_middleware`). It assigns the request id,
-   handles W3C `traceparent`, opens a trace span, and after the response
-   records metrics, the access log line, tenant usage and a `request_logs` row.
+1. **Logging middleware** (`logging_middleware` in `app/main.py`). It assigns
+   the request id, handles W3C `traceparent`, opens a trace span, and after the
+   response records metrics, the access log line, tenant usage and a
+   `request_logs` row.
+2. **Authentication middleware** (`auth_middleware_handler`). It lets
+   `OPTIONS`, the health and metrics paths, `/admin/*` and `/oauth2/*`
+   through (`/metrics` and `/health/detailed` check the admin credential
+   themselves when `OPS_ENDPOINTS_REQUIRE_ADMIN=true`). It answers `/docs`,
+   `/redoc` and `/openapi.json` with 404 unless `DEBUG=true`. For everything
+   else it runs auth-provider plugins, then validates the API key, checks its
+   `allowed_paths`, applies IP rules and policies, and checks the per-key rate
+   limit and the tenant quota. A failure is answered here, with 401, 403 or
+   429, and the request goes no further.
 3. **CORS middleware** (Starlette's `CORSMiddleware`).
 
-Because authentication runs outside logging, a request rejected with 401, 403
-or 429 is not counted in metrics and gets no `X-Request-ID` header.
+Because logging runs outside authentication, a rejected request still gets an
+`X-Request-ID`, is counted in metrics (with the path label reduced to its
+first segment) and is written to `request_logs` with its error code. It is not
+counted in tenant usage.
 
 After the middlewares, FastAPI dispatches to a route. Most traffic reaches the
 catch-all proxy, `gateway_proxy`:
 
 ```mermaid
 flowchart TD
-    req["Incoming HTTP request"] --> auth{"Authentication middleware"}
-    auth -- "public path, /admin or /oauth2" --> log
+    req["Incoming HTTP request"] --> log["Logging middleware: request id, trace span"]
+    log --> auth{"Authentication middleware"}
+    auth -- "public path, /admin or /oauth2" --> cors
+    auth -- "/docs, /redoc, /openapi.json with DEBUG=false" --> r404["404 NOT_FOUND"]
     auth -- "no key or unknown key" --> r401["401 AUTHENTICATION_ERROR"]
-    auth -- "IP rule or policy denies" --> r403["403 AUTHORIZATION_ERROR"]
+    auth -- "outside allowed_paths, IP rule or policy" --> r403["403 AUTHORIZATION_ERROR"]
     auth -- "key or tenant over its limit" --> r429["429 RATE_LIMIT_EXCEEDED"]
-    auth -- "valid key, within limits" --> log["Logging middleware: request id, trace span"]
-    log --> cors["CORS middleware"]
+    auth -- "valid key, within limits" --> cors["CORS middleware"]
     cors --> route{"Route match"}
     route -- "/graphql, /mqtt/publish, /mqtt/subscribe" --> special["Dedicated handler"]
     route -- "/admin/*" --> admin["Admin API"]
@@ -107,7 +114,9 @@ flowchart TD
 | Step | Code | What it does |
 |---|---|---|
 | Find the key | `AuthMiddleware._get_api_key_from_header` (`app/middleware/auth.py`) | Reads the header named by `API_KEY_HEADER` (default `X-API-Key`), then `Authorization: Bearer`. |
-| Validate the key | `AuthMiddleware._validate_api_key` | Redis cache first (if enabled), then the database by SHA-256 hash; checks expiry and `is_active`; finally accepts `SECRET_KEY` if it is not the placeholder. |
+| Validate the key | `AuthMiddleware._validate_api_key` | Redis cache first (if enabled; keyed by the key's hash), then the database by SHA-256 hash; checks expiry and `is_active`; finally accepts `SECRET_KEY` if it is not the placeholder. |
+| Path scope | `path_is_allowed` (`app/middleware/auth.py`) | A key with `allowed_paths` gets 403 for other paths. |
+| Client address | `client_ip` (`app/client_ip.py`) | The connection's address, or `X-Forwarded-For` read from the right when the connection comes from `TRUSTED_PROXIES`. |
 | OAuth2 fallback | `AuthMiddleware._validate_oauth2_token` | A bearer token issued by the gateway's own OAuth2 endpoints is accepted, with the default limits. |
 | Governance | `AuthMiddleware._enforce_governance` | IP allow and deny rules, then the policy engine (`app/governance.py`). |
 | Per-key limit | `RateLimiter.check_rate_limit` (`app/middleware/rate_limit.py`) | Fixed one-minute and one-hour windows, per key, in Redis or in memory. |
@@ -146,7 +155,8 @@ which accepts:
 
 1. An OpenID Connect access token, when `IDA_ISSUER` is set (`app/ida_auth.py`).
 2. `ADMIN_TOKEN`.
-3. `SECRET_KEY`, when it is not the shipped placeholder.
+3. `SECRET_KEY`, when it is not the shipped placeholder and `ADMIN_TOKEN` is
+   empty (or `ADMIN_ACCEPT_SECRET_KEY=true`).
 
 The admin console (`admin-ui/`) is a separate React application. It talks to
 the admin API on its own origin, so it needs a proxy that forwards `/admin` to
@@ -163,7 +173,7 @@ operation.
 |---|---|---|
 | API keys, routes, tenants and tenant usage, request logs, settings profiles, governance policies, IP rules, admin roles and audit log, OpenAPI registrations, agent registry | Database (`DATABASE_URL`) | Yes, if every process uses the same database server. |
 | Per-key rate-limit counters | Redis database from `RATE_LIMIT_REDIS_URL`, or process memory | Only with Redis. |
-| API-key cache (300 seconds) | Redis database from `REDIS_URL`, when `REDIS_ENABLED=true` | Yes. |
+| API-key cache (at most 300 seconds, dropped on delete or disable) | Redis database from `REDIS_URL`, when `REDIS_ENABLED=true` | Yes. |
 | Circuit breakers | Process memory | No. |
 | Webhooks, transformation rules, API versions, OAuth2 providers and tokens, log exporters added at run time | Process memory | No. Lost on restart. |
 | Dynamic route table | Database, with an in-memory copy refreshed every `DYNAMIC_ROUTES_REFRESH_SECONDS` | Yes, after the refresh. |

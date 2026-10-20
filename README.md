@@ -6,8 +6,8 @@ GraphQL and MQTT backends. Apache-2.0.
 
 - **For:** teams that run several agent or API services and want one place to
   issue keys, apply limits and watch traffic, without changing the services.
-- **Not for:** anyone who needs WebSocket or gRPC pass-through, encrypted key
-  storage, per-path key scoping or published performance figures. See
+- **Not for:** anyone who needs WebSocket or gRPC pass-through, role-based
+  admin access, per-protocol rate limits or published performance figures. See
   [what it does not do](#what-it-does-not-do).
 
 **Status:** version 1.0.0, not yet released (see the [changelog](CHANGELOG.md)).
@@ -61,7 +61,7 @@ curl -s -X POST http://localhost:8000/api/users -H "X-API-Key: $API_KEY" \
 You get the created user back from the backend:
 
 ```json
-{"id": "user_1", "name": "Ada", "email": "ada@example.com", "metadata": null, "created_at": "2026-10-20T17:36:55.379598+00:00"}
+{"id": "user_1", "name": "Ada", "email": "ada@example.com", "metadata": null, "created_at": "2026-10-20T19:29:25.848555+00:00"}
 ```
 
 Without the `X-API-Key` header, the gateway answers 401 and the backend never
@@ -69,17 +69,19 @@ sees the request. The [getting-started tutorial](docs/tutorials/getting-started.
 walks through the same steps with explanations; the output above comes from
 replaying them in process (see that page for how).
 
-**Using Docker Compose instead?** A `.env` copied from `env.example` points
-the backends at `localhost`, which inside the container is the gateway itself,
-so requests answer 502; and the default SQLite file lives inside the
-container and is lost when it is recreated.
-[Deploy with Docker Compose](docs/how-to/deploy-with-docker-compose.md) shows
-the working setup.
+**Using Docker Compose instead?** `docker compose --profile backends up -d --build`
+starts the gateway, Redis, the console and the sample backends; the gateway
+reaches the samples by service name and keeps its SQLite database on the
+`gateway_data` volume. Read
+[Deploy with Docker Compose](docs/how-to/deploy-with-docker-compose.md) first:
+the console's image probably does not build, and port 8000 is published
+directly.
 
 ## What you get
 
-- **API keys** with per-key limits per minute and per hour, optional expiry,
-  created and revoked through an admin API.
+- **API keys** stored as hashes and shown once, with per-key limits per
+  minute and per hour, optional expiry and path scope, created and revoked
+  through an admin API (revocation takes effect on the next request).
 - **Tenant quotas** shared by groups of keys, with usage counters.
 - **Routing** by path prefix to one backend per protocol, plus routes added at
   run time, a circuit breaker per backend, and Server-Sent Events streaming for
@@ -99,15 +101,15 @@ What works for each protocol is in the
 
 - **WebSocket and gRPC pass-through do not work.** The WebSocket route closes
   every connection, and the gRPC bridge answers `"status": "unsupported"`.
-- **API keys are stored in plaintext**, and the admin API returns them in full.
-- **Some controls are stored but not enforced:** key path scoping
-  (`allowed_paths`), admin roles, per-protocol rate limits.
-- **The Alembic migrations do not match the models** and fail on an existing
-  database. The gateway creates its own tables instead.
-- **Unsafe defaults to change:** CORS allows every origin with credentials;
-  `/metrics` and `/health/detailed` need no credential, and the shipped nginx
-  configuration leaves them public; `SECRET_KEY` is accepted on both the admin
-  API and the data plane.
+- **Some settings are not enforced yet:** admin roles, per-protocol rate
+  limits, the policy `rate_limit` action and tenant `requests_per_day`.
+- **`SECRET_KEY` is a break-glass credential** accepted as an API key on every
+  data-plane route (and on the admin API while `ADMIN_TOKEN` is empty).
+- **Defaults to review:** `/metrics` and `/health/detailed` need no credential
+  unless `OPS_ENDPOINTS_REQUIRE_ADMIN=true`; nginx limits them to private
+  addresses, but the Compose file publishes port 8000 directly.
+- **Keys created by earlier builds** stay in plaintext in the database until
+  they are next used.
 - It does not terminate TLS, ship Kubernetes manifests, or publish benchmarks.
 
 Every item, with its workaround: [known limitations](docs/known-limitations.md).
@@ -123,7 +125,7 @@ points:
   [routes and backends](docs/how-to/configure-routes-and-backends.md),
   [production checklist](docs/how-to/secure-for-production.md),
   [Docker Compose](docs/how-to/deploy-with-docker-compose.md),
-  [troubleshooting 401, 502 and 429](docs/how-to/troubleshoot-401-502-429.md)
+  [troubleshooting 401, 403, 404, 502 and 429](docs/how-to/troubleshoot-401-502-429.md)
 - **Look up:** [configuration](docs/reference/configuration.md),
   [HTTP API](docs/reference/http-api.md), [CLI](docs/reference/cli.md),
   [errors](docs/reference/errors.md), [metrics](docs/reference/metrics.md)

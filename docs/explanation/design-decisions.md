@@ -9,7 +9,7 @@ release; it is not a roadmap.
 - [One Python process does everything](#one-python-process-does-everything)
 - [Routing by path prefix, with optional dynamic routes](#routing-by-path-prefix-with-optional-dynamic-routes)
 - [Authentication in a middleware, admin auth per endpoint](#authentication-in-a-middleware-admin-auth-per-endpoint)
-- [The database creates itself](#the-database-creates-itself)
+- [The database creates itself, and Alembic agrees](#the-database-creates-itself-and-alembic-agrees)
 - [Redis is optional](#redis-is-optional)
 - [Running more than one worker or replica](#running-more-than-one-worker-or-replica)
 - [Buffer by default, stream when asked](#buffer-by-default-stream-when-asked)
@@ -51,35 +51,38 @@ endpoint.
 
 - **Buys:** every proxied path is covered by default, including paths no one
   thought of.
-- **Costs:** the middleware has to know which paths are public, and that list
-  includes `/docs` and `/redoc` even when they are not served, which lets those
-  two paths reach a backend without a key. Because it runs before the logging
-  middleware, rejected requests are not measured. WebSocket routes are outside
-  HTTP middleware and must authenticate themselves, which `/ws` does not manage
-  to do.
+- **Costs:** the middleware has to know which paths are public, and must
+  answer the ones that are not served (`/docs`, `/redoc` and `/openapi.json`
+  with `DEBUG=false`) itself, or they would fall through to the catch-all
+  proxy. Its rejections have to be marked (`_auth_reject`) so that the logging
+  middleware, which runs outside it, records them with bounded metric labels.
+  WebSocket routes are outside HTTP middleware and must authenticate
+  themselves, which `/ws` does not manage to do.
 
-## The database creates itself
+## The database creates itself, and Alembic agrees
 
 At start-up the gateway calls SQLAlchemy's `create_all`, which creates missing
-tables and leaves existing ones alone.
+tables and leaves existing ones alone. The Alembic baseline creates the same
+schema and is safe on a database `create_all` already built; a test fails when
+the two disagree.
 
 - **Buys:** a new installation works with no migration step, on SQLite or
-  PostgreSQL.
-- **Costs:** column changes are never applied, and the Alembic migrations in
-  the repository have drifted from the models. Upgrades that change a table
-  need manual SQL. See [Upgrade the gateway](../how-to/upgrade.md).
+  PostgreSQL, and upgrades that change a table have a migration path.
+- **Costs:** two mechanisms to keep in step (the test enforces it), and you
+  must remember to run `alembic upgrade head` when a release changes a table:
+  `create_all` alone will not. See [Upgrade the gateway](../how-to/upgrade.md).
 
 ## Redis is optional
 
 Without Redis, rate-limit counters live in process memory and there is no
 API-key cache. With Redis, counters are shared and validated keys are cached
-for five minutes. If Redis is configured but unreachable, rate limiting falls
+for up to five minutes (the entry is dropped when a key is deleted or
+disabled). If Redis is configured but unreachable, rate limiting falls
 back to memory instead of failing.
 
 - **Buys:** the gateway runs on a laptop with nothing else installed, and a
   Redis outage does not take traffic down.
 - **Costs:** silent degradation: with Redis down, limits become per process.
-  The key cache delays revocation by up to five minutes.
 
 ## Running more than one worker or replica
 
@@ -135,7 +138,7 @@ running gateway with `PUT /admin/config`.
 
 - **Buys:** the twelve-factor style that containers expect, with type checking
   at start-up.
-- **Costs:** list settings must be JSON arrays; settings are read once, so
+- **Costs:** settings are read once, so
   most changes need a restart; and some settings are accepted without being
   used. The [configuration reference](../reference/configuration.md) marks
   them.

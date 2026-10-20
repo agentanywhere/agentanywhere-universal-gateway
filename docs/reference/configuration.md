@@ -47,29 +47,34 @@ Settings are read once, when the gateway starts. Restart after you change
 them, except for the fields marked **live**, which `PUT /admin/config` can
 change on a running process (see the [HTTP API reference](http-api.md)).
 
-A handful of variables are read directly from the process environment rather
-than through `Settings`; they are marked **env only**. Neither `.env` nor
-`CONFIG_FILE` applies to them: the gateway reads `.env` into its settings but
-does not export it, so an env-only variable written in `.env` has no effect
-when you start `uvicorn` yourself. Export it in the shell instead. Under Docker
-Compose, `env_file: .env` puts every line of `.env` into the container's
-environment, so there it does apply.
+A few variables are read directly from the process environment rather than
+through `Settings`; they are marked **env only**: `CONFIG_FILE`, the three
+`LOG_EXPORT_BATCH_SIZE`/`_FLUSH_INTERVAL`/`_MAX_QUEUE_SIZE` values and the
+CLI's variables. Neither `.env` nor `CONFIG_FILE` applies to them when you
+start `uvicorn` yourself; export them in the shell. Under Docker Compose,
+`env_file: .env` puts every line of `.env` into the container's environment,
+so there they do apply. (The `OTEL_*` and `MCP_GATEWAY_PLUGIN_*` variables are
+settings too, so `.env` applies to them; the process environment wins.)
 
 ## Value formats
 
 | Type | Write it as |
 |---|---|
 | Boolean | `true` or `false` (also `1`/`0`, `yes`/`no`) |
-| List | A JSON array, for example `CORS_ORIGINS=["https://app.example.com"]`. A comma-separated value stops start-up with `error parsing value for field`. |
+| List | A JSON array (`CORS_ORIGINS=["https://a.example","https://b.example"]`) or a comma-separated value (`CORS_ORIGINS=https://a.example,https://b.example`). A value that starts with `[` must be valid JSON. |
 | JSON object | A JSON object on one line, for example `AGENT_ROUTES_JSON={"orders":"http://10.0.0.10:8090"}` |
 | URL | Must include a scheme (`http://`, `ws://` and so on) for `MCP_BACKEND_URL`, `A2A_BACKEND_URL`, `HTTP_BACKEND_URL`, `WEBSOCKET_BACKEND_URL`, `GRAPHQL_BACKEND_URL`, `ELASTICSEARCH_URL` and `SPLUNK_URL`; other URL settings are not validated. |
 
 ## Notes used in the tables
 
 - **live**: can be changed at run time with `PUT /admin/config`.
-- **secret**: redacted in `GET /admin/config` output.
-- **not enforced**: accepted and shown by the admin API, but no code acts on
-  it in this release.
+- **secret**: redacted in `GET /admin/config`, `/admin/config/diff` and the
+  config audit log. Every setting whose name ends in a secret word (`_TOKEN`,
+  `_SECRET`, `_PASSWORD`, `_API_KEY` and similar) is redacted, and so is the
+  password of any `user:password@` URL; `?redacted=false` returns raw values
+  to an admin.
+- **not enforced yet**: accepted and shown by the admin API, but no code acts
+  on it in this release.
 - **not read**: accepted, but no code reads it in this release.
 
 <!-- env-vars:start -->
@@ -81,7 +86,7 @@ environment, so there it does apply.
 | `APP_NAME` | `AgentAnywhere Universal Gateway` | Title of the OpenAPI schema and `service.name` in logs. |
 | `APP_VERSION` | `1.0.0` | Version reported by `/health`, `/health/detailed` and the OpenAPI schema. |
 | `ENVIRONMENT` | `production` | Free text, lower-cased. With `production` and a placeholder `SECRET_KEY`, a warning is printed at start-up. Also used in log fields and to choose `https` for generated SDKs. |
-| `DEBUG` | `false` | When `true`, serves `/docs` and `/redoc`, and echoes SQL statements. With `false`, those two paths are forwarded to the default backend without a key check. |
+| `DEBUG` | `false` | When `true`, serves `/docs`, `/redoc` and `/openapi.json`, and echoes SQL statements. With `false`, those three paths answer 404 from the gateway. |
 | `HOST` | `0.0.0.0` | Bind address, used only when the gateway is started with `python -m app.main`. `uvicorn` on the command line takes `--host` instead. |
 | `PORT` | `8000` | Port, used like `HOST`. `docker-compose.yml` also uses it for the host side of the port mapping. |
 | `WORKERS` | `4` | Worker processes, used only by `python -m app.main` with `ENVIRONMENT=production`. The container image runs one process. |
@@ -92,19 +97,21 @@ environment, so there it does apply.
 
 | Variable | Default | Description |
 |---|---|---|
-| `SECRET_KEY` | `change-me-in-production-use-strong-random-key` | **secret.** Accepted as an admin bearer credential (even when `ADMIN_TOKEN` is set), as the console password when `ADMIN_TOKEN` is empty, and as an API key on the data plane. A value starting with `change-me` is treated as unset. No code signs anything with it in this release. See the [security model](../explanation/security-model.md). |
-| `ADMIN_TOKEN` | empty | The admin credential (`Authorization: Bearer`) and, when set, the console password. Not redacted by `GET /admin/config`. |
+| `SECRET_KEY` | `change-me-in-production-use-strong-random-key` | **secret.** Break-glass credential: accepted as an API key on the data plane, and as the admin credential (and console password) only while `ADMIN_TOKEN` is empty. A value starting with `change-me` is treated as unset. Signs nothing. See the [security model](../explanation/security-model.md#the-secret_key-break-glass-credential). |
+| `ADMIN_TOKEN` | empty | **secret.** The admin credential (`Authorization: Bearer`) and, when set, the console password. Once set, `SECRET_KEY` no longer opens the admin API. |
+| `ADMIN_ACCEPT_SECRET_KEY` | `false` | `true` accepts `SECRET_KEY` on the admin API even when `ADMIN_TOKEN` is set, as earlier builds did. The placeholder is never accepted. |
 | `ADMIN_USERNAME` | `admin` | User name the console's sign-in form expects. |
 | `API_KEY_HEADER` | `X-API-Key` | Header the gateway reads API keys from, before falling back to `Authorization: Bearer`. |
-| `ALGORITHM` | `HS256` | **not read.** |
-| `ACCESS_TOKEN_EXPIRE_MINUTES` | `30` | **not read.** |
+| `ALGORITHM` | `HS256` | **not read.** Nothing issues or signs tokens yet. |
+| `ACCESS_TOKEN_EXPIRE_MINUTES` | `30` | **not read.** As above. |
+| `TRUSTED_PROXIES` | `[]` | List of IP addresses or CIDR ranges of reverse proxies. `X-Forwarded-For` is read only when the connection comes from one of them, from the right; the last entry that is not a trusted proxy is the client. Empty: the header is ignored and the connection's address is the client. Example: `TRUSTED_PROXIES=10.0.0.5,172.18.0.0/16`. |
 
 ## CORS
 
 | Variable | Default | Description |
 |---|---|---|
-| `CORS_ORIGINS` | `["*", "http://localhost:3001", "http://localhost:3000"]` | Allowed origins. `env.example` ships `["*"]`. Set the exact origins before you expose the gateway. |
-| `CORS_ALLOW_CREDENTIALS` | `true` | Allow credentials on cross-origin requests. |
+| `CORS_ORIGINS` | `["http://localhost:3001", "http://127.0.0.1:3001"]` | Allowed origins; the default is the admin console on the same machine (also the value in `env.example`). If the list contains `"*"`, credentials are turned off and `cors_wildcard_credentials_disabled` is logged at start-up. |
+| `CORS_ALLOW_CREDENTIALS` | `true` | Allow credentials on cross-origin requests. Ignored (treated as false) when `CORS_ORIGINS` contains `"*"`. |
 | `CORS_ALLOW_METHODS` | `["*"]` | Allowed methods. |
 | `CORS_ALLOW_HEADERS` | `["*"]` | Allowed request headers. |
 
@@ -116,14 +123,14 @@ environment, so there it does apply.
 | `RATE_LIMIT_PER_MINUTE` | `60` | **live.** Limit for principals without their own limit: `SECRET_KEY` used as a key, and OAuth2 tokens. Keys created through the admin API carry their own limits (default 60). |
 | `RATE_LIMIT_PER_HOUR` | `1000` | **live.** As above, per hour. |
 | `RATE_LIMIT_REDIS_URL` | unset | **secret.** Redis URL for rate-limit counters. Unset: counters live in each process's memory. `env.example` sets `redis://localhost:6379/1`. If Redis is unreachable, the gateway falls back to memory. |
-| `REDIS_URL` | `redis://localhost:6379/0` | **secret.** Redis URL for the five-minute API-key cache. |
+| `REDIS_URL` | `redis://localhost:6379/0` | **secret.** Redis URL for the API-key cache (entries keyed by the key's hash, at most five minutes, dropped when a key is deleted or disabled). |
 | `REDIS_ENABLED` | `true` | Use `REDIS_URL` for the API-key cache. If Redis is unreachable, the cache is skipped. |
 
 ## Database
 
 | Variable | Default | Description |
 |---|---|---|
-| `DATABASE_URL` | unset, which means `sqlite+aiosqlite:///./gateway.db` | **secret.** SQLAlchemy async URL. SQLite (`sqlite+aiosqlite:///path`) and PostgreSQL (`postgresql+asyncpg://user:password@host:5432/db`) drivers are in `requirements.txt`. A relative SQLite path is relative to the working directory. Also read by `alembic/env.py`. |
+| `DATABASE_URL` | unset, which means `sqlite+aiosqlite:///./gateway.db` | **secret.** SQLAlchemy async URL. SQLite (`sqlite+aiosqlite:///path`) and PostgreSQL (`postgresql+asyncpg://user:password@host:5432/db`) drivers are in `requirements.txt`. A relative SQLite path is relative to the working directory. Under `docker-compose.yml` the default is `sqlite+aiosqlite:////app/data/gateway.db`, on the `gateway_data` volume; `env.example` leaves the line commented out so that default applies. Alembic uses the same value. |
 
 ## Backends
 
@@ -140,8 +147,13 @@ environment, so there it does apply.
 | `GRPC_BACKEND_URL` | unset | Target for the JSON-to-gRPC bridge, for example `localhost:50051`. The bridge does not work. |
 | `DEFAULT_TIMEOUT` | `30` | Seconds the gateway waits for a buffered backend response. Also the timeout of agent-edge requests. |
 
-Under Docker, `localhost` in these URLs is the gateway container itself. See
-[Deploy with Docker Compose](../how-to/deploy-with-docker-compose.md).
+These values are for a gateway running directly on a machine. Under the
+repository's `docker-compose.yml`, the gateway container does not take the
+`*_BACKEND_URL` lines from `.env`: Compose sets them to the sample backends'
+service names, or to the `DOCKER_*_BACKEND_URL` values you set (see
+[Variables read by other files](#variables-read-by-other-files-not-by-the-gateway)).
+`AG_UI_BACKEND_URL` and `ACP_BACKEND_URL` have no sample service and are read
+from `.env` as usual. Inside a container, `localhost` is the container itself.
 
 ## Dynamic routes
 
@@ -169,23 +181,23 @@ Under Docker, `localhost` in these URLs is the gateway container itself. See
 
 ## Per-protocol settings
 
-The rate-limit values in this section are **not enforced**. They are shown by
+The rate-limit values in this section are **not enforced yet**. They are shown by
 `GET /admin/settings/protocols`. Requests are limited per key.
 
 | Variable | Default | Description |
 |---|---|---|
-| `PROTOCOL_MCP_RATE_LIMIT_PER_MINUTE` | `60` | **not enforced.** |
-| `PROTOCOL_MCP_RATE_LIMIT_PER_HOUR` | `1000` | **not enforced.** |
-| `PROTOCOL_A2A_RATE_LIMIT_PER_MINUTE` | `60` | **not enforced.** |
-| `PROTOCOL_A2A_RATE_LIMIT_PER_HOUR` | `1000` | **not enforced.** |
-| `PROTOCOL_HTTP_RATE_LIMIT_PER_MINUTE` | `100` | **not enforced.** |
-| `PROTOCOL_HTTP_RATE_LIMIT_PER_HOUR` | `5000` | **not enforced.** |
-| `PROTOCOL_MQTT_RATE_LIMIT_PER_MINUTE` | `200` | **not enforced.** |
-| `PROTOCOL_MQTT_RATE_LIMIT_PER_HOUR` | `10000` | **not enforced.** |
-| `PROTOCOL_WEBSOCKET_RATE_LIMIT_PER_MINUTE` | `300` | **not enforced.** |
-| `PROTOCOL_WEBSOCKET_RATE_LIMIT_PER_HOUR` | `15000` | **not enforced.** |
-| `PROTOCOL_GRPC_RATE_LIMIT_PER_MINUTE` | `150` | **not enforced.** |
-| `PROTOCOL_GRPC_RATE_LIMIT_PER_HOUR` | `8000` | **not enforced.** |
+| `PROTOCOL_MCP_RATE_LIMIT_PER_MINUTE` | `60` | **not enforced yet.** |
+| `PROTOCOL_MCP_RATE_LIMIT_PER_HOUR` | `1000` | **not enforced yet.** |
+| `PROTOCOL_A2A_RATE_LIMIT_PER_MINUTE` | `60` | **not enforced yet.** |
+| `PROTOCOL_A2A_RATE_LIMIT_PER_HOUR` | `1000` | **not enforced yet.** |
+| `PROTOCOL_HTTP_RATE_LIMIT_PER_MINUTE` | `100` | **not enforced yet.** |
+| `PROTOCOL_HTTP_RATE_LIMIT_PER_HOUR` | `5000` | **not enforced yet.** |
+| `PROTOCOL_MQTT_RATE_LIMIT_PER_MINUTE` | `200` | **not enforced yet.** |
+| `PROTOCOL_MQTT_RATE_LIMIT_PER_HOUR` | `10000` | **not enforced yet.** |
+| `PROTOCOL_WEBSOCKET_RATE_LIMIT_PER_MINUTE` | `300` | **not enforced yet.** |
+| `PROTOCOL_WEBSOCKET_RATE_LIMIT_PER_HOUR` | `15000` | **not enforced yet.** |
+| `PROTOCOL_GRPC_RATE_LIMIT_PER_MINUTE` | `150` | **not enforced yet.** |
+| `PROTOCOL_GRPC_RATE_LIMIT_PER_HOUR` | `8000` | **not enforced yet.** |
 | `PROTOCOL_AG_UI_RATE_LIMIT_PER_MINUTE` | `120` | **not read.** |
 | `PROTOCOL_AG_UI_RATE_LIMIT_PER_HOUR` | `6000` | **not read.** |
 | `PROTOCOL_ACP_RATE_LIMIT_PER_MINUTE` | `120` | **not read.** |
@@ -207,7 +219,8 @@ The rate-limit values in this section are **not enforced**. They are shown by
 | `CIRCUIT_BREAKER_FAILURE_THRESHOLD` | `5` | **live.** Consecutive failures that open the breaker. While open, requests answer 503. |
 | `CIRCUIT_BREAKER_TIMEOUT` | `60` | **live.** Seconds before an open breaker lets a request through again. |
 | `METRICS_ENABLED` | `true` | **live.** Record and serve Prometheus metrics. `false`: the metrics path answers 404. |
-| `METRICS_PATH` | `/metrics` | Path of the metrics endpoint. Public. |
+| `METRICS_PATH` | `/metrics` | Path of the metrics endpoint. Public unless `OPS_ENDPOINTS_REQUIRE_ADMIN=true`. |
+| `OPS_ENDPOINTS_REQUIRE_ADMIN` | `false` | `true`: `METRICS_PATH` and `/health/detailed` answer 401 without `Authorization: Bearer <admin credential>` (the same check as the admin API). `/health`, `/live` and `/ready` stay public. |
 | `HEALTH_CHECK_PATH` | `/health` | Path of the liveness endpoint. Public. |
 
 ## Logging
@@ -224,7 +237,7 @@ The rate-limit values in this section are **not enforced**. They are shown by
 
 ## Tracing
 
-All four are **env only**.
+Settings; the process environment wins over `.env`.
 
 | Variable | Default | Description |
 |---|---|---|
@@ -291,7 +304,7 @@ All are **live**.
 
 | Variable | Default | Description |
 |---|---|---|
-| `ALERT_THRESHOLD_RATE_LIMIT` | `true` | Enable rate-limit alerts. In this release they are never sent (see [known limitations](../known-limitations.md#rate-limit-alerts-are-never-sent)). |
+| `ALERT_THRESHOLD_RATE_LIMIT` | `true` | Send an alert when a key exceeds its per-minute or per-hour limit. |
 | `ALERT_THRESHOLD_CIRCUIT_BREAKER` | `true` | Send an alert when a circuit breaker opens or closes. |
 | `ALERT_THRESHOLD_ANOMALY_SCORE` | `0.7` | Lowest anomaly score that triggers an alert. |
 | `ALERT_THRESHOLD_ERROR_RATE` | `0.1` | Error rate that counts as high. |
@@ -304,10 +317,10 @@ All are **live**.
 |---|---|---|
 | `PLUGINS_ENABLED` | `true` | Load plugins at start-up and run them on requests. |
 | `PLUGIN_PATHS` | `[]` | List of directories to load plugin modules from. |
-| `PLUGINS_DISABLED` | `[]` | List of plugin names not to load, for example `["audit-logger"]`. |
+| `PLUGINS_DISABLED` | `[]` | List of plugin names not to load, for example `audit-logger,header-injector`. |
 | `PLUGIN_CONFIGS_JSON` | unset | JSON object of plugin name to configuration object, for example `{"header-injector": {"enabled": true}}`. |
-| `MCP_GATEWAY_PLUGIN_PATH` | unset | **env only.** Extra plugin directories, separated by `:` (`;` on Windows). Legacy name, kept on purpose. |
-| `MCP_GATEWAY_PLUGIN_DISABLED` | unset | **env only.** Extra plugin names not to load, comma-separated. Legacy name, kept on purpose. |
+| `MCP_GATEWAY_PLUGIN_PATH` | empty | Extra plugin directories, separated by `:` (`;` on Windows). Read from `.env` or the environment. Legacy name, kept on purpose. |
+| `MCP_GATEWAY_PLUGIN_DISABLED` | empty | Extra plugin names not to load, comma-separated. Read from `.env` or the environment. Legacy name, kept on purpose. |
 
 ## OpenID Connect and the agent edge
 
@@ -351,8 +364,11 @@ read them.
 
 | Variable | Read by | Meaning |
 |---|---|---|
-| `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_PORT` | `docker-compose.yml` (`postgres` service), `scripts/setup_postgres.sh` | Database name, user, password (falls back to the public placeholder `change-me-in-production`) and host port. The gateway reads only `DATABASE_URL`. |
-| `GRAFANA_ADMIN_PASSWORD` | `docker-compose.yml` (`grafana` service) | Grafana admin password; falls back to `admin`. |
+| `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_PORT` | `docker-compose.yml` (`postgres` service), `scripts/setup_postgres.sh` | Database name, user, password and host port. The `postgres` container refuses to start while `POSTGRES_PASSWORD` is empty or starts with `change-me`. The gateway reads only `DATABASE_URL`. |
+| `GRAFANA_ADMIN_PASSWORD` | `docker-compose.yml` (`grafana` service) | Grafana admin password. The `grafana` container refuses to start while it is empty or `admin`. |
 | `ADMIN_UI_PORT`, `ADMIN_UI_URL`, `NGINX_ENABLED`, `NGINX_HTTP_PORT`, `NGINX_HTTPS_PORT`, `SSL_CERT_PATH`, `SSL_KEY_PATH`, `PROMETHEUS_ENABLED`, `PROMETHEUS_PORT`, `GRAFANA_ENABLED`, `GRAFANA_PORT` | Nothing in this repository | Placeholders in `env.example` for your own tooling. |
+| `DOCKER_MCP_BACKEND_URL`, `DOCKER_A2A_BACKEND_URL`, `DOCKER_HTTP_BACKEND_URL`, `DOCKER_WEBSOCKET_BACKEND_URL`, `DOCKER_MQTT_BROKER_URL`, `DOCKER_GRPC_BACKEND_URL`, `DOCKER_GRAPHQL_BACKEND_URL` | `docker-compose.yml` (`gateway` service) | Backend URLs for the containerised gateway. Compose sets the gateway's `*_BACKEND_URL` from these, defaulting to the sample backends' service names, and ignores the `*_BACKEND_URL` lines of `.env`. |
+| `POSTGRES_WAIT_SECONDS` | `scripts/setup_postgres.sh` | How long the script waits for PostgreSQL (default 60). |
+| `GATEWAY_TEST_POSTGRES_URL` | `tests/test_migrations.py` | An empty, disposable PostgreSQL database for the migration tests (they drop every table in it). |
 | `VITE_BASE_PATH`, `VITE_API_URL` | The admin console build (`admin-ui/`) | Path prefix the console is served under, and an optional API base URL. |
 | `GATEWAY_URL`, `REQUIRE_INTEGRATION` | `tests/test_container_integration.py` | Where the live-server tests look for a gateway, and whether a missing gateway fails instead of skipping. |

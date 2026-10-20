@@ -81,14 +81,37 @@ def test_getting_started_flow(client, sample_backend):
     assert denied.status_code == 401
     assert denied.json()["error"] == "AUTHENTICATION_ERROR"
     assert denied.json()["message"] == "API key required"
+    assert denied.headers["X-Request-ID"] == denied.json()["request_id"]
 
 
-def test_api_key_create_rejects_json_body(client):
-    """docs/reference/cli.md documents that a JSON body answers 422."""
+def test_documented_api_key_shapes(client):
+    """docs/how-to/manage-api-keys.md: JSON body, key shown once, list has
+    id and key_prefix but never the key, scoped keys get 403 elsewhere."""
     admin = {"Authorization": f"Bearer {settings.secret_key}"}
-    res = client.post("/admin/api-keys", json={"name": "cli"}, headers=admin)
-    assert res.status_code == 422
-    assert res.json()["details"]["errors"][0]["location"] == ["query", "name"]
+    res = client.post(
+        "/admin/api-keys",
+        json={"name": "mcp-only", "allowed_paths": ["/mcp"]},
+        headers=admin,
+    )
+    assert res.status_code == 200, res.text
+    created = res.json()
+    assert created["key"].startswith(created["key_prefix"])
+    listed = client.get("/admin/api-keys", headers=admin).json()
+    entry = next(k for k in listed if k["id"] == created["id"])
+    assert "key" not in entry
+    assert entry["key_prefix"] == created["key_prefix"]
+    denied = client.get("/api/users", headers={"X-API-Key": created["key"]})
+    assert denied.status_code == 403
+    assert denied.json()["error"] == "AUTHORIZATION_ERROR"
+    assert denied.headers["X-Request-ID"] == denied.json()["request_id"]
+
+
+def test_docs_paths_answer_404_without_debug(client):
+    """docs/reference/http-api.md: /docs, /redoc, /openapi.json are 404 with DEBUG=false."""
+    if settings.debug:
+        pytest.skip("DEBUG is on in this environment")
+    for path in ("/docs", "/redoc", "/openapi.json"):
+        assert client.get(path).status_code == 404
 
 
 def test_documented_rate_limit_response(client, sample_backend):

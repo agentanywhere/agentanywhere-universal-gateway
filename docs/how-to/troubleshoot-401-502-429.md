@@ -1,16 +1,19 @@
-# Troubleshoot 401, 502 and 429
+# Troubleshoot 401, 403, 404, 502 and 429
 
 **Goal:** find out why a request through the gateway fails with one of the
-three most common errors, and fix it.
+most common errors, and fix it.
 
 **Before you start:** have the full response body (`curl -s`, not `-o
 /dev/null`), the gateway's logs, and the admin credential in `ADMIN`. Every
 error body has an `error` code; the [errors reference](../reference/errors.md)
-lists them all.
+lists them all. Every error response carries an `X-Request-ID` header and the
+same value as `request_id` in the body; search the gateway log for it.
 
 ## Contents
 
 - [401](#401)
+- [403](#403)
+- [404 for /docs, /redoc or /openapi.json](#404-for-docs-redoc-or-openapijson)
 - [502](#502)
 - [429](#429)
 - [Still stuck](#still-stuck)
@@ -33,22 +36,49 @@ lists them all.
 3. **Data plane, invalid key:**
    - Is the key in this gateway's database? List the keys:
      `curl -s "$URL/admin/api-keys" -H "Authorization: Bearer $ADMIN"`.
-     If the list is empty after a restart, the database was replaced (SQLite
-     in a recreated container, or a different working directory).
+     Find yours by `key_prefix` (the list never shows the key itself). If the
+     list is empty after a restart, the database was replaced (a deleted
+     Compose volume, or a different working directory).
    - Is it active and unexpired? The list shows `is_active` and `expires_at`.
    - Did you send the `id` instead of the `key`? Keys start with `sk-`.
 
-4. **Admin plane:** the credential is `ADMIN_TOKEN` (or a `SECRET_KEY` that does
-   not start with `change-me`). If both are unset or placeholders, every admin
-   call answers 401 until you set one and restart. `.env` is read from the
-   directory the gateway was started in.
+4. **Admin plane:** the credential is `ADMIN_TOKEN`. `SECRET_KEY` (if it does
+   not start with `change-me`) works only while `ADMIN_TOKEN` is empty, unless
+   `ADMIN_ACCEPT_SECRET_KEY=true`. If both are unset or placeholders, every
+   admin call answers 401 until you set one and restart. `.env` is read from
+   the directory the gateway was started in.
 
-5. **The console rejects your sign-in:** user name `ADMIN_USERNAME` (default
+5. **`/metrics` or `/health/detailed`:** with `OPS_ENDPOINTS_REQUIRE_ADMIN=true`
+   they need the admin credential as a bearer token.
+
+6. **The console rejects your sign-in:** user name `ADMIN_USERNAME` (default
    `admin`); password `ADMIN_TOKEN`, or `SECRET_KEY` when `ADMIN_TOKEN` is
    empty.
 
 **Check:** the same request with the corrected credential answers something
 other than 401.
+
+## 403
+
+1. Read `message`:
+   - `This API key is not allowed to access this path`: the key was created
+     with `allowed_paths`, and `details` lists them. Use a key whose scope
+     covers the path. Paths with `.` or `..` segments are refused for scoped
+     keys.
+   - `Request blocked by IP rule` or a policy's reason: check
+     `GET /admin/governance/ip-rules` and `GET /admin/governance/policies`.
+     The client address is the connection's unless it comes from an address in
+     `TRUSTED_PROXIES`; behind a proxy without that setting, every request
+     comes from the proxy.
+2. A plain 403 page from nginx on `/metrics` or `/health/detailed` means the
+   client is outside nginx's allow-list.
+
+## 404 for /docs, /redoc or /openapi.json
+
+With `DEBUG=false` (the default), the gateway answers 404 for `/docs`, `/redoc`
+and `/openapi.json`. Set `DEBUG=true` (on a development machine) to serve them.
+The [generated endpoint list](../reference/http-endpoints.md) describes the API
+without them.
 
 ## 502
 
@@ -75,10 +105,11 @@ connect to the backend, or the backend did not answer within
    ```
 
 4. Fix the cause:
-   - **Under Docker, the URL says `localhost`.** That is the gateway
-     container. This happens when `.env` was copied from `env.example`. Set
-     service names (`http://http-backend:8003`) or delete the lines; see
-     [Deploy with Docker Compose](deploy-with-docker-compose.md#the-three-traps).
+   - **Under Docker Compose.** The gateway uses the sample backends' service
+     names unless you set `DOCKER_*_BACKEND_URL`. Start the samples with
+     `docker compose --profile backends up -d`, or point the `DOCKER_` variable
+     at an address the container can reach (inside it, `localhost` is the
+     gateway itself); see [Deploy with Docker Compose](deploy-with-docker-compose.md).
    - **The backend is not running.** Start it.
    - **The backend is slow.** Raise `DEFAULT_TIMEOUT`, or for AG-UI and ACP
      ask for streaming (`Accept: text/event-stream`).
@@ -123,9 +154,8 @@ usually means that protocol's backend URL is not set.
 
 ## Still stuck
 
-- Search the gateway log for the `request_id` of the failed request
-  (absent for 401 and 429 on the data plane, which are answered before a
-  request id is assigned).
+- Search the gateway log, and `GET /admin/logs`, for the `request_id` of the
+  failed request.
 - See the [troubleshooting page](../troubleshooting.md) for other symptoms and
   the [known limitations](../known-limitations.md).
 - Ask for help as described in [Support](../support.md).

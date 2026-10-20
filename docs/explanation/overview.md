@@ -34,16 +34,14 @@ It is licensed under Apache-2.0. Copyright ShepHertz Technologies Pvt. Ltd.
 ## Who it is not for
 
 - Anyone who needs a gateway they can expose to the internet without reading
-  the [known limitations](../known-limitations.md) first. API keys are stored
-  in plaintext, CORS is open by default, and several settings that look like
-  controls (`allowed_paths`, admin roles, per-protocol limits) are not
-  enforced.
+  the [known limitations](../known-limitations.md) first. `SECRET_KEY` is a
+  break-glass API key on every route, the Compose file publishes port 8000
+  past nginx, and several settings that look like controls (admin roles,
+  per-protocol limits) are not enforced yet.
 - Anyone who needs WebSocket or gRPC pass-through. Neither works.
 - Anyone who needs a high-throughput edge proxy. The gateway buffers most
   responses in Python, writes a database row per request and has no published
   performance figures.
-- Anyone who needs managed schema migrations. The shipped Alembic migrations do
-  not match the models.
 
 ## What it does not do
 
@@ -51,8 +49,8 @@ It is licensed under Apache-2.0. Copyright ShepHertz Technologies Pvt. Ltd.
   nginx configuration.
 - It does not implement MCP, A2A or the other protocols as a server. It sits
   in front of servers that do.
-- It does not scope API keys to paths, enforce admin roles, or apply
-  per-protocol rate limits, although it stores settings for all three.
+- It does not enforce admin roles or apply per-protocol rate limits yet,
+  although it stores settings for both.
 - It does not ship Kubernetes manifests or a Helm chart.
 - It does not provide user accounts. The admin console has a single shared
   credential, or OpenID Connect sign-in if you configure an issuer.

@@ -42,6 +42,12 @@ the gateway container itself.
    These are the ports of the sample backends in `samples/backends/`. Leave a
    line out to leave that protocol unrouted.
 
+   Under the repository's `docker-compose.yml`, set the `DOCKER_` variants
+   instead (`DOCKER_HTTP_BACKEND_URL`, `DOCKER_MCP_BACKEND_URL` and so on, for
+   every protocol except AG-UI and ACP): Compose ignores the `*_BACKEND_URL`
+   lines of `.env` and defaults to the sample backends' service names. See
+   [Deploy with Docker Compose](deploy-with-docker-compose.md#point-the-gateway-at-your-own-backends).
+
 2. Restart the gateway. Start the MQTT broker first, if you use one: the
    gateway connects to it only at start-up.
 
@@ -135,7 +141,7 @@ An unknown slug answers 404 `AGENT_NOT_FOUND`.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| 502 `BACKEND_ERROR` | The gateway cannot reach the URL. Under Docker, `localhost` is the container. | Use an address the gateway can reach. See [Troubleshoot 401, 502 and 429](troubleshoot-401-502-429.md). |
+| 502 `BACKEND_ERROR` | The gateway cannot reach the URL. Under Docker, `localhost` is the container, and Compose uses the `DOCKER_*_BACKEND_URL` values. | Use an address the gateway can reach. See [Troubleshoot 401, 403, 404, 502 and 429](troubleshoot-401-502-429.md). |
 | 500 `INTERNAL_ERROR` on `/agui` or `/acp` | `AG_UI_BACKEND_URL` or `ACP_BACKEND_URL` is unset | Set it and restart. |
 | 503 `GraphQL backend not configured` | `GRAPHQL_BACKEND_URL` is unset | Set it and restart. |
 | 503 `MQTT broker not connected` | The broker was not up when the gateway started | Start the broker, then restart the gateway. |

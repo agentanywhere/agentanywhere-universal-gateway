@@ -102,12 +102,14 @@ For the console, in another terminal: `cd admin-ui && npm ci && npm run dev`
 
 ## How a request flows through the code
 
-1. `auth_middleware_handler` (`app/main.py`) is the outermost middleware. It
-   lets public paths and `/admin` through; otherwise it calls
-   `AuthMiddleware.authenticate`, `RateLimiter.check_rate_limit` and
-   `tenant_service.check_quota`, and answers 401, 403 or 429 itself.
-2. `logging_middleware` assigns the request id and records metrics and logs
-   after the response.
+1. `logging_middleware` (`app/main.py`) is the outermost middleware. It
+   assigns the request id and records metrics and logs after the response,
+   including for rejected requests.
+2. `auth_middleware_handler` lets public paths and `/admin` through;
+   otherwise it calls `AuthMiddleware.authenticate` (key, `allowed_paths`, IP
+   rules, policies), `RateLimiter.check_rate_limit` and
+   `tenant_service.check_quota`, and answers 401, 403 or 429 itself through
+   `_auth_reject`.
 3. FastAPI routes the request: `/admin/*` to `admin/api.py`, `/graphql` and
    `/mqtt/*` to their handlers, everything else to `gateway_proxy`.
 4. `gateway_proxy` runs the protocol checks, protocol plugins, the dynamic
@@ -162,10 +164,12 @@ For the console, in another terminal: `cd admin-ui && npm ci && npm run dev`
 
 Add a function with `@app.middleware("http")` in `app/main.py`, or a Starlette
 middleware class with `app.add_middleware(...)`. Starlette runs the
-middleware registered **last** first. Today the order is: authentication
-(outermost), logging, CORS. A middleware registered after
-`auth_middleware_handler` runs before authentication and sees unauthenticated
-requests; one registered before `logging_middleware` runs inside it. WebSocket
+middleware registered **last** first. Today the order is: logging
+(outermost, registered last with `app.middleware("http")(logging_middleware)`),
+authentication, CORS. A middleware registered between the two runs after
+logging and before authentication, and sees unauthenticated requests. A
+response produced by the authentication layer should go through
+`_auth_reject`, so that logging records it as a rejected request. WebSocket
 routes do not pass through HTTP middlewares. Keep reusable logic in a class
 under `app/middleware/` and export it from `app/middleware/__init__.py`, as
 `AuthMiddleware` and `RateLimiter` are.

@@ -24,13 +24,13 @@ bug; please [report it](support.md).
 | [Run behind nginx with TLS](how-to/run-behind-nginx-tls.md) | Serve HTTPS and keep operational endpoints private. |
 | [Secure the gateway for production](how-to/secure-for-production.md) | Work through the production checklist. |
 | [Back up and restore](how-to/back-up-and-restore.md) | Keep and recover keys, tenants and routes. |
-| [Upgrade the gateway](how-to/upgrade.md) | Move to a new release; versioning and the database schema. |
+| [Upgrade the gateway](how-to/upgrade.md) | Move to a new release; versioning, Alembic and the behaviour changes in this release. |
 | [Monitor the gateway](how-to/monitor.md) | Health endpoints, Prometheus, Grafana, logs and traces. |
 | [Write a plugin](how-to/write-a-plugin.md) | Extend the gateway with Python. |
-| [Send events to a webhook](how-to/configure-webhooks.md) | Get notified of circuit breaker and key events. |
+| [Send events to a webhook](how-to/configure-webhooks.md) | Get notified of rate-limit, circuit breaker and key events. |
 | [Run the tests](how-to/run-the-tests.md) | Run the suite and the documentation checks. |
 | [Deploy with Docker Compose](how-to/deploy-with-docker-compose.md) | Run the gateway, Redis, the console and optional services. |
-| [Troubleshoot 401, 502 and 429](how-to/troubleshoot-401-502-429.md) | Fix the three most common request errors. |
+| [Troubleshoot 401, 403, 404, 502 and 429](how-to/troubleshoot-401-502-429.md) | Fix the most common request errors. |
 
 ## Reference: look it up
 
@@ -66,7 +66,7 @@ bug; please [report it](support.md).
 | [Security policy](../SECURITY.md) | How to report a vulnerability; supported versions. |
 | [Contributing](../CONTRIBUTING.md) | How to contribute, and a tour of the codebase. |
 | [Changelog](../CHANGELOG.md) | What changed in each release. |
-| [Plugins (moved)](PLUGINS.md) | Pointer kept for links from the code. |
+| [Plugins (moved)](PLUGINS.md), [Upgrading (moved)](UPGRADING.md), [Deployment (moved)](DEPLOYMENT.md), [Configuration (moved)](CONFIGURATION.md) | Pointers kept for links from code and configuration comments. |
 
 ## Elsewhere in the repository
 

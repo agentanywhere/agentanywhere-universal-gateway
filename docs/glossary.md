@@ -28,7 +28,8 @@ agents and user interfaces, often over Server-Sent Events. Proxied under
 
 **API key.** A credential (`sk-...`) issued with `POST /admin/api-keys` and
 sent by clients in `X-API-Key` or `Authorization: Bearer`. Each key has its own
-rate limits. Stored in plaintext.
+rate limits and optional path scope. Stored as a SHA-256 hash and shown only
+once, when it is created.
 
 **Backend.** A service the gateway forwards requests to. Also called an
 upstream.

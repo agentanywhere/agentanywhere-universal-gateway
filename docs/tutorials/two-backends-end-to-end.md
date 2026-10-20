@@ -82,13 +82,14 @@ Each response looks like this (your ids and keys differ):
 
 ```json
 {
-  "id": "7b60780a-137a-4abb-90b5-d7f32142fbc9",
+  "id": "0aba06f8-5cb8-44c6-b169-2e10324ac96f",
   "name": "batch-job",
-  "key": "sk-Fgx9WSn9X-WvQ6CNvOBuV98swkjM5pV-vOswbTXWehk",
+  "key": "sk-coLRBu1n3BBis7pzEi1OullD0bL_PvffvfA9phHx9dI",
+  "key_prefix": "sk-coLRBu1n",
   "rate_limit_per_minute": 100,
   "rate_limit_per_hour": 1000,
   "is_active": true,
-  "created_at": "2026-10-20T17:36:55.400521",
+  "created_at": "2026-10-20T19:29:25.875929",
   "expires_at": null,
   "allowed_paths": []
 }
@@ -177,8 +178,8 @@ response carries `Retry-After: 60`:
 {
   "error": "RATE_LIMIT_EXCEEDED",
   "message": "Rate limit exceeded: 5 requests per minute",
-  "request_id": null,
-  "timestamp": "2026-10-20T17:36:55.466797",
+  "request_id": "ea68b03b-e9e6-44fb-b442-1e647d5a1f99",
+  "timestamp": "2026-10-20T19:29:25.960190",
   "details": {
     "limit": 5,
     "window": "minute",
@@ -214,13 +215,13 @@ curl -s -X POST http://localhost:8000/admin/tenants \
     "storage_mb": 1000
   },
   "is_active": true,
-  "created_at": "2026-10-20T17:36:55.469382",
-  "updated_at": "2026-10-20T17:36:55.469386"
+  "created_at": "2026-10-20T19:29:25.964349",
+  "updated_at": "2026-10-20T19:29:25.964353"
 }
 ```
 
 The values you did not set are the defaults. Only the minute and hour quotas
-are enforced; see [known limitations](../known-limitations.md#several-limit-settings-are-accepted-but-not-enforced).
+are enforced; see [known limitations](../known-limitations.md#settings-that-are-not-enforced-yet).
 
 Associate the batch job's key with the tenant. The endpoint needs both the id
 and the key itself:
@@ -234,8 +235,8 @@ curl -s -X POST http://localhost:8000/admin/tenants/acme/associate-api-key \
 ```json
 {
   "tenant_id": "acme",
-  "api_key_id": "7b60780a-137a-4abb-90b5-d7f32142fbc9",
-  "api_key": "sk-Fgx9W...",
+  "api_key_id": "0aba06f8-5cb8-44c6-b169-2e10324ac96f",
+  "api_key": "sk-coLRB...",
   "message": "API key associated"
 }
 ```
@@ -261,8 +262,8 @@ This 429 names the tenant and its quota:
 {
   "error": "RATE_LIMIT_EXCEEDED",
   "message": "Rate limit exceeded: 3 requests per minute",
-  "request_id": null,
-  "timestamp": "2026-10-20T17:36:56.138727",
+  "request_id": "3c1c5702-338a-4689-a655-8c817f8f7ad0",
+  "timestamp": "2026-10-20T19:29:26.666233",
   "details": {
     "limit": 3,
     "window": "minute",
@@ -301,7 +302,7 @@ curl -s "http://localhost:8000/admin/tenants/acme/usage?window=minute&lookback=5
     "day": {"request_count": 3, "error_count": 0, "bytes_in": 0, "bytes_out": 216}
   },
   "history": [
-    {"window": "minute", "window_start": "2026-10-20T17:36:00", "request_count": 3, "error_count": 0, "bytes_in": 0, "bytes_out": 216}
+    {"window": "minute", "window_start": "2026-10-20T19:29:00", "request_count": 3, "error_count": 0, "bytes_in": 0, "bytes_out": 216}
   ]
 }
 ```
@@ -315,8 +316,9 @@ curl -s "http://localhost:8000/admin/logs?limit=2" -H "Authorization: Bearer $AD
 ```
 
 Each row has the method, path, status code, response time and client address.
-Requests that the gateway rejected with 401 or 429 are not logged; see
-[known limitations](../known-limitations.md#rejected-requests-are-not-counted).
+Rejected requests are logged too, with the error code in `error`; for
+example, `GET /admin/logs?status_code=429` lists the four 429 responses from
+steps 4 and 5.
 
 ### With the admin console
 
@@ -334,29 +336,36 @@ The Vite development server listens on <http://localhost:3001> and forwards
 and your `ADMIN_TOKEN` as the password. The API Keys page lists the three keys
 you created, with their limits.
 
-**Warning.** The console's delete and enable/disable buttons for API keys do
-not work: they answer 404. Use the admin API to revoke keys (next section and
-[known limitations](../known-limitations.md#key-ids-are-only-shown-once-and-the-console-cannot-revoke-keys)).
+The list shows each key's `key_prefix`, never the key. The delete and
+enable/disable buttons work on the key's id.
 
-With Docker Compose the console is built and served on port 3001 for you; see
-[Deploy with Docker Compose](../how-to/deploy-with-docker-compose.md).
+The console's production build (and so its Docker image) probably does not
+build as shipped; see
+[known limitations](../known-limitations.md#the-admin-consoles-production-build-probably-fails).
+This step was not run for this page.
 
 ## 7. Read the Prometheus metrics
 
-The gateway serves Prometheus metrics at `/metrics`, without a credential:
+The gateway serves Prometheus metrics at `/metrics`, without a credential
+(unless `OPS_ENDPOINTS_REQUIRE_ADMIN=true`):
 
 ```bash
-curl -s http://localhost:8000/metrics | grep -E '^gateway_(red_)?requests_total\{' | grep -E '/api/users|/mcp/query'
+curl -s http://localhost:8000/metrics | grep -E '^gateway_(red_)?requests_total\{' | grep -E 'path="/(api|mcp)|route="/(api|mcp)'
 ```
 
 ```text
 gateway_requests_total{method="POST",path="/api/users",protocol="http",status_code="200"} 1.0
 gateway_requests_total{method="GET",path="/api/users",protocol="http",status_code="200"} 8.0
+gateway_requests_total{method="POST",path="/api",protocol="http",status_code="401"} 1.0
 gateway_requests_total{method="POST",path="/mcp/query",protocol="mcp",status_code="200"} 1.0
+gateway_requests_total{method="GET",path="/api",protocol="http",status_code="429"} 4.0
 gateway_red_requests_total{method="POST",protocol="http",route="/api/users",status_class="2xx",tenant="_"} 1.0
 gateway_red_requests_total{method="GET",protocol="http",route="/api/users",status_class="2xx",tenant="_"} 5.0
+gateway_red_requests_total{method="POST",protocol="http",route="/api",status_class="4xx",tenant="_"} 1.0
 gateway_red_requests_total{method="POST",protocol="http",route="/mcp/query",status_class="2xx",tenant="_"} 1.0
+gateway_red_requests_total{method="GET",protocol="http",route="/api",status_class="4xx",tenant="_"} 3.0
 gateway_red_requests_total{method="GET",protocol="http",route="/api/users",status_class="2xx",tenant="acme"} 3.0
+gateway_red_requests_total{method="GET",protocol="http",route="/api",status_class="4xx",tenant="acme"} 1.0
 ```
 
 Read it like this:
@@ -368,9 +377,11 @@ Read it like this:
   `POST /api/users` is the user you created there.
 - `gateway_red_requests_total` uses a normalised route and a tenant label,
   so you can see the three requests that counted against Acme's quota.
-- The four 429 responses (three for the web application, one for the batch
-  job) are in neither metric, because rejected requests are
-  answered before metrics are recorded.
+- Rejected requests are counted too, with the path reduced to its first
+  segment: `path="/api"` with `status_code="429"` is the four 429 responses
+  from steps 4 and 5, and `status_code="401"` is the request without a key
+  from the first tutorial. `gateway_rate_limit_hits_total` counts the 429s
+  per key id.
 
 To collect the metrics over time, point a Prometheus server at the gateway.
 For a gateway on your own machine, a minimal configuration is:
@@ -389,8 +400,8 @@ monitoring up -d`). Every metric is described in the
 
 ## 8. Clean up
 
-Revoke the two keys by id. You saved the batch job's id; the web
-application's id was in its creation response.
+Revoke the two keys by id. You saved the batch job's id; `GET /admin/api-keys`
+lists the others with their `id` and `key_prefix`.
 
 ```bash
 curl -s -X DELETE "http://localhost:8000/admin/api-keys/$BATCH_ID" -H "Authorization: Bearer $ADMIN"

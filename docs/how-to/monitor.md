@@ -26,8 +26,10 @@ traffic behaves, using its health endpoints, Prometheus metrics and logs.
 | `GET /ready` | Readiness | 200 when the database answers, 503 otherwise. |
 | `GET /health/detailed` | Diagnosis | Database, Redis, backends and log exporters; 503 if any is unhealthy. |
 
-All four need no credential. Keep `/health/detailed` off the public internet;
-it lists your dependencies.
+`/health`, `/live` and `/ready` never need a credential. `/health/detailed`
+needs none either unless `OPS_ENDPOINTS_REQUIRE_ADMIN=true`, in which case it
+answers 401 without `Authorization: Bearer <admin credential>`. Keep it off
+the public internet; it lists your dependencies.
 
 `/health/detailed` reports `unhealthy` when no configured backend answers, so
 do not use it as a liveness or readiness probe: an outage of one backend would
@@ -38,7 +40,7 @@ The Docker image's `HEALTHCHECK` and the Compose healthcheck both call
 
 ## Prometheus
 
-1. Scrape `/metrics` (no credential). The repository's `prometheus.yml`:
+1. Scrape `/metrics`. The repository's `prometheus.yml`:
 
    ```yaml
    scrape_configs:
@@ -46,9 +48,18 @@ The Docker image's `HEALTHCHECK` and the Compose healthcheck both call
        static_configs:
          - targets: ['gateway:8000']
        metrics_path: '/metrics'
+       # With OPS_ENDPOINTS_REQUIRE_ADMIN=true the gateway answers 401 without the
+       # admin credential. Put the token in a file mounted into this container and
+       # uncomment:
+       # authorization:
+       #   type: Bearer
+       #   credentials_file: /etc/prometheus/gateway_admin_token
    ```
 
-2. Restrict `/metrics` to your Prometheus servers at the proxy.
+2. Keep `/metrics` private. The shipped nginx serves it to loopback and
+   private addresses only; port 8000 is not behind nginx. With
+   `OPS_ENDPOINTS_REQUIRE_ADMIN=true` the gateway itself requires the admin
+   credential: mount the token file and uncomment the `authorization:` block.
 
 Useful queries, built from the [metrics reference](../reference/metrics.md):
 
@@ -72,10 +83,12 @@ gateway_dependency_up == 0
 
 Three things to know:
 
-- 401, 403 and 429 responses on the data plane are **not** in these metrics.
-  Count them at your reverse proxy if you need them.
-- `gateway_rate_limit_hits_total`, `gateway_circuit_breaker_state` and
-  `gateway_active_connections` are never updated. Do not alert on them.
+- Rejected requests (401, 403, 429) are counted, with the `path` label of
+  `gateway_requests_total` reduced to the first path segment (or `/other`).
+  `gateway_rate_limit_hits_total` counts 429s from the authentication layer:
+  `sum(rate(gateway_rate_limit_hits_total[5m]))`.
+- `gateway_circuit_breaker_state` and `gateway_active_connections` are never
+  updated. Do not alert on them.
 - `gateway_dependency_up` is only updated when a probe runs (`/ready`,
   `/health/detailed`). Scraping `/metrics` alone does not refresh it; probe
   `/ready` from your orchestrator.
@@ -130,8 +143,8 @@ platform's log collector.
 
 The gateway honours an incoming W3C `traceparent`, sends one to the backend,
 and keeps recent spans in memory (`GET /admin/observability/traces`). To export
-spans over OTLP/HTTP, set these in the process environment (not only in `.env`
-when you run `uvicorn` yourself):
+spans over OTLP/HTTP, set these in `.env` or the environment (the environment
+wins):
 
 ```bash
 OTEL_TRACING_ENABLED=true
@@ -154,4 +167,5 @@ In Prometheus, `up{job="gateway"}` is 1.
 | `/metrics` answers 404 | `METRICS_ENABLED=false`, or a different `METRICS_PATH` | Check the settings. |
 | Prometheus target is down | Wrong address, or the proxy blocks Prometheus | Scrape the gateway directly on the internal network. |
 | Counts look low with several workers | Each worker has its own counters | See the [metrics reference](../reference/metrics.md#several-processes). |
-| No 429 in the metrics | Rejected requests are not counted | Count them at the proxy. |
+| `/metrics` or `/health/detailed` answers 401 | `OPS_ENDPOINTS_REQUIRE_ADMIN=true` | Send the admin credential; configure Prometheus's `authorization:` block. |
+| `/metrics` answers 403 through nginx | The scraper is outside nginx's allow-list | Add it to the `allow` lines, or scrape `gateway:8000` directly. |

@@ -18,11 +18,15 @@ Credential column:
 Parameter notation: `name` is required, `name?` is optional, `=value` is the
 default. *query*, *path* and *body* say where the parameter goes.
 
-Totals: 162 operations (one per method and path), of which 135 are under `/admin`. 3 admin operations need no credential.
+The list is generated with `DEBUG=false`, the default. With `DEBUG=true` the
+gateway also serves `/docs`, `/redoc` and `/openapi.json`; otherwise they
+answer 404.
+
+Totals: 160 operations (one per method and path), of which 135 are under `/admin`. 3 admin operations need no credential.
 
 ## Contents
 
-- [Health, metrics and discovery](#health-metrics-and-discovery) (8)
+- [Health, metrics and discovery](#health-metrics-and-discovery) (7)
 - [Data plane](#data-plane) (4)
 - [WebSocket](#websocket) (2)
 - [OAuth2](#oauth2) (6)
@@ -54,12 +58,11 @@ Totals: 162 operations (one per method and path), of which 135 are under `/admin
 
 | Method | Path | Credential | Parameters | Summary |
 |---|---|---|---|---|
-| GET, HEAD | `/openapi.json` | none |  | OpenAPI schema, served by FastAPI. |
 | GET | `/health` | none |  | Liveness probe — fast, no external calls. |
-| GET | `/health/detailed` | none |  | Detailed health: runs every registered dependency probe. |
+| GET | `/health/detailed` | none; admin with `OPS_ENDPOINTS_REQUIRE_ADMIN=true` |  | Detailed health: runs every registered dependency probe. |
 | GET | `/ready` | none |  | Readiness probe — green only if critical dependencies are up. |
 | GET | `/live` | none |  | Liveness probe (for Kubernetes `livenessProbe`). |
-| GET | `/metrics` | none |  | Prometheus metrics endpoint. |
+| GET | `/metrics` | none; admin with `OPS_ENDPOINTS_REQUIRE_ADMIN=true` |  | Prometheus metrics endpoint. |
 | GET | `/.well-known/agent-card.json` | none |  | A2A Agent Card discovery (RFC 8615 /.well-known). |
 | GET | `/.well-known/ag-ui.json` | none |  | Static discovery pointer for AG-UI (Agent-User Interaction Protocol). |
 
@@ -123,7 +126,7 @@ The HTTP authentication middleware does not run for WebSocket connections. `/ws/
 | Method | Path | Credential | Parameters | Summary |
 |---|---|---|---|---|
 | GET | `/admin/api-keys` | admin |  | List all API keys. |
-| POST | `/admin/api-keys` | admin | `name` *query*<br>`rate_limit_per_minute?` *query*=60<br>`rate_limit_per_hour?` *query*=1000<br>`expires_at?` *query*<br>`expires_in_days?` *query*<br>`allowed_paths?` *query* | Create a new API key. |
+| POST | `/admin/api-keys` | admin | `name?` *query*<br>`rate_limit_per_minute?` *query*<br>`rate_limit_per_hour?` *query*<br>`expires_at?` *query*<br>`expires_in_days?` *query*<br>`allowed_paths?` *query*<br>JSON body: `APIKeyCreateRequest` | Create a new API key. |
 | DELETE | `/admin/api-keys/{key_id}` | admin | `key_id` *path* | Revoke an API key. |
 | PUT | `/admin/api-keys/{key_id}/toggle` | admin | `key_id` *path* | Toggle API key active status. |
 
@@ -159,7 +162,7 @@ The HTTP authentication middleware does not run for WebSocket connections. `/ws/
 | GET | `/admin/governance/audit` | admin | `limit?` *query*=100<br>`offset?` *query*=0<br>`action?` *query*<br>`actor?` *query*<br>`resource_type?` *query*<br>`outcome?` *query* | List recent governance audit entries (with optional filters). |
 | GET | `/admin/governance/audit/verify` | admin |  | Walk the hash chain forward and confirm every entry is intact. |
 | GET | `/admin/governance/roles` | admin |  | List configured admin role assignments. |
-| POST | `/admin/governance/roles` | admin | JSON body: object | Map an admin token to a role. |
+| POST | `/admin/governance/roles` | admin | JSON body: object | Map an admin token to a role (stored, not enforced yet; see above). |
 | DELETE | `/admin/governance/roles/{role_id}` | admin | `role_id` *path* |  |
 | GET | `/admin/governance/policies` | admin |  |  |
 | POST | `/admin/governance/policies` | admin | JSON body: object | Create a declarative policy. |
@@ -337,7 +340,7 @@ The HTTP authentication middleware does not run for WebSocket connections. `/ws/
 
 | Method | Path | Credential | Parameters | Summary |
 |---|---|---|---|---|
-| POST | `/admin/webhooks` | admin | `event_type` *query*<br>`url` *query*<br>`secret?` *query*<br>`headers?` *body*<br>`filters?` *body* | Register a webhook for event notifications. |
+| POST | `/admin/webhooks` | admin | `event_type?` *query*<br>`url?` *query*<br>`secret?` *query*<br>JSON body: `WebhookCreateRequest` | Register a webhook for event notifications. |
 | GET | `/admin/webhooks` | admin | `event_type?` *query* | List all registered webhooks. |
-| DELETE | `/admin/webhooks/{webhook_id}` | admin | `webhook_id` *path*<br>`event_type` *query* | Unregister a webhook. |
+| DELETE | `/admin/webhooks/{webhook_id}` | admin | `webhook_id` *path*<br>`event_type?` *query* | Unregister a webhook. `event_type` is optional: without it the webhook is looked up under every event. |
 | GET | `/admin/webhooks/events` | admin |  | List all available webhook event types. |

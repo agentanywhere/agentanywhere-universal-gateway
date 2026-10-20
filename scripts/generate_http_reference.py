@@ -61,6 +61,10 @@ Credential column:
 
 Parameter notation: `name` is required, `name?` is optional, `=value` is the
 default. *query*, *path* and *body* say where the parameter goes.
+
+The list is generated with `DEBUG=false`, the default. With `DEBUG=true` the
+gateway also serves `/docs`, `/redoc` and `/openapi.json`; otherwise they
+answer 404.
 """
 
 PUBLIC_DATA_PLANE = {
@@ -188,6 +192,8 @@ def build() -> str:
             params = _params(route)
             if path == "/{path:path}":
                 auth = "API key (none for OPTIONS)"
+            elif path in ("/metrics", "/health/detailed"):
+                auth = "none; admin with `OPS_ENDPOINTS_REQUIRE_ADMIN=true`"
             rows.setdefault(_section(path), []).append(
                 (path, ", ".join(methods), auth, params, _summary(route.endpoint))
             )

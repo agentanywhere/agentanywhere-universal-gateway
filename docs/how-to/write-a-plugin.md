@@ -91,18 +91,18 @@ loaded in process for this page, and a test backend received the header.
            return ctx
    ```
 
-2. Tell the gateway where to look, and optionally configure the plugin. In
-   the environment of the gateway process:
+2. Tell the gateway where to look, and optionally configure the plugin, in
+   `.env` or the environment:
 
    ```bash
-   export MCP_GATEWAY_PLUGIN_PATH=/opt/gateway-plugins
-   export PLUGIN_CONFIGS_JSON='{"stamp": {"value": "from-config"}}'
+   PLUGIN_PATHS=/opt/gateway-plugins
+   PLUGIN_CONFIGS_JSON={"stamp": {"value": "from-config"}}
    ```
 
-   `MCP_GATEWAY_PLUGIN_PATH` is read from the process environment only, so
-   export it rather than writing it in `.env` (Docker Compose's `env_file` does
-   export it). Alternatively, set `PLUGIN_PATHS=["/opt/gateway-plugins"]`,
-   which `.env` does apply.
+   The legacy `MCP_GATEWAY_PLUGIN_PATH` (directories separated by `:`) works
+   too. (The in-process check for this page used `MCP_GATEWAY_PLUGIN_PATH`
+   exported in the environment, before this setting could also come from
+   `.env`.)
 
 3. Restart the gateway.
 
@@ -177,9 +177,8 @@ name replaces the earlier one.
 Each plugin receives its dict as `self.config`. The built-in plugins other than
 `request-id` read `enabled` from it.
 
-`PLUGINS_DISABLED=["name"]` (a JSON array) or
-`MCP_GATEWAY_PLUGIN_DISABLED=name,other` (comma-separated, environment only)
-skip plugins at load time. `PLUGINS_ENABLED=false` turns the plugin system off.
+`PLUGINS_DISABLED=name,other` (or a JSON array) and the legacy
+`MCP_GATEWAY_PLUGIN_DISABLED=name,other` skip plugins at load time. `PLUGINS_ENABLED=false` turns the plugin system off.
 
 ## Built-in plugins
 
@@ -227,7 +226,6 @@ For tests that go through the gateway, use the `client` fixture in
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| The plugin is not in `GET /admin/plugins` | Path not seen: `MCP_GATEWAY_PLUGIN_PATH` only in `.env`, a typo, or an import error | Export the variable, or use `PLUGIN_PATHS`; look for `plugins_loaded` and errors in the start-up log. |
-| Start-up fails with `error parsing value for field "plugins_disabled"` | A comma-separated value | Write a JSON array. |
+| The plugin is not in `GET /admin/plugins` | Path not seen (a typo, or `.env` not in the working directory), or an import error | Check `PLUGIN_PATHS`; look for `plugins_loaded` and errors in the start-up log. |
 | The plugin is listed but nothing happens | `plugin_type` does not match the base class, the plugin is disabled, or the request is not on the catch-all path | Check `metadata` and `enabled`; see [Where plugins run](#where-plugins-run). |
 | Errors counted in the plugin's stats | An exception in your code | `GET /admin/plugins/{name}` shows `last_error`. |

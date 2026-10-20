@@ -83,7 +83,7 @@ curl -s http://localhost:8000/health
 ```
 
 ```json
-{"status":"healthy","version":"1.0.0","timestamp":"2026-10-20T17:36:55.280057","services":{}}
+{"status":"healthy","version":"1.0.0","timestamp":"2026-10-20T19:29:25.786858","services":{}}
 ```
 
 ## 4. Start the sample HTTP backend
@@ -116,20 +116,22 @@ timestamps:
 
 ```json
 {
-  "id": "9562198d-3a54-45f9-a3bd-f5fe9503c1d1",
+  "id": "b0bf5920-d931-415d-85b6-ba009a47970f",
   "name": "first-key",
-  "key": "sk-0Pvbwo70FVYyvKsE4oX1rDY0wP130OOHJY-2-sbPWVk",
+  "key": "sk-vx54enZD1I79TIgR6SB8dLB9p_XtaqLa4CkpZqbutkk",
+  "key_prefix": "sk-vx54enZD",
   "rate_limit_per_minute": 60,
   "rate_limit_per_hour": 1000,
   "is_active": true,
-  "created_at": "2026-10-20T17:36:55.288399",
+  "created_at": "2026-10-20T19:29:25.794072",
   "expires_at": null,
   "allowed_paths": []
 }
 ```
 
-Copy the `key` value into a variable, and keep a note of the `id`: you need
-the `id` to revoke the key later, and the list endpoint does not show it.
+Copy the `key` value into a variable now. The gateway stores only a hash of
+it and will never show it again (`GET /admin/api-keys` lists the `id` and
+`key_prefix`, which you use to manage the key later).
 
 ```bash
 API_KEY=paste-the-key-here
@@ -153,7 +155,7 @@ forwarded it to the sample backend, which created a user:
   "name": "Ada",
   "email": "ada@example.com",
   "metadata": null,
-  "created_at": "2026-10-20T17:36:55.379598+00:00"
+  "created_at": "2026-10-20T19:29:25.848555+00:00"
 }
 ```
 
@@ -186,8 +188,8 @@ curl -s -X POST http://localhost:8000/api/users \
 {
   "error": "AUTHENTICATION_ERROR",
   "message": "API key required",
-  "request_id": null,
-  "timestamp": "2026-10-20T17:36:55.395150",
+  "request_id": "dca4d702-c288-40eb-ba10-8b32be8e170b",
+  "timestamp": "2026-10-20T19:29:25.866307",
   "details": {
     "hint": "Include your API key in the X-API-Key header or Authorization header.",
     "documentation": "/docs#authentication"
@@ -195,7 +197,8 @@ curl -s -X POST http://localhost:8000/api/users \
 }
 ```
 
-The status code is 401. The request never reached the backend.
+The status code is 401. The request never reached the backend. The response
+carries an `X-Request-ID` header with the same value as `request_id`.
 
 ## What you did
 

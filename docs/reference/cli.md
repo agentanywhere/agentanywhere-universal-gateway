@@ -92,9 +92,9 @@ URL to `~/.config/agent-universal-gateway/config.json` (or
 |---|---|---|
 | `health` | `GET /health` | No credential needed. |
 | `dashboard` | `GET /admin/dashboard/stats` | |
-| `config show` | `GET /admin/config` | Prints `ADMIN_TOKEN` in clear text. |
-| `keys list` | `GET /admin/api-keys` | Prints full keys. The `id` column is empty, because the endpoint does not return ids. |
-| `keys create --name NAME [--rate-limit-minute N] [--rate-limit-hour N] [--allowed-paths P ...]` | `POST /admin/api-keys` | **Fails with 422.** See below. |
+| `config show` | `GET /admin/config` | Secrets are redacted. |
+| `keys list` | `GET /admin/api-keys` | Ids, names and limits; never the keys themselves. |
+| `keys create --name NAME [--rate-limit-minute N] [--rate-limit-hour N] [--allowed-paths P ...]` | `POST /admin/api-keys` | Prints the new key once; keep it. |
 | `keys toggle KEY_ID` | `PUT /admin/api-keys/{id}/toggle` | Needs the key's `id`. |
 | `keys delete KEY_ID` | `DELETE /admin/api-keys/{id}` | Needs the key's `id`. |
 | `routes list` | `GET /admin/routes` | |
@@ -105,26 +105,23 @@ URL to `~/.config/agent-universal-gateway/config.json` (or
 | `plugins reload [--path DIR ...] [--disable NAME ...] [--config-file FILE]` | `POST /admin/plugins/reload` | `--config-file` is a JSON object of plugin name to configuration. |
 | `plugins remove NAME` | `DELETE /admin/plugins/{name}` | |
 | `webhooks list` | `GET /admin/webhooks` | |
-| `webhooks create --target-url URL [--events E ...] [--secret S]` | `POST /admin/webhooks` | **Fails with 422.** See below. |
-| `webhooks delete ID` | `DELETE /admin/webhooks/{id}` | The endpoint also needs `?event_type=`, which the CLI does not send. |
+| `webhooks create --target-url URL --events E [E ...] [--secret S]` | `POST /admin/webhooks` | `--events` is required; one webhook per event. |
+| `webhooks delete ID` | `DELETE /admin/webhooks/{id}` | |
 | `tenants list` | `GET /admin/tenants` | |
 | `tenants show TENANT_ID` | `GET /admin/tenants/{id}` | |
-| `logs [--limit 20] [--offset 0] [--status CODE] [--path-filter TEXT]` | `GET /admin/logs` | `--status` is ignored (the endpoint expects `status_code`). |
+| `logs [--limit 20] [--offset 0] [--status CODE] [--path-filter TEXT]` | `GET /admin/logs` | `--status` filters by status code. |
 
 Plain output is a table or key-value list. `NO_COLOR` turns colour off.
 
 ## Commands that do not work as written
 
-These were found by reading `app/cli/main.py` against the endpoints; the
-`keys create` failure was reproduced by sending the CLI's request body to the
-gateway.
-
 | Command | Problem | Do this instead |
 |---|---|---|
-| `keys create` | Sends a JSON body; the endpoint takes query parameters. Answers 422 `VALIDATION_ERROR`. | `curl -X POST "$URL/admin/api-keys?name=ci-bot&rate_limit_per_minute=120" -H "Authorization: Bearer $ADMIN"` |
-| `webhooks create` | Sends `{"url", "events", "secret"}` as JSON; the endpoint takes `event_type`, `url` and `secret` as query parameters. | See [Send events to a webhook](../how-to/configure-webhooks.md). |
-| `webhooks delete` | Does not send the required `event_type` query parameter. | `curl -X DELETE "$URL/admin/webhooks/$ID?event_type=rate_limit_exceeded" -H "Authorization: Bearer $ADMIN"` |
-| `logs --status` | Sends `status`, which is ignored. | `curl "$URL/admin/logs?status_code=502" -H "Authorization: Bearer $ADMIN"` |
+| `routes create --methods ...` | The CLI sends a `methods` field; routes have none, so every method is routed. | Leave it out. |
+
+`keys create`, `webhooks create`, `webhooks delete` and `logs --status`, which
+failed or were ignored in earlier builds, work; `tests/test_cli_against_gateway.py`
+runs them against the app.
 
 ## Exit codes
 

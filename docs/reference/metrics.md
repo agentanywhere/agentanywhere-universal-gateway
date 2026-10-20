@@ -1,8 +1,9 @@
 # Metrics reference
 
 AgentAnywhere Universal Gateway serves Prometheus metrics at `METRICS_PATH`
-(default `/metrics`), without a credential, when `METRICS_ENABLED=true` (the
-default). All metrics are in the default `prometheus_client` registry of the
+(default `/metrics`) when `METRICS_ENABLED=true` (the default). It needs no
+credential unless `OPS_ENDPOINTS_REQUIRE_ADMIN=true`, in which case send
+`Authorization: Bearer <admin credential>`. All metrics are in the default `prometheus_client` registry of the
 process that answers the scrape.
 
 The metric families below were read from a live `/metrics` response of the
@@ -12,18 +13,21 @@ gateway in process. Label values in the examples are real.
 
 | Metric | Type | Labels | Updated when |
 |---|---|---|---|
-| `gateway_requests_total` | counter | `method`, `path`, `status_code`, `protocol` | After every request that passes the authentication middleware. |
+| `gateway_requests_total` | counter | `method`, `path`, `status_code`, `protocol` | After every request, including those rejected with 401, 403 or 429. |
 | `gateway_request_duration_seconds` | histogram (buckets 0.01 to 10 s) | `method`, `path`, `protocol` | As above. |
 | `gateway_errors_total` | counter | `error_type`, `protocol` | On 5xx responses produced by the gateway, unhandled exceptions and backend connection failures. |
-| `gateway_red_requests_total` | counter | `method`, `route`, `status_class`, `protocol`, `tenant` | After every request that passes the authentication middleware. |
+| `gateway_red_requests_total` | counter | `method`, `route`, `status_class`, `protocol`, `tenant` | After every request, including rejected ones. |
+| `gateway_rate_limit_hits_total` | counter | `client_id` | On every 429 from the authentication layer (key limit or tenant quota); `client_id` is the key's id. |
 | `gateway_red_request_duration_seconds` | histogram (buckets 0.005 to 10 s) | `method`, `route`, `protocol`, `tenant` | As above. |
 | `gateway_red_errors_total` | counter | `method`, `route`, `protocol`, `tenant`, `error_class` | When the status is 500 or above. |
 
 Label notes:
 
-- `path` is the raw request path. Every distinct path is a new series, so
-  paths with ids in them can create many series. Prefer the `gateway_red_*`
-  metrics for dashboards.
+- `path` is the raw request path for accepted requests. Every distinct path
+  is a new series, so paths with ids in them can create many series; prefer
+  the `gateway_red_*` metrics for dashboards. For rejected requests it is
+  reduced to the first path segment (for example `/api`), or `/other`, so
+  unauthenticated clients cannot create series at will.
 - `route` keeps the first two path segments and replaces the rest with
   `...`, for example `/api/users/...`.
 - `protocol` on `gateway_requests_total` is derived from the path (`mcp`,
@@ -40,8 +44,12 @@ gateway_requests_total{method="POST",path="/mcp/query",protocol="mcp",status_cod
 gateway_red_requests_total{method="GET",protocol="http",route="/api/users",status_class="2xx",tenant="acme"} 3.0
 ```
 
-**Not counted:** requests rejected by the authentication middleware (401, 403
-and 429 on the data plane). They are answered before metrics are recorded.
+Rejected requests, from the end-to-end tutorial:
+
+```text
+gateway_requests_total{method="POST",path="/api",protocol="http",status_code="401"} 1.0
+gateway_requests_total{method="GET",path="/api",protocol="http",status_code="429"} 4.0
+```
 
 ## Health and SLO metrics
 
@@ -60,13 +68,11 @@ release. Do not alert on them.
 
 | Metric | Type | Labels |
 |---|---|---|
-| `gateway_rate_limit_hits_total` | counter | `client_id` |
 | `gateway_circuit_breaker_state` | gauge | `backend_url` |
 | `gateway_active_connections` | gauge | none |
 
-To watch rate limiting, count 429 responses at your reverse proxy. The
-`rate_limit_exceeded` webhook is not sent in this release
-([known limitations](../known-limitations.md#rate-limit-alerts-are-never-sent)).
+To watch rate limiting, use `gateway_rate_limit_hits_total` or the
+`rate_limit_exceeded` webhook ([Send events to a webhook](../how-to/configure-webhooks.md)).
 
 ## Custom metrics
 

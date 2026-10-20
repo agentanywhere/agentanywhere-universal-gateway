@@ -34,7 +34,7 @@ prefix.
 |---|---|---|
 | Data plane | everything except the ones below | `X-API-Key: <key>` or `Authorization: Bearer <key>` |
 | Admin plane | `/admin/*` | `Authorization: Bearer <ADMIN_TOKEN>` |
-| Public | `/health`, `/live`, `/ready`, `/health/detailed`, `/metrics`, `/openapi.json`, `/docs`, `/redoc`, `/.well-known/*`, `/oauth2/*`, `/admin/health`, `/admin/auth/config`, `/admin/auth/login` | nothing |
+| Public | `/health`, `/live`, `/ready`, `/.well-known/*`, `/oauth2/*`, `/admin/health`, `/admin/auth/config`, `/admin/auth/login`; `/metrics` and `/health/detailed` unless `OPS_ENDPOINTS_REQUIRE_ADMIN=true` (then the admin credential); `/openapi.json`, `/docs`, `/redoc` only with `DEBUG=true` (404 otherwise) | nothing |
 
 The [security model](../explanation/security-model.md) explains each
 credential.
@@ -52,8 +52,9 @@ Every response that passes the authentication middleware carries:
 | `X-API-Version`, `Warning`, `Sunset`, `Deprecation` | When the path matches a registered API version. |
 | `X-Anomaly-Detected`, `X-Anomaly-Score` | When the in-process anomaly detector flags the request. |
 
-Responses rejected by the authentication middleware (401, 403, 429 on the data
-plane) do not carry these headers. 429 responses carry `Retry-After`.
+Responses rejected by the authentication layer (401, 403, 429) carry
+`X-Request-ID` too, with the same value in the body's `request_id`. 429
+responses carry `Retry-After`.
 
 ## Errors
 
@@ -167,7 +168,9 @@ Dedicated data-plane endpoints:
 
 ### `POST /admin/api-keys`
 
-Parameters are **query parameters**, not a JSON body.
+Parameters can be query parameters or a JSON body with the same names (in a
+body, `allowed_paths` may be a list). A query parameter wins when both are
+given.
 
 | Parameter | Default | Meaning |
 |---|---|---|
@@ -176,7 +179,7 @@ Parameters are **query parameters**, not a JSON body.
 | `rate_limit_per_hour` | `1000` | Requests per hour. |
 | `expires_at` | none | ISO 8601 time in the future, for example `2027-01-01T00:00:00`. |
 | `expires_in_days` | none | Positive whole number of days. Not together with `expires_at`. |
-| `allowed_paths` | none | Comma-separated prefixes. Stored, **not enforced**. |
+| `allowed_paths` | none | Path scope: comma-separated prefixes (or a JSON list in a body), matched on whole segments; an entry ending in `*` is a plain prefix. Requests elsewhere, and paths with `.` or `..` segments, answer 403. Empty means every path. |
 
 ```bash
 curl -s -X POST "http://localhost:8000/admin/api-keys?name=first-key" -H "Authorization: Bearer $ADMIN"
@@ -184,37 +187,40 @@ curl -s -X POST "http://localhost:8000/admin/api-keys?name=first-key" -H "Author
 
 ```json
 {
-  "id": "081def75-ae37-4024-bc11-c98f6499014f",
+  "id": "37a9faca-3c3c-4f12-940c-d5671d720671",
   "name": "first-key",
-  "key": "sk-uSOliT4cU-YUpnLcdN24SpGHjcvfKun6NxmqEfFLuXw",
+  "key": "sk-fyR0Gj_aKRMbpMmMpCKbz2NpJpWskKOmX583PpC70p0",
+  "key_prefix": "sk-fyR0Gj_a",
   "rate_limit_per_minute": 60,
   "rate_limit_per_hour": 1000,
   "is_active": true,
-  "created_at": "2026-10-20T17:26:25.592112",
+  "created_at": "2026-10-20T19:28:40.389319",
   "expires_at": null,
   "allowed_paths": []
 }
 ```
 
+`key` appears only in this response: the gateway stores a SHA-256 hash.
 400 if `expires_at` is in the past or not ISO 8601, if `expires_in_days` is
-not positive, or if both are given. Sending the parameters as a JSON body
-answers 422 `VALIDATION_ERROR` (`"location": ["query", "name"]`).
+not positive, or if both are given.
 
 ### `GET /admin/api-keys`
 
-Returns every key **including the key itself**, but **not** its `id`:
+Returns every key's `id` and `key_prefix`, never the key:
 
 ```json
 [
   {
-    "key": "sk-uSOliT4cU-YUpnLcdN24SpGHjcvfKun6NxmqEfFLuXw",
+    "id": "37a9faca-3c3c-4f12-940c-d5671d720671",
     "name": "first-key",
+    "key_prefix": "sk-fyR0Gj_a",
     "rate_limit_per_minute": 60,
     "rate_limit_per_hour": 1000,
     "allowed_paths": [],
     "metadata": {},
-    "created_at": "2026-10-20T17:26:25.592112",
+    "created_at": "2026-10-20T19:28:40.389319",
     "expires_at": null,
+    "last_used_at": null,
     "is_active": true
   }
 ]
@@ -223,15 +229,16 @@ Returns every key **including the key itself**, but **not** its `id`:
 ### `PUT /admin/api-keys/{key_id}/toggle`
 
 Flips `is_active`. `{key_id}` is the `id`, not the key; anything else answers
-404 `API key not found`.
+404 `API key not found`. Takes effect on the next request, also with the Redis
+key cache.
 
 ```json
-{"id": "081def75-ae37-4024-bc11-c98f6499014f", "name": "first-key", "is_active": false}
+{"id": "37a9faca-3c3c-4f12-940c-d5671d720671", "name": "first-key", "is_active": false}
 ```
 
 ### `DELETE /admin/api-keys/{key_id}`
 
-Deletes the key. `{"message": "API key deleted"}`, or 404.
+Deletes the key, with immediate effect. `{"message": "API key deleted"}`, or 404.
 
 ## Tenants
 
@@ -326,31 +333,42 @@ row from the `routes` table and wait for the refresh.
 ```json
 {
   "logs": [
-    {"id": 16, "request_id": "a11f92ee-8c32-4d9c-8783-810412e34994", "method": "GET", "path": "/api/users", "client_ip": "testclient", "api_key_id": null, "status_code": 200, "response_time_ms": 1, "timestamp": "2026-10-20T17:36:55.926726", "user_agent": "testclient", "error": null, "protocol": null}
+    {"id": 16, "request_id": "f236eeea-513a-4c9f-9a70-9fcb4c14968a", "method": "GET", "path": "/api/users", "client_ip": "testclient", "api_key_id": "5915a9cc-9e95-450e-8558-8732092d3913", "status_code": 429, "response_time_ms": 3, "timestamp": "2026-10-20T19:28:40.765216", "user_agent": "testclient", "error": "RATE_LIMIT_EXCEEDED", "protocol": null}
   ],
-  "total": 17
+  "total": 2
 }
 ```
 
-`api_key_id` and `protocol` are always `null` in this release.
+(`GET /admin/logs?limit=2&status_code=429`, one row shown.) Rejected requests
+have their error code in `error`. `protocol` is always `null` in this
+release.
 
 ## Runtime configuration
 
 | Endpoint | Does |
 |---|---|
-| `GET /admin/config?section=&redacted=true` | Current settings grouped by section. Secrets are redacted, **except `ADMIN_TOKEN`**. |
-| `GET /admin/config/diff` | Fields that differ from the defaults. |
+| `GET /admin/config?section=&redacted=true` | Current settings grouped by section. Secrets (including `ADMIN_TOKEN`, every `*_TOKEN`, `*_SECRET`, `*_PASSWORD`, `*_API_KEY` setting and URL passwords) are redacted; `redacted=false` returns raw values. |
+| `GET /admin/config/diff` | Fields that differ from the defaults, redacted the same way. |
 | `GET /admin/config/schema` | JSON Schema of the settings. |
 | `POST /admin/config/validate` | Dry-run validation of a JSON object of fields. |
 | `PUT /admin/config` | Apply a JSON object of **live** fields (see the [configuration reference](configuration.md)) to the running process. Other fields are refused. |
 | `POST /admin/config/reload` | Re-read settings from the environment and `CONFIG_FILE`. |
-| `GET /admin/config/audit?limit=100` | Recent runtime changes. |
+| `GET /admin/config/audit?limit=100` | Recent runtime changes, redacted. |
 
 ## Webhooks
 
-Webhooks are kept in memory. `POST /admin/webhooks` takes `event_type`, `url`
-and `secret` as **query parameters**, and optional `headers` and `filters` as
-a JSON body. See [Send events to a webhook](../how-to/configure-webhooks.md).
+Webhooks are kept in memory. `POST /admin/webhooks` takes `url`, `event_type`
+or `events`, `secret`, `headers` and `filters` as a JSON body (`url`,
+`event_type` and `secret` may also be query parameters), registers one webhook
+per event and answers with their `ids`; unknown event names are accepted and
+listed in `unknown_events`. Reproduced:
+
+```json
+{"id": "nonsense_event_1792504721.285245", "ids": ["nonsense_event_1792504721.285245"], "event_type": "nonsense_event", "events": ["nonsense_event"], "url": "https://hooks.example.com/x", "status": "registered", "unknown_events": ["nonsense_event"]}
+```
+
+`DELETE /admin/webhooks/{id}` needs no `event_type`. See
+[Send events to a webhook](../how-to/configure-webhooks.md).
 
 ## Other admin areas
 
@@ -360,7 +378,7 @@ the automated tests in `tests/`; it was not checked by hand for this page.
 
 | Prefix | Purpose |
 |---|---|
-| `/admin/governance/*` | Policies, IP rules, admin roles (not enforced), the hash-chained audit log, expiring keys. |
+| `/admin/governance/*` | Policies, IP rules, admin roles (not enforced yet), the hash-chained audit log, expiring keys. |
 | `/admin/transformations` | Declarative request and response rewrite rules (in memory). |
 | `/admin/versions` | API versions, deprecation and sunset headers (in memory). |
 | `/admin/oauth2/*` | OAuth2 providers and tokens for `/oauth2/*` (in memory). |
@@ -376,5 +394,7 @@ the automated tests in `tests/`; it was not checked by hand for this page.
 
 ## OpenAPI schema
 
-`GET /openapi.json` is always served and needs no credential. `/docs` (Swagger
-UI) and `/redoc` are served only with `DEBUG=true`.
+`/openapi.json`, `/docs` (Swagger UI) and `/redoc` are served only with
+`DEBUG=true`, without a credential. With `DEBUG=false` (the default) the
+gateway answers 404 for them (reproduced) and never forwards them to a
+backend.

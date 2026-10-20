@@ -13,8 +13,7 @@ First public release, under the Apache License 2.0.
 
 - A gateway that authenticates, rate-limits and proxies requests to MCP, A2A,
   AG-UI, ACP, HTTP/REST and GraphQL backends, and publishes to an MQTT broker.
-- API keys with per-key limits and expiry. A path list (`allowed_paths`) is
-  stored but not enforced.
+- API keys with per-key limits, expiry and a path scope (`allowed_paths`).
 - Rate limiting that works with or without Redis.
 - Tenants with per-tenant request quotas and usage counters.
 - A circuit breaker per backend. A backend that cannot be reached answers 502,
@@ -37,7 +36,6 @@ First public release, under the Apache License 2.0.
   stored or reported but not enforced yet. `ALGORITHM` and
   `ACCESS_TOKEN_EXPIRE_MINUTES` are not used: nothing signs tokens yet.
 - The `/admin/ai/*` analytics endpoints are experimental.
-- The Alembic migrations do not match the models.
 
 See [docs/known-limitations.md](docs/known-limitations.md) for the full list.
 
@@ -54,7 +52,7 @@ See [docs/known-limitations.md](docs/known-limitations.md) for the full list.
   one baseline, `0001`, that creates the full current schema. It is safe to
   run on a database the gateway already created at startup, works on SQLite
   and PostgreSQL, and needs no extra driver. A test fails when the models and
-  the migrations disagree. See docs/UPGRADING.md.
+  the migrations disagree. See docs/how-to/upgrade.md.
 - Docker Compose: the SQLite database is kept on the `gateway_data` volume
   (`/app/data/gateway.db`) instead of the container's filesystem, so API keys
   survive the container being recreated.
@@ -98,7 +96,7 @@ See [docs/known-limitations.md](docs/known-limitations.md) for the full list.
   ignored every `lib/`), so the console did not type-check or build from a
   clean clone.
 
-### Changed (may need action on upgrade; see docs/UPGRADING.md)
+### Changed (may need action on upgrade; see docs/how-to/upgrade.md)
 
 - With `ADMIN_TOKEN` set, `SECRET_KEY` is no longer an admin credential
   (`ADMIN_ACCEPT_SECRET_KEY=true` restores it).

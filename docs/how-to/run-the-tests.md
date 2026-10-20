@@ -52,6 +52,10 @@ failures. `pytest --collect-only -q` prints the current number of tests.
   GATEWAY_URL=http://127.0.0.1:59999 pytest
   ```
 
+- The PostgreSQL cases in `tests/test_migrations.py` run only when
+  `GATEWAY_TEST_POSTGRES_URL` is set to a `postgresql+asyncpg://` URL of an
+  empty, disposable database (they drop every table in it). CI does not set
+  it.
 - A test in `tests/test_followup_fixes.py` is skipped when `bash` or
   `scripts/quickstart_test.sh` is missing.
 

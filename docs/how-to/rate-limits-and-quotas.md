@@ -31,7 +31,7 @@ quota. A request that the key's limit rejects is not counted against the
 tenant. A request that the tenant quota rejects has already been counted
 against the key's limit.
 
-Settings that look like limits but are **not enforced**:
+Settings that look like limits but are **not enforced yet**:
 `PROTOCOL_*_RATE_LIMIT_*`, a policy with a `rate_limit` action, and a tenant's
 `requests_per_day`.
 
@@ -124,7 +124,13 @@ them.
 
 - Tenant usage is written after the response, in the background. A burst of
   concurrent requests can exceed the quota by a few.
-- Requests rejected with 401 or 429 are not counted in usage or metrics.
+- Requests rejected with 401, 403 or 429 are not counted in tenant usage.
+  They are counted in `gateway_requests_total` (with the path label reduced
+  to its first segment), `gateway_rate_limit_hits_total` (labelled with the key id)
+  and `request_logs`, and carry `X-Request-ID`.
+- Exceeding a key's per-minute or per-hour limit sends the
+  `rate_limit_exceeded` webhook and, if configured, the email and Slack
+  rate-limit alert ([Send events to a webhook](configure-webhooks.md)).
 - Per-key windows in memory start at the key's first request and last 60 or
   3600 seconds. With Redis, the counter's expiry is renewed on every allowed
   request, so the count resets 60 or 3600 seconds after the last allowed

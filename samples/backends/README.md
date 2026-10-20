@@ -239,7 +239,7 @@ Once backends are running, configure the gateway:
 ```bash
 # Set backend URLs in .env (gateway running directly on this machine; the
 # repository's docker-compose.yml ignores these and uses service names, see
-# docs/DEPLOYMENT.md)
+# docs/how-to/deploy-with-docker-compose.md)
 MCP_BACKEND_URL=http://localhost:8001
 A2A_BACKEND_URL=http://localhost:8002
 HTTP_BACKEND_URL=http://localhost:8003

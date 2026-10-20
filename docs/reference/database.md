@@ -2,8 +2,9 @@
 
 The tables that AgentAnywhere Universal Gateway creates, from the models in
 `app/db_models.py`. The gateway creates any missing table when it starts
-(`init_db()` in `app/database.py` runs SQLAlchemy's `create_all`). It never
-alters or drops an existing table.
+(`init_db()` in `app/database.py` runs SQLAlchemy's `create_all`, which never
+alters or drops an existing table), and the Alembic baseline creates the same
+schema (on an existing database it only adds what is missing).
 
 The database is chosen by `DATABASE_URL`. The default is
 `sqlite+aiosqlite:///./gateway.db`, a file in the working directory.
@@ -26,12 +27,12 @@ PostgreSQL works through `postgresql+asyncpg://...`.
 
 | Table | Holds | Written by |
 |---|---|---|
-| `api_keys` | API keys, **in plaintext**, with their hash and limits | `/admin/api-keys` |
+| `api_keys` | API keys as SHA-256 hashes, with limits and scope (rows from earlier builds may still hold the key until it is next used) | `/admin/api-keys` |
 | `routes` | Dynamic routes | `POST /admin/routes` |
 | `tenants` | Tenants with quota and config | `/admin/tenants` |
 | `tenant_api_keys` | Which key hash belongs to which tenant | `associate-api-key` |
 | `tenant_usage` | Request counters per tenant, per minute, hour and day window | Every request from a tenant's key |
-| `request_logs` | One row per request | Every request (not pruned) |
+| `request_logs` | One row per request, including rejected ones | Every request (not pruned) |
 | `settings_profiles` | Saved protocol and global settings | `/admin/settings/profiles` |
 | `governance_audit_log` | Hash-chained audit entries | Governance and admin actions |
 | `admin_roles` | Token hash to role (not enforced) | `/admin/governance/roles` |
@@ -45,13 +46,13 @@ PostgreSQL works through `postgresql+asyncpg://...`.
 | Column | Type | Notes |
 |---|---|---|
 | `id` | string, primary key | UUID. Needed to toggle or delete a key. |
-| `key` | string, unique, nullable | The key itself, `sk-` plus 43 URL-safe characters. |
+| `key` | string, unique, nullable | Empty for keys created by this release. Rows written by earlier builds hold the key in plaintext until it next authenticates, when it is cleared. |
 | `key_hash` | string, unique, not null | SHA-256 of the key, hex. Used for lookups. |
 | `name` | string | |
 | `rate_limit_per_minute` | integer | Default 60. |
 | `rate_limit_per_hour` | integer | Default 1000. |
-| `allowed_paths` | JSON list | Stored, not enforced. |
-| `key_metadata` | JSON object | |
+| `allowed_paths` | JSON list | Path scope; requests outside it answer 403. Empty means every path. |
+| `key_metadata` | JSON object | Holds `key_prefix`, the first characters of the key, shown by the admin API. |
 | `created_at`, `expires_at`, `last_used_at` | datetime | Naive UTC. `last_used_at` is updated on every database lookup. |
 | `is_active` | boolean | |
 
@@ -86,9 +87,10 @@ release.
 `tenant_id`, `status_code`, `response_time_ms` (integer), `timestamp`,
 `user_agent`, `error`, `protocol`.
 
-In this release `api_key_id`, `tenant_id`, `error` and `protocol` are written
-as null. Requests rejected by the authentication middleware are not logged.
-The table is never pruned.
+Requests rejected by the authentication layer (401, 403, 429) are logged too,
+with the error code in `error` (for example `RATE_LIMIT_EXCEEDED`) and the
+key's id in `api_key_id` when the key was recognised. `tenant_id` and
+`protocol` are written as null in this release. The table is never pruned.
 
 ## settings_profiles
 
@@ -125,12 +127,9 @@ The table is never pruned.
 
 ## Alembic
 
-`alembic/versions/` has two migrations, `001` and `002`. They create
-`api_keys`, `request_logs`, `settings_profiles`, `protocol_settings`,
-`tenants`, `tenant_api_keys` and `tenant_usage`, with columns that differ from
-the models (for example, no `key` column in `api_keys`). They do not create
-`routes`, `agent_registry`, `governance_audit_log`, `admin_roles`,
-`governance_policies`, `governance_ip_rules` or `openapi_registrations`.
-`protocol_settings` has no model. Do not use them; see
-[known limitations](../known-limitations.md#alembic-migrations-do-not-match-the-models)
-and [Upgrade the gateway](../how-to/upgrade.md).
+`alembic/versions/` has one migration, the baseline `0001`
+(`0001_baseline_schema.py`). It creates every table above with the same
+columns, indexes and foreign keys as `create_all`, and on a database the
+gateway already created it adds only what is missing.
+`tests/test_migrations.py` fails if the models and the migration disagree.
+See [Upgrade the gateway](../how-to/upgrade.md).

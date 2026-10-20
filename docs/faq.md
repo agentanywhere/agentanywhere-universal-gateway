@@ -11,8 +11,9 @@ More in [What the gateway is, and what it is not](explanation/overview.md).
 It has an automated test suite that continuous integration runs on every
 push, and the repository includes a Dockerfile, a Compose file and an nginx
 configuration.
-It also stores API keys in plaintext, ships open CORS defaults, and has
-settings that look like controls but are not enforced. Read the
+It also has settings that look like controls but are not enforced yet (admin
+roles, per-protocol rate limits), and `SECRET_KEY` remains a break-glass API
+key. Read the
 [known limitations](known-limitations.md) and work through
 [Secure the gateway for production](how-to/secure-for-production.md), then
 decide. Version 1.0.0 is marked unreleased in the changelog.
@@ -31,9 +32,10 @@ a container rebuild.
 
 ## Why does my Docker quick start answer 502?
 
-`.env` copied from `env.example` points the backends at `localhost`, which
-inside the container is the gateway itself. Use service names. See
-[Deploy with Docker Compose](how-to/deploy-with-docker-compose.md#the-three-traps).
+Under Compose the gateway sends traffic to the sample backends by service
+name. Start them with `docker compose --profile backends up -d --build`, or
+set `DOCKER_HTTP_BACKEND_URL` and the other `DOCKER_` variables to your own
+backends. See [Deploy with Docker Compose](how-to/deploy-with-docker-compose.md#point-the-gateway-at-your-own-backends).
 
 ## Where is the default admin password?
 
@@ -42,23 +44,25 @@ admin API refuses everything.
 
 ## Why do I have both `SECRET_KEY` and `ADMIN_TOKEN`?
 
-`ADMIN_TOKEN` is the operators' credential. `SECRET_KEY` is accepted on both
-the admin API and the data plane, so it should stay in your secret store. See
-[the SECRET_KEY overload](explanation/security-model.md#the-secret_key-overload).
+`ADMIN_TOKEN` is the operators' credential. `SECRET_KEY` is a break-glass
+credential: accepted as an API key on the data plane, and on the admin API
+only while `ADMIN_TOKEN` is empty. Keep it in your secret store. See
+[the SECRET_KEY break-glass credential](explanation/security-model.md#the-secret_key-break-glass-credential).
 
 ## Can I restrict a key to some paths?
 
-Not today. `allowed_paths` is stored but not enforced. Use separate gateways,
-IP rules or policies, and test the result.
+Yes. Create the key with `allowed_paths` (for example `["/mcp"]`); other
+paths answer 403. See [Create, rotate and revoke API keys](how-to/manage-api-keys.md#restrict-a-key-to-some-paths).
 
 ## Can I change a key's rate limit?
 
 Not in place. Create a new key with the new limits and revoke the old one.
 
-## How do I revoke a key if the list does not show its id?
+## I lost an API key. Can the gateway show it again?
 
-Read the id from the `api_keys` table, then `DELETE /admin/api-keys/{id}`. If
-Redis is enabled, also delete `api_key:<key>` from Redis. See
+No. Keys are stored as a hash and shown once, when they are created. Create a
+new key, and revoke the old one by the `id` that `GET /admin/api-keys` lists
+next to its `key_prefix`. Revocation takes effect on the next request. See
 [Create, rotate and revoke API keys](how-to/manage-api-keys.md).
 
 ## Does it work with WebSocket or gRPC?
@@ -93,8 +97,10 @@ returned, and each request writes a database row.
 
 ## Should I use the Alembic migrations?
 
-No. They do not match the current tables. The gateway creates its tables when
-it starts. See [Upgrade the gateway](how-to/upgrade.md).
+Yes, for upgrades. There is one baseline migration, `0001`, which matches the
+models and is safe both on an empty database and on one the gateway already
+created. On a new install you can also just start the gateway, which creates
+its tables. See [Upgrade the gateway](how-to/upgrade.md).
 
 ## Why is the command called `mcp-gateway` in some places?
 

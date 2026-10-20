@@ -1,8 +1,8 @@
 # Send events to a webhook
 
 **Goal:** have the gateway POST a JSON message to your URL when something
-happens, such as a backend's circuit breaker opening or an API key being
-created or revoked.
+happens, such as a key hitting its rate limit, a backend's circuit breaker
+opening, or an API key being created or revoked.
 
 **Before you start:** an HTTPS endpoint that accepts POST requests, the admin
 credential in `ADMIN` and the gateway address in `URL`. Webhooks are kept **in
@@ -11,38 +11,44 @@ processes each one has its own list. Register them from your deployment
 tooling after every start.
 
 This page is written from `app/webhooks.py`, the admin endpoints in
-`admin/api.py` and `tests/test_webhooks.py`; it was not run against a live
-endpoint.
+`admin/api.py` and `tests/test_webhooks.py`. Registration and the
+`rate_limit_exceeded` event were run in process for this page; delivery to a
+live endpoint was not.
 
 ## Events that are actually sent
 
 | Event type | Sent when | `data` includes |
 |---|---|---|
+| `rate_limit_exceeded` | A key exceeds its own per-minute or per-hour limit | `api_key_id`, `api_key_name`, `client_ip`, `limit`, `window`, `path` |
 | `circuit_breaker_open` | A backend's breaker opens | `backend_url`, `failure_count`, `failure_threshold`, `opened_at`, `timeout_seconds`, `message` |
 | `circuit_breaker_closed` | A half-open breaker closes after a success | `backend_url`, `previous_state`, `message` |
 | `api_key_created` | `POST /admin/api-keys` | `api_key_id`, `name`, limits |
 | `api_key_revoked` | `DELETE /admin/api-keys/{id}` | `api_key_id` |
 | `anomaly_detected` | The in-process anomaly detector flags a request | Anomaly details |
 
-`rate_limit_exceeded`, `request_error`, `high_error_rate` and
-`traffic_spike` are listed by `GET /admin/webhooks/events` but are not sent in
-this release. For `rate_limit_exceeded` this was reproduced: the rate limiter
-builds the event from the key's `id`, which the key object it holds does not
-have, and the resulting error is swallowed. The rate-limit email and Slack
-alerts are skipped for the same reason.
+`request_error`, `high_error_rate` and `traffic_spike` are listed by
+`GET /admin/webhooks/events` but nothing sends them in this release. The
+endpoint also accepts names it does not know (a plugin may send its own
+events) and lists them in the response's `unknown_events`; the built-in code
+never sends those.
 
 ## Steps
 
-1. Register one webhook per event type. `event_type`, `url` and `secret` are
-   **query parameters**:
+1. Register the webhook, as a JSON body (query parameters `url`,
+   `event_type` and `secret` work too):
 
    ```bash
-   curl -s -X POST "$URL/admin/webhooks?event_type=circuit_breaker_open&url=https://hooks.example.com/gateway&secret=$WEBHOOK_SECRET" \
-     -H "Authorization: Bearer $ADMIN"
+   curl -s -X POST "$URL/admin/webhooks" -H "Authorization: Bearer $ADMIN" \
+     -H "Content-Type: application/json" \
+     -d "{\"url\": \"https://hooks.example.com/gateway\", \"events\": [\"rate_limit_exceeded\", \"circuit_breaker_open\"], \"secret\": \"$WEBHOOK_SECRET\"}"
    ```
 
-   The answer contains the webhook's `id`. Optional extra request headers and
-   filters go in a JSON body: `{"headers": {"X-Team": "platform"}}`.
+   One webhook is registered per event; the answer lists their ids in `ids`
+   (and the first in `id`). Optional `headers` and `filters` go in the same
+   body. Check that the answer has no `unknown_events`.
+
+   With the CLI:
+   `agentanywhere-gateway webhooks create --target-url https://hooks.example.com/gateway --events rate_limit_exceeded circuit_breaker_open --secret "$WEBHOOK_SECRET"`.
 
 2. Verify the signature in your receiver. The gateway sends:
 
@@ -81,21 +87,18 @@ create and revoke a test key, which sends `api_key_created` and
 
 ## Remove a webhook
 
-`DELETE /admin/webhooks/{id}` needs the event type as a query parameter:
-
 ```bash
-curl -s -X DELETE "$URL/admin/webhooks/$WEBHOOK_ID?event_type=circuit_breaker_open" \
-  -H "Authorization: Bearer $ADMIN"
+curl -s -X DELETE "$URL/admin/webhooks/$WEBHOOK_ID" -H "Authorization: Bearer $ADMIN"
 ```
 
-The CLI's `webhooks create` and `webhooks delete` do not send the parameters
-the endpoints need; use `curl`.
+or `agentanywhere-gateway webhooks delete <id>`.
 
 ## If it did not work
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| 422 on register | Parameters sent as JSON | Put `event_type`, `url` and `secret` in the query string. |
+| 422 on register | `url` or an event is missing | Send `url` and `event_type` or `events`. |
+| `unknown_events` in the answer | A misspelt event name | Use a name from `GET /admin/webhooks/events`. |
 | The webhook is gone | The gateway restarted, or another worker answered | Re-register after each start; run one process. |
-| No deliveries for 429s | `rate_limit_exceeded` is not sent in this release | Count 429 responses at your reverse proxy. |
+| No deliveries for 429s | The 429 came from a tenant quota, or no webhook is registered for `rate_limit_exceeded` | Check the 429's `details` and `GET /admin/webhooks`. |
 | Signature does not match | Different serialisation | Remove `signature`, serialise with sorted keys and Python's default separators (`", "` and `": "`), then compute HMAC-SHA256. |
