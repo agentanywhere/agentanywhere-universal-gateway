@@ -311,6 +311,21 @@ app = FastAPI(
 
 DOCS_PATHS = frozenset({"/docs", "/docs/oauth2-redirect", "/redoc", "/openapi.json"})
 
+def safe_key_label(api_key) -> Optional[str]:
+    """A label for an API key that is safe to log: its id, or, for a key that has no id
+    (the break-glass SECRET_KEY), a short one-way hash. Never the key itself."""
+    if api_key is None:
+        return None
+    key_id = getattr(api_key, "id", None)
+    if key_id:
+        return str(key_id)
+    secret = getattr(api_key, "key", None)
+    if secret:
+        import hashlib
+        return "key-" + hashlib.sha256(str(secret).encode("utf-8")).hexdigest()[:12]
+    return None
+
+
 def _iter_request_db():
     """Yield a DB session for use inside the HTTP/WebSocket middleware.
 
@@ -834,7 +849,7 @@ async def logging_middleware(request: Request, call_next):
                 "timestamp": utcnow().isoformat(),
             }
             if hasattr(request.state, "api_key") and request.state.api_key:
-                request_data["client_id"] = request.state.api_key.key
+                request_data["client_id"] = safe_key_label(request.state.api_key)
             
             ai_result = ai_service.process_request(request_data)
             
@@ -851,9 +866,9 @@ async def logging_middleware(request: Request, call_next):
         try:
             api_key_obj = getattr(request.state, "api_key", None)
             if api_key_obj is not None:
-                key_id = getattr(api_key_obj, "id", None) or getattr(api_key_obj, "key", None)
+                key_id = safe_key_label(api_key_obj)
                 if key_id:
-                    bind_request_context(api_key_id=str(key_id))
+                    bind_request_context(api_key_id=key_id)
             tenant_state = getattr(request.state, "tenant_id", None)
             if tenant_state:
                 bind_request_context(tenant_id=str(tenant_state))
