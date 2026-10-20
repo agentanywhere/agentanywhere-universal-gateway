@@ -35,6 +35,22 @@ ENTRY_POINT_GROUP = "mcp_gateway.plugins"
 BUILTIN_PACKAGE = "app.plugins.builtin"
 
 
+def _compat_setting(env_name: str, field: str) -> str:
+    """Read a compatibility variable from the environment, else from Settings.
+
+    Settings also reads ``.env``, so a value written there applies when
+    uvicorn is started directly, not only when it is exported.
+    """
+    if env_name in os.environ:
+        return os.environ.get(env_name, "")
+    try:
+        from app.config import get_settings
+
+        return str(getattr(get_settings(), field, "") or "")
+    except Exception:  # noqa: BLE001 - settings are optional for the loader
+        return ""
+
+
 @dataclass
 class LoadResult:
     """Summary of a load operation, surfaced by the admin API / CLI."""
@@ -63,8 +79,8 @@ class PluginLoader:
         plugin_configs: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> None:
         self.registry = registry or plugin_registry
-        env_paths = os.environ.get(ENV_PLUGIN_PATH, "")
-        env_disabled = os.environ.get(ENV_PLUGIN_DISABLED, "")
+        env_paths = _compat_setting(ENV_PLUGIN_PATH, "mcp_gateway_plugin_path")
+        env_disabled = _compat_setting(ENV_PLUGIN_DISABLED, "mcp_gateway_plugin_disabled")
         self.plugin_paths: List[str] = [
             p.strip() for p in (list(plugin_paths or []) + env_paths.split(os.pathsep)) if p.strip()
         ]

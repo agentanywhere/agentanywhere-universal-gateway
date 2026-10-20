@@ -1,7 +1,8 @@
 FROM nginx:alpine
 
-# Copy nginx configuration
-COPY nginx.conf /etc/nginx/nginx.conf
+# Copy nginx configuration. nginx.conf holds upstream/server blocks only, so it
+# goes where the stock /etc/nginx/nginx.conf includes it (inside http {}).
+COPY nginx.conf /etc/nginx/conf.d/default.conf
 
 # Create SSL directory
 RUN mkdir -p /etc/nginx/ssl

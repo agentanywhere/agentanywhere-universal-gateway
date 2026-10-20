@@ -1,8 +1,8 @@
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Copy, Eye, EyeOff, Key, Plus, Trash2 } from 'lucide-react'
+import { Copy, Key, Plus, Trash2 } from 'lucide-react'
 import { format } from 'date-fns'
-import { adminApi, type APIKey } from '../api/admin'
+import { adminApi, type APIKey, type CreatedAPIKey } from '../api/admin'
 import { Button } from '../components/ui/Button'
 import { Card } from '../components/ui/Card'
 import { PageHeader } from '../components/ui/PageHeader'
@@ -18,7 +18,8 @@ import { useToast } from '../components/ui/Toast'
 export default function APIKeys() {
   const queryClient = useQueryClient()
   const { toast } = useToast()
-  const [showKeys, setShowKeys] = useState<Record<string, boolean>>({})
+  // The full key is shown once, right after creation; the list never has it.
+  const [createdKey, setCreatedKey] = useState<CreatedAPIKey | null>(null)
   const [newKeyName, setNewKeyName] = useState('')
   const [showCreateModal, setShowCreateModal] = useState(false)
   const [confirmDelete, setConfirmDelete] = useState<APIKey | null>(null)
@@ -34,6 +35,7 @@ export default function APIKeys() {
       queryClient.invalidateQueries({ queryKey: ['api-keys'] })
       setShowCreateModal(false)
       setNewKeyName('')
+      setCreatedKey(key)
       toast({
         title: 'API key created',
         description: key.name,
@@ -127,36 +129,12 @@ export default function APIKeys() {
             </Thead>
             <Tbody>
               {keys.map((key) => (
-                <Tr key={key.key}>
+                <Tr key={key.id}>
                   <Td className="font-medium">{key.name}</Td>
                   <Td>
-                    <div className="flex items-center gap-2">
-                      <code className="rounded bg-muted px-1.5 py-0.5 text-xs font-mono text-muted-foreground">
-                        {showKeys[key.key]
-                          ? key.key
-                          : `${key.key.substring(0, 12)}…`}
-                      </code>
-                      <IconButton
-                        label={showKeys[key.key] ? 'Hide key' : 'Reveal key'}
-                        size="sm"
-                        onClick={() =>
-                          setShowKeys({ ...showKeys, [key.key]: !showKeys[key.key] })
-                        }
-                      >
-                        {showKeys[key.key] ? (
-                          <EyeOff className="h-3.5 w-3.5" />
-                        ) : (
-                          <Eye className="h-3.5 w-3.5" />
-                        )}
-                      </IconButton>
-                      <IconButton
-                        label="Copy key"
-                        size="sm"
-                        onClick={() => copyToClipboard(key.key)}
-                      >
-                        <Copy className="h-3.5 w-3.5" />
-                      </IconButton>
-                    </div>
+                    <code className="rounded bg-muted px-1.5 py-0.5 text-xs font-mono text-muted-foreground">
+                      {key.key_prefix ? `${key.key_prefix}…` : '—'}
+                    </code>
                   </Td>
                   <Td className="whitespace-nowrap text-muted-foreground tabular-nums">
                     {key.rate_limit_per_minute}/min · {key.rate_limit_per_hour}/hr
@@ -178,7 +156,7 @@ export default function APIKeys() {
                       <Button
                         variant="ghost"
                         size="sm"
-                        onClick={() => toggleMutation.mutate(key.key)}
+                        onClick={() => toggleMutation.mutate(key.id)}
                         disabled={toggleMutation.isPending}
                       >
                         {key.is_active ? 'Deactivate' : 'Activate'}
@@ -238,6 +216,33 @@ export default function APIKeys() {
       </Dialog>
 
       <Dialog
+        open={!!createdKey}
+        onClose={() => setCreatedKey(null)}
+        title="Copy your new API key"
+        description="This is the only time the full key is shown. The gateway keeps only a hash of it."
+        footer={
+          <Button onClick={() => setCreatedKey(null)}>Done</Button>
+        }
+      >
+        {createdKey ? (
+          <div className="flex items-center gap-2">
+            <code className="min-w-0 flex-1 break-all rounded bg-muted px-2 py-1 text-xs font-mono">
+              {createdKey.key}
+            </code>
+            <IconButton
+              label="Copy key"
+              size="sm"
+              onClick={() => copyToClipboard(createdKey.key)}
+            >
+              <Copy className="h-3.5 w-3.5" />
+            </IconButton>
+          </div>
+        ) : (
+          <></>
+        )}
+      </Dialog>
+
+      <Dialog
         open={!!confirmDelete}
         onClose={() => setConfirmDelete(null)}
         title="Delete API key?"
@@ -254,7 +259,7 @@ export default function APIKeys() {
             <Button
               variant="danger"
               isLoading={deleteMutation.isPending}
-              onClick={() => confirmDelete && deleteMutation.mutate(confirmDelete.key)}
+              onClick={() => confirmDelete && deleteMutation.mutate(confirmDelete.id)}
             >
               Delete key
             </Button>

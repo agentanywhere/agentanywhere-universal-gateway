@@ -31,8 +31,8 @@ class TenantRepository:
         default_quota = {
             "requests_per_minute": 1000,
             "requests_per_hour": 10000,
-            "requests_per_day": 100000,
-            "storage_mb": 1000,
+            "requests_per_day": 100000,  # not enforced yet (see app/tenant.py)
+            "storage_mb": 1000,  # not enforced yet
         }
         tenant = TenantModel(
             tenant_id=tenant_id,

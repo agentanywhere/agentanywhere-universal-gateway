@@ -14,7 +14,8 @@ from starlette.exceptions import HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
-from app.config import get_settings
+from app.config import cors_middleware_options, get_settings
+from app.client_ip import client_ip as _client_ip
 from app.models import HealthStatus, ErrorResponse, GatewayRequest, ProtocolType, RouteConfig
 from app.exceptions import (
     GatewayException, AuthenticationError, ValidationError,
@@ -47,7 +48,7 @@ from app.versioning import VersionUnavailable
 from app.tenant import tenant_manager
 from app.notifications import notification_manager
 from app.plugins import plugin_registry, load_plugins, PluginContext
-from admin.api import router as admin_router
+from admin.api import router as admin_router, verify_admin_token_value
 from fastapi import WebSocket, WebSocketDisconnect
 import structlog
 
@@ -299,9 +300,16 @@ app = FastAPI(
     title=settings.app_name,
     version=settings.app_version,
     lifespan=lifespan,
+    # The interactive docs and the schema describe every route, admin ones
+    # included, so they are served only with DEBUG=true. Without it the
+    # gateway answers 404 for these paths itself (see DOCS_PATHS below)
+    # instead of proxying them to a backend.
     docs_url="/docs" if settings.debug else None,
     redoc_url="/redoc" if settings.debug else None,
+    openapi_url="/openapi.json" if settings.debug else None,
 )
+
+DOCS_PATHS = frozenset({"/docs", "/docs/oauth2-redirect", "/redoc", "/openapi.json"})
 
 def _iter_request_db():
     """Yield a DB session for use inside the HTTP/WebSocket middleware.
@@ -323,14 +331,13 @@ app.include_router(admin_router)
 from admin.agents_api import router as agents_admin_router
 app.include_router(agents_admin_router)
 
-# CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.cors_origins,
-    allow_credentials=settings.cors_allow_credentials,
-    allow_methods=settings.cors_allow_methods,
-    allow_headers=settings.cors_allow_headers,
-)
+# CORS middleware. A "*" origin turns credentials off (with a warning):
+# browsers reject the wildcard-plus-credentials combination, and Starlette
+# would otherwise echo any Origin back with credentials allowed.
+_cors_options, _cors_warning = cors_middleware_options(settings)
+if _cors_warning:
+    logger.warning("cors_wildcard_credentials_disabled", message=_cors_warning)
+app.add_middleware(CORSMiddleware, **_cors_options)
 
 # --------------------------------------------------------------------------
 # Error rendering: content-negotiated so humans in a browser get a readable
@@ -731,7 +738,6 @@ app.add_exception_handler(RequestValidationError, validation_exception_handler)
 app.add_exception_handler(GatewayException, gateway_exception_handler)
 app.add_exception_handler(Exception, general_exception_handler)
 
-@app.middleware("http")
 async def logging_middleware(request: Request, call_next):
     """Structured access logging, metrics, and W3C trace propagation.
 
@@ -761,10 +767,7 @@ async def logging_middleware(request: Request, call_next):
     request.state.span_id = span_id
     request.state.parent_span_id = parent_span_id
 
-    client_ip = (
-        request.headers.get("x-forwarded-for", "").split(",")[0].strip()
-        or (request.client.host if request.client else None)
-    )
+    client_ip = _client_ip(request)
 
     bind_request_context(
         request_id=request_id,
@@ -812,9 +815,14 @@ async def logging_middleware(request: Request, call_next):
             response = await call_next(request)
             request_span.set_attribute("http.status_code", response.status_code)
         process_time = time.time() - start_time
-        
+        # Set by the auth middleware when it answered the request itself.
+        auth_rejected = bool(getattr(request.state, "auth_rejected", False))
+        metric_path = _rejected_path_label(request.url.path) if auth_rejected else request.url.path
+
         # Process through AI service
         try:
+            if auth_rejected:
+                raise _SkipAI()
             request_data = {
                 "request_id": request_id,
                 "method": request.method,
@@ -834,6 +842,8 @@ async def logging_middleware(request: Request, call_next):
             if ai_result.get("is_anomaly"):
                 response.headers["X-Anomaly-Detected"] = "true"
                 response.headers["X-Anomaly-Score"] = str(ai_result.get("anomaly_score", 0))
+        except _SkipAI:
+            pass
         except Exception as e:
             logger.warning("ai_processing_error", error=str(e))
         
@@ -870,7 +880,7 @@ async def logging_middleware(request: Request, call_next):
             tenant_id_metric = getattr(request.state, "tenant_id", None)
             obs_record_request(
                 method=request.method,
-                path=request.url.path,
+                path=metric_path,
                 status_code=response.status_code,
                 duration_seconds=process_time,
                 protocol="http",
@@ -903,15 +913,22 @@ async def logging_middleware(request: Request, call_next):
             
             metrics.request_count.labels(
                 method=request.method,
-                path=request.url.path,
+                path=metric_path,
                 status_code=response.status_code,
                 protocol=protocol
             ).inc()
             metrics.request_duration.labels(
                 method=request.method,
-                path=request.url.path,
+                path=metric_path,
                 protocol=protocol
             ).observe(process_time)
+            if auth_rejected and response.status_code == 429:
+                try:
+                    metrics.rate_limit_hits.labels(
+                        client_id=_rate_limit_metric_key(request),
+                    ).inc()
+                except Exception:  # noqa: BLE001
+                    pass
         
         # Add response headers
         response.headers["X-Request-ID"] = request_id
@@ -951,7 +968,9 @@ async def logging_middleware(request: Request, call_next):
         
         # Record tenant usage (best-effort, async)
         tenant_id = getattr(request.state, "tenant_id", None)
-        if tenant_id:
+        # A request the auth layer refused (e.g. over the tenant quota) is not
+        # usage; counting it would keep a throttled tenant throttled.
+        if tenant_id and not auth_rejected:
             try:
                 from app.tenant import tenant_service
                 from app.database import AsyncSessionLocal
@@ -1070,7 +1089,7 @@ async def logging_middleware(request: Request, call_next):
                     status_code=response.status_code,
                     response_time_ms=process_time * 1000,
                     user_agent=request.headers.get("user-agent"),
-                    error=None,
+                    error=(getattr(request.state, "auth_error_code", None) if auth_rejected else None),
                 )
                 # Pydantic v2 ignores unknown fields; carry protocol via attribute
                 # because LogRepository.create reads it via getattr()
@@ -1111,6 +1130,47 @@ async def logging_middleware(request: Request, call_next):
         raise
     finally:
         clear_request_context()
+
+
+class _SkipAI(Exception):
+    """Internal: rejected requests are not fed to the AI analytics."""
+
+
+def _rate_limit_metric_key(request: Request) -> str:
+    """Bounded label for gateway_rate_limit_hits_total: the key's id."""
+    principal = getattr(request.state, "api_key", None)
+    key_id = getattr(principal, "id", None) if principal is not None else None
+    if key_id:
+        return str(key_id)
+    if principal is not None:
+        return "non-database-key"
+    return "anonymous"
+
+
+def _auth_reject(request: Request, status_code: int, data: Dict[str, Any], headers=None):
+    """An error response produced by the auth layer, marked as such so the
+    logging middleware records it (bounded metric labels, no tenant usage)."""
+    try:
+        request.state.auth_rejected = True
+        request.state.auth_error_code = data.get("error")
+    except Exception:  # noqa: BLE001
+        pass
+    if not data.get("request_id"):
+        data["request_id"] = getattr(request.state, "request_id", None)
+    return render_error_response(request, status_code, data, headers)
+
+
+# Known first path segments, used as the metric label of rejected requests so
+# that a scanner probing random paths cannot create unbounded series.
+_REJECTED_PATH_LABEL_PREFIXES = frozenset({
+    "mcp", "a2a", "agui", "acp", "mqtt", "ws", "wss", "websocket", "grpc",
+    "graphql", "api", "rest", "http", "agents", "docs", "redoc", "openapi.json",
+})
+
+
+def _rejected_path_label(path: str) -> str:
+    first = (path or "/").lstrip("/").split("/", 1)[0]
+    return f"/{first}" if first in _REJECTED_PATH_LABEL_PREFIXES else "/other"
 
 
 @app.middleware("http")
@@ -1160,10 +1220,25 @@ async def auth_middleware_handler(request: Request, call_next):
     # and admin endpoints (admin has its own auth). OAuth2 endpoints are
     # themselves the means for clients to authenticate, so they must be
     # publicly reachable.
+    if request.url.path in DOCS_PATHS:
+        if app.docs_url or app.openapi_url:
+            # DEBUG=true: FastAPI serves them, without a key.
+            return await call_next(request)
+        # DEBUG=false: not served, and never forwarded to a backend.
+        return _auth_reject(
+            request,
+            status.HTTP_404_NOT_FOUND,
+            {
+                "error": "NOT_FOUND",
+                "message": "API documentation is only served when DEBUG=true.",
+                "request_id": getattr(request.state, "request_id", None),
+                "timestamp": utcnow().isoformat(),
+            },
+        )
+
     public_paths = {
         settings.health_check_path,
         settings.metrics_path,
-        "/docs", "/redoc", "/openapi.json",
         "/ready", "/live", "/health/detailed",
         "/.well-known/agent-card.json",
         "/.well-known/ag-ui.json",
@@ -1302,7 +1377,7 @@ async def auth_middleware_handler(request: Request, call_next):
                             error_code=e.error_code,
                             status_code=e.status_code
                         )
-                        return render_error_response(request, e.status_code, response_data, headers)
+                        return _auth_reject(request, e.status_code, response_data, headers)
                     raise  # Let exception handlers process other exceptions
             except StopIteration:
                 pass
@@ -1337,7 +1412,7 @@ async def auth_middleware_handler(request: Request, call_next):
                 error_code=e.error_code,
                 status_code=e.status_code
             )
-            return render_error_response(request, e.status_code, response_data, headers)
+            return _auth_reject(request, e.status_code, response_data, headers)
         raise  # Re-raise to let exception handlers process other exceptions
     except Exception as e:
         logger.error("auth_middleware_error", error=str(e))
@@ -1391,7 +1466,7 @@ async def auth_middleware_handler(request: Request, call_next):
                     error_code=e.error_code,
                     status_code=e.status_code
                 )
-                return render_error_response(request, e.status_code, response_data, headers)
+                return _auth_reject(request, e.status_code, response_data, headers)
             raise  # Let exception handlers process other exceptions
         except Exception:
             request_id = getattr(request.state, "request_id", None)
@@ -1401,6 +1476,12 @@ async def auth_middleware_handler(request: Request, call_next):
             )
     
     return await call_next(request)
+
+
+# Registered after the auth middleware so that it is the OUTER one: requests
+# the auth layer rejects (401, 403, 429) still get an X-Request-ID, a metric
+# and a request_logs row. Starlette runs the last-registered middleware first.
+app.middleware("http")(logging_middleware)
 
 
 @app.get(settings.health_check_path, response_model=HealthStatus)
@@ -1413,14 +1494,29 @@ async def health_check():
     )
 
 
+def _require_ops_admin(request: Request) -> None:
+    """Admin check for the operational endpoints, when it is turned on.
+
+    With ``OPS_ENDPOINTS_REQUIRE_ADMIN=true`` the metrics path and
+    ``/health/detailed`` need ``Authorization: Bearer <admin credential>``,
+    checked exactly like the admin API. Off by default.
+    """
+    if not settings.ops_endpoints_require_admin:
+        return
+    header = request.headers.get("authorization", "")
+    scheme, _, token = header.partition(" ")
+    verify_admin_token_value(token.strip() if scheme.lower() == "bearer" else None)
+
+
 @app.get("/health/detailed")
-async def detailed_health_check():
+async def detailed_health_check(request: Request):
     """Detailed health: runs every registered dependency probe.
 
     Returns aggregate ``status`` of ``healthy`` / ``degraded`` /
     ``unhealthy`` plus per-probe results. Sets HTTP 503 when overall
     status is unhealthy so external tooling can react.
     """
+    _require_ops_admin(request)
     from app.observability import dependency_probes
 
     results = await dependency_probes.check_all()
@@ -1466,10 +1562,11 @@ async def liveness_check():
 
 
 @app.get(settings.metrics_path)
-async def metrics_endpoint():
+async def metrics_endpoint(request: Request):
     """Prometheus metrics endpoint."""
     if not settings.metrics_enabled:
         raise HTTPException(status_code=404, detail="Metrics disabled")
+    _require_ops_admin(request)
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 

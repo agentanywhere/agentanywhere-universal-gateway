@@ -22,6 +22,8 @@ logger = structlog.get_logger()
 DEFAULT_QUOTA: Dict[str, Any] = {
     "requests_per_minute": 1000,
     "requests_per_hour": 10000,
+    # Stored and counted but not enforced yet: only the minute and hour
+    # quotas are checked. storage_mb is not enforced either.
     "requests_per_day": 100000,
     "storage_mb": 1000,
 }
