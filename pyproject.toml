@@ -28,11 +28,11 @@ classifiers = [
 dynamic = ["dependencies"]
 
 [project.urls]
-Homepage = "https://github.com/agentanywhere/universal-gateway"
-Documentation = "https://github.com/agentanywhere/universal-gateway/tree/main/docs"
-Repository = "https://github.com/agentanywhere/universal-gateway"
-Issues = "https://github.com/agentanywhere/universal-gateway/issues"
-Changelog = "https://github.com/agentanywhere/universal-gateway/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/agentanywhere/agentanywhere-universal-gateway"
+Documentation = "https://github.com/agentanywhere/agentanywhere-universal-gateway/tree/main/docs"
+Repository = "https://github.com/agentanywhere/agentanywhere-universal-gateway"
+Issues = "https://github.com/agentanywhere/agentanywhere-universal-gateway/issues"
+Changelog = "https://github.com/agentanywhere/agentanywhere-universal-gateway/blob/main/CHANGELOG.md"
 
 [project.scripts]
 # Canonical command.
