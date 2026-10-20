@@ -141,3 +141,35 @@ def test_no_required_variable_syntax_in_compose():
         if line.lstrip().startswith("#"):
             continue
         assert not re.search(r"\$\{[A-Z_]+:?\?", line), line
+
+
+# --- nginx: operational endpoints are not public ------------------------------
+
+def _nginx_location(path):
+    text = (REPO / "nginx" / "nginx.conf").read_text()
+    m = re.search(r"location\s+" + re.escape(path) + r"\s*\{(.*?)\n    \}", text, re.S)
+    assert m, f"no location {path} in nginx/nginx.conf"
+    return [l.strip() for l in m.group(1).splitlines()
+            if l.strip() and not l.strip().startswith("#")]
+
+
+@pytest.mark.parametrize("path", ["/metrics", "/health/detailed"])
+def test_nginx_restricts_operational_endpoints(path):
+    lines = _nginx_location(path)
+    allows = [l for l in lines if l.startswith("allow ")]
+    assert {"allow 127.0.0.1;", "allow ::1;", "allow 10.0.0.0/8;",
+            "allow 172.16.0.0/12;", "allow 192.168.0.0/16;"} <= set(allows)
+    assert "allow all;" not in lines
+    deny = lines.index("deny all;")
+    # deny all comes after every allow (first match wins in nginx).
+    assert all(lines.index(a) < deny for a in allows)
+    assert any(l.startswith("proxy_pass http://gateway_backend") for l in lines)
+
+
+def test_nginx_config_is_installed_as_a_server_level_file(compose):
+    assert "./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro" in compose["services"]["nginx"]["volumes"]
+    assert "COPY nginx.conf /etc/nginx/conf.d/default.conf" in (REPO / "nginx" / "Dockerfile").read_text()
+    text = (REPO / "nginx" / "nginx.conf").read_text()
+    # upstream/server at top level: valid only inside the stock http {} block.
+    assert re.search(r"^upstream ", text, re.M)
+    assert not re.search(r"^(events|http)\s*\{", text, re.M)

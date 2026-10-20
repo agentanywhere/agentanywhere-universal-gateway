@@ -25,9 +25,11 @@ These are also in the [README](../README.md). Read them before you deploy.
 - **`SECRET_KEY` has three jobs.** It signs tokens, it is accepted as the admin
   credential when `ADMIN_TOKEN` is empty, and it is accepted as an API key. Set
   a separate `ADMIN_TOKEN` and treat both as secrets.
-- **`/metrics` and `/health/detailed` need no credential.** Anyone who can reach
-  the gateway can read them. The same is true of `/docs`, `/redoc` and
-  `/openapi.json`. See the list of public paths in
+- **`/metrics` and `/health/detailed` need no credential by default.** The
+  shipped `nginx/nginx.conf` limits them to loopback and private addresses,
+  but anyone who reaches the gateway's port 8000 directly can read them unless
+  you set `OPS_ENDPOINTS_REQUIRE_ADMIN=true`. `/docs`, `/redoc` and
+  `/openapi.json` are public too. See the list of public paths in
   [API_REFERENCE.md](API_REFERENCE.md#authentication).
 - **Tenant usage is counted after the response.** A burst of concurrent
   requests can pass a tenant quota by a few requests.
@@ -40,8 +42,8 @@ These are also in the [README](../README.md). Read them before you deploy.
 |---|---|---|
 | `SECRET_KEY` | A placeholder starting with `change-me`. The gateway refuses it as an admin credential. In `ENVIRONMENT=production` it prints a warning but still starts. | Run `python3 scripts/generate_secret_key.py --update-env`. |
 | `ADMIN_TOKEN` | Empty, so `SECRET_KEY` is the admin credential. | Set a separate random value. |
-| `CORS_ORIGINS` | Allows every origin (`env.example` ships `["*"]`, with `CORS_ALLOW_CREDENTIALS=true`). | Set it to the exact origins of your front ends, as a JSON array. |
-| `/metrics`, `/health/detailed` | Open to anyone who can reach the gateway. | Block them at your firewall or reverse proxy, or allow only your monitoring network. In `nginx/nginx.conf` the `/metrics` block has an IP allow-list that is commented out; `/health/detailed` is passed through by the catch-all `location /`. |
+| `CORS_ORIGINS` | The local admin console only: `["http://localhost:3001","http://127.0.0.1:3001"]`, with `CORS_ALLOW_CREDENTIALS=true`. A `"*"` entry makes the gateway turn credentials off and log a warning. | Set it to the exact origins of your front ends, as a JSON array. |
+| `/metrics`, `/health/detailed` | No credential (`OPS_ENDPOINTS_REQUIRE_ADMIN=false`). Through `nginx/nginx.conf`, loopback and private addresses only (403 for others); port 8000 directly, open. | Set `OPS_ENDPOINTS_REQUIRE_ADMIN=true` and give Prometheus the admin token, or firewall port 8000. Adjust the `allow` lines in `nginx/nginx.conf` to your monitoring network. |
 | Redis in `docker-compose.yml` | No password. Port 6379 is published on `127.0.0.1` only. | Keep it on the Compose network or localhost. If you need remote access, add a password and a firewall rule. |
 | PostgreSQL in `docker-compose.yml` (`production` profile) | No password fallback: the container refuses to start while `POSTGRES_PASSWORD` is empty or starts with `change-me`. Port 5432 is published on `127.0.0.1` only. | Set a generated `POSTGRES_PASSWORD` in `.env` before you start the profile. PostgreSQL applies it only when the volume is first initialised; to change it later use `ALTER USER`. |
 | Grafana in `docker-compose.yml` (`monitoring` profile) | Admin user `admin`. No password fallback: the container refuses to start while `GRAFANA_ADMIN_PASSWORD` is empty or `admin`. Port 3000 is published on all interfaces. | Set `GRAFANA_ADMIN_PASSWORD` in `.env`, and restrict port 3000. |
@@ -55,10 +57,13 @@ These are also in the [README](../README.md). Read them before you deploy.
 Tick these off yourself. Nothing in this repository checks them for you.
 
 - [ ] `SECRET_KEY` is a generated random value, and `ADMIN_TOKEN` is a different one.
-- [ ] `CORS_ORIGINS` lists your real origins and not `*`.
+- [ ] `CORS_ORIGINS` lists your real origins and not `*` (with `*`, the gateway
+      disables credentials and logs `cors_wildcard_credentials_disabled`).
 - [ ] TLS is terminated in front of the gateway (see below), with a real certificate.
-- [ ] `/metrics`, `/health/detailed` and, if you want them private, `/docs`,
-      `/redoc` and `/openapi.json` are blocked or restricted at the proxy or firewall.
+- [ ] `/metrics` and `/health/detailed` are not reachable from the internet:
+      `OPS_ENDPOINTS_REQUIRE_ADMIN=true`, or port 8000 firewalled and the nginx
+      allow-list matching your monitoring network. If you want them private,
+      `/docs`, `/redoc` and `/openapi.json` are blocked at the proxy or firewall.
 - [ ] The database is PostgreSQL, or you accept SQLite's limits (see [DEPLOYMENT.md](DEPLOYMENT.md)).
 - [ ] The database file or volume is backed up, and you know how to restore it.
       Remember it holds API keys in plaintext.
@@ -184,7 +189,8 @@ bash scripts/setup_production.sh
 
 ### Metrics
 
-- Gateway: `http://localhost:8000/metrics` (no credential; see above)
+- Gateway: `http://localhost:8000/metrics` (no credential unless
+  `OPS_ENDPOINTS_REQUIRE_ADMIN=true`; see above)
 - Prometheus: `http://localhost:9090` with `docker compose --profile monitoring up -d`
 
 ## Troubleshooting

@@ -20,21 +20,24 @@ authentication middleware (`app/main.py`) lets through:
 | Path | Notes |
 |---|---|
 | `/health` | The default; it is the `HEALTH_CHECK_PATH` setting. |
-| `/metrics` | The default; it is the `METRICS_PATH` setting. Prometheus metrics. |
+| `/metrics` | The default; it is the `METRICS_PATH` setting. Prometheus metrics. Needs the admin credential when `OPS_ENDPOINTS_REQUIRE_ADMIN=true`. |
 | `/ready` | Readiness probe. |
 | `/live` | Liveness probe. |
-| `/health/detailed` | Per-dependency health. |
+| `/health/detailed` | Per-dependency health. Needs the admin credential when `OPS_ENDPOINTS_REQUIRE_ADMIN=true`. |
 | `/docs`, `/redoc`, `/openapi.json` | Interactive documentation and the OpenAPI schema. |
 | `/.well-known/agent-card.json`, `/.well-known/ag-ui.json` | Discovery documents. |
 | `/oauth2/*` | The gateway's OAuth2 endpoints, which clients use to obtain tokens. |
 | `/admin/*` | Not covered by API keys, but not open: the admin endpoints have their own check (see below). All but three answer 401 without the admin credential. |
 
-> **Warning.** `/metrics` and `/health/detailed` need no credential and expose
-> operational detail (Prometheus metrics, per-dependency health and the gateway
-> version) to anyone who can reach the gateway. In production, block them at
-> your firewall or reverse proxy, or expose them only to your monitoring
-> network. The same applies to `/docs`, `/redoc` and `/openapi.json` if you do
-> not want the API surface public.
+> **Warning.** By default `/metrics` and `/health/detailed` need no credential
+> and expose operational detail (Prometheus metrics, per-dependency health and
+> the gateway version) to anyone who can reach the gateway. The shipped
+> `nginx/nginx.conf` answers them only for loopback and private addresses, but
+> the gateway's own port 8000 is not behind it. Set
+> `OPS_ENDPOINTS_REQUIRE_ADMIN=true` to require the admin credential
+> (`Authorization: Bearer ...`) on both, or block them at your firewall. The
+> same applies to `/docs`, `/redoc` and `/openapi.json` if you do not want the
+> API surface public.
 
 The admin credential is `ADMIN_TOKEN`, or `SECRET_KEY` when `ADMIN_TOKEN` is
 empty and `SECRET_KEY` is not the shipped placeholder. See
@@ -97,7 +100,9 @@ Returns 503 with `"status": "not_ready"` if the database check fails.
 GET /metrics
 ```
 
-Returns Prometheus metrics in text format.
+Returns Prometheus metrics in text format. With
+`OPS_ENDPOINTS_REQUIRE_ADMIN=true`, send `Authorization: Bearer <admin credential>`;
+without it the answer is 401.
 
 ## Protocol Endpoints
 

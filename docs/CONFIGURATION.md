@@ -65,12 +65,24 @@ This guide explains how to configure the AgentAnywhere Universal Gateway using e
 
 ### CORS Configuration
 - `CORS_ORIGINS`: List of allowed origins, written as a JSON array
-  - Example: `CORS_ORIGINS=["http://localhost:3000","https://example.com"]`
-  - **The default allows every origin.** The built-in default is
-    `["*", "http://localhost:3001", "http://localhost:3000"]` and `env.example`
-    ships `["*"]`, together with `CORS_ALLOW_CREDENTIALS=true`. Replace it with
+  - Example: `CORS_ORIGINS=["https://console.example.com","https://app.example.com"]`
+  - Default (built in and in `env.example`):
+    `["http://localhost:3001","http://127.0.0.1:3001"]`, the admin console on
+    the same machine (port 3001 for both `npm run dev` in `admin-ui/` and
+    `docker-compose.yml`). The console normally reaches the gateway through
+    its own proxy (`/admin` and `/api` on the same origin), so CORS only comes
+    into play when a page on another origin calls the gateway directly, for
+    example a console built with `VITE_API_URL=http://localhost:8000`. List
     the exact origins of your front ends before you expose the gateway.
-- `CORS_ALLOW_CREDENTIALS`: Allow credentials (true/false; default: true)
+  - `"*"` allows every origin. Browsers refuse `*` together with credentials,
+    and passing both to the CORS middleware would make it echo any origin
+    back with credentials allowed, so **when the list contains `"*"`, the
+    gateway turns `CORS_ALLOW_CREDENTIALS` off** and logs
+    `cors_wildcard_credentials_disabled` at startup. Use explicit origins if
+    browsers must send cookies or HTTP authentication.
+- `CORS_ALLOW_CREDENTIALS`: Allow credentials (true/false; default: true).
+  Applied only with an explicit origin list; ignored (treated as false) when
+  `CORS_ORIGINS` contains `"*"`.
 - `CORS_ALLOW_METHODS`: Allowed HTTP methods, as a JSON array (default: `["*"]`)
 - `CORS_ALLOW_HEADERS`: Allowed headers, as a JSON array (default: `["*"]`)
 
@@ -177,6 +189,20 @@ buffered. The gateway detects streaming when the client sends
 ### Metrics & Monitoring
 - `METRICS_ENABLED`: Enable Prometheus metrics (true/false)
 - `METRICS_PATH`: Metrics endpoint path (default: "/metrics")
+- `OPS_ENDPOINTS_REQUIRE_ADMIN`: When true, `METRICS_PATH` and
+  `/health/detailed` answer 401 unless the request carries
+  `Authorization: Bearer <admin credential>`, the same credential and check as
+  the admin API (`ADMIN_TOKEN`, a non-placeholder `SECRET_KEY`, or an OIDC
+  admin token). Default: false, so an unauthenticated Prometheus scrape keeps
+  working. When you turn it on, give Prometheus the token
+  (`authorization: credentials_file:` in `prometheus.yml`, commented out
+  there). `/health`, `/live` and `/ready` stay public either way.
+
+  Independently of this setting, `nginx/nginx.conf` answers `/metrics` and
+  `/health/detailed` only for loopback and private addresses (10/8,
+  172.16/12, 192.168/16, fc00::/7) and returns 403 to everyone else; edit the
+  `allow` lines there to change that. Clients that reach the gateway's port
+  8000 directly are not covered by nginx, which is what this setting is for.
 
 ### Health Check
 - `HEALTH_CHECK_PATH`: Health check endpoint path (default: "/health")
@@ -199,7 +225,7 @@ When using Docker Compose, the `.env` file is automatically loaded. The `docker-
 ENVIRONMENT=development
 DEBUG=true
 LOG_LEVEL=DEBUG
-CORS_ORIGINS=["*"]
+CORS_ORIGINS=["http://localhost:3001"]
 ```
 
 ### Production
@@ -216,9 +242,10 @@ ADMIN_TOKEN=<generate-a-second-strong-value>
 
 1. **Never commit `.env` file** - It's in `.gitignore`
 2. **Use strong secret keys** - Generate with the provided script
-3. **Restrict CORS origins** - The default and `env.example` allow every origin; set `CORS_ORIGINS` to your real origins before production
-4. **Use environment-specific values** - Different values for dev/staging/prod
-5. **Rotate secrets regularly** - Especially `SECRET_KEY` and database passwords
+3. **Restrict CORS origins** - The default and `env.example` allow only the local admin console; set `CORS_ORIGINS` to your real origins before production, and avoid `"*"`
+4. **Keep operational endpoints private** - `nginx/nginx.conf` limits `/metrics` and `/health/detailed` to private networks; set `OPS_ENDPOINTS_REQUIRE_ADMIN=true` if port 8000 is reachable from outside
+5. **Use environment-specific values** - Different values for dev/staging/prod
+6. **Rotate secrets regularly** - Especially `SECRET_KEY` and database passwords
 
 ## Validation
 

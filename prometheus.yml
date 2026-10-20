@@ -7,5 +7,11 @@ scrape_configs:
     static_configs:
       - targets: ['gateway:8000']
     metrics_path: '/metrics'
+    # With OPS_ENDPOINTS_REQUIRE_ADMIN=true the gateway answers 401 without the
+    # admin credential. Put the token in a file mounted into this container and
+    # uncomment:
+    # authorization:
+    #   type: Bearer
+    #   credentials_file: /etc/prometheus/gateway_admin_token
 
 

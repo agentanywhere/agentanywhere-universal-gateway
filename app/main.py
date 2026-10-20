@@ -14,7 +14,7 @@ from starlette.exceptions import HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
-from app.config import get_settings
+from app.config import cors_middleware_options, get_settings
 from app.models import HealthStatus, ErrorResponse, GatewayRequest, ProtocolType, RouteConfig
 from app.exceptions import (
     GatewayException, AuthenticationError, ValidationError,
@@ -47,7 +47,7 @@ from app.versioning import VersionUnavailable
 from app.tenant import tenant_manager
 from app.notifications import notification_manager
 from app.plugins import plugin_registry, load_plugins, PluginContext
-from admin.api import router as admin_router
+from admin.api import router as admin_router, verify_admin_token_value
 from fastapi import WebSocket, WebSocketDisconnect
 import structlog
 
@@ -323,14 +323,13 @@ app.include_router(admin_router)
 from admin.agents_api import router as agents_admin_router
 app.include_router(agents_admin_router)
 
-# CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.cors_origins,
-    allow_credentials=settings.cors_allow_credentials,
-    allow_methods=settings.cors_allow_methods,
-    allow_headers=settings.cors_allow_headers,
-)
+# CORS middleware. A "*" origin turns credentials off (with a warning):
+# browsers reject the wildcard-plus-credentials combination, and Starlette
+# would otherwise echo any Origin back with credentials allowed.
+_cors_options, _cors_warning = cors_middleware_options(settings)
+if _cors_warning:
+    logger.warning("cors_wildcard_credentials_disabled", message=_cors_warning)
+app.add_middleware(CORSMiddleware, **_cors_options)
 
 # --------------------------------------------------------------------------
 # Error rendering: content-negotiated so humans in a browser get a readable
@@ -1413,14 +1412,29 @@ async def health_check():
     )
 
 
+def _require_ops_admin(request: Request) -> None:
+    """Admin check for the operational endpoints, when it is turned on.
+
+    With ``OPS_ENDPOINTS_REQUIRE_ADMIN=true`` the metrics path and
+    ``/health/detailed`` need ``Authorization: Bearer <admin credential>``,
+    checked exactly like the admin API. Off by default.
+    """
+    if not settings.ops_endpoints_require_admin:
+        return
+    header = request.headers.get("authorization", "")
+    scheme, _, token = header.partition(" ")
+    verify_admin_token_value(token.strip() if scheme.lower() == "bearer" else None)
+
+
 @app.get("/health/detailed")
-async def detailed_health_check():
+async def detailed_health_check(request: Request):
     """Detailed health: runs every registered dependency probe.
 
     Returns aggregate ``status`` of ``healthy`` / ``degraded`` /
     ``unhealthy`` plus per-probe results. Sets HTTP 503 when overall
     status is unhealthy so external tooling can react.
     """
+    _require_ops_admin(request)
     from app.observability import dependency_probes
 
     results = await dependency_probes.check_all()
@@ -1466,10 +1480,11 @@ async def liveness_check():
 
 
 @app.get(settings.metrics_path)
-async def metrics_endpoint():
+async def metrics_endpoint(request: Request):
     """Prometheus metrics endpoint."""
     if not settings.metrics_enabled:
         raise HTTPException(status_code=404, detail="Metrics disabled")
+    _require_ops_admin(request)
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 

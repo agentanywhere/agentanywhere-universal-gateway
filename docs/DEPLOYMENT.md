@@ -115,7 +115,11 @@ plaintext: store backups as you would the keys themselves.
 ## Behind a reverse proxy
 
 The gateway speaks plain HTTP on port 8000. Terminate TLS in front of it.
-`nginx/nginx.conf` is a working starting point:
+`nginx/nginx.conf` is a working starting point. It is a server-level file
+(`upstream` and `server` blocks): `nginx/Dockerfile` and `docker-compose.yml`
+install it as `/etc/nginx/conf.d/default.conf`, inside the stock `http {}`
+block. (Earlier versions mounted it as `/etc/nginx/nginx.conf`, where nginx
+refuses to load it.)
 
 - it redirects HTTP to HTTPS and expects `nginx/ssl/cert.pem` and
   `nginx/ssl/key.pem`;
@@ -124,13 +128,26 @@ The gateway speaks plain HTTP on port 8000. Terminate TLS in front of it.
 - it forwards `Host`, `X-Real-IP`, `X-Forwarded-For`, `X-Forwarded-Proto`,
   `X-Forwarded-Host` and `X-Forwarded-Port`;
 - it allows request bodies up to 100M and read timeouts of 300 seconds;
-- its `/metrics` location has an IP allow-list that is **commented out**, and
-  `/health/detailed`, `/docs`, `/redoc` and `/openapi.json` go through the
-  catch-all `location /`. Restrict the ones you do not want public.
+- `/metrics` and `/health/detailed` are answered only for loopback and
+  private addresses (`127.0.0.1`, `::1`, `10.0.0.0/8`, `172.16.0.0/12`,
+  `192.168.0.0/16`, `fc00::/7`); everyone else gets 403. To change who may
+  read them, edit the `allow` lines in both locations (one address or CIDR per
+  line) and keep `deny all;` last. The check uses the address nginx sees: if
+  another proxy or load balancer is in front, configure `set_real_ip_from` /
+  `real_ip_header` first. Connections relayed by Docker's userland proxy
+  appear to come from the bridge gateway, which is inside `172.16.0.0/12`.
+- `/docs`, `/redoc` and `/openapi.json` go through the catch-all
+  `location /`. Restrict them if you do not want them public.
+
+The allow-list does not cover clients that reach port 8000 directly (the
+Compose file publishes it on all interfaces). For a check that does not depend
+on the network path, set `OPS_ENDPOINTS_REQUIRE_ADMIN=true`: the gateway then
+asks for the admin credential on both endpoints, and Prometheus needs the token
+(see `prometheus.yml`).
 
 If you use another proxy, do the same: pass the original host and client
-address, allow large bodies and long reads if you stream, and block `/metrics`
-and `/health/detailed` from the internet.
+address, allow large bodies and long reads if you stream, and keep `/metrics`
+and `/health/detailed` off the internet.
 
 ## Kubernetes
 

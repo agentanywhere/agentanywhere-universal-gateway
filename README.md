@@ -144,12 +144,14 @@ the volume). See [Quick start: if something goes wrong](docs/QUICKSTART.md#if-so
 and, for backups, [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#backing-up-the-database-volume).
 
 **Security defaults in the Compose file.** Redis has no password and, like
-PostgreSQL, is published on `127.0.0.1` only. If you start the `monitoring`
-profile, Grafana's admin password is `admin` unless you set
-`GRAFANA_ADMIN_PASSWORD`. If you start the `production` profile, set
-`POSTGRES_PASSWORD`; the fallback is a public placeholder. `CORS_ORIGINS`
-allows every origin until you change it, and `/metrics` and `/health/detailed`
-need no credential. The full list, and what to change, is in
+PostgreSQL, is published on `127.0.0.1` only. The `monitoring` profile needs
+`GRAFANA_ADMIN_PASSWORD` and the `production` profile needs
+`POSTGRES_PASSWORD` in `.env`: those containers refuse to start while the value
+is empty or a placeholder. `CORS_ORIGINS` allows only the local admin console
+(`http://localhost:3001`) until you change it. `/metrics` and `/health/detailed`
+need no credential unless you set `OPS_ENDPOINTS_REQUIRE_ADMIN=true`; the nginx
+of the `production` profile serves them to private addresses only, but port
+8000 is published directly. The full list, and what to change, is in
 [docs/PRODUCTION_SETUP.md](docs/PRODUCTION_SETUP.md).
 
 ## Admin console
