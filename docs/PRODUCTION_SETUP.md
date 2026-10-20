@@ -98,14 +98,14 @@ profile also starts the `postgres` service.
 
 ### PostgreSQL and Alembic
 
-- **Alembic**: `alembic/`, with two migrations, `001_initial_schema.py` and
-  `002_multi_tenant.py`.
+- **Alembic**: `alembic/`, with one baseline migration, `0001_baseline_schema.py`,
+  that creates the full schema. It is safe to run on a database the gateway has
+  already created; see [UPGRADING.md](UPGRADING.md).
 - **Setup script**: `scripts/setup_postgres.sh` creates the database if it does
   not exist and prints the `DATABASE_URL` to use.
 
-**Before you rely on `alembic upgrade head`, read [UPGRADING.md](UPGRADING.md).**
-The gateway creates its own tables when it starts, and the migrations do not
-describe the same schema.
+Alembic uses the same `DATABASE_URL` (and the same `asyncpg` driver) as the
+gateway, so no extra driver is needed.
 
 ```bash
 export POSTGRES_DB=gateway
@@ -160,9 +160,8 @@ python3 scripts/generate_secret_key.py --update-env
 generate self-signed certificates if none exist, set up PostgreSQL if
 `USE_POSTGRES=true` and `POSTGRES_PASSWORD` are set, check for `logrotate`,
 check that `docker-compose.yml` has resource limits, and run `alembic upgrade
-head` if PostgreSQL is enabled. It does not set `ADMIN_TOKEN`, `CORS_ORIGINS` or
-any password other than `POSTGRES_PASSWORD`, and it does not restrict `/metrics`.
-Read [UPGRADING.md](UPGRADING.md) before you let it run the migrations.
+head` if PostgreSQL is enabled (it stops if the migration fails). It does not set `ADMIN_TOKEN`, `CORS_ORIGINS` or
+any password other than `POSTGRES_PASSWORD`.
 
 ```bash
 export POSTGRES_PASSWORD=your-secure-password
