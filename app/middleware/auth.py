@@ -136,11 +136,11 @@ class AuthMiddleware:
     def _cache_put(self, key_hash: str, db_key) -> None:
         if not self.redis_client:
             return
-        ttl = api_key_cache.CACHE_TTL_SECONDS
-        if db_key.expires_at:
-            remaining = int((db_key.expires_at - utcnow()).total_seconds())
-            ttl = max(1, min(ttl, remaining))
         try:
+            ttl = api_key_cache.CACHE_TTL_SECONDS
+            if db_key.expires_at:
+                remaining = int((db_key.expires_at - utcnow()).total_seconds())
+                ttl = max(1, min(ttl, remaining))
             key_data = {
                 # The key itself is never written to Redis: the entry is
                 # found by the key's hash, and on a hit the principal is
