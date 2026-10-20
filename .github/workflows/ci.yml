@@ -39,6 +39,12 @@ jobs:
           python -m compileall -q app admin
           ruff check app admin tests --select F821,F823
 
+      - name: Documentation checks
+        run: |
+          python scripts/check_docs.py
+          python scripts/check_env_vars.py
+          python scripts/generate_http_reference.py --check
+
       - name: Test
         run: >
           pytest

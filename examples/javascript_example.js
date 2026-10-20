@@ -81,7 +81,7 @@ async function mqttPublish() {
  *
  * NOT WORKING: the gateway's /ws/* route currently refuses every connection,
  * including ones with a valid API key, and has no relay to a backend. This
- * example shows the intended interface. See docs/PROTOCOLS.md.
+ * example shows the intended interface. See docs/explanation/protocol-support.md.
  */
 function websocketExample() {
   const WebSocket = require('ws');

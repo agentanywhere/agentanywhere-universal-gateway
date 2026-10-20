@@ -11,7 +11,7 @@ make test           # same via Makefile
 make test-cov
 ```
 
-For what CI runs, see `docs/TESTING.md`.
+For what CI runs, see `docs/how-to/run-the-tests.md`.
 
 ## Scope
 
