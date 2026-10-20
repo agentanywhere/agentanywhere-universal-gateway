@@ -15,6 +15,8 @@ Please open an issue.
 - [CLI.md](CLI.md): the `agentanywhere-gateway` command
 - [PLUGINS.md](PLUGINS.md): writing a plugin
 - [TESTING.md](TESTING.md): running the tests, and what CI runs
-- [PRODUCTION_SETUP.md](PRODUCTION_SETUP.md): notes on running behind TLS with PostgreSQL and Redis
+- [DEPLOYMENT.md](DEPLOYMENT.md): container, Compose, reverse proxy, more than one process
+- [PRODUCTION_SETUP.md](PRODUCTION_SETUP.md): production checklist, defaults to change, known limitations
+- [UPGRADING.md](UPGRADING.md): how the database schema is created, and what Alembic does and does not cover
 - [WEBHOOK_TESTING.md](WEBHOOK_TESTING.md): trying out webhooks
 - [PROJECT_STRUCTURE.md](PROJECT_STRUCTURE.md): where things live in the repository

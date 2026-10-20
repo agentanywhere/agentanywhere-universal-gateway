@@ -3,9 +3,10 @@
 AgentAnywhere Universal Gateway puts one authentication, rate-limiting and
 logging layer in front of several agent and application protocols. Seven of the
 routes below work today. **gRPC and WebSocket do not**; their sections say what
-happens instead. This guide gives each protocol a single reference: what path it uses, which environment
-variable points it at a backend, a runnable request/response example, and the
-matching **sample backend** you can start locally.
+happens instead. This guide gives each protocol a single reference: what path
+it uses, which environment variable points it at a backend, a runnable
+request/response example, and the matching **sample backend** you can start
+locally.
 
 Every protocol below has:
 

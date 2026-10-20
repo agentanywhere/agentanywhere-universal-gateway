@@ -134,6 +134,18 @@ This starts the gateway on port 8000, Redis, and the admin console on port
 backends. Before you start, check that nothing else is using ports 8000, 3001
 and 6379.
 
+Under Docker, `localhost` in a `*_BACKEND_URL` means the gateway container
+itself. See [Quick start: if something goes wrong](docs/QUICKSTART.md#if-something-goes-wrong).
+
+**Security defaults in the Compose file.** Redis has no password and, like
+PostgreSQL, is published on `127.0.0.1` only. If you start the `monitoring`
+profile, Grafana's admin password is `admin` unless you set
+`GRAFANA_ADMIN_PASSWORD`. If you start the `production` profile, set
+`POSTGRES_PASSWORD`; the fallback is a public placeholder. `CORS_ORIGINS`
+allows every origin until you change it, and `/metrics` and `/health/detailed`
+need no credential. The full list, and what to change, is in
+[docs/PRODUCTION_SETUP.md](docs/PRODUCTION_SETUP.md).
+
 ## Admin console
 
 The console is a React application in [`admin-ui/`](admin-ui/). With Docker
@@ -186,6 +198,9 @@ Continuous integration runs the same lint, test and build steps on Python 3.10,
 - [API reference](docs/API_REFERENCE.md)
 - [Command-line tool](docs/CLI.md)
 - [Plugins](docs/PLUGINS.md)
+- [Deployment](docs/DEPLOYMENT.md): container, Compose, reverse proxy, more than one process
+- [Production checklist](docs/PRODUCTION_SETUP.md): defaults to change before you expose the gateway
+- [Upgrading and the database schema](docs/UPGRADING.md)
 
 ## Contributing and security
 
