@@ -76,12 +76,67 @@ You get the created user back. Without the `X-API-Key` header you get 401.
 
 ## If something goes wrong
 
+**The gateway will not start.**
+
+- **"Address already in use" (uvicorn).** Something else is listening on port
+  8000. Use `--port 8010` and change the URLs above to match.
+- **`pip install` fails on dependencies.** Python 3.13 is not supported, because
+  several pinned dependencies do not build on it. Use 3.10, 3.11 or 3.12.
+- **`.env` changes have no effect.** Settings are read at startup. Restart the
+  gateway after you edit `.env`.
+- **A list setting makes startup fail.** Settings that hold a list, such as
+  `CORS_ORIGINS`, must be written as a JSON array, for example
+  `CORS_ORIGINS=["https://example.com"]`. A bare comma-separated value is not
+  accepted.
+
+**Admin API or console.**
+
 - **The admin API answers 401.** `SECRET_KEY` in `.env` is still the
-  placeholder, or you are sending a different value from the one the gateway
-  started with. Restart the gateway after changing `.env`.
-- **A request answers 502 or 503.** The backend for that route is not running,
-  or its `*_BACKEND_URL` points somewhere else. 503 after several 502s means
-  the circuit breaker has opened; it closes again after
-  `CIRCUIT_BREAKER_TIMEOUT` seconds.
-- **Port 8000 is taken.** Something else is listening there. Use
-  `--port 8010` and change the URLs above to match.
+  placeholder (a value starting with `change-me`) and `ADMIN_TOKEN` is empty, or
+  you are sending a different value from the one the gateway started with. Send
+  it as `Authorization: Bearer <value>`. Restart the gateway after changing `.env`.
+- **The admin console rejects the sign-in.** The user name is `ADMIN_USERNAME`
+  (default `admin`) and the password is `ADMIN_TOKEN`, or `SECRET_KEY` if
+  `ADMIN_TOKEN` is empty. There is no default password.
+- **Two 401s that look alike.** Admin endpoints (`/admin/*`) take the admin
+  credential. Everything else takes an API key from `POST /admin/api-keys`, in
+  the `X-API-Key` header or as a bearer token. The admin credential is not an
+  API key, except that `SECRET_KEY` is also accepted as one when it is not the
+  placeholder.
+
+**Requests through the gateway.**
+
+- **401 "API key required" or invalid key.** The `X-API-Key` header is missing,
+  or the key does not exist in the database. If you removed `gateway.db`, or are
+  running in Docker without a volume for it, the keys are gone; create a new one.
+- **502.** The gateway could not reach the backend for that route. Check that
+  the backend is running and that the matching `*_BACKEND_URL` points at it.
+  Under Docker, `localhost` in a backend URL means the gateway container itself,
+  not your machine; `docker-compose.yml` uses the value from `.env` when one is
+  set, so replace the `localhost` URLs copied from `env.example` with service
+  names such as `http://http-backend:8003` (the sample backends need
+  `docker compose --profile backends up -d --build`) or with an address the
+  container can reach.
+- **503 after several 502s.** The circuit breaker for that backend has opened.
+  It closes again after `CIRCUIT_BREAKER_TIMEOUT` seconds.
+- **429.** The key or the tenant went over its limit. The response carries a
+  `Retry-After` header.
+
+**Redis.**
+
+- **You do not need Redis for this quick start.** Without it, rate-limit
+  counters are kept in memory, which is correct for a single process only. If a
+  Redis URL is configured but Redis is not reachable, rate limiting also falls
+  back to in-memory counters instead of failing. The copy of `env.example`
+  sets `REDIS_URL` and `RATE_LIMIT_REDIS_URL` to `localhost`; leaving them is
+  harmless without Redis, or comment out `RATE_LIMIT_REDIS_URL` and set
+  `REDIS_ENABLED=false`.
+
+**Docker.**
+
+- **"port is already allocated".** Something on the host is using 8000, 3001 or
+  6379 (or 80/443/5432 with `--profile production`). Stop it, or change the
+  left-hand side of the port mapping in `docker-compose.yml`. The gateway's
+  host port can be set with `PORT` in `.env`.
+
+More on running the gateway outside a laptop: [DEPLOYMENT.md](DEPLOYMENT.md).
