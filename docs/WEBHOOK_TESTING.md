@@ -109,7 +109,7 @@ pytest tests/test_webhooks.py --cov=app.webhooks --cov-report=html
 ### Option 3: Docker Environment
 ```bash
 # Tests will run in Docker container with all dependencies
-docker-compose run gateway pytest tests/test_webhooks.py -v
+docker compose run gateway pytest tests/test_webhooks.py -v
 ```
 
 ## 🎯 Production Readiness

@@ -22,7 +22,7 @@ echo "1. Checking gateway..."
 if curl -s "$GATEWAY_URL/health" > /dev/null 2>&1; then
     echo -e "${GREEN}✓${NC} Gateway is running"
 else
-    echo -e "${RED}✗${NC} Gateway is not running. Start it first: docker-compose up -d"
+    echo -e "${RED}✗${NC} Gateway is not running. Start it first: docker compose up -d"
     exit 1
 fi
 
@@ -52,7 +52,7 @@ if [ "$ALL_BACKENDS_OK" = false ]; then
     echo ""
     echo -e "${YELLOW}⚠${NC} Some backends are not running. Start them with:"
     echo "  cd samples/backends && bash start_all.sh"
-    echo "  Or: docker-compose --profile backends up -d"
+    echo "  Or: docker compose --profile backends up -d"
     echo ""
     read -p "Continue testing anyway? (y/n) " -n 1 -r
     echo
@@ -164,7 +164,7 @@ echo "    -H \"Content-Type: application/json\" \\"
 echo "    -d '{\"query\": \"Your query here\"}'"
 echo ""
 echo "View logs:"
-echo "  docker-compose logs gateway"
-echo "  docker-compose --profile backends logs"
+echo "  docker compose logs gateway"
+echo "  docker compose --profile backends logs"
 
 

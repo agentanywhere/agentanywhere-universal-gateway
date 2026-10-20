@@ -49,7 +49,7 @@ echo "1. Checking if gateway is running..."
 if curl -s http://localhost:8000/health > /dev/null 2>&1; then
     echo -e "${GREEN}✓${NC} Gateway is running"
 else
-    echo -e "${RED}✗${NC} Gateway is not running. Start it with: docker-compose up -d"
+    echo -e "${RED}✗${NC} Gateway is not running. Start it with: docker compose up -d"
     exit 1
 fi
 

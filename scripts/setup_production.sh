@@ -91,8 +91,8 @@ echo "   1. Review and update .env file with production values"
 echo "   2. For production HTTPS, replace self-signed certs with Let's Encrypt:"
 echo "      certbot --nginx -d yourdomain.com"
 echo "   3. Start services with production profile:"
-echo "      docker-compose --profile production up -d"
-echo "   4. Monitor logs: docker-compose logs -f gateway"
+echo "      docker compose --profile production up -d"
+echo "   4. Monitor logs: docker compose logs -f gateway"
 echo ""
 
 

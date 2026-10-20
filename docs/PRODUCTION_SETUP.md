@@ -34,7 +34,7 @@ certbot --nginx -d yourdomain.com
 **Start with HTTPS**:
 
 ```bash
-docker-compose --profile production up -d
+docker compose --profile production up -d
 ```
 
 Access via:
@@ -71,7 +71,7 @@ alembic upgrade head
 **Start with PostgreSQL**:
 
 ```bash
-docker-compose --profile production up -d
+docker compose --profile production up -d
 ```
 
 ### 3. Log Rotation
@@ -90,7 +90,7 @@ docker-compose --profile production up -d
 bash scripts/rotate_logs.sh
 
 # Automatic rotation (add to crontab)
-0 0 * * * /path/to/mcp_gateway/scripts/rotate_logs.sh
+0 0 * * * /path/to/agentanywhere-universal-gateway/scripts/rotate_logs.sh
 ```
 
 **Using logrotate** (if available):
@@ -211,20 +211,20 @@ Before deploying to production:
 # Regenerate certificates
 rm -rf nginx/ssl/*
 bash scripts/generate_ssl_cert.sh
-docker-compose restart nginx
+docker compose restart nginx
 ```
 
 ### Database Connection Issues
 
 ```bash
 # Check PostgreSQL status
-docker-compose ps postgres
+docker compose ps postgres
 
 # Check logs
-docker-compose logs postgres
+docker compose logs postgres
 
 # Test connection
-docker-compose exec postgres psql -U gateway_user -d gateway
+docker compose exec postgres psql -U gateway_user -d gateway
 ```
 
 ### Log Rotation Issues

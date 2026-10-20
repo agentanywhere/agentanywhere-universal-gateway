@@ -7,22 +7,22 @@ help: ## Show this help message
 	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "  %-15s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
 build: ## Build Docker images
-	docker-compose build
+	docker compose build
 
 up: ## Start all services
-	docker-compose up -d
+	docker compose up -d
 
 down: ## Stop all services
-	docker-compose down
+	docker compose down
 
 logs: ## View gateway logs
-	docker-compose logs -f gateway
+	docker compose logs -f gateway
 
 restart: ## Restart gateway service
-	docker-compose restart gateway
+	docker compose restart gateway
 
 clean: ## Remove containers and volumes
-	docker-compose down -v
+	docker compose down -v
 	docker system prune -f
 
 test: ## Run all tests
@@ -40,11 +40,11 @@ test-cov: ## Run tests with coverage
 test-watch: ## Run tests in watch mode
 	pytest-watch
 
-lint: ## Run linters
-	flake8 app/
-	mypy app/
+lint: ## Run the same lint as CI (needs: pip install ruff)
+	python -m compileall -q app admin
+	ruff check app admin tests --select F821,F823
 
-format: ## Format code
+format: ## Format code (needs: pip install black isort; CI does not check formatting)
 	black app/
 	isort app/
 
@@ -55,7 +55,7 @@ install: ## Install dependencies
 	pip install -r requirements.txt
 
 monitoring: ## Start with monitoring (Prometheus + Grafana)
-	docker-compose --profile monitoring up -d
+	docker compose --profile monitoring up -d
 
 health: ## Check gateway health
 	curl http://localhost:8000/health

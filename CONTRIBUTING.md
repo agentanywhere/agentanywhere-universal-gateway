@@ -62,9 +62,9 @@ private reporting process in [SECURITY.md](SECURITY.md) instead.
 
 ### Prerequisites
 
-- Python 3.11+
-- Docker and Docker Compose
-- Redis (for rate limiting)
+- Python 3.10, 3.11 or 3.12 (3.13 is not supported)
+- Docker and Docker Compose (only to run the Compose stack)
+- Redis (optional: without it, rate-limit counters are kept in memory)
 - PostgreSQL (optional, SQLite works for development)
 
 ### Local Development
@@ -100,6 +100,12 @@ private reporting process in [SECURITY.md](SECURITY.md) instead.
    ```
 
 ## Code Style
+
+CI runs `python -m compileall -q app admin` and
+`ruff check app admin tests --select F821,F823`. `make lint` runs the same two
+commands; install ruff first with `pip install ruff`. `black` and `isort`
+(used by `make format`) are not in `requirements.txt` and are not checked by CI;
+install them yourself if you want them.
 
 - Follow PEP 8 for Python code
 - Use type hints where possible
@@ -137,7 +143,7 @@ pytest tests/test_gateway.py -v
 ## Project Structure
 
 ```
-mcp_gateway/
+agentanywhere-universal-gateway/
 ├── app/              # Main application code
 ├── admin/            # Admin API endpoints
 ├── admin-ui/         # React admin console
