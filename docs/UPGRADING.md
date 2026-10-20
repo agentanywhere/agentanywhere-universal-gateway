@@ -130,6 +130,28 @@ and restart the gateway. Also delete the
 - Other state is also per process: with no `RATE_LIMIT_REDIS_URL`, rate-limit
   counters live in each process's memory. See [CONFIGURATION.md](CONFIGURATION.md).
 
+## Behaviour changes in this release
+
+No schema change: API keys are hashed using the existing `key_hash` column.
+
+- **`SECRET_KEY` and the admin API.** If `ADMIN_TOKEN` is set, `SECRET_KEY`
+  no longer authenticates on `/admin/*`, `/metrics` or `/health/detailed`.
+  Give operators and Prometheus `ADMIN_TOKEN`, or set
+  `ADMIN_ACCEPT_SECRET_KEY=true` for the old behaviour.
+- **API keys are hashed.** `GET /admin/api-keys` no longer returns keys, only
+  `id` and `key_prefix`. Existing keys keep working; their plaintext copy is
+  dropped from the database on first use. Record new keys when you create
+  them: they cannot be shown again.
+- **`allowed_paths` is enforced.** A key created with it gets 403 elsewhere.
+- **Client address.** With `TRUSTED_PROXIES` empty (the default), IP rules,
+  logs and metrics use the connection's address, not `X-Forwarded-For`.
+  Behind nginx or a load balancer, set `TRUSTED_PROXIES` to its address, or
+  every request appears to come from the proxy.
+- **API docs.** With `DEBUG=false`, `/docs`, `/redoc` and `/openapi.json`
+  answer 404 instead of being proxied to the default backend.
+- **Rate-limit counters** are renamed (hash of the key), so current minute and
+  hour windows start again once after the upgrade.
+
 ## Before any upgrade
 
 1. Back up the database (the SQLite file, or `pg_dump` for PostgreSQL).

@@ -85,9 +85,9 @@ You get the created user back. Without the `X-API-Key` header you get 401.
 - **`.env` changes have no effect.** Settings are read at startup. Restart the
   gateway after you edit `.env`.
 - **A list setting makes startup fail.** Settings that hold a list, such as
-  `CORS_ORIGINS`, must be written as a JSON array, for example
-  `CORS_ORIGINS=["https://example.com"]`. A bare comma-separated value is not
-  accepted.
+  `CORS_ORIGINS`, take a JSON array (`CORS_ORIGINS=["https://example.com"]`)
+  or a comma-separated value (`CORS_ORIGINS=https://a.example,https://b.example`).
+  A value that starts with `[` must be valid JSON.
 
 **Admin API or console.**
 
@@ -97,7 +97,8 @@ You get the created user back. Without the `X-API-Key` header you get 401.
   it as `Authorization: Bearer <value>`. Restart the gateway after changing `.env`.
 - **The admin console rejects the sign-in.** The user name is `ADMIN_USERNAME`
   (default `admin`) and the password is `ADMIN_TOKEN`, or `SECRET_KEY` if
-  `ADMIN_TOKEN` is empty. There is no default password.
+  `ADMIN_TOKEN` is empty. Once `ADMIN_TOKEN` is set, `SECRET_KEY` is refused.
+  There is no default password.
 - **Two 401s that look alike.** Admin endpoints (`/admin/*`) take the admin
   credential. Everything else takes an API key from `POST /admin/api-keys`, in
   the `X-API-Key` header or as a bearer token. The admin credential is not an

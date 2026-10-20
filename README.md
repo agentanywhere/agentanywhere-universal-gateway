@@ -54,13 +54,13 @@ by hand, so this README does not make claims about them.
 ## Known limitations
 
 - **gRPC and WebSocket do not work** (see the table above).
-- **API keys are stored in plaintext.** The database keeps each key next to its
-  SHA-256 hash, and `GET /admin/api-keys` returns keys in full. With Redis
-  enabled, keys also appear in Redis key names. Protect the database, Redis and
-  the admin credential accordingly.
-- **`SECRET_KEY` has three jobs.** It signs tokens, it is accepted as the admin
-  credential when `ADMIN_TOKEN` is empty, and it is accepted as an API key. Set
-  a separate `ADMIN_TOKEN` and treat both as secrets.
+- **API keys created before this release are stored in plaintext until first
+  used.** New keys are stored as a SHA-256 hash only; an older row loses its
+  plaintext copy the first time its key authenticates. Rows of keys that are
+  never used again keep it, so protect old database backups accordingly.
+- **`SECRET_KEY` is a break-glass credential.** It signs nothing; it is
+  accepted as the admin credential only while `ADMIN_TOKEN` is empty, and as
+  an API key. Set a separate `ADMIN_TOKEN` and treat both as secrets.
 - **The analytics endpoints returned no analysis in our run.** The
   `/admin/ai/*` endpoints (anomalies, scaling, cost, forecast) answered with
   empty results or "Insufficient data" after real traffic. Treat them as
@@ -118,7 +118,8 @@ curl -s -X POST http://localhost:8000/api/users -H "X-API-Key: $API_KEY" -H "Con
 You should get the created user back as JSON. The same request without the
 `X-API-Key` header gets 401.
 
-Interactive API documentation is at <http://localhost:8000/docs>.
+Interactive API documentation is at <http://localhost:8000/docs> when the
+gateway runs with `DEBUG=true`; it is not served otherwise.
 
 ## Docker
 
@@ -174,7 +175,7 @@ Configuration is read from environment variables and from `.env`.
 
 | Variable | What it does | Default |
 |---|---|---|
-| `SECRET_KEY` | Signs tokens. Also the admin credential when `ADMIN_TOKEN` is empty. | a placeholder that is refused |
+| `SECRET_KEY` | Break-glass credential: the admin credential while `ADMIN_TOKEN` is empty, and an API key. Signs nothing yet. | a placeholder that is refused |
 | `ADMIN_TOKEN` | Credential for the admin API and console. | empty |
 | `DATABASE_URL` | SQLAlchemy URL. PostgreSQL is supported through `asyncpg`. `alembic upgrade head` uses the same URL ([docs/UPGRADING.md](docs/UPGRADING.md)). | `sqlite+aiosqlite:///./gateway.db`; under Docker Compose `sqlite+aiosqlite:////app/data/gateway.db` on the `gateway_data` volume |
 | `REDIS_URL`, `REDIS_ENABLED` | Shared rate-limit counters and the API-key cache. | `redis://localhost:6379/0`, `true` |

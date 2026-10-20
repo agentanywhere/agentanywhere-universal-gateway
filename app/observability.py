@@ -908,9 +908,45 @@ def record_request(
 # ---------------------------------------------------------------------------
 
 
+def _env_with_settings_fallback() -> Dict[str, str]:
+    """The OTEL_* values from the process environment, falling back to the
+    gateway's Settings (which also reads ``.env``).
+
+    Reading ``os.environ`` alone meant values written in ``.env`` were ignored
+    whenever uvicorn was started directly, because nothing exports ``.env``
+    into the environment.
+    """
+    merged: Dict[str, str] = {}
+    try:
+        from app.config import get_settings
+
+        s = get_settings()
+        merged = {
+            "OTEL_TRACING_ENABLED": "true" if s.otel_tracing_enabled else "false",
+            "OTEL_EXPORTER_OTLP_ENDPOINT": s.otel_exporter_otlp_endpoint or "",
+            "OTEL_EXPORTER_OTLP_HEADERS": s.otel_exporter_otlp_headers or "",
+            "OTEL_SERVICE_NAME": s.otel_service_name or "",
+        }
+    except Exception:  # noqa: BLE001 - settings are optional here
+        merged = {}
+    for name in (
+        "OTEL_TRACING_ENABLED",
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_HEADERS",
+        "OTEL_SERVICE_NAME",
+    ):
+        if name in os.environ:
+            merged[name] = os.environ[name]
+    return merged
+
+
 def configure_from_env(env: Optional[Dict[str, str]] = None) -> None:
-    """Configure the tracer from environment variables (idempotent)."""
-    env = env if env is not None else os.environ
+    """Configure the tracer from OTEL_* settings (idempotent).
+
+    With no ``env`` given, the process environment wins and ``.env`` (through
+    Settings) fills in the rest.
+    """
+    env = env if env is not None else _env_with_settings_fallback()
     enabled = env.get("OTEL_TRACING_ENABLED", "false").lower() in {"1", "true", "yes"}
     endpoint = env.get("OTEL_EXPORTER_OTLP_ENDPOINT") or None
     headers_raw = env.get("OTEL_EXPORTER_OTLP_HEADERS") or ""

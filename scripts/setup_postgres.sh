@@ -1,7 +1,7 @@
 #!/bin/bash
 # PostgreSQL setup script for production deployment
 
-set -e
+set -euo pipefail
 
 DB_NAME="${POSTGRES_DB:-gateway}"
 DB_USER="${POSTGRES_USER:-gateway_user}"
@@ -16,11 +16,23 @@ if [ -z "$DB_PASSWORD" ]; then
     exit 1
 fi
 
-# Wait for PostgreSQL to be ready
-echo "⏳ Waiting for PostgreSQL to be ready..."
+if ! command -v psql >/dev/null 2>&1; then
+    echo "❌ Error: psql (the PostgreSQL client) is not installed"
+    exit 1
+fi
+
+# Wait for PostgreSQL to be ready, but not forever.
+WAIT_SECONDS="${POSTGRES_WAIT_SECONDS:-60}"
+echo "⏳ Waiting up to ${WAIT_SECONDS}s for PostgreSQL to be ready..."
+waited=0
 until PGPASSWORD="$DB_PASSWORD" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d postgres -c '\q' 2>/dev/null; do
+    if [ "$waited" -ge "$WAIT_SECONDS" ]; then
+        echo "❌ Error: PostgreSQL at $DB_HOST:$DB_PORT is not reachable as $DB_USER after ${WAIT_SECONDS}s"
+        exit 1
+    fi
     echo "   PostgreSQL is unavailable - sleeping"
     sleep 1
+    waited=$((waited + 1))
 done
 
 echo "✅ PostgreSQL is ready"
@@ -34,10 +46,12 @@ EOF
 
 echo "✅ Database setup complete!"
 echo ""
-echo "📝 Update your .env file with:"
-echo "   DATABASE_URL=postgresql+asyncpg://$DB_USER:$DB_PASSWORD@$DB_HOST:$DB_PORT/$DB_NAME"
-echo ""
-echo "🔄 Run migrations:"
-echo "   alembic upgrade head"
+echo "📝 Next steps:"
+echo "   1. Set DATABASE_URL in your .env file (the password is not printed here):"
+echo "      DATABASE_URL=postgresql+asyncpg://$DB_USER:<POSTGRES_PASSWORD>@$DB_HOST:$DB_PORT/$DB_NAME"
+echo "   2. Create the tables, from the repository root, with DATABASE_URL set:"
+echo "      alembic upgrade head"
+echo "      (Or just start the gateway: it creates missing tables itself. Run"
+echo "      'alembic upgrade head' before every upgrade either way; see docs/UPGRADING.md.)"
 
 

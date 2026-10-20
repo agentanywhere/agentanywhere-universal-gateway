@@ -291,11 +291,18 @@ def cmd_webhooks_list(args: argparse.Namespace) -> int:
 
 def cmd_webhooks_create(args: argparse.Namespace) -> int:
     client = make_client(args)
+    if not args.events:
+        raise CLIError(
+            "--events is required, e.g. --events rate_limit_exceeded api_key_revoked "
+            "(GET /admin/webhooks/events lists them)",
+            status_code=None,
+        )
     body = {
         "url": args.target_url,
-        "events": args.events or ["request.completed"],
-        "secret": args.secret,
+        "events": args.events,
     }
+    if args.secret:
+        body["secret"] = args.secret
     data = client.post("/admin/webhooks", json_body=body)
     render(args, data)
     return 0
@@ -332,11 +339,14 @@ def cmd_logs(args: argparse.Namespace) -> int:
     client = make_client(args)
     params = {"limit": args.limit, "offset": args.offset}
     if args.status:
-        params["status"] = args.status
+        # The endpoint's filter is called status_code; "status" was ignored.
+        params["status_code"] = args.status
     if args.path_filter:
         params["path"] = args.path_filter
     data = client.get("/admin/logs", params=params)
-    render(args, data, columns=["timestamp", "method", "path", "status_code", "duration_ms"])
+    if not args.json and isinstance(data, dict) and isinstance(data.get("logs"), list):
+        data = data["logs"]  # the endpoint answers {"logs": [...], "total": n}
+    render(args, data, columns=["timestamp", "method", "path", "status_code", "response_time_ms"])
     return 0
 
 
