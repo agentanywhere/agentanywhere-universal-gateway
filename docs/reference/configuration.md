@@ -1,0 +1,358 @@
+# Configuration reference
+
+Every environment variable that AgentAnywhere Universal Gateway reads, with its
+default and what it does. The list is checked against the code by
+`scripts/check_env_vars.py`, which fails if a variable is read but not listed
+here, or listed but not read.
+
+## Contents
+
+- [How settings are loaded](#how-settings-are-loaded)
+- [Value formats](#value-formats)
+- [Notes used in the tables](#notes-used-in-the-tables)
+- [Application and server](#application-and-server)
+- [Credentials](#credentials)
+- [CORS](#cors)
+- [Rate limiting and Redis](#rate-limiting-and-redis)
+- [Database](#database)
+- [Backends](#backends)
+- [Dynamic routes](#dynamic-routes)
+- [Protocol boundaries and streaming](#protocol-boundaries-and-streaming)
+- [Per-protocol settings](#per-protocol-settings)
+- [Circuit breaker, metrics and health](#circuit-breaker-metrics-and-health)
+- [Logging](#logging)
+- [Tracing](#tracing)
+- [Log export](#log-export)
+- [Email and Slack notifications](#email-and-slack-notifications)
+- [Alert thresholds](#alert-thresholds)
+- [Plugins](#plugins)
+- [OpenID Connect and the agent edge](#openid-connect-and-the-agent-edge)
+- [Command-line tool](#command-line-tool)
+- [Variables read by other files, not by the gateway](#variables-read-by-other-files-not-by-the-gateway)
+
+## How settings are loaded
+
+All gateway settings are fields of the `Settings` class in `app/config.py`
+(pydantic-settings, no prefix, names are not case-sensitive). They are merged
+in this order, later sources winning:
+
+1. the defaults in `app/config.py`;
+2. the file named by `CONFIG_FILE`, if set (`.json`, `.yaml`/`.yml` or `.toml`;
+   keys are field names, either flat or grouped under the section names used
+   by `GET /admin/config`);
+3. the `.env` file in the **current working directory**;
+4. the process environment.
+
+Settings are read once, when the gateway starts. Restart after you change
+them, except for the fields marked **live**, which `PUT /admin/config` can
+change on a running process (see the [HTTP API reference](http-api.md)).
+
+A handful of variables are read directly from the process environment rather
+than through `Settings`; they are marked **env only**. Neither `.env` nor
+`CONFIG_FILE` applies to them: the gateway reads `.env` into its settings but
+does not export it, so an env-only variable written in `.env` has no effect
+when you start `uvicorn` yourself. Export it in the shell instead. Under Docker
+Compose, `env_file: .env` puts every line of `.env` into the container's
+environment, so there it does apply.
+
+## Value formats
+
+| Type | Write it as |
+|---|---|
+| Boolean | `true` or `false` (also `1`/`0`, `yes`/`no`) |
+| List | A JSON array, for example `CORS_ORIGINS=["https://app.example.com"]`. A comma-separated value stops start-up with `error parsing value for field`. |
+| JSON object | A JSON object on one line, for example `AGENT_ROUTES_JSON={"orders":"http://10.0.0.10:8090"}` |
+| URL | Must include a scheme (`http://`, `ws://` and so on) for `MCP_BACKEND_URL`, `A2A_BACKEND_URL`, `HTTP_BACKEND_URL`, `WEBSOCKET_BACKEND_URL`, `GRAPHQL_BACKEND_URL`, `ELASTICSEARCH_URL` and `SPLUNK_URL`; other URL settings are not validated. |
+
+## Notes used in the tables
+
+- **live**: can be changed at run time with `PUT /admin/config`.
+- **secret**: redacted in `GET /admin/config` output.
+- **not enforced**: accepted and shown by the admin API, but no code acts on
+  it in this release.
+- **not read**: accepted, but no code reads it in this release.
+
+<!-- env-vars:start -->
+
+## Application and server
+
+| Variable | Default | Description |
+|---|---|---|
+| `APP_NAME` | `AgentAnywhere Universal Gateway` | Title of the OpenAPI schema and `service.name` in logs. |
+| `APP_VERSION` | `1.0.0` | Version reported by `/health`, `/health/detailed` and the OpenAPI schema. |
+| `ENVIRONMENT` | `production` | Free text, lower-cased. With `production` and a placeholder `SECRET_KEY`, a warning is printed at start-up. Also used in log fields and to choose `https` for generated SDKs. |
+| `DEBUG` | `false` | When `true`, serves `/docs` and `/redoc`, and echoes SQL statements. With `false`, those two paths are forwarded to the default backend without a key check. |
+| `HOST` | `0.0.0.0` | Bind address, used only when the gateway is started with `python -m app.main`. `uvicorn` on the command line takes `--host` instead. |
+| `PORT` | `8000` | Port, used like `HOST`. `docker-compose.yml` also uses it for the host side of the port mapping. |
+| `WORKERS` | `4` | Worker processes, used only by `python -m app.main` with `ENVIRONMENT=production`. The container image runs one process. |
+| `GATEWAY_URL_BASE` | unset | Public base URL of the gateway, used in generated SDKs and the A2A Agent Card. Unset: built from `HOST` and `PORT`. |
+| `CONFIG_FILE` | unset | **env only.** Path to a JSON, YAML or TOML settings file. A file that cannot be read prints a warning and is ignored. |
+
+## Credentials
+
+| Variable | Default | Description |
+|---|---|---|
+| `SECRET_KEY` | `change-me-in-production-use-strong-random-key` | **secret.** Accepted as an admin bearer credential (even when `ADMIN_TOKEN` is set), as the console password when `ADMIN_TOKEN` is empty, and as an API key on the data plane. A value starting with `change-me` is treated as unset. No code signs anything with it in this release. See the [security model](../explanation/security-model.md). |
+| `ADMIN_TOKEN` | empty | The admin credential (`Authorization: Bearer`) and, when set, the console password. Not redacted by `GET /admin/config`. |
+| `ADMIN_USERNAME` | `admin` | User name the console's sign-in form expects. |
+| `API_KEY_HEADER` | `X-API-Key` | Header the gateway reads API keys from, before falling back to `Authorization: Bearer`. |
+| `ALGORITHM` | `HS256` | **not read.** |
+| `ACCESS_TOKEN_EXPIRE_MINUTES` | `30` | **not read.** |
+
+## CORS
+
+| Variable | Default | Description |
+|---|---|---|
+| `CORS_ORIGINS` | `["*", "http://localhost:3001", "http://localhost:3000"]` | Allowed origins. `env.example` ships `["*"]`. Set the exact origins before you expose the gateway. |
+| `CORS_ALLOW_CREDENTIALS` | `true` | Allow credentials on cross-origin requests. |
+| `CORS_ALLOW_METHODS` | `["*"]` | Allowed methods. |
+| `CORS_ALLOW_HEADERS` | `["*"]` | Allowed request headers. |
+
+## Rate limiting and Redis
+
+| Variable | Default | Description |
+|---|---|---|
+| `RATE_LIMIT_ENABLED` | `true` | **live.** Turns per-key rate limiting on or off. Tenant quotas are not affected. |
+| `RATE_LIMIT_PER_MINUTE` | `60` | **live.** Limit for principals without their own limit: `SECRET_KEY` used as a key, and OAuth2 tokens. Keys created through the admin API carry their own limits (default 60). |
+| `RATE_LIMIT_PER_HOUR` | `1000` | **live.** As above, per hour. |
+| `RATE_LIMIT_REDIS_URL` | unset | **secret.** Redis URL for rate-limit counters. Unset: counters live in each process's memory. `env.example` sets `redis://localhost:6379/1`. If Redis is unreachable, the gateway falls back to memory. |
+| `REDIS_URL` | `redis://localhost:6379/0` | **secret.** Redis URL for the five-minute API-key cache. |
+| `REDIS_ENABLED` | `true` | Use `REDIS_URL` for the API-key cache. If Redis is unreachable, the cache is skipped. |
+
+## Database
+
+| Variable | Default | Description |
+|---|---|---|
+| `DATABASE_URL` | unset, which means `sqlite+aiosqlite:///./gateway.db` | **secret.** SQLAlchemy async URL. SQLite (`sqlite+aiosqlite:///path`) and PostgreSQL (`postgresql+asyncpg://user:password@host:5432/db`) drivers are in `requirements.txt`. A relative SQLite path is relative to the working directory. Also read by `alembic/env.py`. |
+
+## Backends
+
+| Variable | Default | Description |
+|---|---|---|
+| `MCP_BACKEND_URL` | `http://localhost:8001` | Backend for `/mcp/*` and `/api/mcp/*`. Also the fallback for paths with no known prefix when `HTTP_BACKEND_URL` is unset. |
+| `A2A_BACKEND_URL` | `http://localhost:8002` | Backend for `/a2a/*` and `/api/a2a/*`. |
+| `AG_UI_BACKEND_URL` | unset | Backend for `/agui/*` and `/api/agui/*` (prefix stripped). Unset: those paths answer 500. |
+| `ACP_BACKEND_URL` | unset | Backend for `/acp/*` and `/api/acp/*` (prefix stripped). Unset: those paths answer 500. |
+| `HTTP_BACKEND_URL` | unset | Backend for `/api/*`, `/rest/*`, `/http/*` and every path with no known prefix. `env.example` sets `http://localhost:8003`. |
+| `GRAPHQL_BACKEND_URL` | unset | Endpoint that `POST /graphql` forwards queries to. `env.example` sets `http://localhost:4000/graphql`; the sample backend is on port 8006. |
+| `MQTT_BROKER_URL` | unset | Broker for `/mqtt/publish` and `/mqtt/subscribe`, for example `mqtt://localhost:1883` (`mqtts://` for TLS). The gateway connects when it starts. |
+| `WEBSOCKET_BACKEND_URL` | unset | Intended backend for `/ws/*`. The route does not work; see the [protocol support matrix](../explanation/protocol-support.md). |
+| `GRPC_BACKEND_URL` | unset | Target for the JSON-to-gRPC bridge, for example `localhost:50051`. The bridge does not work. |
+| `DEFAULT_TIMEOUT` | `30` | Seconds the gateway waits for a buffered backend response. Also the timeout of agent-edge requests. |
+
+Under Docker, `localhost` in these URLs is the gateway container itself. See
+[Deploy with Docker Compose](../how-to/deploy-with-docker-compose.md).
+
+## Dynamic routes
+
+| Variable | Default | Description |
+|---|---|---|
+| `DYNAMIC_ROUTES_ENABLED` | `true` | Honour routes registered with `POST /admin/routes`. `false`: prefix routing only. |
+| `DYNAMIC_ROUTES_REFRESH_SECONDS` | `15` | How often each process reloads the route table from the database. |
+
+## Protocol boundaries and streaming
+
+| Variable | Default | Description |
+|---|---|---|
+| `MCP_BOUNDARY_ENABLED` | `true` | **live.** Validate `POST` bodies under `/mcp`. |
+| `MCP_BOUNDARY_MAX_BODY_BYTES` | `2097152` | **live.** Largest MCP body accepted; larger answers 400. |
+| `MCP_BOUNDARY_ALLOWED_METHODS` | unset | List. If set, only these JSON-RPC methods pass. |
+| `MCP_BOUNDARY_BLOCKED_METHODS` | `[]` | List. JSON-RPC methods that are refused. |
+| `MCP_BOUNDARY_PROMPT_INJECTION_ACTION` | `block` | **live.** `block` answers 400 when a string matches an injection pattern; `audit` only logs it. |
+| `MCP_BOUNDARY_INJECTION_PATTERNS` | unset | List of regular expressions. Unset: a built-in list in `app/tier1_mcp.py`. |
+| `A2A_BOUNDARY_ENABLED` | `true` | **live.** Validate A2A `POST` bodies. |
+| `A2A_ENFORCE_SEND_MESSAGE_SHAPE` | `true` | **live.** Check the shape of A2A send-message bodies. |
+| `ACP_BOUNDARY_ENABLED` | `true` | Validate ACP bodies. |
+| `AG_UI_BOUNDARY_ENABLED` | `true` | Validate AG-UI bodies. |
+| `TIER2_STREAM_CONNECT_TIMEOUT` | `60.0` | Seconds to connect for streamed requests (AG-UI, ACP runs, A2A `message:stream`, agent edge). |
+| `TIER2_STREAM_READ_TIMEOUT` | unset (no limit) | Seconds between chunks for streamed requests. |
+
+## Per-protocol settings
+
+The rate-limit values in this section are **not enforced**. They are shown by
+`GET /admin/settings/protocols`. Requests are limited per key.
+
+| Variable | Default | Description |
+|---|---|---|
+| `PROTOCOL_MCP_RATE_LIMIT_PER_MINUTE` | `60` | **not enforced.** |
+| `PROTOCOL_MCP_RATE_LIMIT_PER_HOUR` | `1000` | **not enforced.** |
+| `PROTOCOL_A2A_RATE_LIMIT_PER_MINUTE` | `60` | **not enforced.** |
+| `PROTOCOL_A2A_RATE_LIMIT_PER_HOUR` | `1000` | **not enforced.** |
+| `PROTOCOL_HTTP_RATE_LIMIT_PER_MINUTE` | `100` | **not enforced.** |
+| `PROTOCOL_HTTP_RATE_LIMIT_PER_HOUR` | `5000` | **not enforced.** |
+| `PROTOCOL_MQTT_RATE_LIMIT_PER_MINUTE` | `200` | **not enforced.** |
+| `PROTOCOL_MQTT_RATE_LIMIT_PER_HOUR` | `10000` | **not enforced.** |
+| `PROTOCOL_WEBSOCKET_RATE_LIMIT_PER_MINUTE` | `300` | **not enforced.** |
+| `PROTOCOL_WEBSOCKET_RATE_LIMIT_PER_HOUR` | `15000` | **not enforced.** |
+| `PROTOCOL_GRPC_RATE_LIMIT_PER_MINUTE` | `150` | **not enforced.** |
+| `PROTOCOL_GRPC_RATE_LIMIT_PER_HOUR` | `8000` | **not enforced.** |
+| `PROTOCOL_AG_UI_RATE_LIMIT_PER_MINUTE` | `120` | **not read.** |
+| `PROTOCOL_AG_UI_RATE_LIMIT_PER_HOUR` | `6000` | **not read.** |
+| `PROTOCOL_ACP_RATE_LIMIT_PER_MINUTE` | `120` | **not read.** |
+| `PROTOCOL_ACP_RATE_LIMIT_PER_HOUR` | `6000` | **not read.** |
+| `PROTOCOL_MQTT_DEFAULT_PORT` | `1883` | Broker port when `MQTT_BROKER_URL` has none. |
+| `PROTOCOL_MQTT_KEEP_ALIVE` | `60` | Shown by the admin API only; the client uses 60 seconds. |
+| `PROTOCOL_WEBSOCKET_MAX_CONNECTIONS` | `500` | Shown by the admin API only. |
+| `PROTOCOL_WEBSOCKET_KEEP_ALIVE` | `30` | Shown by the admin API only. |
+| `PROTOCOL_GRPC_KEEPALIVE_TIME_MS` | `30000` | gRPC channel keepalive option. |
+| `PROTOCOL_GRPC_KEEPALIVE_TIMEOUT_MS` | `5000` | gRPC channel keepalive option. |
+| `PROTOCOL_GRPC_MIN_TIME_BETWEEN_PINGS_MS` | `10000` | gRPC channel option. |
+| `PROTOCOL_GRPC_MIN_PING_INTERVAL_WITHOUT_DATA_MS` | `300000` | gRPC channel option. |
+
+## Circuit breaker, metrics and health
+
+| Variable | Default | Description |
+|---|---|---|
+| `CIRCUIT_BREAKER_ENABLED` | `true` | **live.** One breaker per backend URL, per process. |
+| `CIRCUIT_BREAKER_FAILURE_THRESHOLD` | `5` | **live.** Consecutive failures that open the breaker. While open, requests answer 503. |
+| `CIRCUIT_BREAKER_TIMEOUT` | `60` | **live.** Seconds before an open breaker lets a request through again. |
+| `METRICS_ENABLED` | `true` | **live.** Record and serve Prometheus metrics. `false`: the metrics path answers 404. |
+| `METRICS_PATH` | `/metrics` | Path of the metrics endpoint. Public. |
+| `HEALTH_CHECK_PATH` | `/health` | Path of the liveness endpoint. Public. |
+
+## Logging
+
+| Variable | Default | Description |
+|---|---|---|
+| `LOG_LEVEL` | `INFO` | **live.** `DEBUG`, `INFO`, `WARNING`, `ERROR` or `CRITICAL`. |
+| `LOG_FORMAT` | `json` | **live.** `json`, `text`, or `auto` (text on a terminal, JSON otherwise). |
+| `LOG_SAMPLING_RATE` | `1.0` | **live.** Fraction of INFO lines kept, 0.0 to 1.0. |
+| `LOG_REDACTION_ENABLED` | `true` | **live.** Redact sensitive fields and values in log lines (see `DEFAULT_REDACT_KEYS` and `DEFAULT_REDACT_PATTERNS` in `app/logging_config.py`). |
+| `LOG_INCLUDE_CALLER` | `false` | **live.** Add file, line and function to each line. |
+| `LOG_FILE_PATH` | unset | Also write JSON logs to this rotating file. |
+| `LOG_AUDIT_FILE_PATH` | unset | Write audit log lines to this rotating file. |
+
+## Tracing
+
+All four are **env only**.
+
+| Variable | Default | Description |
+|---|---|---|
+| `OTEL_TRACING_ENABLED` | `false` | Export spans over OTLP/HTTP. Spans are always kept in an in-process buffer for `/admin/observability/traces`. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | Collector endpoint, for example `http://otel-collector:4318/v1/traces`. |
+| `OTEL_EXPORTER_OTLP_HEADERS` | unset | Comma-separated `key=value` headers for OTLP requests. |
+| `OTEL_SERVICE_NAME` | `agentanywhere-gateway` | Service name on spans. |
+
+## Log export
+
+| Variable | Default | Description |
+|---|---|---|
+| `LOG_EXPORT_ENABLED` | `false` | Start the batching export worker at start-up when at least one exporter is configured. |
+| `LOG_EXPORT_BATCH_SIZE` | `100` | **env only.** Entries per batch. |
+| `LOG_EXPORT_FLUSH_INTERVAL` | `5.0` | **env only.** Seconds between flushes. |
+| `LOG_EXPORT_MAX_QUEUE_SIZE` | `10000` | **env only.** Most entries held in the queue. |
+| `ELASTICSEARCH_ENABLED` | `false` | Export to Elasticsearch. |
+| `ELASTICSEARCH_URL` | unset | Elasticsearch URL. |
+| `ELASTICSEARCH_INDEX` | `gateway-logs` | Index name. |
+| `SPLUNK_ENABLED` | `false` | Export to Splunk HEC. |
+| `SPLUNK_URL` | unset | Splunk HEC URL. |
+| `SPLUNK_TOKEN` | unset | **secret.** Splunk HEC token. |
+| `SPLUNK_INDEX` | `gateway` | Splunk index. |
+| `S3_LOG_EXPORT_ENABLED` | `false` | Archive logs to S3 as gzipped NDJSON. Needs `boto3`, which is not in `requirements.txt`. |
+| `S3_LOG_BUCKET` | unset | Bucket. |
+| `S3_LOG_PREFIX` | `gateway-logs/` | Key prefix. |
+| `S3_LOG_REGION` | `us-east-1` | Region. |
+| `CLOUDWATCH_LOGS_ENABLED` | `false` | Export to CloudWatch Logs. Needs `boto3`. |
+| `CLOUDWATCH_LOG_GROUP` | unset | Log group. |
+| `CLOUDWATCH_LOG_STREAM` | unset | Log stream. |
+| `CLOUDWATCH_REGION` | `us-east-1` | Region. |
+| `AWS_ACCESS_KEY_ID` | unset | **secret.** For S3 and CloudWatch. Unset: the default AWS credential chain. |
+| `AWS_SECRET_ACCESS_KEY` | unset | **secret.** As above. |
+| `DATADOG_LOGS_ENABLED` | `false` | Export to Datadog. |
+| `DATADOG_API_KEY` | unset | **secret.** Datadog API key. |
+| `DATADOG_SITE` | `datadoghq.com` | Datadog site. |
+| `DATADOG_SERVICE` | `agentanywhere-gateway` | Service tag. `env.example` sets `mcp-gateway`. |
+| `DATADOG_SOURCE` | `python` | Source tag. |
+| `DATADOG_TAGS` | empty | Comma-separated tags. |
+
+## Email and Slack notifications
+
+| Variable | Default | Description |
+|---|---|---|
+| `EMAIL_NOTIFICATIONS_ENABLED` | `false` | Send alert emails. Needs `SMTP_HOST`. |
+| `SMTP_HOST` | unset | SMTP server. |
+| `SMTP_PORT` | `587` | SMTP port. |
+| `SMTP_USER` | unset | SMTP user name. |
+| `SMTP_PASSWORD` | unset | **secret.** SMTP password. |
+| `SMTP_USE_TLS` | `true` | Use STARTTLS. |
+| `SMTP_FROM_EMAIL` | unset | Sender address. |
+| `EMAIL_ALERT_RECIPIENTS` | empty | Comma-separated recipients. (This is a plain string, not a JSON list.) |
+| `EMAIL_RATE_LIMIT_PER_HOUR` | `50` | Most alert emails per hour. |
+| `SLACK_NOTIFICATIONS_ENABLED` | `false` | Send alerts to a Slack incoming webhook. Needs `SLACK_WEBHOOK_URL`. |
+| `SLACK_WEBHOOK_URL` | unset | **secret.** Incoming webhook URL. |
+| `SLACK_CHANNEL` | unset | Channel override. |
+| `SLACK_USERNAME` | `AgentAnywhere Gateway` | Display name. |
+| `SLACK_ICON_EMOJI` | `:rotating_light:` | **not read.** |
+| `SLACK_RATE_LIMIT_PER_HOUR` | `60` | Most Slack messages per hour. |
+
+## Alert thresholds
+
+All are **live**.
+
+| Variable | Default | Description |
+|---|---|---|
+| `ALERT_THRESHOLD_RATE_LIMIT` | `true` | Enable rate-limit alerts. In this release they are never sent (see [known limitations](../known-limitations.md#rate-limit-alerts-are-never-sent)). |
+| `ALERT_THRESHOLD_CIRCUIT_BREAKER` | `true` | Send an alert when a circuit breaker opens or closes. |
+| `ALERT_THRESHOLD_ANOMALY_SCORE` | `0.7` | Lowest anomaly score that triggers an alert. |
+| `ALERT_THRESHOLD_ERROR_RATE` | `0.1` | Error rate that counts as high. |
+| `ALERT_THRESHOLD_TRAFFIC_SPIKE` | `2.0` | Traffic multiple that counts as a spike. |
+| `ALERT_THRESHOLD_MIN_INTERVAL_SECONDS` | `300` | Least time between two alerts of the same kind. |
+
+## Plugins
+
+| Variable | Default | Description |
+|---|---|---|
+| `PLUGINS_ENABLED` | `true` | Load plugins at start-up and run them on requests. |
+| `PLUGIN_PATHS` | `[]` | List of directories to load plugin modules from. |
+| `PLUGINS_DISABLED` | `[]` | List of plugin names not to load, for example `["audit-logger"]`. |
+| `PLUGIN_CONFIGS_JSON` | unset | JSON object of plugin name to configuration object, for example `{"header-injector": {"enabled": true}}`. |
+| `MCP_GATEWAY_PLUGIN_PATH` | unset | **env only.** Extra plugin directories, separated by `:` (`;` on Windows). Legacy name, kept on purpose. |
+| `MCP_GATEWAY_PLUGIN_DISABLED` | unset | **env only.** Extra plugin names not to load, comma-separated. Legacy name, kept on purpose. |
+
+## OpenID Connect and the agent edge
+
+Off unless set. OpenID Connect sign-in turns on when `IDA_ISSUER`,
+`IDA_BROWSER_ISSUER` or `IDA_ISSUER_BASE` is set.
+
+| Variable | Default | Description |
+|---|---|---|
+| `IDA_ISSUER` | unset | Issuer URL of the OpenID Connect provider, for example `https://sso.example.com/realms/demo`. The admin API then also accepts RS256 access tokens from it. |
+| `IDA_ISSUER_BASE` | unset | Base URL for several realms, for example `https://sso.example.com/realms`. |
+| `IDA_BROWSER_ISSUER` | unset | Issuer URL as the browser sees it, if different from `IDA_ISSUER`. |
+| `IDA_JWKS_BASE` | unset | Where the gateway fetches signing keys, if different from the issuer. |
+| `IDA_JWKS_CACHE_SECONDS` | `3600` | How long signing keys are cached. |
+| `IDA_LEEWAY_SECONDS` | `30` | **not read.** |
+| `IDA_ADMIN_AUDIENCE` | unset, which means `gateway-admin` | Client id an admin token must be issued for. |
+| `IDA_ADMIN_ROLES` | unset, which means `platform_admin,tenant_admin` | Realm roles, comma-separated or a JSON list; the user must hold one. |
+| `IDA_AUDIENCE` | unset | Default audience recorded for agent-edge routes (otherwise the slug). The gateway does not validate tokens on the agent edge. |
+| `AGENT_EDGE_ENABLED` | `false` | Serve `/agents/<slug>/...`. Agent routes stored in the database also turn it on. |
+| `AGENT_ROUTES_JSON` | unset | JSON object of slug to upstream base URL. Seeds the agent registry on first start. |
+| `AGENT_PUBLIC_PATHS_JSON` | unset | JSON object of slug to a list of path prefixes, recorded with each agent. |
+
+## Command-line tool
+
+Read by `agentanywhere-gateway`, not by the gateway. All are **env only**.
+
+| Variable | Default | Description |
+|---|---|---|
+| `AGENT_GATEWAY_URL` | `http://localhost:8000` | Gateway the CLI talks to. |
+| `MCP_GATEWAY_URL` | unset | Legacy name for `AGENT_GATEWAY_URL`, used when that is unset. |
+| `AGENT_GATEWAY_CONFIG` | `~/.config/agent-universal-gateway/config.json` | Where `login` caches the token. |
+| `MCP_GATEWAY_CONFIG` | unset | Legacy name for `AGENT_GATEWAY_CONFIG`. |
+| `MCP_GATEWAY_TOKEN` | unset | Admin credential, used when `--token` is not given. There is no `AGENT_GATEWAY_TOKEN`. |
+| `NO_COLOR` | unset | Any value turns off coloured output. |
+
+<!-- env-vars:end -->
+
+## Variables read by other files, not by the gateway
+
+These appear in `env.example` or `docker-compose.yml` but the gateway does not
+read them.
+
+| Variable | Read by | Meaning |
+|---|---|---|
+| `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_PORT` | `docker-compose.yml` (`postgres` service), `scripts/setup_postgres.sh` | Database name, user, password (falls back to the public placeholder `change-me-in-production`) and host port. The gateway reads only `DATABASE_URL`. |
+| `GRAFANA_ADMIN_PASSWORD` | `docker-compose.yml` (`grafana` service) | Grafana admin password; falls back to `admin`. |
+| `ADMIN_UI_PORT`, `ADMIN_UI_URL`, `NGINX_ENABLED`, `NGINX_HTTP_PORT`, `NGINX_HTTPS_PORT`, `SSL_CERT_PATH`, `SSL_KEY_PATH`, `PROMETHEUS_ENABLED`, `PROMETHEUS_PORT`, `GRAFANA_ENABLED`, `GRAFANA_PORT` | Nothing in this repository | Placeholders in `env.example` for your own tooling. |
+| `VITE_BASE_PATH`, `VITE_API_URL` | The admin console build (`admin-ui/`) | Path prefix the console is served under, and an optional API base URL. |
+| `GATEWAY_URL`, `REQUIRE_INTEGRATION` | `tests/test_container_integration.py` | Where the live-server tests look for a gateway, and whether a missing gateway fails instead of skipping. |
