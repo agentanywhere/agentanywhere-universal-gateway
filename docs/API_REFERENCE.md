@@ -24,7 +24,7 @@ authentication middleware (`app/main.py`) lets through:
 | `/ready` | Readiness probe. |
 | `/live` | Liveness probe. |
 | `/health/detailed` | Per-dependency health. Needs the admin credential when `OPS_ENDPOINTS_REQUIRE_ADMIN=true`. |
-| `/docs`, `/redoc`, `/openapi.json` | Interactive documentation and the OpenAPI schema. |
+| `/docs`, `/redoc`, `/openapi.json` | Interactive documentation and the OpenAPI schema, served only with `DEBUG=true`. With `DEBUG=false` (the default) the gateway answers 404 for them and never forwards them to a backend. |
 | `/.well-known/agent-card.json`, `/.well-known/ag-ui.json` | Discovery documents. |
 | `/oauth2/*` | The gateway's OAuth2 endpoints, which clients use to obtain tokens. |
 | `/admin/*` | Not covered by API keys, but not open: the admin endpoints have their own check (see below). All but three answer 401 without the admin credential. |
@@ -36,12 +36,19 @@ authentication middleware (`app/main.py`) lets through:
 > the gateway's own port 8000 is not behind it. Set
 > `OPS_ENDPOINTS_REQUIRE_ADMIN=true` to require the admin credential
 > (`Authorization: Bearer ...`) on both, or block them at your firewall. The
-> same applies to `/docs`, `/redoc` and `/openapi.json` if you do not want the
-> API surface public.
+> same applies to `/docs`, `/redoc` and `/openapi.json` when you run with
+> `DEBUG=true`.
 
 The admin credential is `ADMIN_TOKEN`, or `SECRET_KEY` when `ADMIN_TOKEN` is
-empty and `SECRET_KEY` is not the shipped placeholder. See
+empty and `SECRET_KEY` is not the shipped placeholder. Once `ADMIN_TOKEN` is
+set, `SECRET_KEY` is not accepted (unless `ADMIN_ACCEPT_SECRET_KEY=true`). See
 [CONFIGURATION.md](CONFIGURATION.md).
+
+Every response, including 401, 403 and 429 answers from the authentication
+layer, carries an `X-Request-ID` header (the client's own, when it sent one)
+and the same value in the body's `request_id`. Rejected requests are counted
+in `gateway_requests_total` (with the path label reduced to its first
+segment, or `/other`) and written to `request_logs` with the error code.
 
 ### API Key Authentication
 
@@ -324,9 +331,16 @@ GET /admin/api-keys
 Authorization: Bearer <ADMIN_TOKEN, or SECRET_KEY if ADMIN_TOKEN is not set>
 ```
 
+Each entry has the key's `id` (what delete and toggle take), `name`,
+`key_prefix` (the first characters, to recognise it by), limits,
+`allowed_paths`, `is_active`, `created_at`, `expires_at` and `last_used_at`.
+The full key is never listed: the gateway stores only its SHA-256 hash.
+
 #### Create API Key
 
-Parameters are passed as query parameters.
+Parameters are passed as query parameters, or as a JSON body with the same
+names (`allowed_paths` may then be a list). A query parameter wins when both
+are given.
 
 ```http
 POST /admin/api-keys?name=My%20API%20Key&rate_limit_per_minute=100&rate_limit_per_hour=1000
@@ -339,14 +353,16 @@ POST /admin/api-keys?name=My%20API%20Key&rate_limit_per_minute=100&rate_limit_pe
 | `rate_limit_per_hour` | Per-hour rate limit (default 1000). |
 | `expires_at` | Optional absolute ISO-8601 expiry (e.g. `2026-01-01T00:00:00`). Must be in the future. |
 | `expires_in_days` | Optional relative expiry in days. Mutually exclusive with `expires_at`. |
-| `allowed_paths` | Optional comma-separated path allow-list (e.g. `/mcp,/a2a`). |
+| `allowed_paths` | Optional comma-separated path allow-list (e.g. `/mcp,/a2a`). Each entry is a path prefix matched on whole segments (`/mcp` allows `/mcp` and `/mcp/tools`, not `/mcpx`); an entry ending in `*` is a plain prefix. Requests elsewhere answer 403, and so does any path with `.` or `..` segments. Empty means every path. |
 
-**Response** (the raw `key` is only returned once, on creation):
+**Response** (the raw `key` is only returned once, on creation; the gateway
+keeps only its hash, so it cannot be shown again):
 ```json
 {
   "id": "…",
   "name": "My API Key",
   "key": "sk-…",
+  "key_prefix": "sk-AbCdEfGh",
   "rate_limit_per_minute": 100,
   "rate_limit_per_hour": 1000,
   "is_active": true,
@@ -370,6 +386,9 @@ DELETE /admin/api-keys/{key_id}
 ```http
 PUT /admin/api-keys/{key_id}/toggle
 ```
+
+Deleting or disabling a key takes effect on the next request, also when the
+Redis key cache is in use.
 
 ### Routes
 
@@ -599,6 +618,10 @@ POST /admin/webhooks
 }
 ```
 
+`url`, `event_type` and `secret` may also be query parameters. One webhook is
+registered per event; the response lists them in `ids` (and the first in
+`id`). `DELETE /admin/webhooks/{id}` finds the webhook without `event_type`.
+
 ## Error Responses
 
 ### 400 Bad Request
@@ -639,7 +662,8 @@ POST /admin/webhooks
 
 ## Interactive API Documentation
 
-Visit http://localhost:8000/docs for interactive Swagger/OpenAPI documentation.
+With `DEBUG=true`, visit http://localhost:8000/docs for interactive
+Swagger/OpenAPI documentation. It is not served otherwise.
 
 ## SDK Generation
 

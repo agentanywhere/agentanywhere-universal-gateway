@@ -18,18 +18,19 @@ For moving an existing database to a newer release see [UPGRADING.md](UPGRADING.
 These are also in the [README](../README.md). Read them before you deploy.
 
 - **gRPC and WebSocket do not work** (see [PROTOCOLS.md](PROTOCOLS.md)).
-- **API keys are stored in plaintext.** The database keeps each key next to its
-  SHA-256 hash, and `GET /admin/api-keys` returns keys in full. With Redis
-  enabled, keys also appear in Redis key names. Protect the database, Redis and
-  the admin credential accordingly.
-- **`SECRET_KEY` has three jobs.** It signs tokens, it is accepted as the admin
-  credential when `ADMIN_TOKEN` is empty, and it is accepted as an API key. Set
-  a separate `ADMIN_TOKEN` and treat both as secrets.
+- **API keys created before this release are stored in plaintext until first
+  used.** New keys are stored as a SHA-256 hash only; an older row loses its
+  plaintext copy the first time its key authenticates. Rows of keys that are
+  never used again keep it, so protect old database backups accordingly.
+- **`SECRET_KEY` is a break-glass credential.** It signs nothing; it is
+  accepted as the admin credential only while `ADMIN_TOKEN` is empty, and as
+  an API key. Set a separate `ADMIN_TOKEN` and treat both as secrets.
 - **`/metrics` and `/health/detailed` need no credential by default.** The
   shipped `nginx/nginx.conf` limits them to loopback and private addresses,
   but anyone who reaches the gateway's port 8000 directly can read them unless
   you set `OPS_ENDPOINTS_REQUIRE_ADMIN=true`. `/docs`, `/redoc` and
-  `/openapi.json` are public too. See the list of public paths in
+  `/openapi.json` are public too when `DEBUG=true` (with the default
+  `DEBUG=false` they answer 404). See the list of public paths in
   [API_REFERENCE.md](API_REFERENCE.md#authentication).
 - **Tenant usage is counted after the response.** A burst of concurrent
   requests can pass a tenant quota by a few requests.
@@ -41,7 +42,8 @@ These are also in the [README](../README.md). Read them before you deploy.
 | Where | Default as shipped | What to do |
 |---|---|---|
 | `SECRET_KEY` | A placeholder starting with `change-me`. The gateway refuses it as an admin credential. In `ENVIRONMENT=production` it prints a warning but still starts. | Run `python3 scripts/generate_secret_key.py --update-env`. |
-| `ADMIN_TOKEN` | Empty, so `SECRET_KEY` is the admin credential. | Set a separate random value. |
+| `ADMIN_TOKEN` | Empty, so `SECRET_KEY` is the admin credential. | Set a separate random value; `SECRET_KEY` then stops working on the admin API. |
+| `TRUSTED_PROXIES` | Empty: `X-Forwarded-For` is ignored and the client address is the connection's. | Behind nginx or a load balancer, list its address so IP rules and logs see the real client. |
 | `CORS_ORIGINS` | The local admin console only: `["http://localhost:3001","http://127.0.0.1:3001"]`, with `CORS_ALLOW_CREDENTIALS=true`. A `"*"` entry makes the gateway turn credentials off and log a warning. | Set it to the exact origins of your front ends, as a JSON array. |
 | `/metrics`, `/health/detailed` | No credential (`OPS_ENDPOINTS_REQUIRE_ADMIN=false`). Through `nginx/nginx.conf`, loopback and private addresses only (403 for others); port 8000 directly, open. | Set `OPS_ENDPOINTS_REQUIRE_ADMIN=true` and give Prometheus the admin token, or firewall port 8000. Adjust the `allow` lines in `nginx/nginx.conf` to your monitoring network. |
 | Redis in `docker-compose.yml` | No password. Port 6379 is published on `127.0.0.1` only. | Keep it on the Compose network or localhost. If you need remote access, add a password and a firewall rule. |
@@ -62,11 +64,11 @@ Tick these off yourself. Nothing in this repository checks them for you.
 - [ ] TLS is terminated in front of the gateway (see below), with a real certificate.
 - [ ] `/metrics` and `/health/detailed` are not reachable from the internet:
       `OPS_ENDPOINTS_REQUIRE_ADMIN=true`, or port 8000 firewalled and the nginx
-      allow-list matching your monitoring network. If you want them private,
-      `/docs`, `/redoc` and `/openapi.json` are blocked at the proxy or firewall.
+      allow-list matching your monitoring network. `DEBUG` is false, so
+      `/docs`, `/redoc` and `/openapi.json` are not served.
 - [ ] The database is PostgreSQL, or you accept SQLite's limits (see [DEPLOYMENT.md](DEPLOYMENT.md)).
 - [ ] The database file or volume is backed up, and you know how to restore it.
-      Remember it holds API keys in plaintext.
+      Keys created before this release may still be in plaintext there.
 - [ ] Redis and PostgreSQL are not reachable from outside the host or network.
 - [ ] Grafana and PostgreSQL passwords are generated values (the Compose file
       refuses empty and placeholder values, but not weak ones).

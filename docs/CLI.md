@@ -77,7 +77,8 @@ agentanywhere-gateway logs --limit 50 --status 500
 
 ```bash
 agentanywhere-gateway keys list
-agentanywhere-gateway keys create --name "ci-bot" --rate-limit-minute 120 --rate-limit-hour 5000
+agentanywhere-gateway keys create --name "ci-bot" --rate-limit-minute 120 --rate-limit-hour 5000 \
+    --allowed-paths /mcp /a2a   # optional; prints the key once, keep it
 agentanywhere-gateway keys toggle <key-id>
 agentanywhere-gateway keys delete <key-id>
 ```
@@ -109,7 +110,7 @@ agentanywhere-gateway plugins remove header-injector
 ```bash
 agentanywhere-gateway webhooks list
 agentanywhere-gateway webhooks create --target-url https://hooks.example.com/x \
-    --events request.completed --secret s3cret
+    --events rate_limit_exceeded api_key_revoked --secret s3cret
 agentanywhere-gateway webhooks delete <id>
 ```
 

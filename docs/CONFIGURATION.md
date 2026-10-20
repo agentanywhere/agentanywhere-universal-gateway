@@ -42,9 +42,10 @@ This guide explains how to configure the AgentAnywhere Universal Gateway using e
 - `WORKERS`: Number of worker processes (default: 4)
 
 ### Security
-- `SECRET_KEY`: Secret key for signing tokens. It has three jobs: it signs
-  tokens, it is accepted as the admin credential when `ADMIN_TOKEN` is empty,
-  and it is accepted as an API key. Set it to a random value.
+- `SECRET_KEY`: A break-glass credential. Nothing in this release signs
+  tokens with it. It is accepted as the admin credential **only while
+  `ADMIN_TOKEN` is empty**, and it is accepted as an API key. Set it to a
+  random value.
   - Generate with: `python3 scripts/generate_secret_key.py --update-env`
   - No length is enforced. The only rule in the code is that a value starting
     with `change-me` (the placeholder shipped in `env.example`) is treated as
@@ -55,16 +56,43 @@ This guide explains how to configure the AgentAnywhere Universal Gateway using e
   and the admin console password. Empty by default. If it is empty, a
   `SECRET_KEY` that is not the placeholder is used instead. If both are
   missing or placeholder, the admin API answers 401 to everything. There is no
-  default password. Set a separate `ADMIN_TOKEN` rather than relying on
+  default password. Once `ADMIN_TOKEN` is set, `SECRET_KEY` no longer opens
+  the admin API. Set a separate `ADMIN_TOKEN` rather than relying on
   `SECRET_KEY`.
+- `ADMIN_ACCEPT_SECRET_KEY`: `true` accepts `SECRET_KEY` on the admin API
+  even when `ADMIN_TOKEN` is set, as releases before this setting did
+  (default: false). The placeholder is never accepted.
 - `ADMIN_USERNAME`: The user name the admin console's sign-in form expects
   (default: "admin"). The password is `ADMIN_TOKEN` (or `SECRET_KEY`, as above).
-- `ALGORITHM`: JWT algorithm (default: "HS256")
-- `ACCESS_TOKEN_EXPIRE_MINUTES`: Token expiration time (default: 30)
+- `ALGORITHM`: JWT algorithm (default: "HS256"). Not used yet: nothing in
+  this release issues or signs tokens.
+- `ACCESS_TOKEN_EXPIRE_MINUTES`: Token expiration time (default: 30). Not used
+  yet, as above.
 - `API_KEY_HEADER`: Header name for API keys (default: "X-API-Key")
+- `TRUSTED_PROXIES`: IP addresses or CIDR ranges of the reverse proxies in
+  front of the gateway (default: empty). With it empty, `X-Forwarded-For` is
+  ignored and the client address (for IP rules, policies, logs and metrics)
+  is the address of the connection. When the connection comes from a listed
+  proxy, the header is read from the right and the last entry that is not
+  itself a listed proxy is the client. Behind the bundled nginx, list nginx's
+  address (under Docker Compose, the `gateway-network` subnet); the shipped
+  `nginx/nginx.conf` overwrites the header with `$remote_addr`.
+  Example: `TRUSTED_PROXIES=10.0.0.5,172.18.0.0/16`.
+
+List settings (`CORS_ORIGINS`, `CORS_ALLOW_METHODS`, `CORS_ALLOW_HEADERS`,
+`TRUSTED_PROXIES`, `PLUGIN_PATHS`, `PLUGINS_DISABLED` and the
+`MCP_BOUNDARY_*` lists) accept a JSON array (`["a","b"]`) or a
+comma-separated value (`a,b`). A value that starts with `[` must be valid
+JSON.
+
+`GET /admin/config` redacts every secret: `SECRET_KEY`, `ADMIN_TOKEN`, any
+setting whose name ends in `_TOKEN`, `_SECRET`, `_PASSWORD`, `_API_KEY` or
+similar, `PLUGIN_CONFIGS_JSON`, `OTEL_EXPORTER_OTLP_HEADERS`, the Redis and
+database URLs, and the password part of any `user:password@` URL.
+`?redacted=false` still returns raw values to an admin.
 
 ### CORS Configuration
-- `CORS_ORIGINS`: List of allowed origins, written as a JSON array
+- `CORS_ORIGINS`: List of allowed origins, as a JSON array or comma-separated
   - Example: `CORS_ORIGINS=["https://console.example.com","https://app.example.com"]`
   - Default (built in and in `env.example`):
     `["http://localhost:3001","http://127.0.0.1:3001"]`, the admin console on
@@ -83,8 +111,8 @@ This guide explains how to configure the AgentAnywhere Universal Gateway using e
 - `CORS_ALLOW_CREDENTIALS`: Allow credentials (true/false; default: true).
   Applied only with an explicit origin list; ignored (treated as false) when
   `CORS_ORIGINS` contains `"*"`.
-- `CORS_ALLOW_METHODS`: Allowed HTTP methods, as a JSON array (default: `["*"]`)
-- `CORS_ALLOW_HEADERS`: Allowed headers, as a JSON array (default: `["*"]`)
+- `CORS_ALLOW_METHODS`: Allowed HTTP methods, as a list (default: `["*"]`)
+- `CORS_ALLOW_HEADERS`: Allowed headers, as a list (default: `["*"]`)
 
 ### Rate Limiting
 - `RATE_LIMIT_ENABLED`: Enable rate limiting (true/false)
@@ -157,8 +185,8 @@ buffered. The gateway detects streaming when the client sends
 `Accept: text/event-stream` (AG-UI, or ACP `POST .../runs`) or `?stream=1`.
 
 - `AG_UI_BOUNDARY_ENABLED` / `ACP_BOUNDARY_ENABLED`: enable payload boundary validation (default: true)
-- `PROTOCOL_AG_UI_RATE_LIMIT_PER_MINUTE` / `_PER_HOUR`: AG-UI rate limits (default: 120 / 6000)
-- `PROTOCOL_ACP_RATE_LIMIT_PER_MINUTE` / `_PER_HOUR`: ACP rate limits (default: 120 / 6000)
+- `PROTOCOL_AG_UI_RATE_LIMIT_PER_MINUTE` / `_PER_HOUR`: AG-UI rate limits (default: 120 / 6000). Not enforced yet, like every `PROTOCOL_*_RATE_LIMIT_*` setting: they are only reported by `GET /admin/settings/protocols`; requests are limited per API key.
+- `PROTOCOL_ACP_RATE_LIMIT_PER_MINUTE` / `_PER_HOUR`: ACP rate limits (default: 120 / 6000). Not enforced yet.
 
 ### Logging
 - `LOG_LEVEL`: Log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
@@ -278,7 +306,9 @@ The project was first called MCP Gateway. Some names still carry that spelling
 `mcp-gateway` command and `scripts/mcp-gateway`, and example log paths and
 service names in `env.example`). They are compatibility aliases for existing
 installations and are kept on purpose; the code reads them under those exact
-names, so do not rename them.
+names, so do not rename them. `MCP_GATEWAY_PLUGIN_PATH`,
+`MCP_GATEWAY_PLUGIN_DISABLED` and the `OTEL_*` tracing variables are read from
+`.env` as well as from the environment (the environment wins).
 
 
 

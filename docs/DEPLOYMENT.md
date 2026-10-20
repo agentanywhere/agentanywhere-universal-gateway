@@ -109,8 +109,9 @@ docker compose start gateway
 ```
 
 To restore, stop the gateway, extract the archive into the volume the same way
-(`tar xzf ... -C /data`), and start it again. The file holds API keys in
-plaintext: store backups as you would the keys themselves.
+(`tar xzf ... -C /data`), and start it again. New API keys are stored as a
+hash, but keys created before this release stay in plaintext until first used:
+store backups as you would the keys themselves.
 
 ## Behind a reverse proxy
 
@@ -126,7 +127,12 @@ refuses to load it.)
 - it proxies everything to `gateway:8000` (the `upstream gateway_backend` block;
   add servers there for several replicas);
 - it forwards `Host`, `X-Real-IP`, `X-Forwarded-For`, `X-Forwarded-Proto`,
-  `X-Forwarded-Host` and `X-Forwarded-Port`;
+  `X-Forwarded-Host` and `X-Forwarded-Port`. `X-Forwarded-For` is overwritten
+  with the address nginx sees (`$remote_addr`), not appended to, so a client
+  cannot choose it. The gateway reads it only from addresses in
+  `TRUSTED_PROXIES`: set that to nginx's address (under Compose, the
+  `gateway-network` subnet), or the gateway sees every request as coming from
+  nginx;
 - it allows request bodies up to 100M and read timeouts of 300 seconds;
 - `/metrics` and `/health/detailed` are answered only for loopback and
   private addresses (`127.0.0.1`, `::1`, `10.0.0.0/8`, `172.16.0.0/12`,
@@ -137,7 +143,8 @@ refuses to load it.)
   `real_ip_header` first. Connections relayed by Docker's userland proxy
   appear to come from the bridge gateway, which is inside `172.16.0.0/12`.
 - `/docs`, `/redoc` and `/openapi.json` go through the catch-all
-  `location /`. Restrict them if you do not want them public.
+  `location /`. The gateway serves them only with `DEBUG=true` and answers
+  404 otherwise.
 
 The allow-list does not cover clients that reach port 8000 directly (the
 Compose file publishes it on all interfaces). For a check that does not depend
