@@ -368,7 +368,8 @@ Read it like this:
   `POST /api/users` is the user you created there.
 - `gateway_red_requests_total` uses a normalised route and a tenant label,
   so you can see the three requests that counted against Acme's quota.
-- The six 429 responses are in neither metric, because rejected requests are
+- The four 429 responses (three for the web application, one for the batch
+  job) are in neither metric, because rejected requests are
   answered before metrics are recorded.
 
 To collect the metrics over time, point a Prometheus server at the gateway.
