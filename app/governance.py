@@ -307,6 +307,8 @@ audit_log = AuditLog()
 class PolicyAction(str, Enum):
     ALLOW = "allow"
     DENY = "deny"
+    # Not enforced yet: a matching rate_limit policy is evaluated and its
+    # limit recorded on the request, but no limit is applied.
     RATE_LIMIT = "rate_limit"
 
 

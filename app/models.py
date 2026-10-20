@@ -65,6 +65,7 @@ class RouteConfig(BaseModel):
 class APIKey(BaseModel):
     """API Key model."""
     key: str
+    id: Optional[str] = None  # database id; None for OAuth2 / break-glass principals
     name: str
     rate_limit_per_minute: int = 60
     rate_limit_per_hour: int = 1000

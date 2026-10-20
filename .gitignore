@@ -12,6 +12,8 @@ eggs/
 .eggs/
 lib/
 lib64/
+# ...but not the admin console's source folder of the same name.
+!admin-ui/src/lib/
 parts/
 sdist/
 var/

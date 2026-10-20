@@ -9,6 +9,8 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from app.config import get_settings
 from app.models import APIKey
+from app.api_key_cache import hash_key
+from app.client_ip import client_ip
 import redis
 import asyncio
 
@@ -63,65 +65,87 @@ class RateLimiter:
         
         # Check per-minute limit
         if not self._check_limit(request, api_key, limit_per_min, 60):
-            # Trigger webhook for rate limit exceeded
-            try:
-                from app.webhooks import webhook_manager, WebhookEventType
-                asyncio.create_task(webhook_manager.trigger_webhook(
-                    WebhookEventType.RATE_LIMIT_EXCEEDED,
-                    {
-                        "api_key_id": api_key.id if api_key else None,
-                        "client_ip": get_remote_address(request),
-                        "limit": limit_per_min,
-                        "window": "minute",
-                        "path": str(request.url.path),
-                    }
-                ))
-            except Exception:
-                pass  # Don't fail request if webhook fails
-            
-            # Send email notification (with threshold checking built-in)
-            try:
-                from app.notifications import notification_manager
-                asyncio.create_task(notification_manager.send_rate_limit_alert(
-                    api_key_id=api_key.id if api_key else None,
-                    client_ip=get_remote_address(request),
-                    limit=limit_per_min,
-                    window="minute",
-                    path=str(request.url.path)
-                ))
-            except Exception:
-                pass  # Don't fail request if email fails
-
-            # NOTE: this raise must live at the `if` scope, NOT inside the
-            # notification `except` above. Previously it was mis-indented, so in
-            # async production (where create_task does not throw) it was dead code
-            # and the per-minute limit was never enforced.
+            self._notify_exceeded(request, api_key, limit_per_min, "minute")
+            # NOTE: this raise must live at the `if` scope, NOT inside a
+            # notification `except`. Previously it was mis-indented, so in
+            # async production (where create_task does not throw) it was dead
+            # code and the per-minute limit was never enforced.
             request_id = getattr(request.state, "request_id", None)
-            # Calculate retry after (seconds until next window)
-            retry_after = 60  # Default to 60 seconds for per-minute limit
             raise RateLimitError(
                 limit=limit_per_min,
                 window="minute",
-                retry_after=retry_after,
+                retry_after=60,  # seconds until the next window, at most
                 request_id=request_id
             )
 
         # Check per-hour limit
         if not self._check_limit(request, api_key, limit_per_hour, 3600):
+            self._notify_exceeded(request, api_key, limit_per_hour, "hour")
             request_id = getattr(request.state, "request_id", None)
-            # Calculate retry after (seconds until next window)
-            retry_after = 3600  # Default to 3600 seconds for per-hour limit
             raise RateLimitError(
                 limit=limit_per_hour,
                 window="hour",
-                retry_after=retry_after,
+                retry_after=3600,
                 request_id=request_id
             )
 
         return True
 
+    def _notify_exceeded(
+        self, request: Request, api_key: Optional[APIKey], limit: int, window: str
+    ) -> None:
+        """Fire the ``rate_limit_exceeded`` webhook and the email/Slack alert.
+
+        Both run as background tasks so the 429 is not delayed; the alert
+        side applies ALERT_THRESHOLD_RATE_LIMIT and its own interval. This
+        used to read ``api_key.id`` from a principal that had no ``id``, so
+        the AttributeError was swallowed and nothing was ever sent.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return  # called outside the event loop (unit tests): nothing to schedule
+        api_key_id = getattr(api_key, "id", None) if api_key else None
+        try:
+            ip = client_ip(request) or get_remote_address(request)
+        except Exception:
+            ip = None
+        path = str(getattr(getattr(request, "url", None), "path", ""))
+        payload = {
+            "api_key_id": api_key_id,
+            "api_key_name": getattr(api_key, "name", None) if api_key else None,
+            "client_ip": ip,
+            "limit": limit,
+            "window": window,
+            "path": path,
+        }
+        try:
+            from app.webhooks import webhook_manager, WebhookEventType
+
+            loop.create_task(
+                webhook_manager.trigger_webhook(WebhookEventType.RATE_LIMIT_EXCEEDED, payload)
+            )
+        except Exception:
+            pass  # Don't fail the request if the webhook cannot be scheduled
+        try:
+            from app.notifications import notification_manager
+
+            loop.create_task(notification_manager.send_rate_limit_alert(
+                api_key_id=api_key_id,
+                client_ip=ip or "",
+                limit=limit,
+                window=window,
+                path=path,
+            ))
+        except Exception:
+            pass  # Don't fail the request if the alert cannot be scheduled
+
     def _identity(self, request: Request, api_key: Optional[APIKey]) -> str:
-        return api_key.key if api_key else get_remote_address(request)
+        # Counters are named after a hash of the key, so Redis never holds a
+        # usable credential in its key names.
+        if api_key:
+            return f"key:{hash_key(api_key.key)[:32]}"
+        return client_ip(request) or get_remote_address(request)
 
     def _check_limit(self, request: Request, api_key: Optional[APIKey], limit: int, window: int) -> bool:
         """Return True if the request is within `limit` for the given window.

@@ -51,6 +51,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 SENSITIVE_FIELDS: Set[str] = {
     "secret_key",
+    "admin_token",
     "smtp_password",
     "splunk_token",
     "datadog_api_key",
@@ -60,13 +61,53 @@ SENSITIVE_FIELDS: Set[str] = {
     "rate_limit_redis_url",  # may contain credentials
     "redis_url",  # may contain credentials
     "database_url",  # may contain credentials
+    "plugin_configs_json",  # plugin settings, e.g. static-token-auth tokens
+    "otel_exporter_otlp_headers",  # usually carries an Authorization header
 }
+
+# Any field whose name ends in one of these is treated as secret too, so a new
+# setting such as ``foo_api_key`` is redacted without having to remember to
+# add it above. (``api_key_header`` and ``access_token_expire_minutes`` do not
+# end in a secret word and stay visible.)
+_SENSITIVE_SUFFIXES: Tuple[str, ...] = (
+    "_token",
+    "_secret",
+    "_password",
+    "_passwd",
+    "_api_key",
+    "_secret_key",
+    "_access_key",
+    "_access_key_id",
+    "_private_key",
+    "_credentials",
+    "_dsn",
+)
+
+# scheme://user:password@host — the password part of a credentialed URL.
+_URL_CREDENTIALS = re.compile(r"(?P<pre>[a-zA-Z][a-zA-Z0-9+.\-]*://[^:/@\s]*:)(?P<pw>[^@\s]+)(?P<post>@)")
+
+
+def is_sensitive_field(field: str) -> bool:
+    """True when a setting's value must not be shown in clear."""
+    name = (field or "").lower()
+    if name in SENSITIVE_FIELDS:
+        return True
+    return name.endswith(_SENSITIVE_SUFFIXES) or name in {s.lstrip("_") for s in _SENSITIVE_SUFFIXES}
 
 
 SECTIONS: Dict[str, Sequence[str]] = {
     "application": ("app_name", "app_version", "environment", "debug"),
     "server": ("host", "port", "workers", "gateway_url_base"),
-    "security": ("secret_key", "algorithm", "access_token_expire_minutes", "api_key_header"),
+    "security": (
+        "secret_key",
+        "admin_token",
+        "admin_username",
+        "admin_accept_secret_key",
+        "algorithm",
+        "access_token_expire_minutes",
+        "api_key_header",
+        "trusted_proxies",
+    ),
     "cors": (
         "cors_origins",
         "cors_allow_credentials",
@@ -214,6 +255,14 @@ SECTIONS: Dict[str, Sequence[str]] = {
         "plugin_paths",
         "plugins_disabled",
         "plugin_configs_json",
+        "mcp_gateway_plugin_path",
+        "mcp_gateway_plugin_disabled",
+    ),
+    "tracing": (
+        "otel_tracing_enabled",
+        "otel_exporter_otlp_endpoint",
+        "otel_exporter_otlp_headers",
+        "otel_service_name",
     ),
 }
 
@@ -253,15 +302,25 @@ SAFE_RELOAD_FIELDS: Set[str] = {
 
 
 def _redact_value(field: str, value: Any) -> Any:
-    """Redact a single value if its key is in ``SENSITIVE_FIELDS``."""
+    """Redact a single value if it is a secret.
+
+    A field is secret when it is in ``SENSITIVE_FIELDS`` or its name ends in
+    a secret word (see :func:`is_sensitive_field`). Any other string that is
+    a URL with ``user:password@`` in it has the password replaced, so a DSN
+    in an unexpected field does not leak either.
+    """
     if value is None or value == "":
         return value
-    if field in SENSITIVE_FIELDS:
+    if is_sensitive_field(field):
         if isinstance(value, str):
             # Show only the last 4 characters as a fingerprint.
             tail = value[-4:] if len(value) > 8 else ""
             return f"***REDACTED***{tail}" if tail else "***REDACTED***"
         return "***REDACTED***"
+    if isinstance(value, str) and "@" in value:
+        return _URL_CREDENTIALS.sub(r"\g<pre>***REDACTED***\g<post>", value)
+    if isinstance(value, (list, tuple)):
+        return [_redact_value(field, item) for item in value]
     return value
 
 
@@ -310,6 +369,71 @@ def _flatten_config_file(data: Mapping[str, Any]) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# List settings: JSON array or comma-separated
+# ---------------------------------------------------------------------------
+
+
+def _is_list_annotation(annotation: Any) -> bool:
+    """True for ``List[...]`` and ``Optional[List[...]]`` annotations."""
+    import typing
+
+    origin = typing.get_origin(annotation)
+    if origin in (list, List, tuple, set):
+        return True
+    if origin is typing.Union:
+        return any(_is_list_annotation(a) for a in typing.get_args(annotation) if a is not type(None))
+    return False
+
+
+def _split_list_setting(value: Any) -> Any:
+    """Turn ``"a, b,c"`` into ``["a", "b", "c"]``; anything else is returned as is.
+
+    A value that starts with ``[`` is meant as JSON and is parsed as JSON, so a
+    malformed array is an error rather than being split on its commas.
+    """
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    if text.startswith("["):
+        return json.loads(text)
+    return [part.strip() for part in text.split(",") if part.strip()]
+
+
+class _ListFriendlyDecodeMixin:
+    """Lets an environment / .env source accept comma-separated lists.
+
+    pydantic-settings decodes list-typed settings as JSON and stops start-up
+    with "error parsing value for field" otherwise. For list fields, a value
+    that is not JSON is handed on as the raw string, and the field validator
+    on :class:`Settings` splits it on commas.
+    """
+
+    def decode_complex_value(self, field_name, field, value):  # type: ignore[override]
+        try:
+            decoded = json.loads(value)
+        except ValueError:
+            if _is_list_annotation(field.annotation) and not str(value).strip().startswith("["):
+                return value
+            raise
+        if _is_list_annotation(field.annotation) and not isinstance(decoded, (list, type(None))):
+            # e.g. PLUGINS_DISABLED=123 or "audit-logger" given as a JSON string.
+            return value if not isinstance(decoded, str) else decoded
+        return decoded
+
+
+def _list_friendly_sources():
+    from pydantic_settings import DotEnvSettingsSource, EnvSettingsSource
+
+    class ListFriendlyEnvSettingsSource(_ListFriendlyDecodeMixin, EnvSettingsSource):
+        pass
+
+    class ListFriendlyDotEnvSettingsSource(_ListFriendlyDecodeMixin, DotEnvSettingsSource):
+        pass
+
+    return ListFriendlyEnvSettingsSource, ListFriendlyDotEnvSettingsSource
+
+
+# ---------------------------------------------------------------------------
 # Settings
 # ---------------------------------------------------------------------------
 
@@ -338,9 +462,20 @@ class Settings(BaseSettings):
     # ADMIN_TOKEN (or a non-placeholder SECRET_KEY); there is no default password.
     admin_username: str = "admin"
     secret_key: str = "change-me-in-production-use-strong-random-key"
+    # SECRET_KEY is accepted as an admin credential only while ADMIN_TOKEN is
+    # empty. true restores the old behaviour of accepting both.
+    admin_accept_secret_key: bool = False
+    # Not used yet: nothing in this release signs tokens, so ALGORITHM and
+    # ACCESS_TOKEN_EXPIRE_MINUTES have no effect.
     algorithm: str = "HS256"
     access_token_expire_minutes: int = 30
     api_key_header: str = "X-API-Key"
+    # Addresses (IPs or CIDR ranges) of the reverse proxies in front of the
+    # gateway. X-Forwarded-For is only read when the connection comes from one
+    # of them, and then from the right: the client address is the last entry
+    # that is not itself a trusted proxy. Empty (the default) means the header
+    # is ignored and the socket peer address is the client address.
+    trusted_proxies: List[str] = []
 
     # CORS. The default lists the admin console's local origins (Vite dev
     # server and docker-compose both serve it on port 3001). A "*" entry turns
@@ -429,6 +564,7 @@ class Settings(BaseSettings):
     tier2_stream_read_timeout: Optional[float] = None
     acp_boundary_enabled: bool = True
     ag_ui_boundary_enabled: bool = True
+    # Not enforced yet (see the protocol defaults below).
     protocol_ag_ui_rate_limit_per_minute: int = 120
     protocol_ag_ui_rate_limit_per_hour: int = 6000
     protocol_acp_rate_limit_per_minute: int = 120
@@ -460,7 +596,9 @@ class Settings(BaseSettings):
     circuit_breaker_failure_threshold: int = 5
     circuit_breaker_timeout: int = 60
 
-    # Protocol-specific Defaults
+    # Protocol-specific Defaults. The *_rate_limit_per_minute/_hour values are
+    # NOT enforced yet: they are only reported by GET /admin/settings/protocols.
+    # Requests are limited per API key.
     protocol_mcp_rate_limit_per_minute: int = 60
     protocol_mcp_rate_limit_per_hour: int = 1000
     protocol_a2a_rate_limit_per_minute: int = 60
@@ -535,6 +673,18 @@ class Settings(BaseSettings):
     plugin_paths: List[str] = []
     plugins_disabled: List[str] = []
     plugin_configs_json: Optional[str] = None
+    # Compatibility names read by the plugin loader. Declared here so that a
+    # value in .env takes effect too, not only one in the process environment.
+    # MCP_GATEWAY_PLUGIN_PATH is os.pathsep-separated; *_DISABLED is a comma list.
+    mcp_gateway_plugin_path: str = ""
+    mcp_gateway_plugin_disabled: str = ""
+
+    # OpenTelemetry export (see app/observability.py). Declared here so that
+    # .env values apply when uvicorn is started directly.
+    otel_tracing_enabled: bool = False
+    otel_exporter_otlp_endpoint: Optional[str] = None
+    otel_exporter_otlp_headers: str = ""
+    otel_service_name: str = "agentanywhere-gateway"
 
     # Alert Thresholds Configuration
     alert_threshold_rate_limit: bool = True
@@ -555,9 +705,49 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls,
+        init_settings,
+        env_settings,
+        dotenv_settings,
+        file_secret_settings,
+    ):
+        """Same sources and order as pydantic-settings, but list settings may
+        be written as ``a,b`` as well as ``["a","b"]`` (see
+        :class:`_ListFriendlyDecodeMixin`)."""
+        env_cls, dotenv_cls = _list_friendly_sources()
+        env_settings = env_cls(
+            settings_cls,
+            case_sensitive=env_settings.case_sensitive,
+            env_prefix=env_settings.env_prefix,
+            env_nested_delimiter=env_settings.env_nested_delimiter,
+        )
+        dotenv_settings = dotenv_cls(
+            settings_cls,
+            env_file=dotenv_settings.env_file,
+            env_file_encoding=dotenv_settings.env_file_encoding,
+            case_sensitive=dotenv_settings.case_sensitive,
+            env_prefix=dotenv_settings.env_prefix,
+            env_nested_delimiter=dotenv_settings.env_nested_delimiter,
+        )
+        return init_settings, env_settings, dotenv_settings, file_secret_settings
+
     # ------------------------------------------------------------------
     # Validators
     # ------------------------------------------------------------------
+
+    @field_validator("*", mode="before")
+    @classmethod
+    def _accept_comma_separated_lists(cls, v: Any, info: Any) -> Any:
+        """Every list setting accepts a JSON array or a comma-separated string."""
+        if not isinstance(v, str):
+            return v
+        field = cls.model_fields.get(info.field_name)
+        if field is None or not _is_list_annotation(field.annotation):
+            return v
+        return _split_list_setting(v)
 
     @field_validator("log_level")
     @classmethod

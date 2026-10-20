@@ -12,12 +12,65 @@ from app.models import APIKey
 from app.database import get_db
 from app.repositories.api_key_repo import APIKeyRepository
 from app.oauth2 import oauth2_manager
+from app import api_key_cache
+from app.client_ip import client_ip as _client_ip
 from sqlalchemy.ext.asyncio import AsyncSession
 import redis
 import json
 
 settings = get_settings()
 security = HTTPBearer(auto_error=False)
+
+
+def _normalise_scope_path(path: str) -> Optional[str]:
+    """Collapse repeated slashes and drop a trailing one.
+
+    Returns None for a path with ``.`` or ``..`` segments: a scoped key never
+    gets to rely on how a backend resolves them.
+    """
+    if not path.startswith("/"):
+        path = "/" + path
+    segments = [seg for seg in path.split("/") if seg != ""]
+    if any(seg in (".", "..") for seg in segments):
+        return None
+    return "/" + "/".join(segments)
+
+
+def path_is_allowed(path: str, patterns) -> bool:
+    """Whether ``path`` falls under one of the key's ``allowed_paths``.
+
+    Each pattern is a path prefix matched on whole segments: ``/mcp`` allows
+    ``/mcp`` and ``/mcp/tools`` but not ``/mcpx``. A pattern ending in ``*``
+    is a plain string prefix (``/api/v*`` allows ``/api/v1`` and ``/api/v2``);
+    ``/*`` at the end is the same as no wildcard. ``/`` or ``*`` allows every
+    path. An empty list allows every path (checked by the caller).
+    Paths with ``.`` or ``..`` segments are refused for scoped keys.
+    """
+    normalised = _normalise_scope_path(path or "/")
+    if normalised is None:
+        return False
+    for raw in patterns:
+        pattern = (raw or "").strip()
+        if not pattern:
+            continue
+        if pattern in ("*", "/", "/*"):
+            return True
+        if pattern.endswith("/*"):
+            pattern = pattern[:-2]
+        elif pattern.endswith("*"):
+            prefix = _normalise_scope_path(pattern[:-1]) or ""
+            # Keep a trailing slash the pattern had before the "*".
+            if pattern[:-1].endswith("/") and prefix != "/":
+                prefix += "/"
+            if normalised.startswith(prefix):
+                return True
+            continue
+        base = _normalise_scope_path(pattern)
+        if base is None:
+            continue
+        if normalised == base or normalised.startswith(base + "/"):
+            return True
+    return False
 
 
 class AuthMiddleware:
@@ -30,6 +83,7 @@ class AuthMiddleware:
                 self.redis_client = redis.from_url(settings.redis_url, decode_responses=True)
             except Exception:
                 pass  # Redis optional
+        api_key_cache.register(self)
     
     def _get_api_key_from_header(self, request: Request) -> Optional[str]:
         """Extract API key from request headers."""
@@ -70,21 +124,66 @@ class AuthMiddleware:
             },
         )
     
+    def _cache_get(self, key_hash: str) -> Optional[dict]:
+        if not self.redis_client:
+            return None
+        try:
+            cached = self.redis_client.get(api_key_cache.cache_key_for_hash(key_hash))
+            return json.loads(cached) if cached else None
+        except Exception:
+            return None
+
+    def _cache_put(self, key_hash: str, db_key) -> None:
+        if not self.redis_client:
+            return
+        ttl = api_key_cache.CACHE_TTL_SECONDS
+        if db_key.expires_at:
+            remaining = int((db_key.expires_at - utcnow()).total_seconds())
+            ttl = max(1, min(ttl, remaining))
+        try:
+            key_data = {
+                # The key itself is never written to Redis: the entry is
+                # found by the key's hash, and on a hit the principal is
+                # rebuilt with the key the caller presented, so a cached key
+                # has the same identity as an uncached one (the rate limiter
+                # and tenant lookup depend on that).
+                "id": db_key.id,
+                "name": db_key.name,
+                "rate_limit_per_minute": db_key.rate_limit_per_minute,
+                "rate_limit_per_hour": db_key.rate_limit_per_hour,
+                "allowed_paths": db_key.allowed_paths or [],
+                "metadata": APIKeyRepository.public_metadata(db_key),
+                "created_at": db_key.created_at.isoformat() if db_key.created_at else None,
+                "expires_at": db_key.expires_at.isoformat() if db_key.expires_at else None,
+                "is_active": db_key.is_active,
+            }
+            self.redis_client.setex(
+                api_key_cache.cache_key_for_hash(key_hash), ttl, json.dumps(key_data)
+            )
+        except Exception:
+            pass
+
     async def _validate_api_key(self, api_key: str, db: Optional[AsyncSession] = None) -> Optional[APIKey]:
         """Validate API key."""
         if not api_key:
             return None
-        
-        # Check Redis cache first
-        if self.redis_client:
+
+        key_hash = api_key_cache.hash_key(api_key)
+
+        # Check Redis cache first. Entries are dropped when a key is deleted,
+        # disabled or changed (see app.api_key_cache), and never outlive the
+        # key's expiry; the checks below are a second line of defence.
+        cached = self._cache_get(key_hash)
+        if cached:
             try:
-                cached = self.redis_client.get(f"api_key:{api_key}")
-                if cached:
-                    key_data = json.loads(cached)
-                    return APIKey(**key_data)
+                principal = APIKey(key=api_key, **{k: v for k, v in cached.items() if v is not None})
+                if principal.is_active and not (
+                    principal.expires_at and principal.expires_at < utcnow()
+                ):
+                    return principal
             except Exception:
                 pass
-        
+
         # Query database if available
         if db:
             try:
@@ -93,45 +192,21 @@ class AuthMiddleware:
                     # Check if expired
                     if db_key.expires_at and db_key.expires_at < utcnow():
                         return None
-                    
+
                     # Check if active
                     if not db_key.is_active:
                         return None
-                    
-                    # Update last used
-                    await APIKeyRepository.update_last_used(db, db_key.id)
-                    
-                    # Cache in Redis
-                    if self.redis_client:
-                        try:
-                            key_data = {
-                                # Must be the same value a database read
-                                # yields (see APIKeyRepository.to_pydantic).
-                                # This used to be the key's hash, which gave a
-                                # cached key a different identity from an
-                                # uncached one: tenant lookups hashed a hash
-                                # and found nothing, so tenant quotas stopped
-                                # being enforced, and the rate limiter counted
-                                # one caller under two names.
-                                "key": db_key.key,
-                                "name": db_key.name,
-                                "rate_limit_per_minute": db_key.rate_limit_per_minute,
-                                "rate_limit_per_hour": db_key.rate_limit_per_hour,
-                                "allowed_paths": db_key.allowed_paths or [],
-                                "is_active": db_key.is_active,
-                            }
-                            self.redis_client.setex(
-                                f"api_key:{api_key}",
-                                300,  # 5 minute cache
-                                json.dumps(key_data)
-                            )
-                        except Exception:
-                            pass
-                    
-                    return APIKeyRepository.to_pydantic(db_key)
+
+                    # Update last used; a row from before hashed storage also
+                    # loses its plaintext copy here (see APIKeyRepository).
+                    await APIKeyRepository.mark_used(db, db_key)
+
+                    self._cache_put(key_hash, db_key)
+
+                    return APIKeyRepository.to_pydantic(db_key, presented_key=api_key)
             except Exception:
                 pass  # Fall through to legacy validation
-        
+
         # Break-glass bootstrap key: accept the configured SECRET_KEY as an API
         # key ONLY when it has been changed from the shipped default. This lets a
         # fresh install authenticate before any DB key exists, without the old
@@ -196,10 +271,33 @@ class AuthMiddleware:
             except Exception:
                 pass
 
+        # Path scope: a key created with allowed_paths may only reach those.
+        self._enforce_allowed_paths(request, validated_key)
+
         # Governance: IP allow/deny + policy engine.
         await self._enforce_governance(request, validated_key)
 
         return validated_key
+
+    def _enforce_allowed_paths(self, request: Request, principal: APIKey) -> None:
+        """Reject a request outside the key's ``allowed_paths`` with 403."""
+        patterns = list(getattr(principal, "allowed_paths", None) or [])
+        if not patterns:
+            return
+        path = getattr(getattr(request, "url", None), "path", "") or ""
+        if path_is_allowed(path, patterns):
+            return
+        from app.exceptions import AuthorizationError
+
+        raise AuthorizationError(
+            message="This API key is not allowed to access this path",
+            details={
+                "path": path,
+                "allowed_paths": patterns,
+                "hint": "The key was created with allowed_paths. Use a key whose scope covers this path.",
+            },
+            request_id=getattr(getattr(request, "state", None), "request_id", None),
+        )
 
     async def _enforce_governance(
         self, request: Request, principal: APIKey
@@ -216,10 +314,7 @@ class AuthMiddleware:
         except Exception:
             return
 
-        client_ip = (
-            request.headers.get("x-forwarded-for", "").split(",")[0].strip()
-            or (request.client.host if request.client else "")
-        )
+        client_ip = _client_ip(request) or ""
         api_key_id = getattr(principal, "key", None)
         tenant_id = getattr(request.state, "tenant_id", None)
 

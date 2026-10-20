@@ -11,14 +11,24 @@ export interface DashboardStats {
   error_rate: number
 }
 
+// As listed by GET /admin/api-keys. The full key is never listed: the
+// gateway stores only its hash. Use `id` for delete and toggle.
 export interface APIKey {
-  key: string
+  id: string
   name: string
+  key_prefix: string
   rate_limit_per_minute: number
   rate_limit_per_hour: number
+  allowed_paths?: string[]
   is_active: boolean
   created_at: string
-  last_used?: string
+  expires_at?: string | null
+  last_used_at?: string | null
+}
+
+// Returned once, by POST /admin/api-keys: includes the full key.
+export interface CreatedAPIKey extends APIKey {
+  key: string
 }
 
 export interface Route {
@@ -55,7 +65,7 @@ export const adminApi = {
     name: string
     rate_limit_per_minute?: number
     rate_limit_per_hour?: number
-  }): Promise<APIKey> => {
+  }): Promise<CreatedAPIKey> => {
     const response = await apiClient.post('/admin/api-keys', null, {
       params: data,
     })

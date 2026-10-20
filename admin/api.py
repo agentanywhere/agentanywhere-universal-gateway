@@ -115,6 +115,20 @@ def _local_admin_credential() -> str:
     return ""
 
 
+def _secret_key_is_admin_credential() -> bool:
+    """Whether SECRET_KEY may be presented as an admin credential.
+
+    Only when it is not the placeholder, and only when ADMIN_TOKEN is empty,
+    unless ADMIN_ACCEPT_SECRET_KEY=true restores the old behaviour of
+    accepting both.
+    """
+    if _is_placeholder_secret(settings.secret_key):
+        return False
+    if not settings.admin_token:
+        return True
+    return bool(getattr(settings, "admin_accept_secret_key", False))
+
+
 def verify_admin_token_value(token: Optional[str]) -> str:
     """Validate a raw admin token string (OIDC SSO, legacy admin token, or SECRET_KEY).
 
@@ -135,13 +149,15 @@ def verify_admin_token_value(token: Optional[str]) -> str:
         ida_auth.verify_admin_token(token)
         return token
 
-    # Explicit admin token, then SECRET_KEY for single-operator deployments —
-    # never the shipped placeholder, which is public. Both are compared in
-    # constant time, and a credential containing non-ASCII bytes is simply
-    # wrong (401) rather than an unhandled error.
-    if constant_time_equals(token, settings.admin_token):
+    # Explicit admin token. SECRET_KEY is only a break-glass fallback for
+    # single-operator deployments that have not set ADMIN_TOKEN (or that opt
+    # back in with ADMIN_ACCEPT_SECRET_KEY), and never while it is the shipped
+    # placeholder, which is public. Both are compared in constant time, and a
+    # credential containing non-ASCII bytes is simply wrong (401) rather than
+    # an unhandled error.
+    if settings.admin_token and constant_time_equals(token, settings.admin_token):
         return token
-    if not _is_placeholder_secret(settings.secret_key) and constant_time_equals(
+    if _secret_key_is_admin_credential() and constant_time_equals(
         token, settings.secret_key
     ):
         return token
@@ -256,35 +272,84 @@ async def get_detailed_health(admin_token: str = Depends(verify_admin_token)):
     }
 
 
-@router.get("/api-keys", response_model=List[APIKey])
+@router.get("/api-keys", response_model=List[Dict[str, Any]])
 async def list_api_keys(
     admin_token: str = Depends(verify_admin_token),
     db: AsyncSession = Depends(get_db)
 ):
-    """List all API keys."""
+    """List all API keys.
+
+    Each entry has the key's ``id`` (what the delete and toggle endpoints
+    take) and a short ``key_prefix`` to recognise it by. The full key is only
+    ever returned once, by ``POST /admin/api-keys``.
+    """
     db_keys = await APIKeyRepository.list_all(db)
-    # Convert SQLAlchemy models to Pydantic models
-    return [APIKeyRepository.to_pydantic(key) for key in db_keys]
+    return [APIKeyRepository.to_public_dict(key) for key in db_keys]
+
+
+class APIKeyCreateRequest(BaseModel):
+    """JSON body accepted by ``POST /admin/api-keys`` (query parameters work too)."""
+
+    name: Optional[str] = None
+    rate_limit_per_minute: Optional[int] = None
+    rate_limit_per_hour: Optional[int] = None
+    expires_at: Optional[str] = None
+    expires_in_days: Optional[int] = None
+    # A list, or a comma-separated string as in the query parameter.
+    allowed_paths: Optional[Any] = None
 
 
 @router.post("/api-keys", response_model=Dict[str, Any])
 async def create_api_key(
-    name: str,
-    rate_limit_per_minute: int = 60,
-    rate_limit_per_hour: int = 1000,
+    name: Optional[str] = None,
+    rate_limit_per_minute: Optional[int] = None,
+    rate_limit_per_hour: Optional[int] = None,
     expires_at: Optional[str] = None,
     expires_in_days: Optional[int] = None,
     allowed_paths: Optional[str] = None,
+    body: Optional[APIKeyCreateRequest] = Body(None),
     admin_token: str = Depends(verify_admin_token),
     db: AsyncSession = Depends(get_db)
 ):
     """Create a new API key.
 
+    Parameters can be sent as query parameters or as a JSON body with the
+    same names (a query parameter wins when both are given). ``name`` is
+    required.
+
     Optional expiry can be given either as an absolute ISO-8601 timestamp
     (``expires_at``) or as a relative number of days from now
-    (``expires_in_days``) — providing both is rejected. ``allowed_paths`` is a
-    comma-separated allow-list of path prefixes the key may access.
+    (``expires_in_days``) — providing both is rejected. ``allowed_paths`` is
+    an allow-list of path prefixes the key may access: a comma-separated
+    string, or a JSON list in the body. Empty means every path.
     """
+    if body is not None:
+        name = name if name is not None else body.name
+        rate_limit_per_minute = (
+            rate_limit_per_minute if rate_limit_per_minute is not None else body.rate_limit_per_minute
+        )
+        rate_limit_per_hour = (
+            rate_limit_per_hour if rate_limit_per_hour is not None else body.rate_limit_per_hour
+        )
+        expires_at = expires_at if expires_at is not None else body.expires_at
+        expires_in_days = expires_in_days if expires_in_days is not None else body.expires_in_days
+        if allowed_paths is None and body.allowed_paths is not None:
+            if isinstance(body.allowed_paths, (list, tuple)):
+                allowed_paths = ",".join(str(p) for p in body.allowed_paths)
+            elif isinstance(body.allowed_paths, str):
+                allowed_paths = body.allowed_paths
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="'allowed_paths' must be a list of paths or a comma-separated string.",
+                )
+    if not name or not str(name).strip():
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="'name' is required (query parameter or JSON body).",
+        )
+    rate_limit_per_minute = 60 if rate_limit_per_minute is None else rate_limit_per_minute
+    rate_limit_per_hour = 1000 if rate_limit_per_hour is None else rate_limit_per_hour
     # --- Resolve / validate expiry -------------------------------------------
     if expires_at is not None and expires_in_days is not None:
         raise HTTPException(
@@ -357,7 +422,8 @@ async def create_api_key(
     return {
         "id": db_key.id,
         "name": db_key.name,
-        "key": key,  # Only returned on creation
+        "key": key,  # Only returned on creation; the gateway keeps only its hash
+        "key_prefix": APIKeyRepository.display_prefix(key),
         "rate_limit_per_minute": db_key.rate_limit_per_minute,
         "rate_limit_per_hour": db_key.rate_limit_per_hour,
         "is_active": db_key.is_active,
@@ -1386,28 +1452,79 @@ async def get_supported_protocols(
 
 # ==================== Webhook Management ====================
 
+class WebhookCreateRequest(BaseModel):
+    """JSON body of ``POST /admin/webhooks``.
+
+    ``headers`` and ``filters`` were always read from the body; ``url``,
+    ``event_type`` (or a list in ``events``) and ``secret`` may now be sent
+    there too instead of as query parameters.
+    """
+
+    url: Optional[str] = None
+    event_type: Optional[str] = None
+    events: Optional[List[str]] = None
+    secret: Optional[str] = None
+    headers: Optional[Dict[str, str]] = None
+    filters: Optional[Dict[str, Any]] = None
+
+
+def _known_webhook_events() -> List[str]:
+    return [
+        value for name, value in vars(WebhookEventType).items()
+        if not name.startswith("_") and isinstance(value, str)
+    ]
+
+
 @router.post("/webhooks", response_model=Dict[str, Any])
 async def create_webhook(
-    event_type: str,
-    url: str,
+    event_type: Optional[str] = None,
+    url: Optional[str] = None,
     secret: Optional[str] = None,
-    headers: Optional[Dict[str, str]] = None,
-    filters: Optional[Dict[str, Any]] = None,
+    body: Optional[WebhookCreateRequest] = Body(None),
     admin_token: str = Depends(verify_admin_token)
 ):
-    """Register a webhook for event notifications."""
-    webhook_id = await webhook_manager.register_webhook(
-        event_type=event_type,
-        url=url,
-        secret=secret,
-        headers=headers,
-        filters=filters
-    )
+    """Register a webhook for event notifications.
+
+    ``url`` and ``event_type`` can be query parameters or body fields; the
+    body may list several events in ``events``, and one webhook is
+    registered per event.
+    """
+    body = body or WebhookCreateRequest()
+    url = url or body.url
+    secret = secret if secret is not None else body.secret
+    events: List[str] = []
+    if event_type:
+        events.append(event_type)
+    if body.event_type:
+        events.append(body.event_type)
+    events.extend(body.events or [])
+    events = list(dict.fromkeys(e for e in events if e))
+    if not url or not events:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="'url' and 'event_type' (or 'events') are required.",
+        )
+    # Unknown names are accepted as before (a plugin may fire its own
+    # events), but reported, since the built-in ones never fire them.
+    known = _known_webhook_events()
+    unknown = [e for e in events if e not in known]
+    ids = []
+    for event in events:
+        ids.append(await webhook_manager.register_webhook(
+            event_type=event,
+            url=url,
+            secret=secret,
+            headers=body.headers,
+            filters=body.filters,
+        ))
     return {
-        "id": webhook_id,
-        "event_type": event_type,
+        "id": ids[0],
+        "ids": ids,
+        "event_type": events[0],
+        "events": events,
         "url": url,
-        "status": "registered"
+        "status": "registered",
+        **({"unknown_events": unknown} if unknown else {}),
     }
 
 
@@ -1437,10 +1554,21 @@ async def list_webhooks(
 @router.delete("/webhooks/{webhook_id}")
 async def delete_webhook(
     webhook_id: str,
-    event_type: str,
+    event_type: Optional[str] = None,
     admin_token: str = Depends(verify_admin_token)
 ):
-    """Unregister a webhook."""
+    """Unregister a webhook. ``event_type`` is optional: without it the
+    webhook is looked up under every event."""
+    if event_type is None:
+        event_type = next(
+            (
+                ev for ev, hooks in webhook_manager.webhooks.items()
+                if any(w.get("id") == webhook_id for w in hooks)
+            ),
+            None,
+        )
+        if event_type is None:
+            raise HTTPException(status_code=404, detail="Webhook not found")
     success = await webhook_manager.unregister_webhook(event_type, webhook_id)
     if not success:
         raise HTTPException(status_code=404, detail="Webhook not found")
@@ -2802,7 +2930,11 @@ async def get_admin_roles(
     admin_token: str = Depends(verify_admin_token),
     db: AsyncSession = Depends(get_db),
 ):
-    """List configured admin role assignments."""
+    """List configured admin role assignments.
+
+    Roles are stored but not enforced yet: every valid admin credential can
+    call every admin endpoint.
+    """
     from app.governance import list_roles
 
     return await list_roles(db)
@@ -2814,7 +2946,7 @@ async def assign_admin_role(
     admin_token: str = Depends(verify_admin_token),
     db: AsyncSession = Depends(get_db),
 ):
-    """Map an admin token to a role.
+    """Map an admin token to a role (stored, not enforced yet; see above).
 
     Body: ``{"token": str, "name": str, "role": "super_admin"|"operator"|"viewer"|"auditor"}``.
     """
