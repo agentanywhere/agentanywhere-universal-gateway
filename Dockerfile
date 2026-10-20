@@ -33,6 +33,13 @@ COPY --from=builder /root/.local /home/gateway/.local
 # Copy application code
 COPY --chown=gateway:gateway . .
 
+# Data directory for the SQLite database (docker-compose.yml mounts the
+# gateway_data volume here and sets DATABASE_URL to /app/data/gateway.db).
+# It must belong to the non-root user: a new named volume takes the owner of
+# this directory, and SQLite needs to create its journal files next to the
+# database.
+RUN mkdir -p /app/data && chown gateway:gateway /app/data
+
 # Generate gRPC proto files if proto file exists
 RUN if [ -f samples/backends/grpc/greeter.proto ]; then \
     python -m grpc_tools.protoc --python_out=samples/backends/grpc --grpc_python_out=samples/backends/grpc -I. samples/backends/grpc/greeter.proto || true; \

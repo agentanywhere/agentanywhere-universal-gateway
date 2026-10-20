@@ -94,12 +94,20 @@ process.
   set; remove or comment out that line to use in-memory counters.
 
 ### Database Configuration
-- `DATABASE_URL`: Database connection string
-  - SQLite: `sqlite+aiosqlite:///./gateway.db`
+- `DATABASE_URL`: Database connection string. Alembic (`alembic upgrade head`)
+  uses the same value; see [UPGRADING.md](UPGRADING.md).
+  - SQLite: `sqlite+aiosqlite:///./gateway.db` (the default when unset; relative
+    to the working directory)
   - PostgreSQL: `postgresql+asyncpg://user:password@host:5432/database`
+  - Under `docker-compose.yml` the default is
+    `sqlite+aiosqlite:////app/data/gateway.db`, on the `gateway_data` volume.
+    `env.example` leaves `DATABASE_URL` commented out so that this default
+    applies.
 - `POSTGRES_DB`: PostgreSQL database name
 - `POSTGRES_USER`: PostgreSQL username
-- `POSTGRES_PASSWORD`: PostgreSQL password
+- `POSTGRES_PASSWORD`: PostgreSQL password. Required by the `production`
+  profile of `docker-compose.yml`: the `postgres` container refuses to start
+  while it is empty or starts with `change-me`.
 - `POSTGRES_PORT`: PostgreSQL port (default: 5432)
 
 ### Backend Service URLs
@@ -117,6 +125,18 @@ not routed (requests to that prefix return a clear "backend not configured" erro
 - `GRPC_BACKEND_URL`: gRPC backend URL (e.g., "localhost:50051")
 - `GRAPHQL_BACKEND_URL`: GraphQL backend URL (e.g., "http://localhost:4000/graphql")
 - `DEFAULT_TIMEOUT`: Default request timeout in seconds (default: 30)
+
+Under `docker-compose.yml` the gateway container does not take
+`MCP_BACKEND_URL`, `A2A_BACKEND_URL`, `HTTP_BACKEND_URL`,
+`WEBSOCKET_BACKEND_URL`, `MQTT_BROKER_URL`, `GRPC_BACKEND_URL` or
+`GRAPHQL_BACKEND_URL` from `.env`: its `environment:` block sets them to the
+sample backends' service names (`http://mcp-backend:8001` and so on, started
+with `--profile backends`). Set `DOCKER_MCP_BACKEND_URL`,
+`DOCKER_A2A_BACKEND_URL`, `DOCKER_HTTP_BACKEND_URL`,
+`DOCKER_WEBSOCKET_BACKEND_URL`, `DOCKER_MQTT_BROKER_URL`,
+`DOCKER_GRPC_BACKEND_URL` or `DOCKER_GRAPHQL_BACKEND_URL` in `.env` to point
+the container at other backends. The gateway itself does not read the
+`DOCKER_` names.
 
 #### Tier-2 streaming (AG-UI / ACP)
 

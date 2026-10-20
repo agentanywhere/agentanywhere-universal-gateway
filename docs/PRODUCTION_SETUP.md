@@ -43,8 +43,9 @@ These are also in the [README](../README.md). Read them before you deploy.
 | `CORS_ORIGINS` | Allows every origin (`env.example` ships `["*"]`, with `CORS_ALLOW_CREDENTIALS=true`). | Set it to the exact origins of your front ends, as a JSON array. |
 | `/metrics`, `/health/detailed` | Open to anyone who can reach the gateway. | Block them at your firewall or reverse proxy, or allow only your monitoring network. In `nginx/nginx.conf` the `/metrics` block has an IP allow-list that is commented out; `/health/detailed` is passed through by the catch-all `location /`. |
 | Redis in `docker-compose.yml` | No password. Port 6379 is published on `127.0.0.1` only. | Keep it on the Compose network or localhost. If you need remote access, add a password and a firewall rule. |
-| PostgreSQL in `docker-compose.yml` (`production` profile) | `POSTGRES_PASSWORD` falls back to the public placeholder `change-me-in-production`. Port 5432 is published on `127.0.0.1` only. | Set `POSTGRES_PASSWORD` in `.env` before you start the profile. |
-| Grafana in `docker-compose.yml` (`monitoring` profile) | Admin user `admin`, password `admin` unless `GRAFANA_ADMIN_PASSWORD` is set. Port 3000 is published on all interfaces. | Set `GRAFANA_ADMIN_PASSWORD` in `.env`, and restrict port 3000. |
+| PostgreSQL in `docker-compose.yml` (`production` profile) | No password fallback: the container refuses to start while `POSTGRES_PASSWORD` is empty or starts with `change-me`. Port 5432 is published on `127.0.0.1` only. | Set a generated `POSTGRES_PASSWORD` in `.env` before you start the profile. PostgreSQL applies it only when the volume is first initialised; to change it later use `ALTER USER`. |
+| Grafana in `docker-compose.yml` (`monitoring` profile) | Admin user `admin`. No password fallback: the container refuses to start while `GRAFANA_ADMIN_PASSWORD` is empty or `admin`. Port 3000 is published on all interfaces. | Set `GRAFANA_ADMIN_PASSWORD` in `.env`, and restrict port 3000. |
+| Gateway database in `docker-compose.yml` | SQLite at `/app/data/gateway.db` on the `gateway_data` volume; it survives container recreation, not `docker compose down -v`. | Back the volume up (see [DEPLOYMENT.md](DEPLOYMENT.md#backing-up-the-database-volume)), or use PostgreSQL. |
 | Prometheus in `docker-compose.yml` (`monitoring` profile) | No authentication. Port 9090 is published on all interfaces. | Restrict port 9090. |
 | Admin console (port 3001) | Published on all interfaces; sign-in needs the admin credential. | Put it behind your reverse proxy and restrict who can reach it. |
 | Sample backends (`backends` profile) | No authentication; ports 8001-8003, 8080, 1883, 9001 and 50051 are published on all interfaces. | Use them for testing only. |
@@ -62,7 +63,8 @@ Tick these off yourself. Nothing in this repository checks them for you.
 - [ ] The database file or volume is backed up, and you know how to restore it.
       Remember it holds API keys in plaintext.
 - [ ] Redis and PostgreSQL are not reachable from outside the host or network.
-- [ ] Default passwords (Grafana, PostgreSQL) are changed.
+- [ ] Grafana and PostgreSQL passwords are generated values (the Compose file
+      refuses empty and placeholder values, but not weak ones).
 - [ ] Log rotation is set up.
 - [ ] You have read [UPGRADING.md](UPGRADING.md) and know how you will apply schema changes.
 - [ ] Health checks respond: `/health`, `/ready` and `/live`.
@@ -114,8 +116,9 @@ export POSTGRES_PASSWORD=your-secure-password
 
 bash scripts/setup_postgres.sh
 
-# Update .env
-echo "DATABASE_URL=postgresql+asyncpg://gateway_user:your-secure-password@localhost:5432/gateway" >> .env
+# Update .env. Use host "postgres" when the gateway runs under docker-compose.yml,
+# "localhost" when it runs directly on this machine.
+echo "DATABASE_URL=postgresql+asyncpg://gateway_user:your-secure-password@postgres:5432/gateway" >> .env
 ```
 
 The `postgres` service in `docker-compose.yml` is part of the `production`

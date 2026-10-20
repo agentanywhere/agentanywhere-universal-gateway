@@ -33,10 +33,13 @@ Notes:
   The `WORKERS` setting is only used when the application is started as
   `python -m app.main` or `python app/main.py` with `ENVIRONMENT=production`,
   not by this image.
-- Without `DATABASE_URL` the gateway uses a SQLite file inside the container.
-  It is lost when the container is removed, and with it every API key. Use
-  PostgreSQL, or point `DATABASE_URL` at a SQLite file on a mounted volume that
-  the container's user (uid 1000) can write.
+- Without `DATABASE_URL` the gateway uses `./gateway.db`, a SQLite file inside
+  the container. It is lost when the container is removed, and with it every
+  API key. Use PostgreSQL, or mount a volume on `/app/data` (the image creates
+  that directory, owned by the container's user, uid 1000) and set
+  `DATABASE_URL=sqlite+aiosqlite:////app/data/gateway.db`, as
+  `docker-compose.yml` does:
+  `docker run ... -v gateway_data:/app/data -e DATABASE_URL=sqlite+aiosqlite:////app/data/gateway.db ...`
 - Inside a container, `localhost` in a `*_BACKEND_URL` or `REDIS_URL` means the
   container itself. Use the backend's host name or address.
 
@@ -50,7 +53,64 @@ docker compose --profile production up -d --build # adds Postgres and Nginx
 ```
 
 Read [PRODUCTION_SETUP.md](PRODUCTION_SETUP.md) first: it lists the default
-credentials and published ports in this file.
+credentials and published ports in this file. The `production` profile needs
+`POSTGRES_PASSWORD` in `.env`, and the `monitoring` profile needs
+`GRAFANA_ADMIN_PASSWORD`: those containers refuse to start (see
+`docker compose logs postgres` / `grafana`) while the value is empty or a
+placeholder. The default `docker compose up` does not need either.
+
+How the Compose file configures the gateway container:
+
+- **Database.** `DATABASE_URL` defaults to
+  `sqlite+aiosqlite:////app/data/gateway.db`, on the named volume
+  `gateway_data` mounted at `/app/data`. The file, and every API key in it,
+  survives `docker compose down`, `up --build` and container recreation. It is
+  deleted by `docker compose down -v` or `docker volume rm`. A `DATABASE_URL`
+  in `.env` or the shell replaces the default; for the `production` profile's
+  PostgreSQL use `postgresql+asyncpg://gateway_user:<password>@postgres:5432/gateway`
+  (host `postgres`, not `localhost`). Do not set a relative SQLite path such as
+  `sqlite+aiosqlite:///./gateway.db` there: it puts the file back inside the
+  container. `.env` files copied from an older `env.example` contain exactly
+  that line; delete it.
+- **Backends.** The `environment:` block sets `MCP_BACKEND_URL`,
+  `A2A_BACKEND_URL`, `HTTP_BACKEND_URL`, `WEBSOCKET_BACKEND_URL`,
+  `MQTT_BROKER_URL`, `GRPC_BACKEND_URL` and `GRAPHQL_BACKEND_URL` to the sample
+  backends' service names (`http://mcp-backend:8001`, ...). `environment:`
+  overrides `env_file:`, so the `localhost` values that `env.example` uses for
+  running outside Docker do not reach the container (there `localhost` would
+  be the gateway itself, and every proxied request would get 502). The sample
+  backends run with `--profile backends`. For your own backends set
+  `DOCKER_MCP_BACKEND_URL`, `DOCKER_HTTP_BACKEND_URL` and so on in `.env`.
+  `AG_UI_BACKEND_URL` and `ACP_BACKEND_URL` have no sample service and are read
+  from `.env` as usual.
+
+### Backing up the database volume
+
+The default database is one SQLite file on the `gateway_data` volume. Compose
+prefixes the volume with the project name (by default the directory name), so
+find it with `docker volume ls | grep gateway_data`.
+
+Online copy, while the gateway runs (SQLite's backup API gives a consistent
+snapshot):
+
+```bash
+docker compose exec gateway python -c "import sqlite3; s=sqlite3.connect('/app/data/gateway.db'); d=sqlite3.connect('/app/data/backup.db'); s.backup(d); d.close(); s.close()"
+docker compose cp gateway:/app/data/backup.db ./gateway-backup-$(date +%F).db
+docker compose exec gateway rm /app/data/backup.db
+```
+
+Whole volume, with the gateway stopped:
+
+```bash
+docker compose stop gateway
+docker run --rm -v <project>_gateway_data:/data -v "$PWD":/backup alpine \
+  tar czf /backup/gateway-data-$(date +%F).tgz -C /data .
+docker compose start gateway
+```
+
+To restore, stop the gateway, extract the archive into the volume the same way
+(`tar xzf ... -C /data`), and start it again. The file holds API keys in
+plaintext: store backups as you would the keys themselves.
 
 ## Behind a reverse proxy
 

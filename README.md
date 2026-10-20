@@ -134,8 +134,14 @@ This starts the gateway on port 8000, Redis, and the admin console on port
 backends. Before you start, check that nothing else is using ports 8000, 3001
 and 6379.
 
-Under Docker, `localhost` in a `*_BACKEND_URL` means the gateway container
-itself. See [Quick start: if something goes wrong](docs/QUICKSTART.md#if-something-goes-wrong).
+Under Compose the gateway's backend URLs point at the sample backends by
+service name (`http://http-backend:8003` and so on), whatever `.env` says for
+`*_BACKEND_URL`; set `DOCKER_HTTP_BACKEND_URL` and the other `DOCKER_` variants
+in `.env` to use your own backends. The SQLite database is kept on the
+`gateway_data` volume at `/app/data/gateway.db`, so API keys survive
+`docker compose down` and rebuilds (not `docker compose down -v`, which deletes
+the volume). See [Quick start: if something goes wrong](docs/QUICKSTART.md#if-something-goes-wrong)
+and, for backups, [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#backing-up-the-database-volume).
 
 **Security defaults in the Compose file.** Redis has no password and, like
 PostgreSQL, is published on `127.0.0.1` only. If you start the `monitoring`

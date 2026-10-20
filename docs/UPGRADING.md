@@ -114,11 +114,19 @@ directory.
   use PostgreSQL. Replicas cannot share a SQLite file across hosts, and writes
   from several processes to one file are serialised and can fail with "database
   is locked".
-- With the repository's `docker-compose.yml`, the gateway container writes the
-  SQLite file inside the container (`/app/gateway.db`). The Compose file mounts
-  only `./logs`, so the file is lost when the container is removed and
-  recreated, and with it every API key. Set `DATABASE_URL` to PostgreSQL, or add
-  a volume for the file, before you rely on the data.
+- With the repository's `docker-compose.yml`, the SQLite file is
+  `/app/data/gateway.db` on the named volume `gateway_data`, so it survives the
+  container being recreated. Earlier versions of the Compose file kept it at
+  `/app/gateway.db` inside the container. If you are moving from one of those
+  and the old container still exists, copy the file out before you recreate it
+  (`docker compose cp gateway:/app/gateway.db ./gateway.db`), then, after the
+  new container is up, copy it in (`docker compose cp ./gateway.db
+  gateway:/app/data/gateway.db`), give it to the container's user
+(`docker compose exec -u root gateway chown gateway:gateway /app/data/gateway.db`)
+and restart the gateway. Also delete the
+  `DATABASE_URL=sqlite+aiosqlite:///./gateway.db` line from a `.env` made from
+  an older `env.example`; it would override the volume path. Backups: see
+  [DEPLOYMENT.md](DEPLOYMENT.md#backing-up-the-database-volume).
 - Other state is also per process: with no `RATE_LIMIT_REDIS_URL`, rate-limit
   counters live in each process's memory. See [CONFIGURATION.md](CONFIGURATION.md).
 
