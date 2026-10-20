@@ -35,6 +35,30 @@ First public release, under the Apache License 2.0.
 
 See the README for the full list.
 
+### Fixed
+
+- Database migrations: the Alembic migrations `001` and `002` were replaced by
+  one baseline, `0001`, that creates the full current schema. It is safe to
+  run on a database the gateway already created at startup, works on SQLite
+  and PostgreSQL, and needs no extra driver. A test fails when the models and
+  the migrations disagree. See docs/UPGRADING.md.
+- Docker Compose: the SQLite database is kept on the `gateway_data` volume
+  (`/app/data/gateway.db`) instead of the container's filesystem, so API keys
+  survive the container being recreated.
+- Docker Compose: the gateway container reaches the sample backends by service
+  name; the `localhost` backend URLs from `env.example` no longer leak into it
+  (they made every request answer 502). Use `DOCKER_*_BACKEND_URL` for other
+  backends.
+- Docker Compose: the `postgres` and `grafana` containers refuse to start while
+  `POSTGRES_PASSWORD` / `GRAFANA_ADMIN_PASSWORD` are empty or placeholders.
+- nginx: `nginx/nginx.conf` is installed as `conf.d/default.conf` (as the main
+  `nginx.conf` it did not load), and `/metrics` and `/health/detailed` are
+  served to loopback and private addresses only.
+- New `OPS_ENDPOINTS_REQUIRE_ADMIN` (default false) requires the admin
+  credential on `/metrics` and `/health/detailed`.
+- CORS: a `"*"` origin now turns credentials off, with a startup warning, and
+  the default origins are the local admin console's instead of `"*"`.
+
 ### Security
 
 - The admin API accepts only the configured `ADMIN_TOKEN`, or `SECRET_KEY`

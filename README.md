@@ -176,7 +176,7 @@ Configuration is read from environment variables and from `.env`.
 |---|---|---|
 | `SECRET_KEY` | Signs tokens. Also the admin credential when `ADMIN_TOKEN` is empty. | a placeholder that is refused |
 | `ADMIN_TOKEN` | Credential for the admin API and console. | empty |
-| `DATABASE_URL` | SQLAlchemy URL. PostgreSQL is supported through `asyncpg`. | `sqlite+aiosqlite:///./gateway.db` |
+| `DATABASE_URL` | SQLAlchemy URL. PostgreSQL is supported through `asyncpg`. `alembic upgrade head` uses the same URL ([docs/UPGRADING.md](docs/UPGRADING.md)). | `sqlite+aiosqlite:///./gateway.db`; under Docker Compose `sqlite+aiosqlite:////app/data/gateway.db` on the `gateway_data` volume |
 | `REDIS_URL`, `REDIS_ENABLED` | Shared rate-limit counters and the API-key cache. | `redis://localhost:6379/0`, `true` |
 | `MCP_BACKEND_URL`, `A2A_BACKEND_URL` | Backends for `/mcp/*` and `/a2a/*`. | `http://localhost:8001`, `http://localhost:8002` |
 | `HTTP_BACKEND_URL`, `AG_UI_BACKEND_URL`, `ACP_BACKEND_URL`, `GRAPHQL_BACKEND_URL`, `MQTT_BROKER_URL` | Backends for the other routes. | not set in code; `env.example` points some at the sample backends |

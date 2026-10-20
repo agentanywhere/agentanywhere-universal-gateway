@@ -38,7 +38,11 @@ docker compose up -d          # all backends, or:
 bash start_all.sh             # start the Python backends locally
 ```
 
-Point the gateway at them (in your `.env`):
+Point the gateway at them (in your `.env`). These values are for a gateway
+running directly on this machine. A gateway started with the repository's
+`docker-compose.yml` does not use them: it reaches the sample backends of the
+`backends` profile by service name, and takes `DOCKER_*_BACKEND_URL` for other
+backends (see [DEPLOYMENT.md](DEPLOYMENT.md#docker-compose-on-one-host)).
 
 ```bash
 MCP_BACKEND_URL=http://localhost:8001
