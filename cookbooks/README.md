@@ -1,43 +1,31 @@
 # Cookbooks
 
-Integration recipes and examples for common use cases.
+Sketches of agent frameworks calling services through AgentAnywhere Universal
+Gateway. Each one sends requests to the gateway with an API key and uses the
+paths of the sample backends (`/mcp/query`, `/a2a/message`), so start the
+gateway and the MCP and A2A samples first
+([sample backends](../samples/backends/README.md)).
 
-## Available Cookbooks
+These scripts were not run for the current documentation, and the framework
+packages are not in `requirements.txt`. Treat them as starting points.
 
-### LangGraph Integration
+| File | Framework | Install |
+|---|---|---|
+| `langgraph_integration.py` | LangGraph: graph nodes that call MCP and A2A through the gateway | `pip install langgraph` |
+| `crewai_integration.py` | CrewAI: a tool class that calls MCP and A2A through the gateway | `pip install crewai` |
 
-**File**: `langgraph_integration.py`
-
-Integrate the gateway with LangGraph agents for AI workflows.
+Set the key in the script (`API_KEY = "your-api-key"`) before you run it:
 
 ```bash
-pip install langgraph
 python cookbooks/langgraph_integration.py
-```
-
-### CrewAI Integration
-
-**File**: `crewai_integration.py`
-
-Use the gateway with CrewAI for multi-agent systems.
-
-```bash
-pip install crewai
 python cookbooks/crewai_integration.py
 ```
 
-## Creating Your Own Cookbook
+## Adding a cookbook
 
-1. Create a new Python file in `cookbooks/`
-2. Include:
-   - Clear description of the integration
-   - Required dependencies
-   - Step-by-step code example
-   - Usage instructions
-3. Add to this README
+1. Add a Python file here with a docstring that says what it shows and which
+   packages it needs.
+2. Read the gateway URL and key from variables at the top of the file.
+3. Add a row to the table above.
 
-## Contributing Cookbooks
-
-We welcome cookbook contributions! See [CONTRIBUTING.md](../CONTRIBUTING.md) for guidelines.
-
-
+See [CONTRIBUTING.md](../CONTRIBUTING.md).

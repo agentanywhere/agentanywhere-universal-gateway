@@ -121,7 +121,7 @@ def example_grpc_request():
     NOT WORKING: the gateway's JSON-to-gRPC bridge does not forward calls to a
     backend. With the stock requirements it answers HTTP 200 with
     "status": "unsupported". This shows the intended interface; see
-    docs/PROTOCOLS.md.
+    docs/explanation/protocol-support.md.
     """
     print("\n=== gRPC Request Example ===")
 

@@ -13,7 +13,8 @@ First public release, under the Apache License 2.0.
 
 - A gateway that authenticates, rate-limits and proxies requests to MCP, A2A,
   AG-UI, ACP, HTTP/REST and GraphQL backends, and publishes to an MQTT broker.
-- API keys with per-key limits, expiry and path scoping.
+- API keys with per-key limits and expiry. A path list (`allowed_paths`) is
+  stored but not enforced.
 - Rate limiting that works with or without Redis.
 - Tenants with per-tenant request quotas and usage counters.
 - A circuit breaker per backend. A backend that cannot be reached answers 502,
@@ -32,8 +33,16 @@ First public release, under the Apache License 2.0.
 - API keys are stored in plaintext next to their hash, and the admin API
   returns them in full.
 - The `/admin/ai/*` analytics endpoints are experimental.
+- The Alembic migrations do not match the models.
 
-See the README for the full list.
+See [docs/known-limitations.md](docs/known-limitations.md) for the full list.
+
+### Documentation
+
+- Documentation reorganised into tutorials, how-to guides, reference and
+  explanation, with a map in `docs/README.md`.
+- `scripts/check_docs.py`, `scripts/check_env_vars.py` and
+  `scripts/generate_http_reference.py --check` run in CI.
 
 ### Security
 
@@ -44,4 +53,4 @@ See the README for the full list.
   `SECRET_KEY` when it is not the placeholder.
 - A credential containing non-ASCII characters is rejected with 401.
 
-[1.0.0]: https://github.com/agentanywhere/universal-gateway/releases/tag/v1.0.0
+[1.0.0]: https://github.com/agentanywhere/agentanywhere-universal-gateway/releases/tag/v1.0.0

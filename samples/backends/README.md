@@ -1,6 +1,23 @@
 # Sample Backends
 
-This directory contains sample backend servers for each protocol supported by the gateway.
+This directory contains small sample servers, one per protocol, for trying
+AgentAnywhere Universal Gateway. They have no authentication and keep data in
+memory; use them for testing only. The
+[getting-started tutorial](../../docs/tutorials/getting-started.md) uses the
+HTTP sample, and the [end-to-end tutorial](../../docs/tutorials/two-backends-end-to-end.md)
+adds the MCP sample.
+
+Things to know:
+
+- The MCP sample is a REST service with an MCP-like `/mcp/query` endpoint, not
+  a full MCP server.
+- The gateway cannot pass traffic to the WebSocket and gRPC samples; see the
+  [protocol support matrix](../../docs/explanation/protocol-support.md).
+- `env.example` sets `GRAPHQL_BACKEND_URL` to port 4000; the GraphQL sample
+  below listens on 8006.
+- The repository's root `docker-compose.yml` has its own copies of some of
+  these services under `--profile backends`; this directory's
+  `docker-compose.yml` is separate.
 
 ## Quick Start
 
