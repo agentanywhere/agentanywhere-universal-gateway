@@ -167,8 +167,8 @@ answer 404 from the gateway.
 
 `/metrics` and `/health/detailed` disclose request paths and counts,
 dependency status and the version. The shipped nginx serves them to loopback
-and private addresses only, but port 8000 is published directly by the Compose
-file; see [Secure the gateway for production](../how-to/secure-for-production.md).
+and private addresses only. The Compose file publishes the gateway's own port
+on `127.0.0.1` by default (set by `BIND_ADDRESS`); see [Secure the gateway for production](../how-to/secure-for-production.md).
 
 ## What the gateway does not do
 

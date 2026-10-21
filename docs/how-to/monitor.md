@@ -57,7 +57,8 @@ The Docker image's `HEALTHCHECK` and the Compose healthcheck both call
    ```
 
 2. Keep `/metrics` private. The shipped nginx serves it to loopback and
-   private addresses only; port 8000 is not behind nginx. With
+   private addresses only; the gateway's own port 8000 is not behind nginx, and
+   is published on `127.0.0.1` unless you set `BIND_ADDRESS`. With
    `OPS_ENDPOINTS_REQUIRE_ADMIN=true` the gateway itself requires the admin
    credential: mount the token file and uncomment the `authorization:` block.
 

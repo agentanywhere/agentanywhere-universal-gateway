@@ -79,7 +79,6 @@ errors there is a step-by-step guide:
 | `/ready` answers 503 with PostgreSQL | The gateway started before the database | Wait for the restart, or `docker compose restart gateway`. |
 | nginx keeps restarting | No certificate in `nginx/ssl/` | `bash scripts/generate_ssl_cert.sh` or copy yours. |
 | `docker compose ps` shows nginx unhealthy while it works | Its healthcheck requests `http://localhost/health`, which redirects to HTTPS | Ignore it, or change the healthcheck. |
-| `docker compose up --build` fails building `admin-ui` | The console's production build probably fails (`postcss.config.js` is ESM, `package.json` has no `"type": "module"`) | Run the console with `npm run dev`; see [known limitations](known-limitations.md#the-admin-consoles-production-build-probably-fails). |
 | `Can't locate revision identified by '002'` from Alembic | The database was built with the old migrations | See [Upgrade the gateway](how-to/upgrade.md#databases-built-with-the-old-migrations). |
 
 ## Data

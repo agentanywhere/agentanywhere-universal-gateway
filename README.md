@@ -74,8 +74,7 @@ starts the gateway, Redis, the console and the sample backends; the gateway
 reaches the samples by service name and keeps its SQLite database on the
 `gateway_data` volume. Read
 [Deploy with Docker Compose](docs/how-to/deploy-with-docker-compose.md) first:
-the console's image probably does not build, and port 8000 is published
-directly.
+published ports listen on `127.0.0.1` unless you set `BIND_ADDRESS`.
 
 ## What you get
 

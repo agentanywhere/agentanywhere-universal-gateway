@@ -72,16 +72,17 @@ The files below were read for this page; the stack was not started.
    (`docker network inspect <project>_gateway-network`), or nginx's address.
    Without this, IP rules, logs and metrics see every request as coming from
    nginx. A whole subnet also trusts anything else on it, including
-   connections to port 8000 relayed from the bridge gateway, so close port
-   8000 (step 5) when you list a subnet.
+   connections to port 8000 relayed from the bridge gateway, so keep port
+   8000 closed (step 5) when you list a subnet.
 
 4. Set `CORS_ORIGINS` to the HTTPS origins of your front ends, and
    `GATEWAY_URL_BASE=https://gateway.example.com` so generated SDKs and the
    A2A Agent Card use the public URL.
 
-5. Close the gateway's own port. `docker-compose.yml` publishes port 8000 on
-   all interfaces, and clients there bypass nginx and its allow-list.
-   Firewall it, or change the mapping to `"127.0.0.1:8000:8000"`. For a check
+5. Keep the gateway's own port closed. `docker-compose.yml` publishes port
+   8000 on `127.0.0.1` only (the `BIND_ADDRESS` default), so clients on other
+   machines cannot bypass nginx and its allow-list. Do not set
+   `BIND_ADDRESS=0.0.0.0` on a host that runs nginx. For a check
    that does not depend on the network path, also set
    `OPS_ENDPOINTS_REQUIRE_ADMIN=true` and give Prometheus the admin token (the
    commented `authorization:` block in `prometheus.yml`).
