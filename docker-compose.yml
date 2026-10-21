@@ -5,7 +5,7 @@ services:
       dockerfile: Dockerfile
     container_name: mcp_a2a_gateway
     ports:
-      - "${PORT:-8000}:8000"
+      - "${BIND_ADDRESS:-127.0.0.1}:${PORT:-8000}:8000"
     env_file:
       - .env
     environment:
@@ -155,7 +155,7 @@ services:
     image: prom/prometheus:latest
     container_name: gateway_prometheus
     ports:
-      - "9090:9090"
+      - "${BIND_ADDRESS:-127.0.0.1}:9090:9090"
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml
       - prometheus_data:/prometheus
@@ -173,7 +173,7 @@ services:
     image: grafana/grafana:latest
     container_name: gateway_grafana
     ports:
-      - "3000:3000"
+      - "${BIND_ADDRESS:-127.0.0.1}:3000:3000"
     environment:
       # REQUIRED for the `monitoring` profile: set GRAFANA_ADMIN_PASSWORD in
       # .env. There is no fallback (Grafana's own default would be "admin");
@@ -214,7 +214,7 @@ services:
         VITE_BASE_PATH: /
     container_name: gateway_admin_ui
     ports:
-      - "3001:80"
+      - "${BIND_ADDRESS:-127.0.0.1}:3001:80"
     depends_on:
       - gateway
     restart: unless-stopped
@@ -273,7 +273,7 @@ services:
       dockerfile: Dockerfile
     container_name: mcp_backend
     ports:
-      - "8001:8001"
+      - "${BIND_ADDRESS:-127.0.0.1}:8001:8001"
     networks:
       - gateway-network
     healthcheck:
@@ -291,7 +291,7 @@ services:
       dockerfile: Dockerfile
     container_name: a2a_backend
     ports:
-      - "8002:8002"
+      - "${BIND_ADDRESS:-127.0.0.1}:8002:8002"
     networks:
       - gateway-network
     healthcheck:
@@ -309,7 +309,7 @@ services:
       dockerfile: Dockerfile
     container_name: http_backend
     ports:
-      - "8003:8003"
+      - "${BIND_ADDRESS:-127.0.0.1}:8003:8003"
     networks:
       - gateway-network
     healthcheck:
@@ -327,7 +327,7 @@ services:
       dockerfile: Dockerfile
     container_name: websocket_backend
     ports:
-      - "8080:8080"
+      - "${BIND_ADDRESS:-127.0.0.1}:8080:8080"
     networks:
       - gateway-network
     healthcheck:
@@ -343,8 +343,8 @@ services:
     image: eclipse-mosquitto:2.0
     container_name: mqtt_broker
     ports:
-      - "1883:1883"
-      - "9001:9001"
+      - "${BIND_ADDRESS:-127.0.0.1}:1883:1883"
+      - "${BIND_ADDRESS:-127.0.0.1}:9001:9001"
     volumes:
       - ./samples/backends/mqtt/config:/mosquitto/config
       - ./samples/backends/mqtt/data:/mosquitto/data
@@ -360,7 +360,7 @@ services:
       dockerfile: Dockerfile
     container_name: grpc_backend
     ports:
-      - "50051:50051"
+      - "${BIND_ADDRESS:-127.0.0.1}:50051:50051"
     networks:
       - gateway-network
     restart: unless-stopped

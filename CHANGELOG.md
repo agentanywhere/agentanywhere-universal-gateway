@@ -26,6 +26,11 @@ First public release, under the Apache License 2.0.
   command-line tool. These are covered by the automated tests.
 - Sample backends for every protocol, a Dockerfile and a Compose file.
 
+### Deployment
+
+- Compose publishes every port except nginx's 80 and 443 on `127.0.0.1` (change with `BIND_ADDRESS`), so the gateway's own port no longer bypasses nginx.
+- The admin console's production build works (`admin-ui/package.json` is an ES module) and CI builds it.
+
 ### Known limitations
 
 - The gRPC bridge and the WebSocket route do not work.

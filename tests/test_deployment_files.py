@@ -173,3 +173,30 @@ def test_nginx_config_is_installed_as_a_server_level_file(compose):
     # upstream/server at top level: valid only inside the stock http {} block.
     assert re.search(r"^upstream ", text, re.M)
     assert not re.search(r"^(events|http)\s*\{", text, re.M)
+
+
+def test_published_ports_bind_to_localhost_except_nginx(compose):
+    """Only nginx's 80 and 443 may listen on every interface; the gateway's own port must not
+    bypass nginx. Everything else binds to 127.0.0.1 unless BIND_ADDRESS says otherwise."""
+    open_ports = {}
+    for name, service in compose["services"].items():
+        for port in service.get("ports", []):
+            text = str(port)
+            if text.startswith("127.0.0.1:") or text.startswith("${BIND_ADDRESS:-127.0.0.1}:"):
+                continue
+            open_ports.setdefault(name, []).append(text)
+    assert open_ports == {"nginx": ["80:80", "443:443"]}, open_ports
+
+
+def test_gateway_port_default_is_localhost(compose):
+    assert compose["services"]["gateway"]["ports"] == ["${BIND_ADDRESS:-127.0.0.1}:${PORT:-8000}:8000"]
+
+
+def test_admin_console_is_an_es_module_so_its_postcss_config_loads():
+    """postcss.config.js and tailwind.config.js use `export default`; without "type": "module"
+    the production build (and the console's Docker image) fails."""
+    import json
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parent.parent / "admin-ui"
+    assert json.loads((root / "package.json").read_text(encoding="utf-8")).get("type") == "module"
+    assert "export default" in (root / "postcss.config.js").read_text(encoding="utf-8")

@@ -55,16 +55,12 @@ The gateway's `environment:` block, which overrides `.env`, sets:
    `docker volume rm` delete it. A relative SQLite `DATABASE_URL` in `.env`
    (older `env.example` files had one) puts the file back inside the
    container: delete that line.
-2. **Port 8000 bypasses nginx.** The gateway's port is published on all
-   interfaces. Clients there skip TLS and nginx's allow-list for `/metrics` and
-   `/health/detailed`. Firewall it, or bind it to `127.0.0.1`.
-3. **The console's image probably does not build.** Its production build
-   (`npm run build`) is reported to fail because `admin-ui/postcss.config.js`
-   is an ES module and `admin-ui/package.json` has no `"type": "module"`, so
-   `docker compose up --build` may stop at `admin-ui`
-   ([known limitations](../known-limitations.md#the-admin-consoles-production-build-probably-fails)).
-   Start the other services by name (`docker compose up -d --build gateway
-   redis`) and run the console with `npm run dev` if it does.
+2. **Published ports listen on localhost.** Every port the Compose file
+   publishes, except nginx's 80 and 443, binds to `127.0.0.1` by default.
+   To reach the gateway or the console from another machine without nginx,
+   set `BIND_ADDRESS=0.0.0.0` in `.env`; that opens the port to the network
+   and skips nginx's TLS and allow-list for `/metrics` and `/health/detailed`,
+   so firewall it and set `OPS_ENDPOINTS_REQUIRE_ADMIN=true`.
 
 ## Steps
 
@@ -220,7 +216,6 @@ there is more than one replica
 | 502 `BACKEND_ERROR` for every request | The `backends` profile is not running, or a `DOCKER_*_BACKEND_URL` is unreachable | Start the profile, or fix the address. |
 | Keys gone after an update | The volume was deleted, or `.env` sets a relative SQLite `DATABASE_URL` | Restore a backup; delete the line. |
 | `postgres` or `grafana` exits at once | Its password is empty or a placeholder | Set `POSTGRES_PASSWORD` or `GRAFANA_ADMIN_PASSWORD`. |
-| The build stops at `admin-ui` | The console's production build | See [Things to know](#things-to-know). |
 | `port is already allocated` | Something on the host uses 8000, 3001, 6379 (or 80, 443, 5432, 3000, 9090, 8001 to 8003, 8080, 1883, 9001, 50051 with profiles) | Stop it, or change the left side of the port mapping. `PORT` in `.env` changes the gateway's host port. |
 | The console's sign-in fails | Wrong password, or the gateway is not healthy | The password is `ADMIN_TOKEN` (or `SECRET_KEY` if `ADMIN_TOKEN` is empty). Check `docker compose logs gateway`. |
 | `/ready` answers 503 | The database is not reachable | Check `DATABASE_URL` and `docker compose ps postgres`. |

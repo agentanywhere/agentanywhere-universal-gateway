@@ -339,10 +339,8 @@ you created, with their limits.
 The list shows each key's `key_prefix`, never the key. The delete and
 enable/disable buttons work on the key's id.
 
-The console's production build (and so its Docker image) probably does not
-build as shipped; see
-[known limitations](../known-limitations.md#the-admin-consoles-production-build-probably-fails).
-This step was not run for this page.
+The console's production build (`npm run build` in `admin-ui/`) and its Docker
+image are built by CI. This step itself was not run for this page.
 
 ## 7. Read the Prometheus metrics
 

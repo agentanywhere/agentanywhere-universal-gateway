@@ -35,8 +35,7 @@ It is licensed under Apache-2.0. Copyright ShepHertz Technologies Pvt. Ltd.
 
 - Anyone who needs a gateway they can expose to the internet without reading
   the [known limitations](../known-limitations.md) first. `SECRET_KEY` is a
-  break-glass API key on every route, the Compose file publishes port 8000
-  past nginx, and several settings that look like controls (admin roles,
+  break-glass API key on every route, and several settings that look like controls (admin roles,
   per-protocol limits) are not enforced yet.
 - Anyone who needs WebSocket or gRPC pass-through. Neither works.
 - Anyone who needs a high-throughput edge proxy. The gateway buffers most

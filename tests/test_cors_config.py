@@ -133,4 +133,4 @@ def test_env_example_lists_the_admin_console_origins():
     assert "http://localhost:3001" in origins
     # The console really is on 3001: Vite dev server and docker-compose.
     assert "port: 3001" in (REPO / "admin-ui" / "vite.config.ts").read_text()
-    assert '"3001:80"' in (REPO / "docker-compose.yml").read_text()
+    assert '"${BIND_ADDRESS:-127.0.0.1}:3001:80"' in (REPO / "docker-compose.yml").read_text()

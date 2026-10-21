@@ -133,15 +133,17 @@ These are accepted, stored or reported, but no code acts on them:
 
 ## Deployment files
 
-### Port 8000 is published directly and bypasses nginx
+### Published ports bind to localhost by default
 
-`docker-compose.yml` publishes the gateway on `${PORT:-8000}` on all
-interfaces. Clients that reach it there skip the nginx of the `production`
-profile, including its TLS and its allow-list for `/metrics` and
-`/health/detailed`.
+Every port `docker-compose.yml` publishes (the gateway, the admin console,
+Prometheus, Grafana, the sample backends) listens on `127.0.0.1` unless you set
+`BIND_ADDRESS` in `.env`. Only nginx's 80 and 443 listen on every interface.
+So on a host with the `production` profile, clients reach the gateway through
+nginx and its TLS, and its allow-list for `/metrics` and `/health/detailed`.
 
-**Workaround.** Firewall port 8000, or change the mapping to
-`"127.0.0.1:8000:8000"`, and set `OPS_ENDPOINTS_REQUIRE_ADMIN=true`. See
+If you set `BIND_ADDRESS=0.0.0.0` (to reach the gateway or the console from
+another machine without nginx) the port is open to that network and bypasses
+nginx: firewall it, and set `OPS_ENDPOINTS_REQUIRE_ADMIN=true`. See
 [Run behind nginx with TLS](how-to/run-behind-nginx-tls.md).
 
 ### The nginx healthcheck probably reports unhealthy
@@ -152,18 +154,6 @@ this page.
 
 **Workaround.** Ignore the status, or change the healthcheck to request
 `https://localhost/health` with certificate checking off.
-
-### The admin console's production build probably fails
-
-`admin-ui/postcss.config.js` uses ES module syntax (`export default`), but
-`admin-ui/package.json` has no `"type": "module"`, and the production build
-(`npx vite build`) is reported to fail on it. The type check passes. So the
-console's Docker image, which runs `npm run build`, probably does not build,
-and with it `docker compose up --build` for the default services. Not run for
-this page.
-
-**Workaround.** Run the console with the Vite development server
-(`npm run dev` in `admin-ui/`), or fix the configuration in your copy.
 
 ### The password checks refuse placeholders, not weak passwords
 
