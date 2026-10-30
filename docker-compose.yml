@@ -277,7 +277,8 @@ services:
     networks:
       - gateway-network
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8001/health"]
+      # The sample images are python:slim: no wget or curl. GET (not HEAD).
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health', timeout=4)"]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -295,7 +296,7 @@ services:
     networks:
       - gateway-network
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8002/health"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8002/health', timeout=4)"]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -313,7 +314,7 @@ services:
     networks:
       - gateway-network
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8003/health"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8003/health', timeout=4)"]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -331,7 +332,7 @@ services:
     networks:
       - gateway-network
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health', timeout=4)"]
       interval: 10s
       timeout: 5s
       retries: 3
