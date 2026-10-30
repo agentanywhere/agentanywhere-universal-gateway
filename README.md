@@ -27,6 +27,19 @@ Read the [known limitations](docs/known-limitations.md) before you deploy it.
 You need Python 3.10, 3.11 or 3.12, `git` and `curl`. Redis, PostgreSQL and
 Docker are not needed. Most of the time goes into `pip install`.
 
+**Windows.** The commands assume Linux or macOS. On Windows use Git Bash (or
+WSL) and make these changes:
+
+- Install Python 3.10, 3.11 or 3.12. The newest download from python.org may
+  be 3.13 or later, which is not supported.
+- Use `python` where the commands say `python3`: `python3` on Windows is the
+  Microsoft Store shortcut and fails with "Python was not found".
+- Create the environment with `py -3.12 -m venv .venv` (the `py` launcher
+  picks the version), and activate it with `source .venv/Scripts/activate`
+  in Git Bash, `.venv\Scripts\Activate.ps1` in PowerShell, or
+  `.venv\Scripts\activate.bat` in cmd. The folder is `Scripts`, not `bin`.
+- Wherever a step says `source .venv/bin/activate`, use that activation line.
+
 ```bash
 git clone https://github.com/agentanywhere/agentanywhere-universal-gateway.git
 cd agentanywhere-universal-gateway
