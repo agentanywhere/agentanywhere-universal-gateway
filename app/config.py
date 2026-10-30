@@ -494,6 +494,9 @@ class Settings(BaseSettings):
     # Redis
     redis_url: str = "redis://localhost:6379/0"
     redis_enabled: bool = True
+    # Seconds a Redis call may block (connect and read). Redis is optional;
+    # without a short limit an absent server stalls every request.
+    redis_socket_timeout: float = 1.0
 
     # Database
     database_url: Optional[str] = None

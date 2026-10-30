@@ -24,7 +24,12 @@ class RateLimiter:
         self.redis_client = None
         if settings.rate_limit_redis_url:
             try:
-                self.redis_client = redis.from_url(settings.rate_limit_redis_url, decode_responses=True)
+                self.redis_client = redis.from_url(
+                    settings.rate_limit_redis_url,
+                    decode_responses=True,
+                    socket_connect_timeout=settings.redis_socket_timeout,
+                    socket_timeout=settings.redis_socket_timeout,
+                )
             except Exception:
                 pass
 
