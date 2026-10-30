@@ -17,6 +17,7 @@ from app.client_ip import client_ip as _client_ip
 from sqlalchemy.ext.asyncio import AsyncSession
 import redis
 import json
+import time
 
 settings = get_settings()
 security = HTTPBearer(auto_error=False)
@@ -80,9 +81,17 @@ class AuthMiddleware:
         self.redis_client = None
         if settings.redis_enabled:
             try:
-                self.redis_client = redis.from_url(settings.redis_url, decode_responses=True)
+                self.redis_client = redis.from_url(
+                    settings.redis_url,
+                    decode_responses=True,
+                    socket_connect_timeout=settings.redis_socket_timeout,
+                    socket_timeout=settings.redis_socket_timeout,
+                )
             except Exception:
                 pass  # Redis optional
+        # After a failed Redis call, skip the cache until this monotonic time
+        # so an absent Redis costs one short timeout, not one per request.
+        self._redis_down = (None, 0.0)  # (client, retry-at)
         api_key_cache.register(self)
     
     def _get_api_key_from_header(self, request: Request) -> Optional[str]:
@@ -124,17 +133,31 @@ class AuthMiddleware:
             },
         )
     
+    REDIS_RETRY_SECONDS = 30.0
+
+    def _redis_available(self) -> bool:
+        client, retry_at = self._redis_down
+        return bool(self.redis_client) and (
+            client is not self.redis_client or time.monotonic() >= retry_at
+        )
+
+    def _redis_failed(self) -> None:
+        self._redis_down = (self.redis_client, time.monotonic() + self.REDIS_RETRY_SECONDS)
+
     def _cache_get(self, key_hash: str) -> Optional[dict]:
-        if not self.redis_client:
+        if not self._redis_available():
             return None
         try:
             cached = self.redis_client.get(api_key_cache.cache_key_for_hash(key_hash))
             return json.loads(cached) if cached else None
+        except redis.RedisError:
+            self._redis_failed()
+            return None
         except Exception:
             return None
 
     def _cache_put(self, key_hash: str, db_key) -> None:
-        if not self.redis_client:
+        if not self._redis_available():
             return
         try:
             ttl = api_key_cache.CACHE_TTL_SECONDS
@@ -160,6 +183,8 @@ class AuthMiddleware:
             self.redis_client.setex(
                 api_key_cache.cache_key_for_hash(key_hash), ttl, json.dumps(key_data)
             )
+        except redis.RedisError:
+            self._redis_failed()
         except Exception:
             pass
 

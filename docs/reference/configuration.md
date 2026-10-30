@@ -125,6 +125,7 @@ settings too, so `.env` applies to them; the process environment wins.)
 | `RATE_LIMIT_REDIS_URL` | unset | **secret.** Redis URL for rate-limit counters. Unset: counters live in each process's memory. `env.example` sets `redis://localhost:6379/1`. If Redis is unreachable, the gateway falls back to memory. |
 | `REDIS_URL` | `redis://localhost:6379/0` | **secret.** Redis URL for the API-key cache (entries keyed by the key's hash, at most five minutes, dropped when a key is deleted or disabled). |
 | `REDIS_ENABLED` | `true` | Use `REDIS_URL` for the API-key cache. If Redis is unreachable, the cache is skipped. |
+| `REDIS_SOCKET_TIMEOUT` | `1.0` | Seconds a Redis call may block. After a failed call the cache is skipped for 30 seconds, so a missing Redis does not slow requests. |
 
 ## Database
 
