@@ -49,7 +49,7 @@ source .venv/bin/activate
 python3 samples/backends/http/http_server.py
 ```
 
-In a third terminal, start the MCP backend:
+In a third terminal, start the MCP backend (on Windows, use `python` and `.venv/Scripts/activate`, as in the [quick start](../../README.md#quick-start)):
 
 ```bash
 cd agentanywhere-universal-gateway

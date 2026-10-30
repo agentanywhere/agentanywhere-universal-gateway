@@ -26,9 +26,9 @@ written from `docker-compose.yml`, the Dockerfiles, `env.example` and
 
 | Service | Profile | Port on the host | Notes |
 |---|---|---|---|
-| `gateway` (container `mcp_a2a_gateway`) | default | `${PORT:-8000}` on all interfaces | Built from `Dockerfile`: Python 3.11, one uvicorn process, user `gateway` (uid 1000). Reads `.env`. SQLite at `/app/data/gateway.db` on the `gateway_data` volume. |
+| `gateway` (container `mcp_a2a_gateway`) | default | `${BIND_ADDRESS:-127.0.0.1}:${PORT:-8000}` (this machine only unless `BIND_ADDRESS=0.0.0.0`) | Built from `Dockerfile`: Python 3.11, one uvicorn process, user `gateway` (uid 1000). Reads `.env`. SQLite at `/app/data/gateway.db` on the `gateway_data` volume. |
 | `redis` | default | `127.0.0.1:6379` | No password. Rate-limit counters (database 1) and the API-key cache (database 0). |
-| `admin-ui` | default | 3001 on all interfaces | Console, served by nginx, which proxies `/admin` and `/api` to `gateway:8000`. |
+| `admin-ui` | default | `${BIND_ADDRESS:-127.0.0.1}:3001` (this machine only unless `BIND_ADDRESS=0.0.0.0`) | Console, served by nginx, which proxies `/admin` and `/api` to `gateway:8000`. |
 | `postgres` | `production` | `127.0.0.1:${POSTGRES_PORT:-5432}` | PostgreSQL 15. Refuses to start while `POSTGRES_PASSWORD` is empty or starts with `change-me`. |
 | `nginx` | `production` | 80 and 443 | TLS proxy; needs certificates in `nginx/ssl/`. |
 | `prometheus` | `monitoring` | 9090 | Scrapes `gateway:8000/metrics`. |
@@ -71,6 +71,9 @@ The gateway's `environment:` block, which overrides `.env`, sets:
    python3 scripts/generate_secret_key.py --update-env
    echo "ADMIN_TOKEN=$(python3 scripts/generate_secret_key.py 2>/dev/null)" >> .env
    ```
+
+   On Windows, use `python` in place of `python3` (the `python3` command is the
+   Microsoft Store shortcut and fails). See the Windows note in the [quick start](../../README.md#quick-start).
 
 2. Set `CORS_ORIGINS` to your front ends' origins if browsers on other origins
    call the gateway (the default allows the console on port 3001), and
@@ -218,6 +221,7 @@ there is more than one replica
 | `postgres` or `grafana` exits at once | Its password is empty or a placeholder | Set `POSTGRES_PASSWORD` or `GRAFANA_ADMIN_PASSWORD`. |
 | `port is already allocated` | Something on the host uses 8000, 3001, 6379 (or 80, 443, 5432, 3000, 9090, 8001 to 8003, 8080, 1883, 9001, 50051 with profiles) | Stop it, or change the left side of the port mapping. `PORT` in `.env` changes the gateway's host port. |
 | The console's sign-in fails | Wrong password, or the gateway is not healthy | The password is `ADMIN_TOKEN` (or `SECRET_KEY` if `ADMIN_TOKEN` is empty). Check `docker compose logs gateway`. |
+| `ports are not available: exposing port TCP 127.0.0.1:6379 ... Only one usage of each socket address` (Windows wording) | A Redis or Memurai already runs on the host and holds 6379 | Find it: `netstat -ano \| grep ":6379 "` in Git Bash (the last column is the process id), or `Get-NetTCPConnection -LocalPort 6379` in PowerShell. Stop that service (on Windows this needs an administrator prompt), or change the left side of the `redis` port mapping in `docker-compose.yml` to, for example, `127.0.0.1:6380:6379`. `PORT` in `.env` only changes the gateway's host port, not Redis's. The gateway reaches Redis inside the Compose network, so it is unaffected by the host port. |
 | `/ready` answers 503 | The database is not reachable | Check `DATABASE_URL` and `docker compose ps postgres`. |
 | 503 `MQTT broker not connected` | The broker started after the gateway | `docker compose restart gateway`. |
 | `nginx` shows unhealthy | Its healthcheck requests `http://localhost/health`, which redirects | See [known limitations](../known-limitations.md#the-nginx-healthcheck-probably-reports-unhealthy). |

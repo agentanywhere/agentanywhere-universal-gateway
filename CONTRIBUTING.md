@@ -42,6 +42,9 @@ You need Python 3.10, 3.11 or 3.12. Docker is only needed for the Compose
 stack, Node.js 20 only for the admin console, Redis and PostgreSQL only if you
 work on those paths.
 
+On Windows, see the note in the [README quick start](README.md#quick-start): use
+`python`, `py -3.12 -m venv .venv` and `.venv/Scripts/activate`.
+
 ```bash
 git clone https://github.com/agentanywhere/agentanywhere-universal-gateway.git
 cd agentanywhere-universal-gateway

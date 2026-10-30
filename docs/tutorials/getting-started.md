@@ -41,6 +41,10 @@ in the directory you start it from.
 
 ## 1. Install the gateway
 
+> **Windows:** use `python` instead of `python3`, create the environment with
+> `py -3.12 -m venv .venv`, and activate it with `source .venv/Scripts/activate`
+> (Git Bash). Details in the [quick start](../../README.md#quick-start).
+
 ```bash
 git clone https://github.com/agentanywhere/agentanywhere-universal-gateway.git
 cd agentanywhere-universal-gateway
