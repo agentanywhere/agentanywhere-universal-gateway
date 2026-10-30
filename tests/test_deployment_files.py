@@ -200,3 +200,12 @@ def test_admin_console_is_an_es_module_so_its_postcss_config_loads():
     root = pathlib.Path(__file__).resolve().parent.parent / "admin-ui"
     assert json.loads((root / "package.json").read_text(encoding="utf-8")).get("type") == "module"
     assert "export default" in (root / "postcss.config.js").read_text(encoding="utf-8")
+
+
+# --- sample backend health checks --------------------------------------------
+
+@pytest.mark.parametrize("service", ["mcp-backend", "a2a-backend", "http-backend", "websocket-backend"])
+def test_sample_backend_healthchecks_use_tools_in_the_image(compose, service):
+    # The sample images are python:slim, which has neither wget nor curl.
+    test = compose["services"][service]["healthcheck"]["test"]
+    assert test[:3] == ["CMD", "python", "-c"], test
