@@ -87,3 +87,7 @@ nginx/ssl/
 
 # Linters
 .ruff_cache/
+
+# Output of python -m perf.suite
+perf-report.md
+perf.json

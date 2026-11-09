@@ -32,6 +32,16 @@ from app.main import app
 settings = get_settings()
 
 
+def pytest_collection_modifyitems(config, items):
+    """Performance tests start real processes and take a while: run them only on request."""
+    if "performance" in (config.getoption("-m") or ""):
+        return
+    skip = pytest.mark.skip(reason="performance test: run with `pytest -m performance`")
+    for item in items:
+        if "performance" in item.keywords:
+            item.add_marker(skip)
+
+
 @pytest_asyncio.fixture(scope="function")
 async def db_session():
     """Create a test database session."""

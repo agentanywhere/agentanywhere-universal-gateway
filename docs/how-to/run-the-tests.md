@@ -40,6 +40,9 @@ failures. `pytest --collect-only -q` prints the current number of tests.
 
 ## What is skipped
 
+- `tests/perf/` starts a real stack and runs only with `pytest -m performance`; see
+  [Test performance](performance-testing.md).
+
 - A test in `tests/test_log_exporters.py` is skipped when `boto3` is not
   installed (it is not in `requirements.txt`).
 - `tests/test_container_integration.py` runs only when a gateway answers at
