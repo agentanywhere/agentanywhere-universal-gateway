@@ -64,6 +64,48 @@ write, `--header 'Name: value'` for extra headers, and `--expect-status 429` or
 ([API keys](manage-api-keys.md)); otherwise you measure the rate limiter, and
 most of the requests are 429. Never point this at a production gateway.
 
+## Benchmark on separate machines
+
+One machine running the load generator, the gateway and the backend measures all three at once. For
+figures you can compare, use four hosts on one private network (gateway, backend, load generator, and
+PostgreSQL if you want to compare databases), and send load at a constant rate with
+[vegeta](https://github.com/tsenart/vegeta). The scripts are in `perf/fleet/`.
+
+1. On each host: Python 3.12, `git`, and this repository in `~/gw` (the gateway and backend hosts also need
+   `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`). On the load generator install
+   `vegeta`; on the gateway host install `sysstat` and `py-spy` if you want CPU records and profiles.
+2. On the gateway host create `~/gw/run/secrets.env` with `ADMIN_TOKEN=` and `SECRET_KEY=` (long random values,
+   `chmod 600`), and, if you test PostgreSQL, `~/gw/run/pg.url` holding a `postgresql+asyncpg://` URL.
+3. Start the benchmark backend on its host: `WORKERS=3 bash perf/fleet/backend_up.sh`. It answers every request
+   with the same 11 bytes, so what you measure through the gateway above the direct call is the gateway's.
+4. Describe the hosts in a `fleet.json` (see the docstring of `perf/fleet/ladder.py`) and run the ladder from your
+   own machine:
+
+   ```bash
+   FLEET=fleet.json python -m perf.fleet.ladder --label run1 \
+     --configs nodb,sqlite,sqlite-wal,postgres,postgres-batched --workers 4,8 \
+     --rates 100,200,400,600,800 --duration 45 --warmup 10 \
+     --gateway-env "API_KEY_LOCAL_CACHE_TTL_SECONDS=5 AI_ANALYTICS_ENABLED=false" --out results.jsonl
+   python -m perf.fleet.report results.jsonl --label run1
+   ```
+
+   It restarts the gateway for every configuration (and refuses to continue if fewer workers started than you
+   asked for), runs the same constant-rate attack straight at the backend as a baseline, records gateway-host
+   CPU and memory with `mpstat` and `pidstat`, and writes one JSON line per run. `report` turns the file into one
+   table per worker count.
+
+| Configuration | What it is |
+|---|---|
+| `nodb` | request-log writes off (`REQUEST_LOG_MODE=off`); the ceiling with no persistence on the request path |
+| `sqlite` | SQLite with its defaults, one write per request |
+| `sqlite-wal` | SQLite with `SQLITE_JOURNAL_MODE=WAL`, `SQLITE_SYNCHRONOUS=NORMAL`, `SQLITE_BUSY_TIMEOUT_MS=5000` |
+| `postgres` | PostgreSQL, one write per request |
+| any of these plus `-batched` | the same, with `REQUEST_LOG_MODE=batched` (rows written in batches by one task) |
+
+Run each rate for at least 45 seconds and discard the first 10, repeat a cell that looks odd, and keep the
+backend baseline: if the backend itself slows down at a rate, the gateway figure at that rate is not the
+gateway's. Near the point where a configuration stops coping, results vary from run to run.
+
 ## Read the results fairly
 
 - The load generator, the gateway and the backend share one machine in the
