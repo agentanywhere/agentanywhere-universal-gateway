@@ -497,13 +497,39 @@ class SLO:
     rolling_window_seconds: int = 3600  # 1h sliding window for live burn rate
     budget_window_seconds: int = 30 * 24 * 3600  # 30d budget window
     samples: Deque[SLOSample] = field(default_factory=lambda: deque(maxlen=100_000))
+    # One-second buckets [second, total, good] covering the rolling window, with running
+    # sums, so the live availability and burn rate cost O(1) per request instead of a
+    # scan of every stored sample.
+    _buckets: Deque[List[float]] = field(default_factory=deque, repr=False)
+    _win_total: int = field(default=0, repr=False)
+    _win_good: int = field(default=0, repr=False)
 
     def record(self, success: bool, latency_ms: float) -> None:
         # Combine HTTP success with latency-target success when configured.
         if self.latency_threshold_ms is not None and latency_ms > self.latency_threshold_ms:
             success = False
-        sample = SLOSample(timestamp=time.time(), success=success, latency_ms=latency_ms)
+        now = time.time()
+        sample = SLOSample(timestamp=now, success=success, latency_ms=latency_ms)
         self.samples.append(sample)
+        second = int(now)
+        if self._buckets and self._buckets[-1][0] == second:
+            bucket = self._buckets[-1]
+        else:
+            bucket = [second, 0, 0]
+            self._buckets.append(bucket)
+        bucket[1] += 1
+        self._win_total += 1
+        if success:
+            bucket[2] += 1
+            self._win_good += 1
+        self._expire(now)
+
+    def _expire(self, now: float) -> None:
+        cutoff = int(now - self.rolling_window_seconds)
+        while self._buckets and self._buckets[0][0] < cutoff:
+            _, total, good = self._buckets.popleft()
+            self._win_total -= total
+            self._win_good -= good
 
     def _recent(self, window_seconds: int) -> List[SLOSample]:
         cutoff = time.time() - window_seconds
@@ -513,6 +539,9 @@ class SLO:
 
     def availability(self, window_seconds: Optional[int] = None) -> Optional[float]:
         window = window_seconds or self.rolling_window_seconds
+        if window == self.rolling_window_seconds:
+            self._expire(time.time())
+            return (self._win_good / self._win_total) if self._win_total else None
         recent = self._recent(window)
         if not recent:
             return None

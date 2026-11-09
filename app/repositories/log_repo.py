@@ -38,6 +38,30 @@ class LogRepository:
         return db_log
     
     @staticmethod
+    async def create_many(db: AsyncSession, items) -> int:
+        """Insert many ``(RequestLog, api_key_id)`` pairs in one transaction, without the
+        refresh that ``create`` does (nothing reads the rows back)."""
+        rows = [
+            RequestLogModel(
+                request_id=log.request_id,
+                method=log.method,
+                path=log.path,
+                client_ip=log.client_ip,
+                api_key_id=key_id,
+                status_code=log.status_code,
+                response_time_ms=int(log.response_time_ms),
+                user_agent=log.user_agent,
+                error=log.error,
+                protocol=getattr(log, "protocol", None),
+                timestamp=log.timestamp if hasattr(log, "timestamp") else utcnow(),
+            )
+            for log, key_id in items
+        ]
+        db.add_all(rows)
+        await db.commit()
+        return len(rows)
+
+    @staticmethod
     async def get_by_request_id(db: AsyncSession, request_id: str) -> Optional[RequestLogModel]:
         """Get log by request ID."""
         result = await db.execute(

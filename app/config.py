@@ -595,6 +595,22 @@ class Settings(BaseSettings):
     # Access logs with a status at or above this are never sampled out.
     log_sample_always_status_ge: int = 400
     startup_banner: bool = True
+    # Where request-log rows go: inline (one write per request, the default), batched
+    # (bounded queue, one transaction per batch) or off. See app/request_log_writer.py.
+    # Seconds an API key stays cached in each worker's memory when Redis is not used (0 = off).
+    # While cached, a request needs no database read or write for authentication; a key that is
+    # revoked through another worker can still be accepted here until the entry expires.
+    api_key_local_cache_ttl_seconds: float = 0.0
+    # Per-request anomaly detection and usage analytics (scikit-learn, run in the request path).
+    ai_analytics_enabled: bool = True
+    request_log_mode: str = "inline"
+    request_log_batch_size: int = 200
+    request_log_flush_interval: float = 0.25
+    request_log_queue_size: int = 20000
+    # SQLite only, applied to every new connection. Empty keeps SQLite's own default.
+    sqlite_journal_mode: str = ""      # for example WAL
+    sqlite_synchronous: str = ""       # for example NORMAL
+    sqlite_busy_timeout_ms: int = 0    # 0 keeps the driver's default (5 seconds)
 
     # Metrics
     metrics_enabled: bool = True

@@ -56,6 +56,8 @@ import structlog
 
 settings = get_settings()
 logger = setup_logging()
+from app.request_log_writer import writer_from_settings  # noqa: E402
+request_log_writer = writer_from_settings(settings)
 auth_middleware = AuthMiddleware()
 rate_limiter = RateLimiter()
 router = Router()
@@ -91,6 +93,8 @@ async def lifespan(app: FastAPI):
     # Initialize database
     await init_db()
     logger.info("database_initialized")
+    await request_log_writer.start()
+    logger.info("request_log_writer_started", mode=request_log_writer.mode)
 
     try:
         from app.database import AsyncSessionLocal
@@ -300,6 +304,11 @@ async def lifespan(app: FastAPI):
         grpc_handler.close()
     if graphql_handler:
         await graphql_handler.close()
+    await request_log_writer.stop()
+    logger.info(
+        "request_log_writer_stopped",
+        written=request_log_writer.written, dropped=request_log_writer.dropped, failed=request_log_writer.failed,
+    )
     await close_db()
 
 
@@ -845,7 +854,7 @@ async def logging_middleware(request: Request, call_next):
 
         # Process through AI service
         try:
-            if auth_rejected:
+            if auth_rejected or not settings.ai_analytics_enabled:
                 raise _SkipAI()
             request_data = {
                 "request_id": request_id,
@@ -1073,8 +1082,6 @@ async def logging_middleware(request: Request, call_next):
                 "/metrics",
             )
             if not any(persist_path.startswith(p) for p in skip_persist_prefixes):
-                from app.database import AsyncSessionLocal
-                from app.repositories.log_repo import LogRepository
                 from app.models import RequestLog as RequestLogPydantic
 
                 api_key_obj_for_log = getattr(request.state, "api_key", None)
@@ -1122,16 +1129,7 @@ async def logging_middleware(request: Request, call_next):
                 except Exception:
                     pass
 
-                async def _persist_request_log(log_entry_pyd, key_id):
-                    try:
-                        async with AsyncSessionLocal() as session:
-                            await LogRepository.create(session, log_entry_pyd, api_key_id=key_id)
-                    except Exception as exc:
-                        logger.debug("request_log_persist_failed", error=str(exc))
-
-                asyncio.create_task(
-                    _persist_request_log(pydantic_log, api_key_id_for_log)
-                )
+                request_log_writer.submit(pydantic_log, api_key_id_for_log)
         except Exception as exc:
             logger.debug("request_log_persist_dispatch_failed", error=str(exc))
 
@@ -1305,9 +1303,13 @@ async def auth_middleware_handler(request: Request, call_next):
                         # Resolve tenant + enforce quota (best-effort)
                         try:
                             from app.tenant import tenant_service
-                            tenant_dict = await tenant_service.get_tenant_for_api_key(
-                                db, api_key.key
-                            )
+                            if getattr(request.state, "tenant_lookup_done", False):
+                                # authenticate() already looked the tenant up for this request.
+                                tenant_dict = getattr(request.state, "tenant", None)
+                            else:
+                                tenant_dict = await tenant_service.get_tenant_for_api_key(
+                                    db, api_key.key
+                                )
                             if tenant_dict and tenant_dict.get("is_active", True):
                                 request.state.tenant_id = tenant_dict["tenant_id"]
                                 request.state.tenant = tenant_dict
