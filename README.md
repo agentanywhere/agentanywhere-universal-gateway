@@ -121,8 +121,17 @@ curl -s -X POST http://127.0.0.1:8000/api/users -H "X-API-Key: $API_KEY" \
 ```
 
 The console is a separate React app; plain `uvicorn` does not serve it. To see
-it, run `cd admin-ui && npm ci && npm run dev` in another terminal (Node 22)
-and open <http://127.0.0.1:3001>.
+it, open another terminal (Node 22) and run this from the repository directory,
+the one that contains `admin-ui/`:
+
+```bash
+cd agentanywhere-universal-gateway/admin-ui
+npm ci
+npm run dev
+```
+
+Then open <http://127.0.0.1:3001> and sign in as `admin` with your `ADMIN_TOKEN`.
+The gateway must be running on port 8000: the dev server proxies to it.
 
 ### What you should see
 
