@@ -87,3 +87,14 @@ def test_unknown_agent_slug_is_html_page_for_browser(client, one_agent):
     assert resp.status_code == 404
     assert resp.headers["content-type"].startswith("text/html")
     assert "Agent not found" in resp.text
+
+
+def test_auth_hint_links_docs_only_when_they_are_served(client):
+    from app.main import app
+
+    body = client.get(_protected_path(), headers={"Accept": "application/json"}).json()
+    link = body["details"]["documentation"]
+    if app.docs_url:
+        assert link == "/docs#authentication"
+    else:
+        assert link.startswith("https://") and link.endswith("manage-api-keys.md")

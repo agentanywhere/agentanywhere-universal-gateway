@@ -26,11 +26,15 @@ export function Dialog({
   hideClose,
 }: DialogProps) {
   const dialogRef = React.useRef<HTMLDivElement | null>(null)
+  // Callers usually pass an inline onClose; keeping it in a ref stops the effect
+  // below from re-running (and re-focusing the close button) on every re-render.
+  const onCloseRef = React.useRef(onClose)
+  onCloseRef.current = onClose
 
   React.useEffect(() => {
     if (!open) return
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose()
+      if (e.key === 'Escape') onCloseRef.current()
     }
     document.addEventListener('keydown', onKey)
     const previouslyFocused = document.activeElement as HTMLElement | null
@@ -49,7 +53,7 @@ export function Dialog({
       document.body.style.overflow = previousOverflow
       previouslyFocused?.focus?.()
     }
-  }, [open, onClose])
+  }, [open])
 
   if (!open) return null
 

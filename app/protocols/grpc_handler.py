@@ -76,9 +76,6 @@ class GRPCHandler:
                 import grpc_reflection.v1alpha.reflection as grpc_reflection
                 from grpc_reflection.v1alpha import reflection_pb2
                 
-                # Get service descriptor
-                stub = reflection_pb2.ServerReflectionStub(channel)
-                
                 # For now, use a simplified approach with known services
                 # In production, you'd load proto files and use generated stubs
                 

@@ -184,7 +184,7 @@ class AnomalyDetector:
             normalized_score = -score / 10.0  # Normalize
             normalized_score = max(-1.0, min(1.0, normalized_score))
             
-            is_anomaly = prediction == -1
+            is_anomaly = bool(prediction == -1)
             
             if is_anomaly:
                 logger.warning(
@@ -194,7 +194,7 @@ class AnomalyDetector:
                     features=features.flatten().tolist()
                 )
             
-            return is_anomaly, normalized_score
+            return is_anomaly, float(normalized_score)
         except Exception as e:
             logger.warning("anomaly_detection_error", error=str(e), error_type=type(e).__name__)
             return False, 0.0

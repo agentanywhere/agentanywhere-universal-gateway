@@ -7,6 +7,7 @@ from fastapi import Request, HTTPException, status, Depends
 from app.exceptions import AuthenticationError
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from app.config import get_settings
+from app.docs_links import docs_link
 from app.secure_compare import constant_time_equals
 from app.models import APIKey
 from app.database import get_db
@@ -280,7 +281,7 @@ class AuthMiddleware:
                 message="Invalid or inactive API key. Please check your API key and try again.",
                 details={
                     "hint": "Ensure your API key is correct and active. You can check your API keys in the admin console.",
-                    "documentation": "/docs#authentication"
+                    "documentation": docs_link("authentication")
                 },
                 request_id=request_id
             )

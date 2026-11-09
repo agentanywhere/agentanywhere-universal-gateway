@@ -147,7 +147,9 @@ def verify_admin_token(token: str) -> dict:
 
     allowed = _allowed_roles()
     found = _token_roles(claims)
-    if allowed and not (found & allowed):
+    # An empty allow-list (e.g. IDA_ADMIN_ROLES='[]') denies everyone; it must
+    # not switch the role check off.
+    if not (found & allowed):
         logger.warning(
             "ida_admin_role_denied email=%s found_roles=%s required=%s",
             claims.get("email") or claims.get("preferred_username"),

@@ -60,9 +60,9 @@ class WebSocketHandler:
                     except WebSocketDisconnect:
                         break
                     except json.JSONDecodeError:
-                        # Handle binary or non-JSON messages
-                        data = await websocket.receive_bytes()
-                        await websocket.send_bytes(data)
+                        # Non-JSON text: the frame is already consumed as text,
+                        # so echo it back as text (receive_bytes would fail).
+                        await websocket.send_text(data)
                         
         except Exception as e:
             logger.error("websocket_error", connection_id=connection_id, error=str(e))
