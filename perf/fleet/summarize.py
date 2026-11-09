@@ -18,7 +18,7 @@ from typing import Dict, List, Optional
 def percentile(sorted_values: List[float], pct: float) -> float:
     if not sorted_values:
         return 0.0
-    rank = max(1, math.ceil(pct / 100.0 * len(sorted_values)))
+    rank = max(1, math.ceil(round(pct / 100.0 * len(sorted_values), 9)))   # round: 99.9% of 1000 is 999, not 999.0000000000001
     return sorted_values[min(rank, len(sorted_values)) - 1]
 
 
