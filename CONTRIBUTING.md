@@ -61,7 +61,7 @@ uvicorn app.main:app --port 8000 --reload
 create a key and send a request.
 
 For the console, in another terminal: `cd admin-ui && npm ci && npm run dev`
-(port 3001, proxying `/admin` and `/api` to `localhost:8000`).
+(port 3001, proxying `/admin` and `/api` to `127.0.0.1:8000`).
 
 ## A tour of the codebase
 

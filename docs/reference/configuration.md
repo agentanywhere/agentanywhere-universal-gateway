@@ -245,6 +245,7 @@ The rate-limit values in this section are **not enforced yet**. They are shown b
 | `LOG_TIMESTAMP_FORMAT` | `iso` | `iso` (UTC, milliseconds) or `epoch` (seconds). |
 | `LOG_SAMPLE_ALWAYS_STATUS_GE` | `400` | Access logs with a status at or above this are never sampled out. |
 | `STARTUP_BANNER` | `true` | Print a configuration summary to stderr when the gateway is ready. It shows URLs and which admin credential applies, never a secret. Each worker process prints its own. |
+| `DOCUMENTATION_URL` | the project's `docs/` folder on GitHub | The documentation link in the start-up banner. Set it to your own docs site. |
 
 ## Tracing
 
