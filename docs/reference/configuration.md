@@ -235,6 +235,16 @@ The rate-limit values in this section are **not enforced yet**. They are shown b
 | `LOG_INCLUDE_CALLER` | `false` | **live.** Add file, line and function to each line. |
 | `LOG_FILE_PATH` | unset | Also write JSON logs to this rotating file. |
 | `LOG_AUDIT_FILE_PATH` | unset | Write audit log lines to this rotating file. |
+| `LOG_LEVEL_OVERRIDES` | unset | Per-logger levels as `logger=LEVEL` pairs, comma-separated, for example `uvicorn.access=WARNING,httpx=WARNING`. Bad entries are skipped and reported in a `logging_config_invalid` line. |
+| `LOG_REDACT_KEYS` | unset | Extra field names to redact, comma-separated. Adds to the built-in `DEFAULT_REDACT_KEYS`. |
+| `LOG_REDACT_PATTERNS` | unset | Extra regular expressions to scrub from values, comma-separated. Adds to the built-in patterns; an invalid regex is skipped and reported. |
+| `LOG_FILE_MAX_BYTES` | `104857600` | Rotate `LOG_FILE_PATH` and `LOG_AUDIT_FILE_PATH` at this size. |
+| `LOG_FILE_BACKUP_COUNT` | `10` | Rotated files to keep. |
+| `LOG_INCLUDE_HOSTNAME` | `true` | Add `host.name` to every line. |
+| `LOG_INCLUDE_PROCESS_INFO` | `true` | Add `process.pid` to every line. |
+| `LOG_TIMESTAMP_FORMAT` | `iso` | `iso` (UTC, milliseconds) or `epoch` (seconds). |
+| `LOG_SAMPLE_ALWAYS_STATUS_GE` | `400` | Access logs with a status at or above this are never sampled out. |
+| `STARTUP_BANNER` | `true` | Print a configuration summary to stderr when the gateway is ready. It shows URLs and which admin credential applies, never a secret. Each worker process prints its own. |
 
 ## Tracing
 

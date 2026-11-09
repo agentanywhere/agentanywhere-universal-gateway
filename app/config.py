@@ -581,6 +581,20 @@ class Settings(BaseSettings):
     log_file_path: Optional[str] = None
     log_audit_file_path: Optional[str] = None
     log_include_caller: bool = False
+    # Extra per-logger levels, e.g. "uvicorn.access=WARNING,httpx=WARNING".
+    log_level_overrides: str = ""
+    # Extra field names to redact (comma-separated) and extra regexes to scrub
+    # from values (comma-separated); both add to the built-in defaults.
+    log_redact_keys: str = ""
+    log_redact_patterns: str = ""
+    log_file_max_bytes: int = 100 * 1024 * 1024
+    log_file_backup_count: int = 10
+    log_include_hostname: bool = True
+    log_include_process_info: bool = True
+    log_timestamp_format: str = "iso"  # iso | epoch
+    # Access logs with a status at or above this are never sampled out.
+    log_sample_always_status_ge: int = 400
+    startup_banner: bool = True
 
     # Metrics
     metrics_enabled: bool = True

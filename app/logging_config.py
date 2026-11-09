@@ -478,6 +478,91 @@ def _level_for(level: str) -> int:
     return getattr(logging, level.upper(), logging.INFO)
 
 
+VALID_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
+VALID_FORMATS = frozenset({"json", "text", "auto"})
+VALID_TIMESTAMP_FORMATS = frozenset({"iso", "epoch"})
+
+
+def parse_level_overrides(raw: Optional[str]) -> Tuple[Dict[str, str], List[str]]:
+    """Parse ``"uvicorn.access=WARNING,httpx=ERROR"`` into ``({logger: LEVEL}, problems)``."""
+    levels: Dict[str, str] = {}
+    problems: List[str] = []
+    for item in (raw or "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        name, sep, level = item.partition("=")
+        name, level = name.strip(), level.strip().upper()
+        if not sep or not name or level not in VALID_LEVELS:
+            problems.append(f"LOG_LEVEL_OVERRIDES entry {item!r} (expected logger=LEVEL)")
+            continue
+        levels[name] = level
+    return levels, problems
+
+
+def _csv(raw: Optional[str]) -> List[str]:
+    return [part.strip() for part in (raw or "").split(",") if part.strip()]
+
+
+def _apply_settings(cfg: "LoggingConfig", settings: Any) -> List[str]:
+    """Copy logging settings onto ``cfg``. Returns human-readable problems, never raises."""
+    problems: List[str] = []
+
+    level = str(settings.log_level or cfg.level).upper()
+    if level not in VALID_LEVELS:
+        problems.append(f"LOG_LEVEL {settings.log_level!r} is not one of {sorted(VALID_LEVELS)}; using INFO")
+        level = "INFO"
+    cfg.level = level
+
+    fmt = str(settings.log_format or cfg.format).lower()
+    if fmt not in VALID_FORMATS:
+        problems.append(f"LOG_FORMAT {settings.log_format!r} is not one of {sorted(VALID_FORMATS)}; using json")
+        fmt = "json"
+    cfg.format = fmt
+
+    cfg.service_name = settings.app_name or cfg.service_name
+    cfg.service_version = settings.app_version or cfg.service_version
+    cfg.environment = settings.environment or cfg.environment
+    cfg.sample_rate = min(1.0, max(0.0, float(getattr(settings, "log_sampling_rate", cfg.sample_rate))))
+    cfg.redaction_enabled = bool(getattr(settings, "log_redaction_enabled", cfg.redaction_enabled))
+    cfg.include_caller = bool(getattr(settings, "log_include_caller", cfg.include_caller))
+    cfg.include_hostname = bool(getattr(settings, "log_include_hostname", cfg.include_hostname))
+    cfg.include_process_info = bool(getattr(settings, "log_include_process_info", cfg.include_process_info))
+    cfg.sample_always_status_ge = int(
+        getattr(settings, "log_sample_always_status_ge", cfg.sample_always_status_ge)
+    )
+    cfg.file_max_bytes = max(1024, int(getattr(settings, "log_file_max_bytes", cfg.file_max_bytes)))
+    cfg.file_backup_count = max(0, int(getattr(settings, "log_file_backup_count", cfg.file_backup_count)))
+
+    ts = str(getattr(settings, "log_timestamp_format", cfg.timestamp_format)).lower()
+    if ts not in VALID_TIMESTAMP_FORMATS:
+        problems.append(f"LOG_TIMESTAMP_FORMAT {ts!r} is not one of {sorted(VALID_TIMESTAMP_FORMATS)}; using iso")
+        ts = "iso"
+    cfg.timestamp_format = ts
+
+    file_path = getattr(settings, "log_file_path", None)
+    if file_path:
+        cfg.file_path = file_path
+    audit_file = getattr(settings, "log_audit_file_path", None)
+    if audit_file:
+        cfg.audit_file_path = audit_file
+
+    overrides, bad = parse_level_overrides(getattr(settings, "log_level_overrides", ""))
+    cfg.logger_levels.update(overrides)
+    problems += bad
+
+    cfg.redact_keys |= {k.lower() for k in _csv(getattr(settings, "log_redact_keys", ""))}
+    for pattern in _csv(getattr(settings, "log_redact_patterns", "")):
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            problems.append(f"LOG_REDACT_PATTERNS entry {pattern!r} is not a valid regex ({exc}); ignored")
+            continue
+        if pattern not in cfg.redact_patterns:
+            cfg.redact_patterns = [*cfg.redact_patterns, pattern]
+    return problems
+
+
 _initialised = False
 
 
@@ -502,29 +587,14 @@ def setup_logging(
     if refresh_from_settings is None:
         refresh_from_settings = not _initialised
 
+    problems: List[str] = []
     if refresh_from_settings:
         try:
             from app.config import get_settings  # local to avoid import cycles
 
-            settings = get_settings()
-            cfg.level = (settings.log_level or cfg.level).upper()
-            cfg.format = settings.log_format or cfg.format
-            cfg.service_name = settings.app_name or cfg.service_name
-            cfg.service_version = settings.app_version or cfg.service_version
-            cfg.environment = settings.environment or cfg.environment
-            cfg.sample_rate = float(getattr(settings, "log_sampling_rate", cfg.sample_rate))
-            cfg.redaction_enabled = bool(
-                getattr(settings, "log_redaction_enabled", cfg.redaction_enabled)
-            )
-            cfg.include_caller = bool(getattr(settings, "log_include_caller", cfg.include_caller))
-            file_path = getattr(settings, "log_file_path", None)
-            if file_path:
-                cfg.file_path = file_path
-            audit_file = getattr(settings, "log_audit_file_path", None)
-            if audit_file:
-                cfg.audit_file_path = audit_file
-        except Exception:
-            pass
+            problems = _apply_settings(cfg, get_settings())
+        except Exception as exc:
+            problems = [f"could not read logging settings ({type(exc).__name__}: {exc}); using defaults"]
 
     if config_overrides:
         for key, value in config_overrides.items():
@@ -564,7 +634,10 @@ def setup_logging(
     )
 
     _initialised = True
-    return structlog.get_logger("gateway")
+    log = structlog.get_logger("gateway")
+    for problem in problems:
+        log.warning("logging_config_invalid", detail=problem)
+    return log
 
 
 def get_logger(name: Optional[str] = None) -> structlog.stdlib.BoundLogger:

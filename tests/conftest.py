@@ -6,6 +6,7 @@
 import os
 
 os.environ.setdefault("SECRET_KEY", "test-only-secret-key-not-a-placeholder-32b")
+os.environ.setdefault("STARTUP_BANNER", "false")
 
 import pytest
 import pytest_asyncio
