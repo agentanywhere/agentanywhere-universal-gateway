@@ -15,6 +15,7 @@ patterns (e.g. ``/api/users/*``) and can be filtered by HTTP method.
 from __future__ import annotations
 
 import fnmatch
+import functools
 import json
 import re
 import uuid
@@ -38,8 +39,12 @@ jinja_env = Environment(
 # Helpers
 # ---------------------------------------------------------------------------
 
+@functools.lru_cache(maxsize=2048)
 def _glob_to_regex(pattern: str) -> re.Pattern:
-    """Convert a glob path pattern (``*`` / ``**``) to a compiled regex."""
+    """Convert a glob path pattern (``*`` / ``**``) to a compiled regex.
+
+    Cached per pattern: compiling on every request for every rule is wasted work.
+    """
     if pattern.startswith("^") or pattern.endswith("$"):
         return re.compile(pattern)
     return re.compile(fnmatch.translate(pattern))

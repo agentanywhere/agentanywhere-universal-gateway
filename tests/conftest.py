@@ -42,6 +42,16 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(skip)
 
 
+@pytest.fixture(autouse=True)
+def _reset_metric_path_labels():
+    """The gateway caps how many distinct `path` metric labels it will create; a whole test run
+    creates far more paths than a real gateway would, so start each test with an empty set."""
+    from app import observability
+
+    observability._metric_path_labels.clear()
+    yield
+
+
 @pytest_asyncio.fixture(scope="function")
 async def db_session():
     """Create a test database session."""

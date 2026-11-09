@@ -29,7 +29,9 @@ from __future__ import annotations
 import asyncio
 import math
 import os
+import re
 import statistics
+import threading
 import time
 import uuid
 from collections import defaultdict, deque
@@ -232,11 +234,17 @@ class Span:
         }
 
 
+# A trace id can be chosen by the client (``traceparent``), so the spans kept per
+# trace are capped: further spans are counted in ``dropped_spans`` and not stored.
+MAX_SPANS_PER_TRACE = 200
+
+
 @dataclass
 class Trace:
     trace_id: str
     spans: List[Span] = field(default_factory=list)
     started_at: float = field(default_factory=time.time)
+    dropped_spans: int = 0
 
     @property
     def root(self) -> Optional[Span]:
@@ -252,13 +260,16 @@ class Trace:
         return round((end - self.started_at) * 1000, 3)
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        out = {
             "trace_id": self.trace_id,
             "started_at": self.started_at,
             "duration_ms": self.duration_ms,
             "span_count": len(self.spans),
             "spans": [s.to_dict() for s in self.spans],
         }
+        if self.dropped_spans:
+            out["dropped_spans"] = self.dropped_spans
+        return out
 
 
 _current_span_var: ContextVar[Optional[Span]] = ContextVar("current_span", default=None)
@@ -347,7 +358,11 @@ class Tracer:
                 evict_id = next(iter(self._traces))
                 if evict_id != trace_id:
                     self._traces.pop(evict_id, None)
-        trace.spans.append(span)
+        if len(trace.spans) >= MAX_SPANS_PER_TRACE:
+            # Still hand the span back to the caller (it just is not retained).
+            trace.dropped_spans += 1
+        else:
+            trace.spans.append(span)
         return span
 
     def end_span(self, span: Span) -> None:
@@ -895,6 +910,39 @@ def normalize_route(path: str) -> str:
     if len(parts) > 3:
         kept.append("...")
     return "/".join(kept) or "/"
+
+
+_ID_SEGMENT_RE = re.compile(
+    r"^(?:\d+|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+    r"|[0-9a-fA-F]{8,}|[A-Za-z0-9_-]*\d[A-Za-z0-9_-]*\d[A-Za-z0-9_-]*)$"
+)
+METRIC_PATH_MAX_SEGMENTS = 4
+METRIC_PATH_MAX_LABELS = 200
+_metric_path_labels: set = set()
+_metric_path_lock = threading.Lock()
+
+
+def metric_path_label(path: str) -> str:
+    """Bounded Prometheus ``path`` label for a request path.
+
+    Numeric / uuid / hex / digit-bearing segments collapse to ``:id``, at most
+    ``METRIC_PATH_MAX_SEGMENTS`` segments are kept, and once
+    ``METRIC_PATH_MAX_LABELS`` distinct values exist new ones become ``other``.
+    """
+    segs = [s for s in (path or "/").split("/") if s]
+    if not segs:
+        return "/"
+    kept = [":id" if _ID_SEGMENT_RE.match(s) else s[:32] for s in segs[:METRIC_PATH_MAX_SEGMENTS]]
+    label = "/" + "/".join(kept)
+    if len(segs) > METRIC_PATH_MAX_SEGMENTS:
+        label += "/..."
+    with _metric_path_lock:
+        if label in _metric_path_labels:
+            return label
+        if len(_metric_path_labels) >= METRIC_PATH_MAX_LABELS:
+            return "other"
+        _metric_path_labels.add(label)
+    return label
 
 
 def record_request(

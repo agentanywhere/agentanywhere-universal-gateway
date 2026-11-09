@@ -74,11 +74,12 @@ async def test_batched_survives_a_failing_database(monkeypatch):
             raise RuntimeError("db down")
 
     monkeypatch.setattr(database, "AsyncSessionLocal", Boom())
+    monkeypatch.setattr("app.request_log_writer._RETRY_DELAYS", (0.01, 0.01))
     w = RequestLogWriter(mode="batched", batch_size=2, flush_interval=0.02, queue_size=10)
     await w.start()
     for i in range(4):
         w.submit(_entry(i), None)
-    await asyncio.sleep(0.2)
+    await asyncio.sleep(0.3)
     await w.stop()
     assert w.failed == 4 and w.written == 0
 
@@ -253,3 +254,44 @@ async def test_tenant_lookup_is_cached_only_when_the_local_ttl_is_on(monkeypatch
             await mw.authenticate(req, db=object())
             assert req.state.tenant_id == "t1"
         assert calls["n"] == expected_calls
+
+
+async def test_a_failed_batch_is_retried_and_then_written(session_factory, monkeypatch):
+    monkeypatch.setattr("app.request_log_writer._RETRY_DELAYS", (0.01, 0.01))
+    calls = {"n": 0}
+    real = database.AsyncSessionLocal
+
+    def flaky():
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise RuntimeError("database is locked")
+        return real()
+
+    monkeypatch.setattr(database, "AsyncSessionLocal", flaky)
+    w = RequestLogWriter(mode="batched", batch_size=10, flush_interval=0.02, queue_size=100)
+    await w.start()
+    for i in range(3):
+        w.submit(_entry(i), None)
+    await w.stop()
+    assert calls["n"] == 3 and w.written == 3 and w.failed == 0
+    assert await _count(session_factory) == 3
+
+
+async def test_stop_writes_the_batch_it_was_building_instead_of_dropping_it(session_factory):
+    w = RequestLogWriter(mode="batched", batch_size=100, flush_interval=30.0, queue_size=100)
+    await w.start()
+    for i in range(7):
+        w.submit(_entry(i), None)
+    await asyncio.sleep(0.05)            # the writer has taken them off the queue and is waiting to fill the batch
+    await w.stop()
+    assert w.written == 7 and w.dropped == 0 and await _count(session_factory) == 7
+
+
+async def test_stop_on_a_full_queue_falls_back_to_cancel_and_drain(session_factory):
+    w = RequestLogWriter(mode="batched", batch_size=5, flush_interval=0.01, queue_size=3)
+    await w.start()
+    w._queue.put_nowait((_entry(0), None))
+    w._queue.put_nowait((_entry(1), None))
+    w._queue.put_nowait((_entry(2), None))
+    await w.stop()
+    assert await _count(session_factory) == 3

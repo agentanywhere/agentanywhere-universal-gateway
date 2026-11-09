@@ -16,6 +16,9 @@ import asyncio
 
 settings = get_settings()
 
+# How often (seconds) expired in-memory counters are swept.
+MEMORY_SWEEP_INTERVAL_SECONDS = 30.0
+
 
 class RateLimiter:
     """Rate limiting using slowapi and Redis."""
@@ -184,6 +187,13 @@ class RateLimiter:
         """In-process fixed-window counter. Thread-safe."""
         now = time.time()
         with self._memory_lock:
+            # Drop expired windows now and then so one-off clients do not
+            # accumulate forever. An expired entry is treated as absent below,
+            # so pruning never changes an allow/deny decision.
+            if now >= getattr(self, "_next_memory_sweep", 0.0):
+                self._next_memory_sweep = now + MEMORY_SWEEP_INTERVAL_SECONDS
+                for k in [k for k, (exp, _c) in self._memory_counters.items() if now >= exp]:
+                    del self._memory_counters[k]
             expiry, count = self._memory_counters.get(key, (0.0, 0))
             if now >= expiry:
                 # Window elapsed (or first hit) — start a fresh window.

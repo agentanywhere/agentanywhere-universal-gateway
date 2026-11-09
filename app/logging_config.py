@@ -281,11 +281,34 @@ def _get_compiled_patterns() -> List[re.Pattern]:
     return compiled
 
 
+# A UUID (hyphenated, or 32 hex chars) standing as a whole token. Request ids are
+# uuid4s; the loose card pattern would otherwise eat their long digit-only runs
+# and break log correlation.
+_UUID_TOKEN_RE = re.compile(
+    r"(?<![0-9A-Za-z-])(?:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+    r"|[0-9a-fA-F]{32})(?![0-9A-Za-z-])"
+)
+
+
+def _redact_string(value: str) -> str:
+    patterns = _get_compiled_patterns()
+    kept: List[str] = []
+
+    def _stash(m: "re.Match[str]") -> str:
+        kept.append(m.group(0))
+        return f"\x00{len(kept) - 1}\x00"
+
+    protected = _UUID_TOKEN_RE.sub(_stash, value) if len(value) >= 32 else value
+    for rx in patterns:
+        protected = rx.sub(REDACTED, protected)
+    if kept:
+        protected = re.sub(r"\x00(\d+)\x00", lambda m: kept[int(m.group(1))] if int(m.group(1)) < len(kept) else m.group(0), protected)
+    return protected
+
+
 def _redact_value(value: Any) -> Any:
     if isinstance(value, str):
-        for rx in _get_compiled_patterns():
-            value = rx.sub(REDACTED, value)
-        return value
+        return _redact_string(value)
     if isinstance(value, Mapping):
         return _redact_mapping(value)
     if isinstance(value, list):

@@ -56,8 +56,17 @@ async def test_tenant_over_quota_returns_429(mock_route, client, db_session):
         "quota": {"requests_per_minute": 10, "requests_per_hour": 100},
     }
 
-    with patch("app.tenant.tenant_service") as ts:
-        ts.get_tenant_for_api_key = AsyncMock(return_value=tenant)
+    # authenticate() resolves the tenant once (through the repository) and the quota gate reuses
+    # it, so the tenant is supplied at the repository.
+    from types import SimpleNamespace
+
+    tenant_row = SimpleNamespace(**tenant)
+    with patch("app.repositories.tenant_repo.TenantRepository.get_tenant_for_api_key",
+               AsyncMock(return_value=tenant_row)), \
+         patch("app.repositories.tenant_repo.TenantRepository.to_dict", staticmethod(lambda t: tenant)), \
+         patch("app.tenant.tenant_service") as ts:
+        ts.prime_quota = AsyncMock()
+        ts.clear_quota_prime = lambda db: None
         # Minute window is exhausted; hour window is fine.
         ts.check_quota = AsyncMock(side_effect=[False, True])
 

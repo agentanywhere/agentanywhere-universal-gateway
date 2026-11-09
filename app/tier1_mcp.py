@@ -1,9 +1,10 @@
 """MCP-aware request validation: JSON-RPC envelope, tool schemas, prompt-injection heuristics."""
 from __future__ import annotations
 
+import functools
 import json
 import re
-from typing import Any, Dict, Iterator, List, Mapping, Optional, Set
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Set, Tuple, Union
 
 from app.config import get_settings
 from app.exceptions import ValidationError
@@ -24,14 +25,20 @@ _DEFAULT_INJECTION_PATTERNS: List[str] = [
 ]
 
 
-def _compile_patterns(raw: List[str]) -> List[re.Pattern]:
+@functools.lru_cache(maxsize=32)
+def _compile_patterns_cached(raw: Tuple[str, ...]) -> Tuple[re.Pattern, ...]:
     out: List[re.Pattern] = []
     for p in raw:
         try:
             out.append(re.compile(p, re.IGNORECASE | re.MULTILINE))
         except re.error:
             continue
-    return out
+    return tuple(out)
+
+
+def _compile_patterns(raw: List[str]) -> List[re.Pattern]:
+    """Compile (once per distinct pattern list) the injection regexes."""
+    return list(_compile_patterns_cached(tuple(raw)))
 
 
 def _iter_json_strings(obj: Any, depth: int = 0) -> Iterator[str]:
@@ -189,7 +196,10 @@ def _validate_single_jsonrpc(
         _check_prompt_injection(params, request_id=request_id)
         rm_l = str(rpc_method or "").lower().replace(".", "/")
         if rm_l == "tools/call" or rm_l.endswith("/tools/call"):
-            _validate_tools_call(params, tool_input_schemas, request_id=request_id)
+            # ``tool_input_schemas`` may be a zero-arg callable so callers
+            # only pay for the schema index on actual tools/call requests.
+            schemas = tool_input_schemas() if callable(tool_input_schemas) else tool_input_schemas
+            _validate_tools_call(params, schemas, request_id=request_id)
 
 
 def _check_prompt_injection(params: Mapping[str, Any], *, request_id: Optional[str]) -> None:

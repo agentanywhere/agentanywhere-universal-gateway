@@ -377,7 +377,10 @@ class AuthMiddleware:
             return
 
         client_ip = _client_ip(request) or ""
-        api_key_id = getattr(principal, "key", None)
+        # api_key-scoped IP rules store the key's database id, never the
+        # plaintext key. Principals without an id (OAuth2 / break-glass)
+        # are simply not subject to key-scoped rules.
+        api_key_id = getattr(principal, "id", None)
         tenant_id = getattr(request.state, "tenant_id", None)
 
         allowed, matched = ip_rule_engine.evaluate(

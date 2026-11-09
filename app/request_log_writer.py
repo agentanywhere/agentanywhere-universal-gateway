@@ -21,6 +21,10 @@ logger = structlog.get_logger("gateway")
 
 MODES = ("inline", "batched", "off")
 
+_STOP = object()                 # queued to ask the writer to finish what is ahead of it
+_RETRY_DELAYS = (0.2, 0.5)       # seconds before the second and third attempt to write a batch
+_STOP_TIMEOUT = 10.0             # most we wait for the queue to drain at shutdown
+
 
 class RequestLogWriter:
     def __init__(
@@ -75,33 +79,52 @@ class RequestLogWriter:
             self._task = asyncio.create_task(self._run())
 
     async def stop(self) -> None:
-        """Write what is still queued, then stop."""
+        """Write everything still queued, then stop.
+
+        A stop marker goes in behind the queued rows and the writer finishes the batch it is
+        building before it sees it, so nothing it already took off the queue is lost. If the
+        queue is full or the database is too slow, the writer is cancelled after a timeout and
+        what is left is counted as dropped.
+        """
         if self._task is None:
             return
         task, self._task = self._task, None
-        task.cancel()
         try:
-            await task
-        except asyncio.CancelledError:
-            pass
-        await self._drain()
+            self._queue.put_nowait(_STOP)
+            await asyncio.wait_for(asyncio.shield(task), timeout=_STOP_TIMEOUT)
+        except (asyncio.QueueFull, asyncio.TimeoutError):
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            await self._drain()
         self._queue = None
 
     async def _run(self) -> None:
         assert self._queue is not None
         while True:
             first = await self._queue.get()
+            if first is _STOP:
+                return
             batch: List[Tuple[Any, Optional[str]]] = [first]
+            stopping = False
             deadline = asyncio.get_running_loop().time() + self.flush_interval
             while len(batch) < self.batch_size:
                 remaining = deadline - asyncio.get_running_loop().time()
                 if remaining <= 0:
                     break
                 try:
-                    batch.append(await asyncio.wait_for(self._queue.get(), timeout=remaining))
+                    item = await asyncio.wait_for(self._queue.get(), timeout=remaining)
                 except asyncio.TimeoutError:
                     break
+                if item is _STOP:
+                    stopping = True
+                    break
+                batch.append(item)
             await self._write_batch(batch)
+            if stopping:
+                return
 
     async def _drain(self) -> None:
         if self._queue is None:
@@ -109,20 +132,30 @@ class RequestLogWriter:
         while not self._queue.empty():
             batch = []
             while len(batch) < self.batch_size and not self._queue.empty():
-                batch.append(self._queue.get_nowait())
-            await self._write_batch(batch)
+                item = self._queue.get_nowait()
+                if item is not _STOP:
+                    batch.append(item)
+            if batch:
+                await self._write_batch(batch)
 
     async def _write_batch(self, batch: List[Tuple[Any, Optional[str]]]) -> None:
-        try:
-            from app.database import AsyncSessionLocal
-            from app.repositories.log_repo import LogRepository
+        """Write one batch in one transaction; retry a couple of times if the database is busy."""
+        error: Optional[Exception] = None
+        for attempt, delay in enumerate((0.0, *_RETRY_DELAYS)):
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                from app.database import AsyncSessionLocal
+                from app.repositories.log_repo import LogRepository
 
-            async with AsyncSessionLocal() as session:
-                await LogRepository.create_many(session, batch)
-            self.written += len(batch)
-        except Exception as exc:
-            self.failed += len(batch)
-            logger.warning("request_log_batch_failed", rows=len(batch), error=str(exc))
+                async with AsyncSessionLocal() as session:
+                    await LogRepository.create_many(session, batch)
+                self.written += len(batch)
+                return
+            except Exception as exc:
+                error = exc
+        self.failed += len(batch)
+        logger.warning("request_log_batch_failed", rows=len(batch), attempts=1 + len(_RETRY_DELAYS), error=str(error))
 
 
 def writer_from_settings(settings: Any) -> RequestLogWriter:

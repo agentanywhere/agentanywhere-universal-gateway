@@ -3,8 +3,10 @@ from datetime import datetime, timedelta
 from app.time_utils import utcnow
 from typing import Optional, List, Dict, Any
 
+import asyncio
 import hashlib
-from sqlalchemy import select, update, delete, func
+import weakref
+from sqlalchemy import and_, or_, select, insert, update, delete, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db_models import TenantModel, TenantAPIKeyModel, TenantUsageModel
@@ -206,34 +208,91 @@ class TenantRepository:
         bytes_in: int = 0,
         bytes_out: int = 0,
     ) -> None:
-        """Increment usage counters for a tenant across rolling windows."""
-        windows = windows or ["minute", "hour", "day"]
-        for window in windows:
-            window_start = TenantRepository._window_bounds(window)
-            existing = await db.execute(
-                select(TenantUsageModel)
-                .where(TenantUsageModel.tenant_id == tenant_id)
-                .where(TenantUsageModel.window == window)
-                .where(TenantUsageModel.window_start == window_start)
-            )
-            row = existing.scalar_one_or_none()
-            if row is None:
-                row = TenantUsageModel(
-                    tenant_id=tenant_id,
-                    window=window,
-                    window_start=window_start,
-                    request_count=request_count,
-                    error_count=error_count,
-                    bytes_in=bytes_in,
-                    bytes_out=bytes_out,
+        """Increment usage counters for a tenant across rolling windows.
+
+        The counters are bumped in the database (``request_count =
+        request_count + :n``), never read-modified-written in Python, so
+        concurrent requests cannot lose each other's updates. The common case
+        is one UPDATE covering every window plus the COMMIT. A row is
+        INSERTed only for a window that had none, under an in-process lock,
+        with the UPDATE retried first, so two requests racing to open the same
+        window produce one row, not two (the table has no UNIQUE constraint).
+        """
+        windows = list(dict.fromkeys(windows or ["minute", "hour", "day"]))
+        starts = {w: TenantRepository._window_bounds(w) for w in windows}
+        deltas = dict(
+            request_count=request_count,
+            error_count=error_count,
+            bytes_in=bytes_in,
+            bytes_out=bytes_out,
+        )
+
+        missing = await TenantRepository._bump_windows(db, tenant_id, starts, deltas)
+        if missing:
+            async with TenantRepository._get_insert_lock():
+                # Another request may have created the rows since our UPDATE.
+                missing = await TenantRepository._bump_windows(
+                    db, tenant_id, {w: starts[w] for w in missing}, deltas
                 )
-                db.add(row)
-            else:
-                row.request_count += request_count
-                row.error_count += error_count
-                row.bytes_in += bytes_in
-                row.bytes_out += bytes_out
+                if missing:
+                    await db.execute(
+                        insert(TenantUsageModel),
+                        [
+                            dict(tenant_id=tenant_id, window=w, window_start=starts[w], **deltas)
+                            for w in missing
+                        ],
+                    )
+                await db.commit()
+            return
         await db.commit()
+
+    _insert_locks: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+
+    @staticmethod
+    def _get_insert_lock() -> asyncio.Lock:
+        """One lock per event loop (an asyncio.Lock must not cross loops)."""
+        loop = asyncio.get_running_loop()
+        lock = TenantRepository._insert_locks.get(loop)
+        if lock is None:
+            lock = TenantRepository._insert_locks[loop] = asyncio.Lock()
+        return lock
+
+    @staticmethod
+    async def _bump_windows(
+        db: AsyncSession,
+        tenant_id: str,
+        starts: Dict[str, datetime],
+        deltas: Dict[str, int],
+    ) -> List[str]:
+        """UPDATE the counters of existing rows; return the windows that had no row."""
+        values = {k: getattr(TenantUsageModel, k) + v for k, v in deltas.items()}
+        if getattr(db.get_bind().dialect, "update_returning", False):
+            stmt = (
+                update(TenantUsageModel)
+                .where(TenantUsageModel.tenant_id == tenant_id)
+                .where(or_(*[
+                    and_(TenantUsageModel.window == w, TenantUsageModel.window_start == s)
+                    for w, s in starts.items()
+                ]))
+                .values(**values)
+                .returning(TenantUsageModel.window)
+                .execution_options(synchronize_session=False)
+            )
+            hit = {row[0] for row in (await db.execute(stmt)).all()}
+            return [w for w in starts if w not in hit]
+        missing = []
+        for w, s in starts.items():  # old SQLite without RETURNING
+            res = await db.execute(
+                update(TenantUsageModel)
+                .where(TenantUsageModel.tenant_id == tenant_id)
+                .where(TenantUsageModel.window == w)
+                .where(TenantUsageModel.window_start == s)
+                .values(**values)
+                .execution_options(synchronize_session=False)
+            )
+            if not res.rowcount:
+                missing.append(w)
+        return missing
 
     @staticmethod
     async def current_usage(
@@ -315,6 +374,31 @@ class TenantRepository:
         )
         used = int(result.scalar() or 0)
         return (used + cost) <= int(limit)
+
+    @staticmethod
+    async def used_in_windows(
+        db: AsyncSession,
+        tenant_id: str,
+        windows: List[str],
+    ) -> Dict[str, int]:
+        """Requests used in the current window of each of ``windows``: one query."""
+        starts = {w: TenantRepository._window_bounds(w) for w in windows}
+        result = await db.execute(
+            select(
+                TenantUsageModel.window,
+                func.coalesce(func.sum(TenantUsageModel.request_count), 0),
+            )
+            .where(TenantUsageModel.tenant_id == tenant_id)
+            .where(or_(*[
+                and_(TenantUsageModel.window == w, TenantUsageModel.window_start == s)
+                for w, s in starts.items()
+            ]))
+            .group_by(TenantUsageModel.window)
+        )
+        used = {w: 0 for w in windows}
+        for window, total in result.all():
+            used[window] = int(total or 0)
+        return used
 
     @staticmethod
     def to_dict(tenant: TenantModel) -> Dict[str, Any]:
