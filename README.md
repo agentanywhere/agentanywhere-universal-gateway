@@ -51,6 +51,15 @@ echo "ADMIN_TOKEN=$(python3 scripts/generate_secret_key.py 2>/dev/null)" >> .env
 uvicorn app.main:app --port 8000
 ```
 
+Check that it is up: `curl -s http://127.0.0.1:8000/health` returns
+`{"status":"healthy",...}`. Opening `http://127.0.0.1:8000/` in a browser shows
+a 401 "API key required" page. That is expected: every route except the health
+and readiness endpoints needs a key, so the 401 means the gateway is running.
+
+Use `127.0.0.1`, not `localhost`. The server listens on IPv4 only, and on some
+machines (macOS in particular) `localhost` resolves to the IPv6 address first
+and the connection fails.
+
 In a second terminal, start the sample HTTP backend (port 8003, where
 `HTTP_BACKEND_URL` in `env.example` points):
 
@@ -65,9 +74,9 @@ backend through the gateway:
 ```bash
 cd agentanywhere-universal-gateway
 ADMIN=$(grep '^ADMIN_TOKEN=' .env | tail -n 1 | cut -d= -f2-)
-API_KEY=$(curl -s -X POST "http://localhost:8000/admin/api-keys?name=first-key" \
+API_KEY=$(curl -s -X POST "http://127.0.0.1:8000/admin/api-keys?name=first-key" \
   -H "Authorization: Bearer $ADMIN" | python3 -c 'import json,sys; print(json.load(sys.stdin)["key"])')
-curl -s -X POST http://localhost:8000/api/users -H "X-API-Key: $API_KEY" \
+curl -s -X POST http://127.0.0.1:8000/api/users -H "X-API-Key: $API_KEY" \
   -H "Content-Type: application/json" -d '{"name": "Ada", "email": "ada@example.com"}'
 ```
 

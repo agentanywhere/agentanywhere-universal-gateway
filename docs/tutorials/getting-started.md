@@ -80,10 +80,14 @@ The gateway prints JSON log lines. A line with `"event": "mqtt_connection_failed
 is expected: `env.example` points `MQTT_BROKER_URL` at a broker you have not
 started, and nothing in this tutorial uses it.
 
-Leave it running. In a second terminal, check that it answers:
+Leave it running. In a second terminal, check that it answers. Use
+`127.0.0.1`, not `localhost`: the server listens on IPv4 only, and on some
+machines (macOS in particular) `localhost` resolves to the IPv6 address first
+and the connection fails. A browser pointed at `/` shows a 401 page, which is
+expected because that route needs a key.
 
 ```bash
-curl -s http://localhost:8000/health
+curl -s http://127.0.0.1:8000/health
 ```
 
 ```json
@@ -111,7 +115,7 @@ Open a third terminal and read the admin credential from `.env`:
 ```bash
 cd agentanywhere-universal-gateway
 ADMIN=$(grep '^ADMIN_TOKEN=' .env | tail -n 1 | cut -d= -f2-)
-curl -s -X POST "http://localhost:8000/admin/api-keys?name=first-key" \
+curl -s -X POST "http://127.0.0.1:8000/admin/api-keys?name=first-key" \
   -H "Authorization: Bearer $ADMIN"
 ```
 
@@ -144,7 +148,7 @@ API_KEY=paste-the-key-here
 ## 6. Send a request through the gateway
 
 ```bash
-curl -s -X POST http://localhost:8000/api/users \
+curl -s -X POST http://127.0.0.1:8000/api/users \
   -H "X-API-Key: $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"name": "Ada", "email": "ada@example.com"}'
@@ -166,7 +170,7 @@ forwarded it to the sample backend, which created a user:
 Read it back the same way:
 
 ```bash
-curl -s http://localhost:8000/api/users -H "X-API-Key: $API_KEY"
+curl -s http://127.0.0.1:8000/api/users -H "X-API-Key: $API_KEY"
 ```
 
 ```json
@@ -183,7 +187,7 @@ curl -s http://localhost:8000/api/users -H "X-API-Key: $API_KEY"
 ## 7. See what happens without a key
 
 ```bash
-curl -s -X POST http://localhost:8000/api/users \
+curl -s -X POST http://127.0.0.1:8000/api/users \
   -H "Content-Type: application/json" \
   -d '{"name": "Ada", "email": "ada@example.com"}'
 ```

@@ -427,6 +427,8 @@ def _error_html(status_code: int, data: Dict[str, Any]) -> str:
 
     esc = _html.escape
     hint_block = f'<p class="hint">{esc(str(hint))}</p>' if hint else ""
+    # /docs only exists when DEBUG=true; otherwise the button would lead to a 404.
+    docs_button = '<a class="btn ghost" href="/docs">API docs</a>' if app.docs_url else ""
     rid_block = (
         f'<p class="rid">Request ID <code id="rid">{esc(str(request_id))}</code>'
         f'<button id="copy" type="button" aria-label="Copy request ID">Copy</button></p>'
@@ -515,7 +517,7 @@ def _error_html(status_code: int, data: Dict[str, Any]) -> str:
     {countdown_block}
     <div class="actions">
       <a class="btn" href="/">Go home</a>
-      <a class="btn ghost" href="/docs">API docs</a>
+      {docs_button}
     </div>
     {rid_block}
   </main>

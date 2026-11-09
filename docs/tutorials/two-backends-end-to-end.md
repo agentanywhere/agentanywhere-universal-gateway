@@ -72,9 +72,9 @@ Open a fourth terminal for your requests:
 ```bash
 cd agentanywhere-universal-gateway
 ADMIN=$(grep '^ADMIN_TOKEN=' .env | tail -n 1 | cut -d= -f2-)
-curl -s -X POST "http://localhost:8000/admin/api-keys?name=web-app&rate_limit_per_minute=5" \
+curl -s -X POST "http://127.0.0.1:8000/admin/api-keys?name=web-app&rate_limit_per_minute=5" \
   -H "Authorization: Bearer $ADMIN"
-curl -s -X POST "http://localhost:8000/admin/api-keys?name=batch-job&rate_limit_per_minute=100" \
+curl -s -X POST "http://127.0.0.1:8000/admin/api-keys?name=batch-job&rate_limit_per_minute=100" \
   -H "Authorization: Bearer $ADMIN"
 ```
 
@@ -108,7 +108,7 @@ BATCH_ID=paste-the-batch-job-id
 The MCP backend, with the web application's key:
 
 ```bash
-curl -s -X POST http://localhost:8000/mcp/query \
+curl -s -X POST http://127.0.0.1:8000/mcp/query \
   -H "X-API-Key: $WEB_KEY" -H "Content-Type: application/json" \
   -d '{"query": "What is on my calendar?", "context": {"user_id": "ada"}}'
 ```
@@ -132,7 +132,7 @@ The `processed_at` value is a fixed string in the sample backend.
 The HTTP backend, with the same key:
 
 ```bash
-curl -s http://localhost:8000/api/users -H "X-API-Key: $WEB_KEY"
+curl -s http://127.0.0.1:8000/api/users -H "X-API-Key: $WEB_KEY"
 ```
 
 ```json
@@ -157,7 +157,7 @@ six more:
 
 ```bash
 for i in 1 2 3 4 5 6; do
-  curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8000/api/users -H "X-API-Key: $WEB_KEY"
+  curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8000/api/users -H "X-API-Key: $WEB_KEY"
 done
 ```
 
@@ -197,7 +197,7 @@ A **tenant** groups API keys under one quota. Create one for Acme Corp with
 a limit of 3 requests a minute:
 
 ```bash
-curl -s -X POST http://localhost:8000/admin/tenants \
+curl -s -X POST http://127.0.0.1:8000/admin/tenants \
   -H "Authorization: Bearer $ADMIN" -H "Content-Type: application/json" \
   -d '{"tenant_id": "acme", "name": "Acme Corp", "quota": {"requests_per_minute": 3}}'
 ```
@@ -227,7 +227,7 @@ Associate the batch job's key with the tenant. The endpoint needs both the id
 and the key itself:
 
 ```bash
-curl -s -X POST http://localhost:8000/admin/tenants/acme/associate-api-key \
+curl -s -X POST http://127.0.0.1:8000/admin/tenants/acme/associate-api-key \
   -H "Authorization: Bearer $ADMIN" -H "Content-Type: application/json" \
   -d "{\"api_key_id\": \"$BATCH_ID\", \"api_key\": \"$BATCH_KEY\"}"
 ```
@@ -245,7 +245,7 @@ The batch job's own limit is 100 a minute, but the tenant's is 3:
 
 ```bash
 for i in 1 2 3 4; do
-  curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8000/api/users -H "X-API-Key: $BATCH_KEY"
+  curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8000/api/users -H "X-API-Key: $BATCH_KEY"
 done
 ```
 
@@ -289,7 +289,7 @@ parallel requests can pass the quota by a few before the count catches up.
 The tenant's usage counters:
 
 ```bash
-curl -s "http://localhost:8000/admin/tenants/acme/usage?window=minute&lookback=5" \
+curl -s "http://127.0.0.1:8000/admin/tenants/acme/usage?window=minute&lookback=5" \
   -H "Authorization: Bearer $ADMIN"
 ```
 
@@ -312,7 +312,7 @@ The rejected fourth request is not in the count.
 The most recent request log rows:
 
 ```bash
-curl -s "http://localhost:8000/admin/logs?limit=2" -H "Authorization: Bearer $ADMIN"
+curl -s "http://127.0.0.1:8000/admin/logs?limit=2" -H "Authorization: Bearer $ADMIN"
 ```
 
 Each row has the method, path, status code, response time and client address.
@@ -348,7 +348,7 @@ The gateway serves Prometheus metrics at `/metrics`, without a credential
 (unless `OPS_ENDPOINTS_REQUIRE_ADMIN=true`):
 
 ```bash
-curl -s http://localhost:8000/metrics | grep -E '^gateway_(red_)?requests_total\{' | grep -E 'path="/(api|mcp)|route="/(api|mcp)'
+curl -s http://127.0.0.1:8000/metrics | grep -E '^gateway_(red_)?requests_total\{' | grep -E 'path="/(api|mcp)|route="/(api|mcp)'
 ```
 
 ```text
@@ -402,7 +402,7 @@ Revoke the two keys by id. You saved the batch job's id; `GET /admin/api-keys`
 lists the others with their `id` and `key_prefix`.
 
 ```bash
-curl -s -X DELETE "http://localhost:8000/admin/api-keys/$BATCH_ID" -H "Authorization: Bearer $ADMIN"
+curl -s -X DELETE "http://127.0.0.1:8000/admin/api-keys/$BATCH_ID" -H "Authorization: Bearer $ADMIN"
 ```
 
 ```json
@@ -412,7 +412,7 @@ curl -s -X DELETE "http://localhost:8000/admin/api-keys/$BATCH_ID" -H "Authoriza
 Delete the tenant:
 
 ```bash
-curl -s -X DELETE http://localhost:8000/admin/tenants/acme -H "Authorization: Bearer $ADMIN"
+curl -s -X DELETE http://127.0.0.1:8000/admin/tenants/acme -H "Authorization: Bearer $ADMIN"
 ```
 
 Stop the backends and the gateway with Ctrl-C. The keys, tenant and request

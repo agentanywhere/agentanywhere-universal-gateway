@@ -39,6 +39,15 @@ def test_browser_gets_html_page(client):
     assert '{"error"' not in html
 
 
+def test_html_page_links_docs_only_when_they_are_served(client):
+    from app.main import app
+
+    accept = "text/html,application/xhtml+xml"
+    served = bool(app.docs_url)
+    html = client.get(_protected_path(), headers={"Accept": accept}).text
+    assert ('href="/docs"' in html) is served
+
+
 def test_xhr_html_accept_still_gets_json(client):
     # A fetch()/XHR that sets X-Requested-With should keep JSON even if it lists html.
     resp = client.get(
