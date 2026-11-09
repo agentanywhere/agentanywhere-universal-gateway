@@ -258,6 +258,11 @@ async def lifespan(app: FastAPI):
     if graphql_handler:
         logger.info("graphql_handler_initialized")
 
+    from app.banner import banner_facts, print_banner
+
+    print_banner(settings)
+    logger.info("gateway_ready", **banner_facts(settings))
+
     yield
     
     logger.info("gateway_shutting_down")

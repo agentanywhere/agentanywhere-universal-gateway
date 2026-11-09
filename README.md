@@ -51,6 +51,12 @@ echo "ADMIN_TOKEN=$(python3 scripts/generate_secret_key.py 2>/dev/null)" >> .env
 uvicorn app.main:app --port 8000
 ```
 
+When the gateway is ready it prints a banner on stderr with the health-check
+URL, which credential opens the admin API, and the logging settings. It never
+shows a secret. Turn it off with `STARTUP_BANNER=false`; the log level, format,
+redaction and per-logger levels are all settings (see
+[configuration](docs/reference/configuration.md)).
+
 Check that it is up: `curl -s http://127.0.0.1:8000/health` returns
 `{"status":"healthy",...}`. Opening `http://127.0.0.1:8000/` in a browser shows
 a 401 "API key required" page. That is expected: every route except the health

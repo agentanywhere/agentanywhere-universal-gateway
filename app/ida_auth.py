@@ -7,7 +7,6 @@ legacy admin username/password and SECRET_KEY bearer tokens for local dev.
 from __future__ import annotations
 
 import json
-import logging
 import time
 from functools import lru_cache
 from typing import Any, Dict, List, Optional
@@ -15,8 +14,9 @@ from typing import Any, Dict, List, Optional
 from fastapi import HTTPException, status
 
 from app.config import get_settings
+from app.logging_config import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 _JWKS_CACHE: Dict[str, Any] = {"fetched_at": 0.0, "keys": None}
 
@@ -139,7 +139,7 @@ def verify_admin_token(token: str) -> dict:
             detail=f"Invalid token: {exc}",
         ) from exc
     except Exception as exc:
-        logger.warning("JWKS/token validation failed: %s", exc)
+        logger.warning("ida_token_validation_failed", error=str(exc), error_type=type(exc).__name__)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid token",
@@ -151,10 +151,10 @@ def verify_admin_token(token: str) -> dict:
     # not switch the role check off.
     if not (found & allowed):
         logger.warning(
-            "ida_admin_role_denied email=%s found_roles=%s required=%s",
-            claims.get("email") or claims.get("preferred_username"),
-            sorted(found),
-            sorted(allowed),
+            "ida_admin_role_denied",
+            user=claims.get("email") or claims.get("preferred_username"),
+            found_roles=sorted(found),
+            required_roles=sorted(allowed),
         )
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
