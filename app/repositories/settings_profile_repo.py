@@ -127,7 +127,9 @@ class SettingsProfileRepository:
     
     @staticmethod
     async def set_default(db: AsyncSession, profile_id: str) -> Optional[SettingsProfileModel]:
-        """Set a profile as default."""
+        """Set a profile as default. Returns None, changing nothing, if it does not exist."""
+        if await SettingsProfileRepository.get_by_id(db, profile_id) is None:
+            return None
         await SettingsProfileRepository.unset_all_defaults(db, exclude_id=profile_id)
         await db.execute(
             update(SettingsProfileModel)

@@ -97,7 +97,7 @@ class MQTTHandler:
             # Try to parse as JSON
             try:
                 data = json.loads(payload)
-            except:
+            except (ValueError, TypeError):
                 data = {"raw": payload}
             
             # Call registered callback

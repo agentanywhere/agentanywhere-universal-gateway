@@ -4,6 +4,7 @@ import time
 import uuid
 import json
 import asyncio
+from types import SimpleNamespace
 import httpx
 from contextlib import asynccontextmanager
 from typing import Dict, Any, Optional
@@ -15,6 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 from app.config import cors_middleware_options, get_settings
+from app.docs_links import docs_link
 from app.client_ip import client_ip as _client_ip
 from app.models import HealthStatus, ErrorResponse, GatewayRequest, ProtocolType, RouteConfig
 from app.exceptions import (
@@ -1351,7 +1353,7 @@ async def auth_middleware_handler(request: Request, call_next):
                             message="API key required",
                             details={
                                 "hint": "Include your API key in the X-API-Key header or Authorization header.",
-                                "documentation": "/docs#authentication"
+                                "documentation": docs_link("authentication")
                             },
                             request_id=request_id
                         )
@@ -1450,7 +1452,7 @@ async def auth_middleware_handler(request: Request, call_next):
                     message="API key required",
                     details={
                         "hint": "Include your API key in the X-API-Key header or Authorization header.",
-                        "documentation": "/docs#authentication"
+                        "documentation": docs_link("authentication")
                     },
                     request_id=request_id
                 )
@@ -1605,7 +1607,13 @@ async def websocket_proxy(websocket: WebSocket, path: str):
     try:
         async for db in _iter_request_db():
             api_key_obj = await auth_middleware.authenticate(
-                type('Request', (), {'headers': {'X-API-Key': api_key}})(),
+                SimpleNamespace(
+                    headers={**dict(websocket.headers), 'X-API-Key': api_key},
+                    method="GET",
+                    state=websocket.state,
+                    client=websocket.client,
+                    url=websocket.url,
+                ),
                 db
             )
             if not api_key_obj:
@@ -2180,7 +2188,7 @@ async def gateway_proxy(request: Request, path: str):
                     message="gRPC backend is not configured",
                     details={
                         "hint": "Please configure GRPC_BACKEND_URL in your environment variables.",
-                        "documentation": "/docs#configuration"
+                        "documentation": docs_link("configuration")
                     },
                     request_id=request_id
                 )
@@ -2214,7 +2222,7 @@ async def gateway_proxy(request: Request, path: str):
             return JSONResponse(content=result)
         
         # Handle GraphQL requests
-        if path.startswith("/graphql") or path.startswith("/api/graphql"):
+        if path.startswith("graphql") or path.startswith("api/graphql") or path.startswith("/graphql") or path.startswith("/api/graphql"):
             if not graphql_handler:
                 request_id = getattr(request.state, "request_id", None)
                 raise ServiceUnavailableError(
@@ -2222,7 +2230,7 @@ async def gateway_proxy(request: Request, path: str):
                     message="GraphQL backend is not configured",
                     details={
                         "hint": "Please configure GRAPHQL_BACKEND_URL in your environment variables.",
-                        "documentation": "/docs#configuration"
+                        "documentation": docs_link("configuration")
                     },
                     request_id=request_id
                 )
@@ -2449,6 +2457,9 @@ async def gateway_proxy(request: Request, path: str):
             "headers": dict(request.headers),
         }
         
+        # Stays None when transformation is skipped or fails (including binary
+        # bodies that are not UTF-8), so the upstream status passes through.
+        status_code = None
         try:
             # Try to parse body as JSON for transformation
             body_json = None
@@ -2628,7 +2639,7 @@ async def gateway_proxy(request: Request, path: str):
                 message="Gateway HTTP client is not available",
                 details={
                     "hint": "The gateway HTTP client is not available. This may occur during shutdown or in test environments.",
-                    "documentation": "/docs#troubleshooting"
+                    "documentation": docs_link("troubleshooting")
                 },
                 request_id=request_id
             )

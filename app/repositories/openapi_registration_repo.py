@@ -23,6 +23,14 @@ class OpenAPIRegistrationRepository:
         expose_mcp_tools: bool = True,
         expose_a2a_skills: bool = True,
     ) -> OpenAPIRegistrationModel:
+        # `name` is UNIQUE, so a soft-deleted registration with the same name
+        # would make the insert fail; it is gone as far as callers are concerned.
+        await db.execute(
+            delete(OpenAPIRegistrationModel).where(
+                OpenAPIRegistrationModel.name == name,
+                OpenAPIRegistrationModel.is_active.is_(False),
+            )
+        )
         row = OpenAPIRegistrationModel(
             id=str(uuid.uuid4()),
             name=name,

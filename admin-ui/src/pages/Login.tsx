@@ -154,6 +154,14 @@ export default function Login() {
                     Secured by{' '}
                     <span className="font-medium text-foreground">sso.example.com</span>
                   </p>
+                  {!showNative && error && (
+                    <div
+                      role="alert"
+                      className="rounded-md border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive"
+                    >
+                      {error}
+                    </div>
+                  )}
                   {!showNative && (
                     <button
                       type="button"

@@ -496,6 +496,18 @@ class OpenAPIRegistrationRequest(BaseModel):
     expose_a2a_skills: bool = True
 
 
+def _policy_priority(value: Any) -> int:
+    """Policy priority from a request body: missing/null means the default of 100."""
+    if value is None:
+        return 100
+    if isinstance(value, bool):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="'priority' must be an integer")
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="'priority' must be an integer")
+
+
 def _registration_to_dict(row) -> Dict[str, Any]:
     return {
         "id": row.id,
@@ -1195,6 +1207,15 @@ async def update_logging_config(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Unknown logging fields: {invalid}. Allowed: {sorted(allowed)}",
         )
+
+    if "sample_rate" in payload:
+        rate = payload["sample_rate"]
+        if isinstance(rate, bool) or not isinstance(rate, (int, float)) or not 0.0 <= rate <= 1.0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="sample_rate must be a number between 0.0 and 1.0",
+            )
+        payload["sample_rate"] = float(rate)
 
     try:
         # Coerce sets where appropriate.
@@ -3051,7 +3072,7 @@ async def create_governance_policy(
         db,
         name=payload["name"],
         description=payload.get("description"),
-        priority=int(payload.get("priority", 100)),
+        priority=_policy_priority(payload.get("priority")),
         enabled=bool(payload.get("enabled", True)),
         conditions=payload["conditions"],
         action=payload["action"],
@@ -3085,6 +3106,8 @@ async def update_governance_policy(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"No updatable fields. Allowed: {sorted(allowed)}",
         )
+    if "priority" in changes:
+        changes["priority"] = _policy_priority(changes["priority"])
     updated = await update_policy(db, policy_id, **changes)
     if not updated:
         raise HTTPException(

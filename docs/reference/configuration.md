@@ -337,7 +337,7 @@ Off unless set. OpenID Connect sign-in turns on when `IDA_ISSUER`,
 | `IDA_JWKS_CACHE_SECONDS` | `3600` | How long signing keys are cached. |
 | `IDA_LEEWAY_SECONDS` | `30` | **not read.** |
 | `IDA_ADMIN_AUDIENCE` | unset, which means `gateway-admin` | Client id an admin token must be issued for. |
-| `IDA_ADMIN_ROLES` | unset, which means `platform_admin,tenant_admin` | Realm roles, comma-separated or a JSON list; the user must hold one. |
+| `IDA_ADMIN_ROLES` | unset, which means `platform_admin,tenant_admin` | Realm roles, comma-separated or a JSON list; the user must hold one. An empty list (`[]`) denies every user. |
 | `IDA_AUDIENCE` | unset | Default audience recorded for agent-edge routes (otherwise the slug). The gateway does not validate tokens on the agent edge. |
 | `AGENT_EDGE_ENABLED` | `false` | Serve `/agents/<slug>/...`. Agent routes stored in the database also turn it on. |
 | `AGENT_ROUTES_JSON` | unset | JSON object of slug to upstream base URL. Seeds the agent registry on first start. |
