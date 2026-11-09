@@ -15,9 +15,9 @@
 .in{animation:in 9s linear infinite}
 .ok{animation:ok 9s linear infinite}
 .no{animation:no 9s linear infinite}
-@keyframes in{0%{opacity:0;transform:translate(0,0)}1.5%{opacity:1}13%{opacity:1;transform:translate(160px,var(--dy))}15%{opacity:0;transform:translate(160px,var(--dy))}100%{opacity:0;transform:translate(160px,var(--dy))}}
-@keyframes ok{0%{opacity:0;transform:translate(0,0)}1.5%{opacity:1}13%{opacity:1;transform:translate(160px,var(--dy))}15%{opacity:0;transform:translate(160px,var(--dy))}100%{opacity:0;transform:translate(160px,var(--dy))}}
-@keyframes no{0%{opacity:0;fill:#2CC7FE;transform:translate(0,0)}1.5%{opacity:1}13%{opacity:1;fill:#2CC7FE;transform:translate(160px,var(--dy))}16%{fill:#F59E0B;opacity:1;transform:translate(160px,var(--dy))}24%{fill:#F59E0B;opacity:0;transform:translate(160px,calc(var(--dy) + 70px))}100%{opacity:0}}
+@keyframes in{0%{opacity:0;transform:translate(0,0)}1.5%{opacity:1}13%{opacity:1;transform:translate(150px,var(--dy))}15%{opacity:0;transform:translate(150px,var(--dy))}100%{opacity:0;transform:translate(150px,var(--dy))}}
+@keyframes ok{0%{opacity:0;transform:translate(0,0)}1.5%{opacity:1}13%{opacity:1;transform:translate(150px,var(--dy))}15%{opacity:0;transform:translate(150px,var(--dy))}100%{opacity:0;transform:translate(150px,var(--dy))}}
+@keyframes no{0%{opacity:0;fill:#2CC7FE;transform:translate(0,0)}1.5%{opacity:1}13%{opacity:1;fill:#2CC7FE;transform:translate(150px,var(--dy))}16%{fill:#F59E0B;opacity:1;transform:translate(150px,var(--dy))}24%{fill:#F59E0B;opacity:0;transform:translate(150px,calc(var(--dy) + 70px))}100%{opacity:0}}
 .tag{opacity:0;animation:tag 9s linear infinite}
 @keyframes tag{0%,14%{opacity:0}18%{opacity:1}26%{opacity:1}30%,100%{opacity:0}}
 @media (prefers-reduced-motion:reduce){.in,.ok,.no,.tag,.glow{animation:none}.pk{opacity:0}.glow{opacity:.8}.tag{opacity:1}}
@@ -27,60 +27,60 @@
 <rect x=".5" y=".5" width="879" height="399" rx="14" fill="none" stroke="#26344A"/>
 <text class="mono eyebrow" x="28" y="30">AGENTANYWHERE · UNIVERSAL GATEWAY</text>
 <text class="serif ink" x="440" y="62" text-anchor="middle" font-size="22" font-style="italic">Every protocol. One governed edge.</text>
-<line class="line" x1="170" y1="92" x2="330" y2="215.0"/>
+<line class="line" x1="170" y1="92" x2="320" y2="215.0"/>
 <rect class="card" x="40" y="78" width="130" height="28" rx="6"/>
 <text class="mono body" x="105" y="96" text-anchor="middle" font-size="11" letter-spacing=".06em">MCP</text>
-<line class="line" x1="170" y1="132" x2="330" y2="215.0"/>
+<line class="line" x1="170" y1="132" x2="320" y2="215.0"/>
 <rect class="card" x="40" y="118" width="130" height="28" rx="6"/>
 <text class="mono body" x="105" y="136" text-anchor="middle" font-size="11" letter-spacing=".06em">A2A</text>
-<line class="line" x1="170" y1="172" x2="330" y2="215.0"/>
+<line class="line" x1="170" y1="172" x2="320" y2="215.0"/>
 <rect class="card" x="40" y="158" width="130" height="28" rx="6"/>
 <text class="mono body" x="105" y="176" text-anchor="middle" font-size="11" letter-spacing=".06em">HTTP/REST</text>
-<line class="line" x1="170" y1="212" x2="330" y2="215.0"/>
+<line class="line" x1="170" y1="212" x2="320" y2="215.0"/>
 <rect class="card" x="40" y="198" width="130" height="28" rx="6"/>
 <text class="mono body" x="105" y="216" text-anchor="middle" font-size="11" letter-spacing=".06em">GraphQL</text>
-<line class="line" x1="170" y1="252" x2="330" y2="215.0"/>
+<line class="line" x1="170" y1="252" x2="320" y2="215.0"/>
 <rect class="card" x="40" y="238" width="130" height="28" rx="6"/>
 <text class="mono body" x="105" y="256" text-anchor="middle" font-size="11" letter-spacing=".06em">AG-UI</text>
-<line class="line" x1="170" y1="292" x2="330" y2="215.0"/>
+<line class="line" x1="170" y1="292" x2="320" y2="215.0"/>
 <rect class="card" x="40" y="278" width="130" height="28" rx="6"/>
 <text class="mono body" x="105" y="296" text-anchor="middle" font-size="11" letter-spacing=".06em">ACP</text>
-<line class="line" x1="170" y1="332" x2="330" y2="215.0"/>
+<line class="line" x1="170" y1="332" x2="320" y2="215.0"/>
 <rect class="card" x="40" y="318" width="130" height="28" rx="6"/>
 <text class="mono body" x="105" y="336" text-anchor="middle" font-size="11" letter-spacing=".06em">MQTT</text>
-<line class="line" x1="550" y1="215.0" x2="710" y2="125.0"/>
+<line class="line" x1="560" y1="215.0" x2="710" y2="125.0"/>
 <rect class="card" x="710" y="111.0" width="130" height="28" rx="6"/>
 <text class="mono body" x="775" y="129.0" text-anchor="middle" font-size="11" letter-spacing=".08em">MODELS</text>
 <circle cx="710" cy="125.0" r="3" fill="#10B981"/>
-<line class="line" x1="550" y1="215.0" x2="710" y2="185.0"/>
+<line class="line" x1="560" y1="215.0" x2="710" y2="185.0"/>
 <rect class="card" x="710" y="171.0" width="130" height="28" rx="6"/>
 <text class="mono body" x="775" y="189.0" text-anchor="middle" font-size="11" letter-spacing=".08em">TOOLS</text>
 <circle cx="710" cy="185.0" r="3" fill="#10B981"/>
-<line class="line" x1="550" y1="215.0" x2="710" y2="245.0"/>
+<line class="line" x1="560" y1="215.0" x2="710" y2="245.0"/>
 <rect class="card" x="710" y="231.0" width="130" height="28" rx="6"/>
 <text class="mono body" x="775" y="249.0" text-anchor="middle" font-size="11" letter-spacing=".08em">AGENTS</text>
 <circle cx="710" cy="245.0" r="3" fill="#10B981"/>
-<line class="line" x1="550" y1="215.0" x2="710" y2="305.0"/>
+<line class="line" x1="560" y1="215.0" x2="710" y2="305.0"/>
 <rect class="card" x="710" y="291.0" width="130" height="28" rx="6"/>
 <text class="mono body" x="775" y="309.0" text-anchor="middle" font-size="11" letter-spacing=".08em">SERVICES</text>
 <circle cx="710" cy="305.0" r="3" fill="#10B981"/>
-<rect class="gw" x="330" y="165" width="220" height="100" rx="12"/>
-<rect class="glow" x="330" y="165" width="220" height="100" rx="12" fill="none" stroke="url(#g)" stroke-width="2"/>
+<rect class="gw" x="320" y="165" width="240" height="100" rx="12"/>
+<rect class="glow" x="320" y="165" width="240" height="100" rx="12" fill="none" stroke="url(#g)" stroke-width="2"/>
 <text class="mono ink" x="440.0" y="207" text-anchor="middle" font-size="13" letter-spacing=".14em">UNIVERSAL GATEWAY</text>
 <text class="mono muted" x="440.0" y="229" text-anchor="middle" font-size="9.5" letter-spacing=".16em">KEY · LIMIT · POLICY · OBSERVE</text>
 <circle class="pk in" cx="170" cy="92" r="4.5" style="--dy:123.0px;animation-delay:0.0s"/>
-<circle class="pk ok" cx="550" cy="215.0" r="4.5" style="--dy:-90.0px;animation-delay:0.5s"/>
+<circle class="pk ok" cx="560" cy="215.0" r="4.5" style="--dy:-90.0px;animation-delay:0.5s"/>
 <circle class="pk in" cx="170" cy="132" r="4.5" style="--dy:83.0px;animation-delay:1.2s"/>
-<circle class="pk ok" cx="550" cy="215.0" r="4.5" style="--dy:-30.0px;animation-delay:1.7s"/>
+<circle class="pk ok" cx="560" cy="215.0" r="4.5" style="--dy:-30.0px;animation-delay:1.7s"/>
 <circle class="pk no" cx="170" cy="172" r="4.5" style="--dy:43.0px;animation-delay:2.4s"/>
 <g class="tag" style="animation-delay:2.4s"><text class="mono" x="440.0" y="295" text-anchor="middle" font-size="12" fill="#F59E0B" letter-spacing=".1em">401 · no API key</text></g>
 <circle class="pk in" cx="170" cy="212" r="4.5" style="--dy:3.0px;animation-delay:3.6s"/>
-<circle class="pk ok" cx="550" cy="215.0" r="4.5" style="--dy:30.0px;animation-delay:4.1s"/>
+<circle class="pk ok" cx="560" cy="215.0" r="4.5" style="--dy:30.0px;animation-delay:4.1s"/>
 <circle class="pk in" cx="170" cy="252" r="4.5" style="--dy:-37.0px;animation-delay:4.8s"/>
-<circle class="pk ok" cx="550" cy="215.0" r="4.5" style="--dy:90.0px;animation-delay:5.3s"/>
+<circle class="pk ok" cx="560" cy="215.0" r="4.5" style="--dy:90.0px;animation-delay:5.3s"/>
 <circle class="pk no" cx="170" cy="292" r="4.5" style="--dy:-77.0px;animation-delay:6.0s"/>
 <g class="tag" style="animation-delay:6.0s"><text class="mono" x="440.0" y="295" text-anchor="middle" font-size="12" fill="#F59E0B" letter-spacing=".1em">429 · rate limit</text></g>
 <circle class="pk in" cx="170" cy="332" r="4.5" style="--dy:-117.0px;animation-delay:7.2s"/>
-<circle class="pk ok" cx="550" cy="215.0" r="4.5" style="--dy:-90.0px;animation-delay:7.7s"/>
+<circle class="pk ok" cx="560" cy="215.0" r="4.5" style="--dy:-90.0px;animation-delay:7.7s"/>
 <text class="sans muted" x="28" y="382" font-size="11.5">Each request is authenticated, rate limited, checked against policy and counted before it reaches a backend.</text>
 </svg>
