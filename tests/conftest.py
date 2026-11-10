@@ -11,6 +11,7 @@ os.environ.setdefault("STARTUP_BANNER", "false")
 import pytest
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.pool import StaticPool
 from app.database import Base, get_db
 # Import all models to ensure they're registered with Base
@@ -70,14 +71,20 @@ async def db_session():
         engine, class_=AsyncSession, expire_on_commit=False
     )
     
-    async with async_session() as session:
+    session = async_session()
+    try:
         yield session
-    
-    # Clean up
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
-    
-    await engine.dispose()
+    finally:
+        # A test may hand this engine to the app, which uses it from the test
+        # client's thread; if that thread has already closed the one shared
+        # connection there is nothing left to roll back or drop.
+        try:
+            await session.close()
+            async with engine.begin() as conn:
+                await conn.run_sync(Base.metadata.drop_all)
+        except (ValueError, OperationalError):
+            pass
+        await engine.dispose()
 
 
 @pytest.fixture

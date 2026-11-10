@@ -254,6 +254,7 @@ The rate-limit values in this section are **not enforced yet**. They are shown b
 | `SQLITE_BUSY_TIMEOUT_MS` | `0` | SQLite only: how long a connection waits for a lock, in milliseconds. `0` keeps the driver's default of five seconds. |
 | `API_KEY_LOCAL_CACHE_TTL_SECONDS` | `0` (off) | Seconds a validated API key, and the tenant it belongs to, stay cached in each worker's memory when Redis is not used. While cached, authenticating a request needs no database read or write. A key revoked or changed through another worker can still be accepted here until the entry expires; changes made through the same worker take effect at once. |
 | `AI_ANALYTICS_ENABLED` | `true` | Run the per-request anomaly detection and usage analytics. They run inside the request path and cost several milliseconds of CPU per request; set `false` for throughput. |
+| `DOCUMENTATION_URL` | the project's `docs/` folder on GitHub | The documentation link in the start-up banner. Set it to your own docs site. |
 
 ## Tracing
 

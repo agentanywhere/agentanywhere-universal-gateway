@@ -125,32 +125,56 @@ def test_print_banner_survives_a_closed_stream():
     assert print_banner(_settings(), out) is False
 
 
-def test_startup_prints_the_banner_and_logs_gateway_ready(monkeypatch, capsys, caplog):
+def test_startup_logs_gateway_ready_with_the_banner_facts(monkeypatch):
+    from unittest.mock import MagicMock
+
     from fastapi.testclient import TestClient
 
     import app.main as main
 
-    monkeypatch.setattr(main.settings, "startup_banner", True)
-    monkeypatch.setattr(main, "init_db", AsyncMock())
-    monkeypatch.setattr(main, "close_db", AsyncMock())
-    with caplog.at_level("INFO"), TestClient(main.app):
-        pass
-    err = capsys.readouterr().err
-    assert main.settings.app_name in err and "Health check" in err
-    assert any("gateway_ready" in r.getMessage() for r in caplog.records)
-
-
-def test_startup_banner_can_be_switched_off(monkeypatch, capsys):
-    from fastapi.testclient import TestClient
-
-    import app.main as main
-
-    monkeypatch.setattr(main.settings, "startup_banner", False)
+    log = MagicMock()
+    monkeypatch.setattr(main, "logger", log)
     monkeypatch.setattr(main, "init_db", AsyncMock())
     monkeypatch.setattr(main, "close_db", AsyncMock())
     with TestClient(main.app):
         pass
-    assert "Health check" not in capsys.readouterr().err
+    ready = [c for c in log.info.call_args_list if c.args and c.args[0] == "gateway_ready"]
+    assert len(ready) == 1
+    assert {"health_url", "protocols", "admin_credential", "log_level"} <= ready[0].kwargs.keys()
+
+
+@pytest.mark.parametrize("argv,expected", [
+    (["/venv/bin/uvicorn", "app.main:app"], True),
+    (["/venv/lib/uvicorn/__main__.py", "app.main:app"], True),
+    (["/venv/bin/gunicorn", "app.main:app"], True),
+    (["/venv/bin/pytest", "tests"], False),
+    (["script.py", "uvicorn"], True),
+    ([], False),
+])
+def test_banner_only_when_started_by_a_server(argv, expected):
+    from app.banner import running_as_server
+    assert running_as_server(argv) is expected
+
+
+def test_announce_startup_prints_once_and_not_for_tools(monkeypatch):
+    import app.banner as banner
+
+    monkeypatch.setattr(banner, "_announced", False)
+    out = io.StringIO()
+    assert banner.announce_startup(_settings(), out, argv=["pytest"]) is False and out.getvalue() == ""
+    assert banner.announce_startup(_settings(), out, argv=["uvicorn", "app.main:app"]) is True
+    assert "Test Gateway" in out.getvalue()
+    assert banner.announce_startup(_settings(), out, argv=["uvicorn", "app.main:app"]) is False
+    assert out.getvalue().count("Test Gateway") == 1
+
+
+def test_announce_startup_respects_the_switch(monkeypatch):
+    import app.banner as banner
+
+    monkeypatch.setattr(banner, "_announced", False)
+    out = io.StringIO()
+    assert banner.announce_startup(_settings(startup_banner=False), out, argv=["uvicorn"]) is False
+    assert out.getvalue() == ""
 
 
 @pytest.mark.parametrize("argv,expected", [
@@ -167,3 +191,22 @@ def test_banner_address_follows_the_uvicorn_flags(argv, expected):
 def test_banner_health_url_uses_the_real_port(monkeypatch):
     monkeypatch.setattr("sys.argv", ["uvicorn", "app.main:app", "--port", "9300"])
     assert banner_facts(_settings())["health_url"] == "http://127.0.0.1:9300/health"
+
+
+def test_banner_lists_protocols_console_and_documentation():
+    text = render_banner(_settings(
+        http_backend_url="http://h:1", mcp_backend_url="http://m:2", a2a_backend_url=None,
+        documentation_url="https://docs.example.com/gw",
+    ))
+    assert "HTTP/REST · MCP · A2A · AG-UI · ACP · GraphQL · MQTT" in text
+    assert "WebSocket · gRPC" in text and "no pass-through" in text
+    assert "http://127.0.0.1:3001" in text and "npm run dev" in text
+    assert "https://docs.example.com/gw" in text
+    assert "HTTP/REST, MCP" in text and "A2A," not in text.split("Backends")[1].splitlines()[0]
+    assert "http://h:1" not in text and "http://m:2" not in text      # names only, never URLs
+
+
+def test_banner_backends_row_when_none_configured_and_default_docs_link():
+    s = _settings(http_backend_url=None, mcp_backend_url=None, a2a_backend_url=None)
+    text = render_banner(s)
+    assert "none configured" in text and "docs/README.md" in text

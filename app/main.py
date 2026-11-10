@@ -16,6 +16,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 from app.config import cors_middleware_options, get_settings
+from app.banner import announce_startup, banner_facts
+from app.logging_config import setup_logging
+
+# First thing the process does, ahead of the heavier imports below: show the
+# banner (so a slow start is not silent) and configure logging (so the lines the
+# later imports log already use the configured format and redaction).
+announce_startup(get_settings())
+setup_logging()
+
 from app.docs_links import docs_link
 from app.client_ip import client_ip as _client_ip
 from app.models import HealthStatus, ErrorResponse, GatewayRequest, ProtocolType, RouteConfig
@@ -263,9 +272,6 @@ async def lifespan(app: FastAPI):
     if graphql_handler:
         logger.info("graphql_handler_initialized")
 
-    from app.banner import banner_facts, print_banner
-
-    print_banner(settings)
     logger.info("gateway_ready", **banner_facts(settings))
 
     yield
