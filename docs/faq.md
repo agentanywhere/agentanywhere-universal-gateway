@@ -6,6 +6,47 @@ A Python reverse proxy that puts API keys, rate limits, tenant quotas, routing
 and metrics in front of MCP, A2A, AG-UI, ACP, HTTP, GraphQL and MQTT backends.
 More in [What the gateway is, and what it is not](explanation/overview.md).
 
+## What is an AI agent gateway?
+
+A gateway that sits between AI agents and the tools, models and services they
+call. Instead of each service doing its own sign-in, limiting and logging, the
+gateway does it once: it checks the API key, applies limits and policy, checks
+the protocol message, forwards the request and records what happened. See
+[What the gateway is, and what it is not](explanation/overview.md).
+
+## Which protocols does it support?
+
+MCP (HTTP transport), A2A (HTTP and Server-Sent Events), AG-UI, ACP, HTTP/REST,
+GraphQL and MQTT. The WebSocket route closes every connection and the gRPC
+bridge answers `"status": "unsupported"`. The
+[protocol support matrix](explanation/protocol-support.md) says what works for
+each protocol and which tests show it.
+
+## Does it support the Model Context Protocol (MCP)?
+
+Yes, over the HTTP transport. Requests under `/mcp/` are authenticated and rate
+limited, checked for JSON-RPC shape, size, allowed methods and a simple
+prompt-injection pattern filter, and forwarded to `MCP_BACKEND_URL`.
+
+## How do I run it with Docker?
+
+Copy `env.example` to `.env`, generate the secrets, and run
+`docker compose --profile backends up -d --build`. The gateway listens on
+`127.0.0.1:8000` and the admin console on `127.0.0.1:3001`. The steps and the
+optional PostgreSQL, nginx and monitoring profiles are in
+[Deploy with Docker Compose](how-to/deploy-with-docker-compose.md).
+
+## Where is the admin console?
+
+Port 3001: started by Docker Compose, or by `npm run dev` in `admin-ui/`. Sign
+in as `admin` with your `ADMIN_TOKEN`. There is no default password. The
+[README](../README.md#see-your-gateway) shows each page.
+
+## How do I measure its performance?
+
+There are no published figures. [Test performance](how-to/performance-testing.md)
+shows how to measure your own set-up with the bundled load tester.
+
 ## Is it ready for production?
 
 It has an automated test suite that continuous integration runs on every

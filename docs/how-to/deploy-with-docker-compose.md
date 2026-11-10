@@ -7,7 +7,12 @@ and monitoring.
 **Before you start:** Docker with the Compose plugin (`docker compose`), and
 ports 8000, 3001 and 6379 free (more for the optional profiles). This page is
 written from `docker-compose.yml`, the Dockerfiles, `env.example` and
-`tests/test_deployment_files.py`; the commands were not run for this release.
+`tests/test_deployment_files.py`. The first three steps and the sample backends
+were run end to end on 9 November 2026 (Docker 28.1.1 on Apple Silicon, with
+`PORT=18000` because another service held port 8000): the gateway came up
+healthy, the console served on port 3001, an API key was created, and a request
+through the gateway reached the sample HTTP backend. The optional `production`
+and `monitoring` profiles were not run.
 
 ## Contents
 
@@ -90,12 +95,12 @@ The gateway's `environment:` block, which overrides `.env`, sets:
 
 ```bash
 docker compose ps                       # gateway "healthy" after about 30 seconds
-curl -s http://localhost:8000/health    # {"status":"healthy",...}
+curl -s http://127.0.0.1:8000/health    # {"status":"healthy",...}
 ADMIN=$(grep '^ADMIN_TOKEN=' .env | tail -n 1 | cut -d= -f2-)
-curl -s -X POST "http://localhost:8000/admin/api-keys?name=first-key" -H "Authorization: Bearer $ADMIN"
+curl -s -X POST "http://127.0.0.1:8000/admin/api-keys?name=first-key" -H "Authorization: Bearer $ADMIN"
 ```
 
-If the console started, open <http://localhost:3001> and sign in as `admin`
+If the console started, open <http://127.0.0.1:3001> and sign in as `admin`
 with your `ADMIN_TOKEN`.
 
 ## Run the sample backends
@@ -156,7 +161,7 @@ Restart the gateway after the change.
 
 The gateway's `depends_on` names only Redis, so on a first start the gateway
 may come up before PostgreSQL is ready; `restart: unless-stopped` restarts it.
-`curl -s http://localhost:8000/ready` answers 200 once the database is
+`curl -s http://127.0.0.1:8000/ready` answers 200 once the database is
 reachable. Data lives in the `postgres_data` volume.
 
 ## Add monitoring
@@ -166,10 +171,10 @@ docker compose --profile monitoring up -d
 ```
 
 Set `GRAFANA_ADMIN_PASSWORD` in `.env` first. Prometheus is at
-<http://localhost:9090> and scrapes the gateway every 15 seconds; with
+<http://127.0.0.1:9090> and scrapes the gateway every 15 seconds; with
 `OPS_ENDPOINTS_REQUIRE_ADMIN=true`, give it the token (the commented
 `authorization:` block in `prometheus.yml`). Grafana is at
-<http://localhost:3000>; add Prometheus (`http://prometheus:9090`) as a data
+<http://127.0.0.1:3000>; add Prometheus (`http://prometheus:9090`) as a data
 source. See [Monitor the gateway](monitor.md).
 
 ## Day-to-day commands
