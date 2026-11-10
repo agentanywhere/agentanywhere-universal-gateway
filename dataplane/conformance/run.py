@@ -19,7 +19,8 @@ sys.path.insert(0, str(ROOT))
 from perf.suite import _BACKEND, _BACKEND_RUNNER, free_port, wait_healthy  # noqa: E402
 
 BIN = ROOT / "dataplane/target/release/dataplane"
-PROMISED = ("x-request-id", "traceparent", "retry-after", "content-type", "x-response-time", "x-api-version")
+PROMISED = ("x-request-id", "traceparent", "retry-after", "content-type", "x-response-time", "x-api-version",
+            "x-tenant-id", "x-content-type-options")
 
 
 def webhook_receiver():
@@ -52,7 +53,7 @@ def main() -> int:
                "DATABASE_URL": f"sqlite+aiosqlite:///{tmp}/g.db", "HTTP_BACKEND_URL": f"http://127.0.0.1:{bport}",
                "REDIS_ENABLED": "false", "LOG_LEVEL": "WARNING", "STARTUP_BANNER": "false", "DEBUG": "false",
                "TRUSTED_PROXIES": "127.0.0.1", "DATAPLANE_TOKEN": "conformance-token",
-               "CIRCUIT_BREAKER_TIMEOUT": "2"}  # short, so the breaker scenarios can wait it out
+               "CIRCUIT_BREAKER_TIMEOUT": "2", "DEFAULT_TIMEOUT": "2"}  # short, so the breaker and timeout scenarios can wait them out
 
         def start_backend():
             return subprocess.Popen([sys.executable, "-c", _BACKEND_RUNNER, str(ROOT / _BACKEND), str(bport)],
@@ -200,16 +201,133 @@ def main() -> int:
             t = wait_until(lambda: httpx.get(f"{rs}/api/users", headers={"X-API-Key": rev["key"]}, timeout=10).status_code == 401)
             check("a revoked key is refused within seconds", t is not None and t - t0 < 2.5, f"after {t - t0:.2f}s" if t else "still served")
 
-            rule = httpx.post(f"{py}/admin/governance/ip-rules", headers=adm, timeout=10,
-                              json={"cidr": "203.0.113.0/24", "action": "deny", "scope": "global"})
-            rule.raise_for_status()
+            # --- governance and tenants, decided by the data plane itself ---------------------------
+            print()
+
+            def same(name, a, b, native=True, details=True):
+                """Same status, same body in full (bar the volatile fields), and answered by the data plane."""
+                compare(name, a, b)
+                if details and a.status_code == b.status_code and a.status_code >= 400:
+                    x, y = a.json().get("details"), b.json().get("details")
+                    check(f"{name}: details match", x == y, "" if x == y else f"{x} vs {y}")
+                    check(f"{name}: keys in the same order", list(a.json()) == list(b.json()), str(list(b.json())))
+                if native:
+                    check(f"{name}: answered by the data plane", b.headers.get("x-served-by") == "dataplane")
+
+            def both(method, path, pair, extra=None):
+                h = {"X-API-Key": "{key}", **(extra or {})}
+                return call(py, method, path, h, None, pair["py"]["key"]), call(rs, method, path, h, None, pair["rs"]["key"])
+
+            def post(path, body):
+                r = httpx.post(f"{py}{path}", headers=adm, json=body, timeout=10)
+                r.raise_for_status()
+                return r.json()
+
+            def scoped_key(name):
+                r = httpx.post(f"{py}/admin/api-keys", headers=adm, timeout=10, params={
+                    "name": name, "rate_limit_per_minute": 1000, "rate_limit_per_hour": 10000, "allowed_paths": "/api/users"})
+                r.raise_for_status()
+                return r.json()
+
+            scoped = {"py": scoped_key("conf-py-scoped"), "rs": scoped_key("conf-rs-scoped")}
+            assert wait_until(lambda: served_natively(scoped["rs"]["key"])), "scoped key never became native"
+            same("a scoped key inside its paths", *both("GET", "/api/users/1", scoped))
+            same("a scoped key outside its paths (403)", *both("GET", "/api/orders", scoped))
+            a, b = both("GET", "/api/users%2F1", scoped)
+            same("an escaped path is left to Python", a, b, native=False)
+            check("an escaped path is not answered by the data plane", b.headers.get("x-served-by") != "dataplane")
+
+            plain = {"py": keys["py"], "rs": keys["rs"]}
+            far = {"X-Forwarded-For": "198.51.100.9"}
+
+            def native_status(want, extra=None):
+                def probe():
+                    r = call(rs, "GET", "/api/users", {"X-API-Key": "{key}", **(extra or {})}, None, keys["rs"]["key"])
+                    return r.status_code == want and r.headers.get("x-served-by") == "dataplane"
+                return probe
+
+            rule = post("/admin/governance/ip-rules", {"cidr": "198.51.100.0/24", "action": "deny", "scope": "global"})
             t0 = time.time()
-            t = wait_until(lambda: not served_natively(keys["rs"]["key"]) and httpx.get(
-                f"{rs}/api/users", headers={"X-API-Key": keys["rs"]["key"]}, timeout=10).status_code == 200)
-            check("an IP rule hands keys back to Python (still answered)", t is not None, f"after {t - t0:.2f}s" if t else "still native")
-            httpx.delete(f"{py}/admin/governance/ip-rules/{rule.json()['id']}", headers=adm, timeout=10).raise_for_status()
-            t = wait_until(lambda: served_natively(keys["rs"]["key"]))
-            check("removing the rule makes keys native again", t is not None)
+            t = wait_until(native_status(403, far))
+            check("an IP rule is enforced by the data plane within seconds", t is not None, f"after {t - t0:.2f}s" if t else "never")
+            same("a denied address (403)", *both("GET", "/api/users", plain, far))
+            same("another address under the same rule", *both("GET", "/api/users", plain))
+            httpx.delete(f"{py}/admin/governance/ip-rules/{rule['id']}", headers=adm, timeout=10).raise_for_status()
+            check("removing the rule lets the address back in", wait_until(native_status(200, far)) is not None)
+
+            allow = post("/admin/governance/ip-rules", {"cidr": "198.51.100.0/24", "action": "allow", "scope": "global"})
+            assert wait_until(native_status(403)), "allow-list never reached the data plane"
+            same("an address outside the allow-list (403)", *both("GET", "/api/users", plain))
+            same("an address inside the allow-list", *both("GET", "/api/users", plain, far))
+            httpx.delete(f"{py}/admin/governance/ip-rules/{allow['id']}", headers=adm, timeout=10).raise_for_status()
+            assert wait_until(native_status(200)), "allow-list never left the data plane"
+
+            policy = post("/admin/governance/policies", {"name": "conf-no-deletes", "priority": 10, "action": {"type": "deny", "reason": "No deletes \u2014 read \"only\""},
+                                                         "conditions": {"path": "/api/users/*", "methods": ["DELETE"]}})
+
+            def refused_delete():
+                r = call(rs, "DELETE", "/api/users/999", {"X-API-Key": "{key}"}, None, keys["rs"]["key"])
+                return r.status_code == 403 and r.headers.get("x-served-by") == "dataplane"
+
+            t0 = time.time()
+            t = wait_until(refused_delete)
+            check("a policy is enforced by the data plane within seconds", t is not None, f"after {t - t0:.2f}s" if t else "never")
+            same("a policy refuses the request (403)", *both("DELETE", "/api/users/999", plain))
+            same("the same policy lets other methods through", *both("GET", "/api/users/1", plain))
+            httpx.delete(f"{py}/admin/governance/policies/{policy['id']}", headers=adm, timeout=10).raise_for_status()
+            check("removing the policy lifts it", wait_until(lambda: not refused_delete()) is not None)
+
+            # Tenant quotas are counted per clock minute: do not start a count that straddles one.
+            if time.time() % 60 > 40:
+                time.sleep(61 - time.time() % 60)
+
+            def tenant(tid, per_minute, name):
+                post("/admin/tenants", {"tenant_id": tid, "name": tid, "quota": {"requests_per_minute": per_minute}})
+                key = make_key(name, 1000)
+                post(f"/admin/tenants/{tid}/associate-api-key", {"api_key_id": key["id"], "api_key": key["key"]})
+                return key
+
+            def tenant_native(key, tid):
+                def probe():
+                    r = httpx.get(f"{rs}/health", timeout=10)  # not counted against any quota
+                    snap = httpx.get(f"{py}/internal/dataplane/snapshot", headers={"X-Dataplane-Token": "conformance-token"}, timeout=10).json()
+                    return r.status_code == 200 and any(k.get("id") == key["id"] and k.get("tenant") == tid and k.get("native_ok") for k in snap["keys"])
+                return probe
+
+            owned = {"py": tenant("conf-py-tenant", 3, "conf-py-owned"), "rs": tenant("conf-rs-tenant", 3, "conf-rs-owned")}
+            assert wait_until(tenant_native(owned["rs"], "conf-rs-tenant")), "tenant key never reached the snapshot"
+            time.sleep(0.6)  # one more sync, so the data plane holds that snapshot
+            pairs = [both("GET", "/api/users", owned) for _ in range(4)]
+            print("      tenant-quota statuses  python", [x.status_code for x, _ in pairs], " rust", [y.status_code for _, y in pairs])
+            check("tenant quota sequence matches", [x.status_code for x, _ in pairs] == [y.status_code for _, y in pairs] == [200, 200, 200, 429])
+            same("a tenant's request", *pairs[0])
+            same("a tenant over its quota (429)", *pairs[3], details=False)  # they name different tenants: compared below
+            fix = lambda d: json.loads(json.dumps(d).replace("conf-py-tenant", "conf-rs-tenant"))
+            for (x, y), what in ((pairs[0], "served"), (pairs[3], "refused")):
+                check(f"X-Tenant-ID on a {what} request", x.headers.get("x-tenant-id") == "conf-py-tenant"
+                      and y.headers.get("x-tenant-id") == "conf-rs-tenant", f"{x.headers.get('x-tenant-id')} / {y.headers.get('x-tenant-id')}")
+            check("the 429 names the tenant and its quota", fix(pairs[3][0].json()["details"]) == pairs[3][1].json()["details"],
+                  json.dumps(pairs[3][1].json()["details"]))
+
+            if time.time() % 60 > 45:
+                time.sleep(61 - time.time() % 60)
+            shared = tenant("conf-shared-tenant", 4, "conf-shared")
+            assert wait_until(tenant_native(shared, "conf-shared-tenant")), "shared tenant key never reached the snapshot"
+            time.sleep(0.6)
+            hit = lambda base: httpx.get(f"{base}/api/users", headers={"X-API-Key": shared["key"]}, timeout=10)
+            first = [hit(py).status_code for _ in range(2)]
+            time.sleep(1.0)  # the data plane hears what Python served
+            second = [hit(rs) for _ in range(3)]
+            check("a quota is shared: what Python served counts in the data plane",
+                  first == [200, 200] and [r.status_code for r in second] == [200, 200, 429]
+                  and all(r.headers.get("x-served-by") == "dataplane" for r in second),
+                  f"python {first}, then data plane {[r.status_code for r in second]}")
+            time.sleep(1.5)  # Python hears what the data plane served
+            third = hit(py)
+            check("a quota is shared: what the data plane served counts in Python", third.status_code == 429, f"[{third.status_code}]")
+            usage = httpx.get(f"{py}/admin/tenants/conf-shared-tenant/usage", headers=adm, timeout=10)
+            if usage.status_code == 200:
+                print("      tenant usage as the product reports it:", json.dumps(usage.json())[:200])
 
             # --- what the data plane served is visible to the product --------------------------------
             def metric(name, **labels):
@@ -268,6 +386,11 @@ def main() -> int:
             print()
             bkey = {"py": make_key("conf-py-breaker", 1000), "rs": make_key("conf-rs-breaker", 1000)}
             assert wait_until(lambda: served_natively(bkey["rs"]["key"])), "breaker key never became native"
+            time.sleep(1.5)
+            errs0 = (metric("gateway_errors_total", error_type="BACKEND_ERROR", protocol="gateway"),
+                     metric("gateway_errors_total", error_type="SERVICE_UNAVAILABLE", protocol="gateway"),
+                     metric("gateway_errors_total", error_type="ConnectError", protocol="unknown"))
+            before_errs_delta = lambda now: tuple(n - o for n, o in zip(now, errs0))
             procs[0].send_signal(signal.SIGTERM)
             procs[0].wait(timeout=15)
             get = lambda base, who: call(base, "GET", "/api/users", {"X-API-Key": "{key}"}, None, bkey[who]["key"])
@@ -278,7 +401,18 @@ def main() -> int:
             opened = hooked("circuit_breaker_open")
             check("the breaker opening in the data plane fires the webhook", t is not None and len(opened) == 1,
                   json.dumps(opened[0]["data"], sort_keys=True) if opened else "none received")
+            time.sleep(1.5)
+            errs = lambda **l: metric("gateway_errors_total", **l)
+            seen_rs = (errs(error_type="BACKEND_ERROR", protocol="gateway"), errs(error_type="SERVICE_UNAVAILABLE", protocol="gateway"),
+                       errs(error_type="ConnectError", protocol="unknown"))
             a = [get(py, "py") for _ in range(6)]
+            time.sleep(0.5)
+            seen_py = (errs(error_type="BACKEND_ERROR", protocol="gateway") - seen_rs[0],
+                       errs(error_type="SERVICE_UNAVAILABLE", protocol="gateway") - seen_rs[1],
+                       errs(error_type="ConnectError", protocol="unknown") - seen_rs[2])
+            print("      gateway_errors_total (BACKEND_ERROR, SERVICE_UNAVAILABLE, ConnectError)  from the data plane",
+                  before_errs_delta(seen_rs), " from python", seen_py)
+            check("upstream failures feed gateway_errors_total the same way", before_errs_delta(seen_rs) == seen_py)
             print("      backend-down statuses  python", [r.status_code for r in a], " rust", [r.status_code for r in b])
             compare("backend unreachable (502 shape)", a[0], b[0])
             compare("circuit open (503 shape)", a[5], b[5])
@@ -310,6 +444,24 @@ def main() -> int:
             both = hooked("circuit_breaker_closed")
             check("the closed webhook carries the same payload from both",
                   len(both) == 2 and mask(both[0]["data"]) == mask(both[1]["data"]), f"{len(both)} closed webhooks")
+
+            # The backend accepts the connection and then says nothing.
+            time.sleep(1.5)
+            slow = lambda: errs(error_type="ReadTimeout", protocol="unknown")
+            s0 = slow()
+            procs[0].send_signal(signal.SIGSTOP)
+            try:
+                b = get(rs, "rs")
+                time.sleep(1.0)
+                s1 = slow()
+                a = get(py, "py")
+            finally:
+                procs[0].send_signal(signal.SIGCONT)
+            time.sleep(0.5)
+            same("backend too slow to answer (timeout)", a, b)
+            check("a timeout is counted under the same error type by both", (s1 - s0, slow() - s1) == (1.0, 1.0),
+                  f"data plane {s1 - s0:.0f}, python {slow() - s1:.0f}")
+            compare("backend answering again (200)", get(py, "py"), get(rs, "rs"))
 
             # Last: the control plane goes away. The data plane must stop serving natively.
             procs[1].send_signal(signal.SIGTERM)

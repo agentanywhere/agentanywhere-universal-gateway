@@ -54,48 +54,204 @@ async def test_the_revision_is_stable_while_nothing_changes(db_session):
     )["revision"]
 
 
-async def test_a_tenant_key_is_not_native(db_session):
-    plaintext, model = await _key(db_session, name="tenant-key")
-    await TenantRepository.create(db_session, "t1", "T1", quota={"requests_per_minute": 5})
-    db_session.add(TenantAPIKeyModel(tenant_id="t1", api_key_id=model.id, api_key_hash=hashlib.sha256(plaintext.encode()).hexdigest()))
-    await db_session.commit()
-    other_plain, other = await _key(db_session, name="plain-key")
+async def _tenant_key(db, tenant_id="t1", quota=None, name="tenant-key"):
+    plaintext, model = await _key(db, name=name)
+    await TenantRepository.create(db, tenant_id, tenant_id.upper(), quota=quota)
+    db.add(TenantAPIKeyModel(tenant_id=tenant_id, api_key_id=model.id,
+                             api_key_hash=hashlib.sha256(plaintext.encode()).hexdigest()))
+    await db.commit()
+    return plaintext, model
+
+
+async def test_a_tenant_key_is_native_and_carries_its_tenants_quota(db_session):
+    quota = {"requests_per_minute": 5, "requests_per_hour": 0}
+    _, model = await _tenant_key(db_session, quota=quota)
+    _, other = await _key(db_session, name="plain-key")
     snap = await dataplane_sync.build_snapshot(db_session)
-    assert _by_id(snap, model.id)["native_ok"] is False
-    assert _by_id(snap, other.id)["native_ok"] is True
+    entry = _by_id(snap, model.id)
+    assert entry["native_ok"] is True and entry["tenant"] == "t1"
+    assert "tenant" not in _by_id(snap, other.id)
+    # Zero means unlimited, as in check_quota; the refusal's details are rendered here, once.
+    assert snap["tenants"]["t1"] == {
+        "minute": 5, "hour": None,
+        "details_json": '{"tenant_id":"t1","quota":{"requests_per_minute":5,"requests_per_hour":0,'
+                        '"requests_per_day":100000,"storage_mb":1000}}',
+    }
 
 
-async def test_a_global_ip_rule_makes_every_key_non_native(db_session):
+async def test_an_inactive_tenants_key_is_served_as_a_key_without_a_tenant(db_session):
+    _, model = await _tenant_key(db_session)
+    await TenantRepository.set_active(db_session, "t1", False)
+    entry = _by_id(await dataplane_sync.build_snapshot(db_session), model.id)
+    assert entry["native_ok"] is True and "tenant" not in entry
+
+
+@pytest.mark.parametrize("quota", [
+    {"requests_per_minute": "5"}, {"requests_per_minute": 2.5}, {"requests_per_hour": True},
+])
+async def test_a_quota_that_is_not_a_whole_number_stays_with_python(db_session, quota):
+    _, model = await _tenant_key(db_session, quota=quota)
+    snap = await dataplane_sync.build_snapshot(db_session)
+    assert _by_id(snap, model.id)["native_ok"] is False and "t1" not in snap["tenants"]
+
+
+async def test_a_key_linked_to_a_tenant_under_another_digest_stays_with_python(db_session):
+    _, model = await _key(db_session)
+    await TenantRepository.create(db_session, "t1", "T1")
+    db_session.add(TenantAPIKeyModel(tenant_id="t1", api_key_id=model.id, api_key_hash="0" * 64))
+    await db_session.commit()
+    assert _by_id(await dataplane_sync.build_snapshot(db_session), model.id)["native_ok"] is False
+
+
+async def test_ip_rules_are_compiled_in_evaluation_order_and_keys_stay_native(db_session):
+    from datetime import datetime
+
     _, a = await _key(db_session, name="a")
-    _, b = await _key(db_session, name="b")
-    db_session.add(IPRuleModel(cidr="203.0.113.0/24", action="deny", scope="global", enabled=True))
+    db_session.add_all([
+        IPRuleModel(id="r2", cidr="10.0.0.0/8", action="allow", scope="api_key", scope_id=a.id, enabled=True,
+                    created_at=datetime(2026, 1, 2)),
+        IPRuleModel(id="r1", cidr="203.0.113.7/24", action="deny", scope="global", enabled=True,
+                    created_at=datetime(2026, 1, 1)),
+        IPRuleModel(id="r3", cidr="not-a-network", action="deny", scope="global", enabled=True,
+                    created_at=datetime(2026, 1, 3)),
+        # Ignored by the engine, so not sent: disabled, no scope id, an unknown action, an unknown scope.
+        IPRuleModel(id="r4", cidr="10.0.0.0/8", action="deny", scope="global", enabled=False),
+        IPRuleModel(id="r5", cidr="10.0.0.0/8", action="deny", scope="tenant", scope_id=None, enabled=True),
+        IPRuleModel(id="r6", cidr="10.0.0.0/8", action="log", scope="global", enabled=True),
+        IPRuleModel(id="r7", cidr="10.0.0.0/8", action="deny", scope="team", scope_id="x", enabled=True),
+    ])
     await db_session.commit()
     snap = await dataplane_sync.build_snapshot(db_session)
-    assert not _by_id(snap, a.id)["native_ok"] and not _by_id(snap, b.id)["native_ok"]
+    assert _by_id(snap, a.id)["native_ok"] is True
+    assert snap["ip_rules"] == [
+        {"scope": "global", "scope_id": None, "allow": False, "net": "203.0.113.0/24",
+         "details_json": '{"rule_id":"r1","scope":"global"}'},
+        {"scope": "api_key", "scope_id": a.id, "allow": True, "net": "10.0.0.0/8",
+         "details_json": '{"rule_id":"r2","scope":"api_key"}'},
+        {"scope": "global", "scope_id": None, "allow": False, "net": None,
+         "details_json": '{"rule_id":"r3","scope":"global"}'},
+    ]
 
 
 async def test_a_disabled_ip_rule_changes_nothing(db_session):
     _, a = await _key(db_session)
+    before = await dataplane_sync.build_snapshot(db_session)
     db_session.add(IPRuleModel(cidr="203.0.113.0/24", action="deny", scope="global", enabled=False))
     await db_session.commit()
-    assert _by_id(await dataplane_sync.build_snapshot(db_session), a.id)["native_ok"] is True
+    after = await dataplane_sync.build_snapshot(db_session)
+    assert after["ip_rules"] == [] and after["revision"] == before["revision"]
 
 
-async def test_a_key_scoped_ip_rule_affects_only_that_key(db_session):
-    _, a = await _key(db_session, name="a")
-    _, b = await _key(db_session, name="b")
-    db_session.add(IPRuleModel(cidr="10.0.0.0/8", action="allow", scope="api_key", scope_id=a.id, enabled=True))
+async def test_policies_are_compiled_in_priority_order(db_session):
+    _, a = await _key(db_session)
+    db_session.add_all([
+        PolicyModel(id="p2", name="late", priority=50, enabled=True, conditions={}, action={"type": "ALLOW"}),
+        PolicyModel(id="p1", name="office hours", priority=10, enabled=True, conditions={
+            "path": "/api/admin/*", "methods": ["post", "Delete"], "tenants": ["t1"],
+            "cidrs": ["198.51.100.9/24", "nonsense"], "time_of_day": {"start": "22:30", "end": "06:00"},
+        }, action={"type": "deny"}),
+        PolicyModel(id="p3", name="said why", priority=60, enabled=True, conditions={"methods": ["GET"]},
+                    action={"type": "deny", "reason": "no \"reads\" today"}),
+        PolicyModel(id="p4", name="off", priority=1, enabled=False, conditions={}, action={"type": "deny"}),
+        # API-key requests carry no role, so this one can never match them and is left out.
+        PolicyModel(id="p5", name="admins", priority=5, enabled=True, conditions={"roles": ["admin"]},
+                    action={"type": "deny"}),
+    ])
     await db_session.commit()
     snap = await dataplane_sync.build_snapshot(db_session)
-    assert _by_id(snap, a.id)["native_ok"] is False
-    assert _by_id(snap, b.id)["native_ok"] is True
+    assert _by_id(snap, a.id)["native_ok"] is True
+    assert snap["policies"] == [
+        {"path": "/api/admin/*", "methods": ["POST", "DELETE"], "tenants": ["t1"], "cidrs": ["198.51.100.0/24"],
+         "time": [22 * 60 + 30, 6 * 60], "deny": True,
+         "message_json": '"denied by policy \'office hours\'"', "details_json": '{"policy_id":"p1"}'},
+        {"path": None, "methods": [], "tenants": [], "cidrs": None, "time": None, "deny": False,
+         "message_json": '"denied by policy \'late\'"', "details_json": '{"policy_id":"p2"}'},
+        {"path": None, "methods": ["GET"], "tenants": [], "cidrs": None, "time": None, "deny": True,
+         "message_json": '"no \\"reads\\" today"', "details_json": '{"policy_id":"p3"}'},
+    ]
 
 
-async def test_an_enabled_policy_makes_every_key_non_native(db_session):
-    _, a = await _key(db_session)
-    db_session.add(PolicyModel(name="p1", conditions={}, action={"type": "deny"}, enabled=True))
+@pytest.mark.parametrize("conditions", [
+    {"headers": {"x-team": "^ops$"}},   # matching on headers is not reproduced
+    {"path": "/api/[ab]*"},             # nor are character classes in a path pattern
+    {"methods": "GET"},
+])
+async def test_a_policy_the_data_plane_cannot_evaluate_sends_every_key_to_python(db_session, conditions):
+    _, a = await _key(db_session, name="a")
+    _, b = await _key(db_session, name="b")
+    db_session.add(PolicyModel(name="p1", conditions=conditions, action={"type": "deny"}, enabled=True))
     await db_session.commit()
-    assert _by_id(await dataplane_sync.build_snapshot(db_session), a.id)["native_ok"] is False
+    snap = await dataplane_sync.build_snapshot(db_session)
+    assert not _by_id(snap, a.id)["native_ok"] and not _by_id(snap, b.id)["native_ok"]
+    assert snap["policies"] == [] and snap["ip_rules"] == []
+
+
+async def test_a_policy_with_unreadable_times_is_not_restricted_by_time(db_session):
+    await _key(db_session)
+    db_session.add(PolicyModel(id="p1", name="p1", enabled=True, action={"type": "deny"},
+                               conditions={"time_of_day": {"start": "25:00", "end": "06:00"}}))
+    await db_session.commit()
+    assert (await dataplane_sync.build_snapshot(db_session))["policies"][0]["time"] is None
+
+
+async def test_allowed_paths_are_compiled_as_path_is_allowed_reads_them(db_session):
+    from app.middleware.auth import path_is_allowed
+
+    patterns = ["/api/users/*", " /api/orders ", "/api/inv*", "/api/files/*x*", "", "api/v1/"]
+    _, a = await _key(db_session, name="scoped", allowed_paths=patterns)
+    _, everything = await _key(db_session, name="star", allowed_paths=["/api/x", "/*"])
+    _, plain = await _key(db_session, name="plain")
+    snap = await dataplane_sync.build_snapshot(db_session)
+    scope = _by_id(snap, a.id)["allowed_paths"]
+    assert _by_id(snap, a.id)["native_ok"] is True
+    assert scope["rules"] == [
+        ["under", "/api/users"], ["under", "/api/orders"], ["prefix", "/api/inv"], ["prefix", "/api/files/*x"],
+        ["under", "/api/v1"],
+    ]
+    assert scope["patterns_json"] == '["/api/users/*"," /api/orders ","/api/inv*","/api/files/*x*","","api/v1/"]'
+    assert _by_id(snap, everything.id)["allowed_paths"]["rules"] == [["all"]]
+    assert "allowed_paths" not in _by_id(snap, plain.id)
+
+    # The compiled form decides exactly as the gateway's own check does.
+    def compiled(path):
+        from app.middleware.auth import _normalise_scope_path
+
+        n = _normalise_scope_path(path or "/")
+        if n is None:
+            return False
+        return any(
+            r[0] == "all" or (r[0] == "prefix" and n.startswith(r[1]))
+            or (r[0] == "under" and (n == r[1] or n.startswith(r[1] + "/")))
+            for r in scope["rules"]
+        )
+
+    for path in ["/api/users", "/api/users/1", "/api/usersx", "/api/orders/9", "/api/inventory", "/api/in",
+                 "/api/files/*x/1", "/api/files/a", "/api/v1", "/api/v1/z", "/api/../admin", "//api//users/", "/"]:
+        assert compiled(path) == path_is_allowed(path, patterns), path
+
+
+async def test_tenant_usage_reported_by_the_data_plane_counts_against_the_quota(db_session, monkeypatch):
+    from datetime import datetime, timezone
+
+    monkeypatch.setattr(get_settings(), "dataplane_token", "s3cret")
+    _, model = await _tenant_key(db_session, quota={"requests_per_minute": 5})
+    now = datetime.now(timezone.utc)
+    minute = int(now.replace(second=0, microsecond=0).timestamp())
+    out = await dataplane_sync.report(dataplane_sync.DataplaneReport(tenant_usage=[
+        dataplane_sync.ReportedTenantUsage(tenant_id="t1", minute=minute, requests=3, errors=1, bytes_out=90),
+        dataplane_sync.ReportedTenantUsage(tenant_id="t1", minute=minute - 3600 * 5, requests=40),
+        dataplane_sync.ReportedTenantUsage(tenant_id="t1", minute=minute, requests=0),
+    ]), x_dataplane_token="s3cret", db=db_session)
+    assert out["tenant_requests"] == 43
+    full = await dataplane_sync.snapshot(since=None, x_dataplane_token="s3cret", db=db_session)
+    usage = full["tenant_usage"]
+    # Only the three served in the current minute count now; the forty belong to an hour long past.
+    assert usage["minute_start"] == minute and usage["used"]["t1"] == [3, 3]
+    same = await dataplane_sync.snapshot(since=full["revision"], x_dataplane_token="s3cret", db=db_session)
+    assert same == {"unchanged": True, "revision": full["revision"], "tenant_usage": usage}
+    tenant = await TenantRepository.get_by_id(db_session, "t1")
+    assert await TenantRepository.check_quota(db_session, tenant, "minute", 2)
+    assert not await TenantRepository.check_quota(db_session, tenant, "minute", 3)
 
 
 async def test_a_request_altering_plugin_sends_every_path_to_python(db_session, monkeypatch):
@@ -164,7 +320,8 @@ async def test_since_the_current_revision_answers_unchanged(db_session, monkeypa
     full = await dataplane_sync.snapshot(since=None, x_dataplane_token="s3cret", db=db_session)
     assert "keys" in full
     same = await dataplane_sync.snapshot(since=full["revision"], x_dataplane_token="s3cret", db=db_session)
-    assert same == {"unchanged": True, "revision": full["revision"]}
+    assert same == {"unchanged": True, "revision": full["revision"], "tenant_usage": full["tenant_usage"]}
+    assert full["tenant_usage"]["used"] == {}
     stale = await dataplane_sync.snapshot(since="old", x_dataplane_token="s3cret", db=db_session)
     assert "keys" in stale
 

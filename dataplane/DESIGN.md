@@ -128,6 +128,10 @@ fast path measured by a benchmark that fails CI on regression; per-core runtimes
 Realistic note: raw proxy speed against Rust and C proxies such as Envoy, NGINX and agentgateway is the hardest axis, and
 "ahead" is only claimed if the shared rig shows it. If it does not, the results say so and we keep working.
 
+**Where the code stands.** Phase 1 is implemented in `dataplane/` except the data plane's own health and metrics
+endpoints (those still come from the Python gateway), and with one breaker for the single backend. From phase 2,
+governance policies are already native. See [README.md](README.md) for what is handled, what is not, and the known gaps.
+
 ## Open questions (need a decision before phase 1)
 
 1. **Where does the code live?** Proposal: a `dataplane/` crate in this repository, Apache-2.0, built in CI next to the

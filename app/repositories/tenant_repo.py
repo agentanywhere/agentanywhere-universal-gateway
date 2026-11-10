@@ -207,8 +207,12 @@ class TenantRepository:
         error_count: int = 0,
         bytes_in: int = 0,
         bytes_out: int = 0,
+        now: Optional[datetime] = None,
     ) -> None:
         """Increment usage counters for a tenant across rolling windows.
+
+        ``now`` places the usage in the windows of that moment instead of the
+        current ones: the data plane reports requests a little after serving them.
 
         The counters are bumped in the database (``request_count =
         request_count + :n``), never read-modified-written in Python, so
@@ -219,7 +223,7 @@ class TenantRepository:
         window produce one row, not two (the table has no UNIQUE constraint).
         """
         windows = list(dict.fromkeys(windows or ["minute", "hour", "day"]))
-        starts = {w: TenantRepository._window_bounds(w) for w in windows}
+        starts = {w: TenantRepository._window_bounds(w, now) for w in windows}
         deltas = dict(
             request_count=request_count,
             error_count=error_count,
