@@ -22,7 +22,7 @@ The list is generated with `DEBUG=false`, the default. With `DEBUG=true` the
 gateway also serves `/docs`, `/redoc` and `/openapi.json`; otherwise they
 answer 404.
 
-Totals: 160 operations (one per method and path), of which 135 are under `/admin`. 3 admin operations need no credential.
+Totals: 162 operations (one per method and path), of which 135 are under `/admin`. 3 admin operations need no credential.
 
 ## Contents
 
@@ -30,6 +30,7 @@ Totals: 160 operations (one per method and path), of which 135 are under `/admin
 - [Data plane](#data-plane) (4)
 - [WebSocket](#websocket) (2)
 - [OAuth2](#oauth2) (6)
+- [Internal](#internal) (2)
 - [Admin: /admin/agents](#admin-adminagents) (11)
 - [Admin: /admin/ai](#admin-adminai) (5)
 - [Admin: /admin/api-keys](#admin-adminapi-keys) (4)
@@ -94,6 +95,13 @@ The HTTP authentication middleware does not run for WebSocket connections. `/ws/
 | POST | `/oauth2/revoke` | none |  | OAuth2 token revocation endpoint (RFC 7009). |
 | GET | `/oauth2/userinfo` | none | `provider` *query*<br>`access_token` *query* | OAuth2 user info endpoint. |
 | GET | `/oauth2/providers` | none |  | List registered OAuth2 providers (public-safe metadata only). |
+
+## Internal
+
+| Method | Path | Credential | Parameters | Summary |
+|---|---|---|---|---|
+| POST | `/internal/dataplane/report` | `X-Dataplane-Token`; 404 unless `DATAPLANE_TOKEN` is set | JSON body: `DataplaneReport` | What the Rust data plane served and saw: counts, log rows, key use and events. |
+| GET | `/internal/dataplane/snapshot` | `X-Dataplane-Token`; 404 unless `DATAPLANE_TOKEN` is set | `since?` *query* | The working set the Rust data plane serves from: key digests, limits and settings. |
 
 ## Admin: /admin/agents
 

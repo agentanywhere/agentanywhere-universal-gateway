@@ -118,6 +118,12 @@ async def build_snapshot(db: AsyncSession) -> Dict[str, Any]:
         "fallthrough_prefixes": ["/"] if all_paths_via_python else [],
         "rate_limit_enabled": bool(settings.rate_limit_enabled),
         "inject_request_id": inject_request_id,
+        "circuit_breaker": {
+            "enabled": bool(settings.circuit_breaker_enabled),
+            "failure_threshold": int(settings.circuit_breaker_failure_threshold),
+            "timeout_seconds": int(settings.circuit_breaker_timeout),
+        },
+        "upstream_timeout_seconds": float(settings.default_timeout),
         "api_versions": _versions(),
     }
     snap["revision"] = hashlib.sha256(json.dumps(snap, sort_keys=True).encode()).hexdigest()
@@ -180,7 +186,30 @@ class ReportedKeyUse(BaseModel):
     at: int  # epoch seconds of the key's latest use
 
 
+class ReportedEvent(BaseModel):
+    """Something this gateway announces by webhook and alert when it happens here: the circuit breaker
+    opening or closing (``circuit_breaker``) or a key going over its limit (``rate_limit_exceeded``)."""
+
+    type: str
+    # circuit_breaker
+    state: Optional[str] = None
+    previous_state: Optional[str] = None
+    backend_url: Optional[str] = None
+    failure_count: int = 0
+    failure_threshold: int = 0
+    opened_at: float = 0.0
+    timeout_seconds: int = 0
+    # rate_limit_exceeded
+    api_key_id: Optional[str] = None
+    client_ip: Optional[str] = None
+    limit: int = 0
+    window: Optional[str] = None
+    path: Optional[str] = None
+    count: int = 1  # how many refused requests this one event stands for
+
+
 class DataplaneReport(BaseModel):
+    events: list[ReportedEvent] = Field(default_factory=list, max_length=2000)
     keys_used: list[ReportedKeyUse] = Field(default_factory=list, max_length=5000)
     aggregates: list[ReportedAggregate] = Field(default_factory=list, max_length=5000)
     rows: list[ReportedRow] = Field(default_factory=list, max_length=5000)
@@ -244,6 +273,70 @@ def apply_report(report: DataplaneReport) -> Dict[str, int]:
     return {"requests": counted, "rows": len(report.rows), "rows_skipped": skipped}
 
 
+# Webhook and alert deliveries in flight; held here so they are not collected before they finish.
+_background: set = set()
+
+
+def _in_background(coro) -> None:
+    task = asyncio.get_running_loop().create_task(coro)
+    _background.add(task)
+    task.add_done_callback(_background.discard)
+
+
+async def apply_events(db: AsyncSession, events: list) -> int:
+    """Announce what happened in the data plane exactly as this gateway announces its own: the same
+    webhook event types and payloads, the same alerts (which keep their own thresholds and intervals).
+    Deliveries run in the background so a slow receiver never delays the report.
+
+    A rate-limit event stands for every request one key had refused in one window since the last
+    report (``count``), where this gateway fires one webhook per refused request."""
+    from app.notifications import notification_manager
+    from app.webhooks import WebhookEventType, webhook_manager
+
+    limited = [e for e in events if e.type == "rate_limit_exceeded"]
+    names: Dict[str, Optional[str]] = {}
+    ids = {e.api_key_id for e in limited if e.api_key_id}
+    if ids:
+        rows = await db.execute(select(APIKeyModel.id, APIKeyModel.name).where(APIKeyModel.id.in_(ids)))
+        names = {row[0]: row[1] for row in rows.all()}
+
+    announced = 0
+    for e in events:
+        if e.type == "circuit_breaker" and e.state == "open":
+            message = f"Circuit breaker opened after {e.failure_count} failures"
+            _in_background(webhook_manager.trigger_webhook(WebhookEventType.CIRCUIT_BREAKER_OPEN, {
+                "backend_url": e.backend_url, "state": "open", "previous_state": e.previous_state,
+                "failure_count": e.failure_count, "failure_threshold": e.failure_threshold,
+                "opened_at": e.opened_at, "timeout_seconds": e.timeout_seconds, "message": message,
+            }))
+        elif e.type == "circuit_breaker" and e.state == "closed":
+            message = "Circuit breaker closed after successful request"
+            _in_background(webhook_manager.trigger_webhook(WebhookEventType.CIRCUIT_BREAKER_CLOSED, {
+                "backend_url": e.backend_url, "state": "closed", "previous_state": e.previous_state,
+                "failure_count": e.failure_count, "message": message,
+            }))
+        elif e.type == "rate_limit_exceeded":
+            _in_background(webhook_manager.trigger_webhook(WebhookEventType.RATE_LIMIT_EXCEEDED, {
+                "api_key_id": e.api_key_id, "api_key_name": names.get(e.api_key_id or ""),
+                "client_ip": e.client_ip, "limit": e.limit, "window": e.window, "path": e.path,
+                "count": max(1, e.count),
+            }))
+            _in_background(notification_manager.send_rate_limit_alert(
+                api_key_id=e.api_key_id, client_ip=e.client_ip or "", limit=e.limit,
+                window=e.window or "", path=e.path or "",
+            ))
+            announced += 1
+            continue
+        else:
+            continue  # a kind this version does not know: ignore rather than refuse the whole report
+        _in_background(notification_manager.send_circuit_breaker_alert(
+            backend_url=e.backend_url or "", state=e.state, previous_state=e.previous_state or "",
+            failure_count=e.failure_count, message=message,
+        ))
+        announced += 1
+    return announced
+
+
 async def apply_key_usage(db: AsyncSession, uses: list) -> int:
     """Move each key's ``last_used_at`` forward to the data plane's latest use (never backwards)."""
     n = 0
@@ -267,9 +360,11 @@ async def report(
     x_dataplane_token: Optional[str] = Header(default=None),
     db: AsyncSession = Depends(get_db),
 ) -> Dict[str, int]:
+    """What the Rust data plane served and saw: counts, log rows, key use and events."""
     _authorize(x_dataplane_token)
     out = apply_report(body)
     out["keys_updated"] = await apply_key_usage(db, body.keys_used)
+    out["events"] = await apply_events(db, body.events)
     return out
 
 
@@ -279,6 +374,7 @@ async def snapshot(
     x_dataplane_token: Optional[str] = Header(default=None),
     db: AsyncSession = Depends(get_db),
 ) -> Dict[str, Any]:
+    """The working set the Rust data plane serves from: key digests, limits and settings."""
     _authorize(x_dataplane_token)
     snap = await current_snapshot(db)
     if since and since == snap["revision"]:

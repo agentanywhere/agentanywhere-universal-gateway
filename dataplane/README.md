@@ -52,6 +52,13 @@ for `/internal/...`. Tunables: `--sync-interval-ms` (default 500) and `--max-sta
     `--log-rows-per-second` (default 1000). Rows beyond the cap are not sent; they are counted in
     `gateway_dataplane_rows_skipped_total`, never silently lost. Rows go through the normal request-log sink.
   * If a report cannot be delivered, the counts are kept for the next one; the rows are dropped and counted.
+  * The breaker opening or closing and keys going over their limit ride along as events, and the Python gateway fires
+    the same webhooks (`circuit_breaker_open`, `circuit_breaker_closed`, `rate_limit_exceeded`) and alerts for them.
+* **The backend is protected the way Python protects it.** A circuit breaker with the gateway's settings
+  (`CIRCUIT_BREAKER_ENABLED`, `CIRCUIT_BREAKER_FAILURE_THRESHOLD`, `CIRCUIT_BREAKER_TIMEOUT`, read from the snapshot)
+  counts requests the backend did not answer; when it opens, requests get the gateway's `503 SERVICE_UNAVAILABLE`
+  without being sent, and an unreachable backend gets its `502 BACKEND_ERROR`, both with the same bodies as Python.
+  The data plane's breaker is its own: it does not share state with the Python workers' breakers.
 
 `snapshot.json` (`--snapshot`) is still accepted to bootstrap or to run without a control plane, for tests and benchmarks.
 Its format is the same as what the control plane serves; see `src/snapshot.rs`.
@@ -73,9 +80,13 @@ its answer is the answer.
 * **Reporting is by aggregate and sample, not per request.** Counts, latency and SLOs are exact; the request-log view
   shows every error but only a capped number of successes at high rates. There is no per-request `http_access` log line
   for native requests. Each key's `last_used_at` is kept current (the latest use per key rides along with each report).
-* **Rate-limit webhooks and alerts are not fired** when the data plane returns a 429.
+* **A rate-limit webhook stands for a batch, not one request.** A native 429 fires the same webhook and alert, but
+  once per key and window in each report, with a `count` of the requests refused, where Python fires one per request.
+* **The upstream timeout covers the wait for the backend to start answering** (`DEFAULT_TIMEOUT`, from the snapshot);
+  a response that starts and then stalls is not cut off. No test exercises the timeout itself yet.
+* **`gateway_errors_total` by error type is not fed** for native upstream failures; the request counters, the RED
+  error counter and the request log are.
 * **Tenant quotas, IP rules and policies are not evaluated natively**; keys they apply to are served by Python.
-* **No per-backend circuit breaker**, and a failed upstream gives a simplified 502 body.
 * **Rate-limit counters are shared by all threads**, so limits are exact; Python's are per worker process.
 * The `Server` response header differs (uvicorn on one side), and native answers add `X-Served-By`.
 

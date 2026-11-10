@@ -6,6 +6,10 @@
 //! does not grow with traffic. Individual request-log rows are sent for every error and for
 //! successes up to a rate cap; the rest are counted as skipped (and shown in a metric), never
 //! silently lost. If a report cannot be delivered the aggregates are kept for the next one.
+//!
+//! Events are the things the control plane announces by webhook and alert: the circuit breaker
+//! opening or closing, and a key going over its rate limit (one event per key and window per
+//! report, carrying how many requests were refused).
 use crate::limits::Window;
 use crate::proxy::State;
 use bytes::Bytes;
@@ -15,6 +19,7 @@ use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use hyper_util::rt::TokioExecutor;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -24,6 +29,7 @@ pub const BOUNDS: [f64; 8] = [0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0];
 const SHARDS: usize = 32;
 const MAX_LABELS: usize = 200;
 const MAX_SEGMENTS: usize = 4;
+const MAX_EVENTS: usize = 1000;
 
 #[derive(Hash, PartialEq, Eq, Clone)]
 struct AggKey {
@@ -66,6 +72,36 @@ pub struct Row {
     pub error: Option<String>,
 }
 
+#[derive(Serialize, Clone, Debug, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Event {
+    CircuitBreaker {
+        state: &'static str,
+        previous_state: &'static str,
+        backend_url: String,
+        failure_count: u32,
+        failure_threshold: u32,
+        opened_at: f64,
+        timeout_seconds: u64,
+    },
+    RateLimitExceeded {
+        api_key_id: String,
+        client_ip: String,
+        limit: u32,
+        window: &'static str,
+        /// The first refused path; `count` says how many requests the event stands for.
+        path: String,
+        count: u64,
+    },
+}
+
+struct Limited {
+    client_ip: String,
+    limit: u32,
+    path: String,
+    count: u64,
+}
+
 #[derive(Serialize)]
 struct KeyUse {
     id: String,
@@ -78,6 +114,7 @@ struct Report {
     aggregates: Vec<AggOut>,
     rows: Vec<Row>,
     rows_skipped: u64,
+    events: Vec<Event>,
 }
 
 pub struct Reporter {
@@ -90,6 +127,9 @@ pub struct Reporter {
     max_rows_per_sec: u32,
     row_cap: usize,
     skipped_rows: AtomicU64,
+    events: Mutex<Vec<Event>>,
+    /// Refusals since the last report, per (key id, window).
+    limited: Mutex<HashMap<(String, &'static str), Limited>>,
 }
 
 pub fn bucket_index(seconds: f64) -> usize {
@@ -125,6 +165,8 @@ impl Reporter {
             max_rows_per_sec,
             row_cap,
             skipped_rows: AtomicU64::new(0),
+            events: Mutex::new(Vec::new()),
+            limited: Mutex::new(HashMap::new()),
         }
     }
 
@@ -205,6 +247,50 @@ impl Reporter {
         self.skipped_rows.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Queue an event for the next report. Beyond the cap the oldest are kept and new ones dropped.
+    pub fn event(&self, event: Event) {
+        let mut events = self.events.lock().unwrap();
+        if events.len() < MAX_EVENTS {
+            events.push(event);
+        }
+    }
+
+    /// A request was refused with a 429. Only reached on refusals, so the lock is off the hot path.
+    pub fn rate_limited(&self, key_id: &str, window: &'static str, limit: u32, path: &str, ip: IpAddr) {
+        let mut limited = self.limited.lock().unwrap();
+        if let Some(l) = limited.get_mut(&(key_id.to_owned(), window)) {
+            l.count += 1;
+        } else if limited.len() < MAX_EVENTS {
+            limited.insert(
+                (key_id.to_owned(), window),
+                Limited { client_ip: ip.to_string(), limit, path: path.to_owned(), count: 1 },
+            );
+        }
+    }
+
+    fn take_events(&self) -> Vec<Event> {
+        let mut events = std::mem::take(&mut *self.events.lock().unwrap());
+        for ((api_key_id, window), l) in std::mem::take(&mut *self.limited.lock().unwrap()) {
+            events.push(Event::RateLimitExceeded {
+                api_key_id,
+                client_ip: l.client_ip,
+                limit: l.limit,
+                window,
+                path: l.path,
+                count: l.count,
+            });
+        }
+        events
+    }
+
+    /// Put undelivered events back, ahead of anything queued since.
+    fn restore_events(&self, mut events: Vec<Event>) {
+        let mut queued = self.events.lock().unwrap();
+        events.append(&mut queued);
+        events.truncate(MAX_EVENTS);
+        *queued = events;
+    }
+
     fn take_used(&self) -> HashMap<String, u64> {
         let mut merged: HashMap<String, u64> = HashMap::new();
         for shard in &self.used {
@@ -253,7 +339,13 @@ impl Reporter {
     }
 }
 
-fn to_report(aggs: &[(AggKey, Agg)], rows: Vec<Row>, skipped: u64, used: &HashMap<String, u64>) -> Report {
+fn to_report(
+    aggs: &[(AggKey, Agg)],
+    rows: Vec<Row>,
+    skipped: u64,
+    used: &HashMap<String, u64>,
+    events: &[Event],
+) -> Report {
     Report {
         keys_used: used.iter().map(|(id, at)| KeyUse { id: id.clone(), at: *at }).collect(),
         aggregates: aggs
@@ -269,6 +361,7 @@ fn to_report(aggs: &[(AggKey, Agg)], rows: Vec<Row>, skipped: u64, used: &HashMa
             .collect(),
         rows,
         rows_skipped: skipped,
+        events: events.to_vec(),
     }
 }
 
@@ -282,11 +375,12 @@ pub async fn run(state: Arc<State>, reporter: Arc<Reporter>, control: String, to
         tokio::time::sleep(interval).await;
         let (aggs, rows, skipped) = reporter.take();
         let used = reporter.take_used();
-        if aggs.is_empty() && rows.is_empty() && skipped == 0 && used.is_empty() {
+        let events = reporter.take_events();
+        if aggs.is_empty() && rows.is_empty() && skipped == 0 && used.is_empty() && events.is_empty() {
             continue;
         }
         let rows_len = rows.len() as u64;
-        let body = match serde_json::to_vec(&to_report(&aggs, rows, skipped, &used)) {
+        let body = match serde_json::to_vec(&to_report(&aggs, rows, skipped, &used, &events)) {
             Ok(b) => b,
             Err(_) => continue,
         };
@@ -316,6 +410,7 @@ pub async fn run(state: Arc<State>, reporter: Arc<Reporter>, control: String, to
             // Counts are kept for the next report; rows are not (they would grow without bound).
             reporter.restore(aggs, skipped + rows_len);
             reporter.restore_used(used);
+            reporter.restore_events(events);
             if !failing {
                 eprintln!("dataplane: could not deliver a report to the control plane; counts are kept, rows are skipped");
                 failing = true;
@@ -412,6 +507,61 @@ mod tests {
         assert!(r.take_used().is_empty());
         r.restore_used(used);
         assert_eq!(r.take_used().len(), 2);
+    }
+
+    #[test]
+    fn refusals_become_one_event_per_key_and_window() {
+        let r = Reporter::new(1000, 100);
+        let ip: IpAddr = "10.0.0.9".parse().unwrap();
+        for _ in 0..50 {
+            r.rate_limited("k1", "minute", 3, "/api/users", ip);
+        }
+        r.rate_limited("k1", "hour", 100, "/api/orders", ip);
+        r.rate_limited("k2", "minute", 3, "/api/users", ip);
+        let mut events = r.take_events();
+        events.sort_by_key(|e| serde_json::to_string(e).unwrap());
+        assert_eq!(events.len(), 3);
+        assert!(events.contains(&Event::RateLimitExceeded {
+            api_key_id: "k1".into(),
+            client_ip: "10.0.0.9".into(),
+            limit: 3,
+            window: "minute",
+            path: "/api/users".into(),
+            count: 50,
+        }));
+        assert!(r.take_events().is_empty());
+    }
+
+    #[test]
+    fn events_survive_a_failed_delivery_in_order_and_have_the_wire_shape() {
+        let r = Reporter::new(1000, 100);
+        let open = Event::CircuitBreaker {
+            state: "open",
+            previous_state: "closed",
+            backend_url: "http://b".into(),
+            failure_count: 5,
+            failure_threshold: 5,
+            opened_at: 1.5,
+            timeout_seconds: 60,
+        };
+        r.event(open.clone());
+        let taken = r.take_events();
+        r.event(Event::CircuitBreaker {
+            state: "closed",
+            previous_state: "half-open",
+            backend_url: "http://b".into(),
+            failure_count: 0,
+            failure_threshold: 5,
+            opened_at: 2.0,
+            timeout_seconds: 60,
+        });
+        r.restore_events(taken);
+        let events = r.take_events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0], open);
+        let wire = serde_json::to_value(&events[0]).unwrap();
+        assert_eq!(wire["type"], "circuit_breaker");
+        assert_eq!(wire["previous_state"], "closed");
     }
 
     #[test]

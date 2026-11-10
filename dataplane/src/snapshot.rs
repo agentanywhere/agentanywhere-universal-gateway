@@ -3,11 +3,13 @@
 //! Keys are stored only as SHA-256 digests (what the database stores), so the data plane
 //! never holds a usable credential. For now the snapshot is a JSON file; the control-plane
 //! channel that serves it live, with change events, is the next step (see DESIGN.md).
+use crate::breaker;
 use crate::limits::Window;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use std::hash::{BuildHasherDefault, Hasher};
 
 /// Keys are already SHA-256 digests, so the first eight bytes are a perfectly good hash.
@@ -57,6 +59,9 @@ pub struct Snapshot {
     pub revision: Option<String>,
     pub api_versions: ApiVersions,
     pub rate_limit_enabled: bool,
+    pub circuit_breaker: breaker::Config,
+    /// How long the backend may take to start answering before the request fails with a 502.
+    pub upstream_timeout: Duration,
     pub keys: HashMap<Digest32, KeyEntry, BuildHasherDefault<DigestHasher>>,
     /// Path prefixes the control plane must handle (dynamic routes, transformation rules, ...).
     pub fallthrough_prefixes: Vec<String>,
@@ -76,6 +81,15 @@ struct SnapshotFile {
     unchanged: bool,
     #[serde(default)]
     inject_request_id: bool,
+    circuit_breaker: Option<BreakerRecord>,
+    upstream_timeout_seconds: Option<f64>,
+}
+
+#[derive(Deserialize)]
+struct BreakerRecord {
+    enabled: bool,
+    failure_threshold: u32,
+    timeout_seconds: u64,
 }
 
 #[derive(Deserialize)]
@@ -189,6 +203,12 @@ impl Snapshot {
             revision: file.revision,
             api_versions,
             rate_limit_enabled: file.rate_limit_enabled,
+            // Without these sections, the gateway's shipped defaults apply.
+            circuit_breaker: file
+                .circuit_breaker
+                .map(|c| breaker::Config { enabled: c.enabled, threshold: c.failure_threshold, timeout_secs: c.timeout_seconds })
+                .unwrap_or_default(),
+            upstream_timeout: Duration::from_secs_f64(file.upstream_timeout_seconds.filter(|s| *s > 0.0 && s.is_finite()).unwrap_or(30.0)),
             keys,
             fallthrough_prefixes: file.fallthrough_prefixes,
         }))
@@ -243,6 +263,19 @@ mod tests {
             Snapshot::parse(r#"{"unchanged":true,"revision":"r1"}"#, Some(&first)).unwrap(),
             Parsed::Unchanged
         ));
+    }
+
+    #[test]
+    fn breaker_and_timeout_come_from_the_control_plane_or_default() {
+        let snap = Snapshot::from_json(r#"{"keys":[]}"#).unwrap();
+        assert_eq!(snap.circuit_breaker, breaker::Config { enabled: true, threshold: 5, timeout_secs: 60 });
+        assert_eq!(snap.upstream_timeout, Duration::from_secs(30));
+        let snap = Snapshot::from_json(
+            r#"{"keys":[],"upstream_timeout_seconds":2.5,"circuit_breaker":{"enabled":false,"failure_threshold":2,"timeout_seconds":7}}"#,
+        )
+        .unwrap();
+        assert_eq!(snap.circuit_breaker, breaker::Config { enabled: false, threshold: 2, timeout_secs: 7 });
+        assert_eq!(snap.upstream_timeout, Duration::from_millis(2500));
     }
 
     #[test]

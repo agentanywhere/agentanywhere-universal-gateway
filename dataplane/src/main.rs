@@ -2,6 +2,7 @@
 //!
 //! dataplane --listen 127.0.0.1:8000 --snapshot snapshot.json \
 //!           --backend http://127.0.0.1:9100 --control http://127.0.0.1:8001
+mod breaker;
 mod limits;
 mod proxy;
 mod report;
@@ -106,6 +107,7 @@ async fn main() {
         backend: args.backend,
         control: args.control.clone(),
         client,
+        breaker: breaker::Breaker::new(),
         sync: link,
         reporter: reporter.clone(),
     });

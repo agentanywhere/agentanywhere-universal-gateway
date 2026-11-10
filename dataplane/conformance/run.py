@@ -8,7 +8,8 @@ Each scenario is sent to the Python gateway directly and to the data plane, and 
 code, the body and the headers the gateway promises are compared. A status, error-code or body
 difference fails the run. Header-name differences are listed as known gaps, not failures.
 """
-import json, os, secrets, signal, subprocess, sys, tempfile, time
+import json, os, secrets, signal, subprocess, sys, tempfile, threading, time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import httpx
@@ -19,6 +20,24 @@ from perf.suite import _BACKEND, _BACKEND_RUNNER, free_port, wait_healthy  # noq
 
 BIN = ROOT / "dataplane/target/release/dataplane"
 PROMISED = ("x-request-id", "traceparent", "retry-after", "content-type", "x-response-time", "x-api-version")
+
+
+def webhook_receiver():
+    """A local endpoint that keeps every webhook the gateway delivers; returns (url, received)."""
+    received = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            received.append(json.loads(self.rfile.read(int(self.headers.get("content-length", 0)))))
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *_):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return f"http://127.0.0.1:{server.server_port}/hook", received
 
 
 def main() -> int:
@@ -32,10 +51,15 @@ def main() -> int:
         env = {**os.environ, "SECRET_KEY": secrets.token_urlsafe(48), "ADMIN_TOKEN": admin,
                "DATABASE_URL": f"sqlite+aiosqlite:///{tmp}/g.db", "HTTP_BACKEND_URL": f"http://127.0.0.1:{bport}",
                "REDIS_ENABLED": "false", "LOG_LEVEL": "WARNING", "STARTUP_BANNER": "false", "DEBUG": "false",
-               "TRUSTED_PROXIES": "127.0.0.1", "DATAPLANE_TOKEN": "conformance-token"}
+               "TRUSTED_PROXIES": "127.0.0.1", "DATAPLANE_TOKEN": "conformance-token",
+               "CIRCUIT_BREAKER_TIMEOUT": "2"}  # short, so the breaker scenarios can wait it out
+
+        def start_backend():
+            return subprocess.Popen([sys.executable, "-c", _BACKEND_RUNNER, str(ROOT / _BACKEND), str(bport)],
+                                    cwd=ROOT, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
         try:
-            procs.append(subprocess.Popen([sys.executable, "-c", _BACKEND_RUNNER, str(ROOT / _BACKEND), str(bport)],
-                                          cwd=ROOT, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+            procs.append(start_backend())
             procs.append(subprocess.Popen([sys.executable, "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1",
                                            "--port", str(gport), "--log-level", "warning"], cwd=ROOT, env=env,
                                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
@@ -77,6 +101,14 @@ def main() -> int:
                 return None
 
             assert wait_until(lambda: served_natively(keys["rs"]["key"]), 8), "data plane never started serving natively"
+            hook_url, hooks = webhook_receiver()
+            httpx.post(f"{py}/admin/webhooks", headers=adm, timeout=10, json={
+                "url": hook_url, "events": ["rate_limit_exceeded", "circuit_breaker_open", "circuit_breaker_closed"],
+            }).raise_for_status()
+
+            def hooked(event, **data):
+                return [h for h in hooks if h.get("event_type") == event
+                        and all(h.get("data", {}).get(k) == v for k, v in data.items())]
             scenarios = [
                 ("no key", "GET", "/api/users", {}, None, "py", "rs"),
                 ("wrong key", "GET", "/api/users", {"X-API-Key": "sk-nope"}, None, "py", "rs"),
@@ -223,6 +255,61 @@ def main() -> int:
             logs429 = httpx.get(f"{py}/admin/logs", params={"limit": 1000, "status_code": 429}, headers=adm, timeout=10).json()["logs"]
             check("a native 429 is logged with its key", any(l.get("api_key_id") == lim["id"] for l in logs429))
             check("a native 429 feeds the rate-limit metric", metric("gateway_rate_limit_hits_total", client_id=lim["id"]) >= 1)
+
+            got = hooked("rate_limit_exceeded", api_key_id=lim["id"])
+            check("a native 429 fires the rate-limit webhook", len(got) >= 1,
+                  json.dumps(got[0]["data"], sort_keys=True) if got else "none received")
+            theirs = hooked("rate_limit_exceeded", api_key_id=keys["py_lim"]["id"])
+            if got and theirs:
+                extra = set(got[0]["data"]) ^ set(theirs[0]["data"])
+                check("the rate-limit webhook carries the same fields (plus a count)", extra == {"count"}, str(sorted(extra)))
+
+            # --- the backend goes away ---------------------------------------------------------------
+            print()
+            bkey = {"py": make_key("conf-py-breaker", 1000), "rs": make_key("conf-rs-breaker", 1000)}
+            assert wait_until(lambda: served_natively(bkey["rs"]["key"])), "breaker key never became native"
+            procs[0].send_signal(signal.SIGTERM)
+            procs[0].wait(timeout=15)
+            get = lambda base, who: call(base, "GET", "/api/users", {"X-API-Key": "{key}"}, None, bkey[who]["key"])
+            # The data plane first and alone, so the webhook it causes can be told from Python's own.
+            b = [get(rs, "rs") for _ in range(6)]
+            check("the data plane answered these itself", all(r.headers.get("x-served-by") == "dataplane" for r in b))
+            t = wait_until(lambda: hooked("circuit_breaker_open"), 4)
+            opened = hooked("circuit_breaker_open")
+            check("the breaker opening in the data plane fires the webhook", t is not None and len(opened) == 1,
+                  json.dumps(opened[0]["data"], sort_keys=True) if opened else "none received")
+            a = [get(py, "py") for _ in range(6)]
+            print("      backend-down statuses  python", [r.status_code for r in a], " rust", [r.status_code for r in b])
+            compare("backend unreachable (502 shape)", a[0], b[0])
+            compare("circuit open (503 shape)", a[5], b[5])
+            if [r.status_code for r in a] != [r.status_code for r in b]:
+                print("FAIL  backend-down sequence differs"); failures += 1
+            for name, x, y in (("502", a[0], b[0]), ("503", a[5], b[5])):
+                if x.status_code == y.status_code and x.status_code >= 500 and x.json().get("details") != y.json().get("details"):
+                    print(f"FAIL  {name} details differ: {x.json().get('details')} vs {y.json().get('details')}"); failures += 1
+            wait_until(lambda: len(hooked("circuit_breaker_open")) == 2, 3)
+            both = hooked("circuit_breaker_open")
+            if len(both) == 2:
+                when = lambda d: {k: ("<when>" if k == "opened_at" else v) for k, v in d.items()}
+                x, y = when(both[0]["data"]), when(both[1]["data"])
+                check("the open webhook carries the same payload from both", x == y,
+                      "" if x == y else f"{json.dumps(x, sort_keys=True)} vs {json.dumps(y, sort_keys=True)}")
+            else:
+                check("Python's own breaker also announced opening", False, f"{len(both)} open webhooks")
+
+            procs[0] = start_backend()
+            wait_healthy(f"http://127.0.0.1:{bport}/health", procs[0])
+            time.sleep(2.2)  # past CIRCUIT_BREAKER_TIMEOUT: half-open
+            b = get(rs, "rs")
+            check("after the wait the data plane tries the backend again", b.status_code == 200
+                  and b.headers.get("x-served-by") == "dataplane", f"[{b.status_code}]")
+            t = wait_until(lambda: hooked("circuit_breaker_closed"), 4)
+            check("the breaker closing in the data plane fires the webhook", t is not None and len(hooked("circuit_breaker_closed")) == 1)
+            compare("backend back (200)", get(py, "py"), get(rs, "rs"))
+            wait_until(lambda: len(hooked("circuit_breaker_closed")) == 2, 3)
+            both = hooked("circuit_breaker_closed")
+            check("the closed webhook carries the same payload from both",
+                  len(both) == 2 and mask(both[0]["data"]) == mask(both[1]["data"]), f"{len(both)} closed webhooks")
 
             # Last: the control plane goes away. The data plane must stop serving natively.
             procs[1].send_signal(signal.SIGTERM)

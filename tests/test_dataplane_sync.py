@@ -281,3 +281,104 @@ async def test_last_used_moves_forward_and_never_back(db_session):
         dataplane_sync.ReportedKeyUse(id=model.id, at=later - 3600),
         dataplane_sync.ReportedKeyUse(id="no-such-key", at=later),
     ]) == 0
+
+
+async def test_the_snapshot_carries_the_breaker_settings_and_the_upstream_timeout(db_session, monkeypatch):
+    s = get_settings()
+    first = await dataplane_sync.build_snapshot(db_session)
+    assert first["circuit_breaker"] == {
+        "enabled": bool(s.circuit_breaker_enabled),
+        "failure_threshold": s.circuit_breaker_failure_threshold,
+        "timeout_seconds": s.circuit_breaker_timeout,
+    }
+    assert first["upstream_timeout_seconds"] == float(s.default_timeout)
+    monkeypatch.setattr(s, "circuit_breaker_failure_threshold", s.circuit_breaker_failure_threshold + 1)
+    dataplane_sync.reset_cache()
+    assert (await dataplane_sync.build_snapshot(db_session))["revision"] != first["revision"]
+
+
+@pytest.fixture
+def announced(monkeypatch):
+    """Record the webhooks and alerts a report's events cause, in place of delivering them."""
+    from app.notifications import notification_manager
+    from app.webhooks import webhook_manager
+
+    seen = {"webhooks": [], "breaker_alerts": [], "limit_alerts": []}
+
+    async def webhook(event_type, payload, filters=None):
+        seen["webhooks"].append((event_type, payload))
+        return []
+
+    async def breaker_alert(**kw):
+        seen["breaker_alerts"].append(kw)
+
+    async def limit_alert(**kw):
+        seen["limit_alerts"].append(kw)
+
+    monkeypatch.setattr(webhook_manager, "trigger_webhook", webhook)
+    monkeypatch.setattr(notification_manager, "send_circuit_breaker_alert", breaker_alert)
+    monkeypatch.setattr(notification_manager, "send_rate_limit_alert", limit_alert)
+    return seen
+
+
+async def _settle():
+    import asyncio
+
+    while dataplane_sync._background:
+        await asyncio.gather(*list(dataplane_sync._background))
+
+
+async def test_a_breaker_opening_in_the_data_plane_is_announced_like_our_own(db_session, announced):
+    event = dataplane_sync.ReportedEvent(
+        type="circuit_breaker", state="open", previous_state="closed", backend_url="http://b:9",
+        failure_count=5, failure_threshold=5, opened_at=1762776000.5, timeout_seconds=60,
+    )
+    assert await dataplane_sync.apply_events(db_session, [event]) == 1
+    await _settle()
+    assert announced["webhooks"] == [("circuit_breaker_open", {
+        "backend_url": "http://b:9", "state": "open", "previous_state": "closed", "failure_count": 5,
+        "failure_threshold": 5, "opened_at": 1762776000.5, "timeout_seconds": 60,
+        "message": "Circuit breaker opened after 5 failures",
+    })]
+    assert announced["breaker_alerts"] == [{
+        "backend_url": "http://b:9", "state": "open", "previous_state": "closed", "failure_count": 5,
+        "message": "Circuit breaker opened after 5 failures",
+    }]
+
+
+async def test_a_breaker_closing_in_the_data_plane_is_announced_like_our_own(db_session, announced):
+    event = dataplane_sync.ReportedEvent(
+        type="circuit_breaker", state="closed", previous_state="half-open", backend_url="http://b:9",
+    )
+    assert await dataplane_sync.apply_events(db_session, [event]) == 1
+    await _settle()
+    assert announced["webhooks"] == [("circuit_breaker_closed", {
+        "backend_url": "http://b:9", "state": "closed", "previous_state": "half-open", "failure_count": 0,
+        "message": "Circuit breaker closed after successful request",
+    })]
+    assert announced["breaker_alerts"][0]["state"] == "closed"
+
+
+async def test_a_native_rate_limit_refusal_is_announced_with_the_keys_name(db_session, announced):
+    _, model = await _key(db_session, name="billing-service")
+    event = dataplane_sync.ReportedEvent(
+        type="rate_limit_exceeded", api_key_id=model.id, client_ip="198.51.100.7", limit=3, window="minute",
+        path="/api/users", count=41,
+    )
+    assert await dataplane_sync.apply_events(db_session, [event]) == 1
+    await _settle()
+    assert announced["webhooks"] == [("rate_limit_exceeded", {
+        "api_key_id": model.id, "api_key_name": "billing-service", "client_ip": "198.51.100.7", "limit": 3,
+        "window": "minute", "path": "/api/users", "count": 41,
+    })]
+    assert announced["limit_alerts"] == [{
+        "api_key_id": model.id, "client_ip": "198.51.100.7", "limit": 3, "window": "minute", "path": "/api/users",
+    }]
+
+
+async def test_an_event_of_an_unknown_kind_is_ignored_not_refused(db_session, announced):
+    events = [dataplane_sync.ReportedEvent(type="something_newer"),
+              dataplane_sync.ReportedEvent(type="circuit_breaker", state="half-open")]
+    assert await dataplane_sync.apply_events(db_session, events) == 0
+    await _settle()
+    assert announced == {"webhooks": [], "breaker_alerts": [], "limit_alerts": []}

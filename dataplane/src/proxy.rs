@@ -16,10 +16,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::breaker::{self, Breaker};
+use crate::report::{Event, Reporter, Row};
 use crate::snapshot::{hash_key, Snapshot};
-use crate::report::{Reporter, Row};
 use crate::sync::Link;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 pub type Body = BoxBody<Bytes, hyper::Error>;
 
@@ -28,6 +29,8 @@ pub struct State {
     pub backend: String,
     pub control: String,
     pub client: Client<HttpConnector, Incoming>,
+    /// For the backend native requests go to. The control plane keeps its own for what it serves.
+    pub breaker: Breaker,
     /// Present when the snapshot comes from the control plane; native serving needs it fresh.
     pub sync: Option<Arc<Link>>,
     /// Present with a control-plane link: what was served is reported back.
@@ -164,17 +167,69 @@ fn rate_limited(window: &str, limit: u32, retry_after: u32, t: &Trace) -> Respon
     resp
 }
 
-fn bad_gateway(t: &Trace) -> Response<Body> {
+/// The Python gateway's error envelope, for the upstream failures a native request can meet.
+fn gateway_error(status: StatusCode, code: &str, message: &str, details: &str, t: &Trace) -> Response<Body> {
     let body = format!(
-        "{{\"error\":\"BACKEND_ERROR\",\"message\":\"Backend: upstream request failed\",\"request_id\":\"{}\",\"timestamp\":\"{}\"}}",
+        "{{\"error\":\"{code}\",\"message\":\"{message}\",\"request_id\":\"{}\",\"details\":{details},\"timestamp\":\"{}\"}}",
         t.request_id,
         iso_now()
     );
     let mut resp = Response::new(full(body));
-    *resp.status_mut() = StatusCode::BAD_GATEWAY;
-    resp.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    stamp(resp.headers_mut(), t);
+    *resp.status_mut() = status;
+    let h = resp.headers_mut();
+    h.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    h.insert("x-content-type-options", HeaderValue::from_static("nosniff"));
+    stamp(h, t);
     resp
+}
+
+/// The backend did not answer (refused, reset, or slower than the timeout).
+fn backend_unavailable(t: &Trace) -> Response<Body> {
+    gateway_error(
+        StatusCode::BAD_GATEWAY,
+        "BACKEND_ERROR",
+        "Backend: Backend service unavailable",
+        "{\"hint\":\"The upstream backend could not be reached. Check that the backend is running and reachable from the gateway.\",\"service\":\"Backend\"}",
+        t,
+    )
+}
+
+/// The circuit breaker is open: the request was not sent.
+fn circuit_open(t: &Trace) -> Response<Body> {
+    gateway_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "SERVICE_UNAVAILABLE",
+        "Backend: Upstream service is temporarily unavailable (circuit open)",
+        "{\"service\":\"Backend\"}",
+        t,
+    )
+}
+
+/// The control plane itself could not be reached; there is no gateway behind us to shape the answer.
+fn control_unreachable() -> Response<Body> {
+    let t = Trace { request_id: uuid::Uuid::new_v4().to_string(), traceparent: String::new() };
+    gateway_error(
+        StatusCode::BAD_GATEWAY,
+        "BACKEND_ERROR",
+        "Gateway: control plane unreachable",
+        "{\"service\":\"Gateway\"}",
+        &t,
+    )
+}
+
+fn announce(st: &State, cfg: &breaker::Config, tr: breaker::Transition) {
+    eprintln!("dataplane: circuit breaker for {} is {} (was {})", st.backend, tr.state.name(), tr.previous.name());
+    if let Some(reporter) = &st.reporter {
+        reporter.event(Event::CircuitBreaker {
+            state: tr.state.name(),
+            previous_state: tr.previous.name(),
+            backend_url: st.backend.clone(),
+            failure_count: tr.failures,
+            failure_threshold: cfg.threshold,
+            opened_at: SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0),
+            timeout_seconds: cfg.timeout_secs,
+        });
+    }
 }
 
 fn stamp(h: &mut HeaderMap, t: &Trace) {
@@ -223,9 +278,9 @@ pub async fn handle(
                 });
                 let denied = if snap.rate_limit_enabled {
                     if !entry.minute.allow(entry.per_minute, 60, now as u32) {
-                        Some(rate_limited("minute", entry.per_minute, 60, &t))
+                        Some(("minute", entry.per_minute, 60))
                     } else if !entry.hour.allow(entry.per_hour, 3600, now as u32) {
-                        Some(rate_limited("hour", entry.per_hour, 3600, &t))
+                        Some(("hour", entry.per_hour, 3600))
                     } else {
                         None
                     }
@@ -234,11 +289,34 @@ pub async fn handle(
                 };
                 let version = version.map(|(v, _)| v.to_owned());
                 let inject_request_id = snap.inject_request_id;
+                let (cb, timeout) = (snap.circuit_breaker, snap.upstream_timeout);
                 drop(snap);
                 let was_denied = denied.is_some();
-                let mut resp = match denied {
-                    Some(r) => r,
-                    None => forward(&st, &st.backend, peer, req, Some(t), version.as_deref(), inject_request_id).await,
+                let (mut resp, error) = match denied {
+                    Some((window, limit, retry_after)) => {
+                        if let (Some(reporter), Some(m)) = (&st.reporter, &meta) {
+                            reporter.rate_limited(&m.key_id, window, limit, &m.path, peer.ip());
+                        }
+                        (rate_limited(window, limit, retry_after, &t), Some("RATE_LIMIT_EXCEEDED"))
+                    }
+                    None if !st.breaker.allow(&cb, Instant::now()) => (circuit_open(&t), Some("SERVICE_UNAVAILABLE")),
+                    None => {
+                        let sent = forward(&st, &st.backend, peer, req, Some(&t), version.as_deref(), inject_request_id, Some(timeout));
+                        match sent.await {
+                            Ok(resp) => {
+                                if let Some(tr) = st.breaker.success(&cb) {
+                                    announce(&st, &cb, tr);
+                                }
+                                (resp, None)
+                            }
+                            Err(Unanswered) => {
+                                if let Some(tr) = st.breaker.failure(&cb, Instant::now()) {
+                                    announce(&st, &cb, tr);
+                                }
+                                (backend_unavailable(&t), Some("BACKEND_ERROR"))
+                            }
+                        }
+                    }
                 };
                 let h = resp.headers_mut();
                 // Tells operators (and the conformance suite) which plane answered.
@@ -261,7 +339,7 @@ pub async fn handle(
                         status,
                         duration_ms: seconds * 1000.0,
                         user_agent: m.user_agent.clone(),
-                        error: was_denied.then(|| "RATE_LIMIT_EXCEEDED".to_string()),
+                        error: error.map(str::to_owned),
                     });
                 }
                 return Ok(resp);
@@ -269,26 +347,30 @@ pub async fn handle(
         }
     }
     drop(snap);
-    Ok(forward(&st, &st.control, peer, req, None, None, false).await)
+    Ok(forward(&st, &st.control, peer, req, None, None, false, None).await.unwrap_or_else(|Unanswered| control_unreachable()))
 }
+
+/// The upstream gave no response: refused, reset, or slower than the timeout.
+struct Unanswered;
 
 /// Forward to `base`. With a trace, this is a native request: the Python gateway's
 /// upstream headers are reproduced and the response is stamped. Without one, it is handed
-/// to the control plane as it came, plus the client's address.
+/// to the control plane as it came, plus the client's address. `timeout` bounds the wait for the
+/// response to start.
+#[allow(clippy::too_many_arguments)]
 async fn forward(
     st: &State,
     base: &str,
     peer: SocketAddr,
     req: Request<Incoming>,
-    native: Option<Trace>,
+    native: Option<&Trace>,
     version: Option<&str>,
     inject_request_id: bool,
-) -> Response<Body> {
+    timeout: Option<Duration>,
+) -> Result<Response<Body>, Unanswered> {
     let (parts, body) = req.into_parts();
     let pq = parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
-    let Ok(uri) = format!("{base}{pq}").parse::<Uri>() else {
-        return bad_gateway(&native.unwrap_or(Trace { request_id: String::new(), traceparent: String::new() }));
-    };
+    let Ok(uri) = format!("{base}{pq}").parse::<Uri>() else { return Err(Unanswered) };
     let mut out = Request::builder().method(parts.method).uri(uri);
     let headers = out.headers_mut().expect("builder has headers");
     for (name, value) in parts.headers.iter() {
@@ -298,7 +380,7 @@ async fn forward(
         }
         headers.append(name.clone(), value.clone());
     }
-    match &native {
+    match native {
         Some(t) => {
             headers.insert("x-protocol", HeaderValue::from_static("http"));
             if let Some(v) = version.and_then(|v| HeaderValue::from_str(v).ok()) {
@@ -326,21 +408,24 @@ async fn forward(
             }
         }
     }
-    let Ok(request) = out.body(body) else {
-        return bad_gateway(&native.unwrap_or(Trace { request_id: String::new(), traceparent: String::new() }));
+    let Ok(request) = out.body(body) else { return Err(Unanswered) };
+    let sent = st.client.request(request);
+    let answer = match timeout {
+        Some(limit) => tokio::time::timeout(limit, sent).await.map_err(|_| Unanswered)?,
+        None => sent.await,
     };
-    match st.client.request(request).await {
+    match answer {
         Ok(resp) => {
             let (mut rp, rb) = resp.into_parts();
             for h in HOP_BY_HOP {
                 rp.headers.remove(h);
             }
-            if let Some(t) = &native {
+            if let Some(t) = native {
                 stamp(&mut rp.headers, t);
             }
-            Response::from_parts(rp, rb.boxed())
+            Ok(Response::from_parts(rp, rb.boxed()))
         }
-        Err(_) => bad_gateway(&native.unwrap_or(Trace { request_id: uuid::Uuid::new_v4().to_string(), traceparent: String::new() })),
+        Err(_) => Err(Unanswered),
     }
 }
 
