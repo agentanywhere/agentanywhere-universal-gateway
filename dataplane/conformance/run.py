@@ -8,7 +8,7 @@ Each scenario is sent to the Python gateway directly and to the data plane, and 
 code, the body and the headers the gateway promises are compared. A status, error-code or body
 difference fails the run. Header-name differences are listed as known gaps, not failures.
 """
-import hashlib, json, os, secrets, signal, subprocess, sys, tempfile
+import json, os, secrets, signal, subprocess, sys, tempfile, time
 from pathlib import Path
 
 import httpx
@@ -32,7 +32,7 @@ def main() -> int:
         env = {**os.environ, "SECRET_KEY": secrets.token_urlsafe(48), "ADMIN_TOKEN": admin,
                "DATABASE_URL": f"sqlite+aiosqlite:///{tmp}/g.db", "HTTP_BACKEND_URL": f"http://127.0.0.1:{bport}",
                "REDIS_ENABLED": "false", "LOG_LEVEL": "WARNING", "STARTUP_BANNER": "false", "DEBUG": "false",
-               "TRUSTED_PROXIES": "127.0.0.1"}
+               "TRUSTED_PROXIES": "127.0.0.1", "DATAPLANE_TOKEN": "conformance-token"}
         try:
             procs.append(subprocess.Popen([sys.executable, "-c", _BACKEND_RUNNER, str(ROOT / _BACKEND), str(bport)],
                                           cwd=ROOT, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
@@ -52,16 +52,31 @@ def main() -> int:
             # Separate keys per target and per limit, so the two planes never share a counter.
             keys = {"py": make_key("conf-py", 1000), "rs": make_key("conf-rs", 1000),
                     "py_lim": make_key("conf-py-lim", 3), "rs_lim": make_key("conf-rs-lim", 3)}
-            snap = {"keys": [{"hash": hashlib.sha256(keys[n]["key"].encode()).hexdigest(), "id": keys[n].get("id", n),
-                              "rate_limit_per_minute": keys[n]["rate_limit_per_minute"], "rate_limit_per_hour": 1000}
-                             for n in ("rs", "rs_lim")]}
-            (Path(tmp) / "snapshot.json").write_text(json.dumps(snap))
-            procs.append(subprocess.Popen([str(BIN), "--listen", f"127.0.0.1:{dport}", "--snapshot", f"{tmp}/snapshot.json",
+            # The data plane gets its keys from the Python gateway; a fast interval and a short
+            # staleness limit keep the live scenarios quick.
+            procs.append(subprocess.Popen([str(BIN), "--listen", f"127.0.0.1:{dport}", "--control-token", "conformance-token",
+                                           "--sync-interval-ms", "200", "--max-staleness-ms", "2000",
                                            "--backend", f"http://127.0.0.1:{bport}", "--control", f"http://127.0.0.1:{gport}"]))
-            wait_healthy(f"http://127.0.0.1:{dport}/health", procs[2])
+            time.sleep(1.5)
 
             py, rs = f"http://127.0.0.1:{gport}", f"http://127.0.0.1:{dport}"
             tp_in = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+            adm = {"Authorization": f"Bearer {admin}"}
+
+            def served_natively(key):
+                """200 stamped X-Served-By: dataplane: answered by the data plane, not by Python behind it."""
+                r = httpx.get(f"{rs}/api/users", headers={"X-API-Key": key}, timeout=10)
+                return r.status_code == 200 and r.headers.get("x-served-by") == "dataplane"
+
+            def wait_until(check, seconds=4.0):
+                end = time.time() + seconds
+                while time.time() < end:
+                    if check():
+                        return time.time()
+                    time.sleep(0.05)
+                return None
+
+            assert wait_until(lambda: served_natively(keys["rs"]["key"]), 8), "data plane never started serving natively"
             scenarios = [
                 ("no key", "GET", "/api/users", {}, None, "py", "rs"),
                 ("wrong key", "GET", "/api/users", {"X-API-Key": "sk-nope"}, None, "py", "rs"),
@@ -126,6 +141,49 @@ def main() -> int:
             if a[3].status_code == 429 and b[3].status_code == 429:
                 if json.loads(a[3].text)["details"] != json.loads(b[3].text)["details"]:
                     print("FAIL  429 details differ"); failures += 1
+
+            def check(name, ok, detail=""):
+                nonlocal failures
+                print(f"{'PASS' if ok else 'FAIL'}  {name}" + (f"  {detail}" if detail else ""))
+                failures += not ok
+
+            print()
+            # --- live control-plane link ---------------------------------------------------------
+            ip_dp = httpx.get(f"{rs}/internal/dataplane/snapshot", headers={"X-Dataplane-Token": "conformance-token"}, timeout=10)
+            check("/internal is not reachable through the data plane", ip_dp.status_code == 404, f"[{ip_dp.status_code}]")
+            direct = httpx.get(f"{py}/internal/dataplane/snapshot", timeout=10)
+            check("snapshot endpoint refuses a missing token", direct.status_code == 403, f"[{direct.status_code}]")
+            snap = httpx.get(f"{py}/internal/dataplane/snapshot", headers={"X-Dataplane-Token": "conformance-token"}, timeout=10).json()
+            check("snapshot holds digests, never plaintext", all(k["key"] not in json.dumps(snap) for k in keys.values()))
+
+            new = make_key("conf-new", 1000)
+            t0 = time.time()
+            t = wait_until(lambda: served_natively(new["key"]))
+            check("a key created after start becomes native", t is not None, f"after {t - t0:.2f}s" if t else "never")
+
+            rev = make_key("conf-revoke", 1000)
+            assert wait_until(lambda: served_natively(rev["key"])), "key never became native"
+            t0 = time.time()
+            httpx.delete(f"{py}/admin/api-keys/{rev['id']}", headers=adm, timeout=10).raise_for_status()
+            t = wait_until(lambda: httpx.get(f"{rs}/api/users", headers={"X-API-Key": rev["key"]}, timeout=10).status_code == 401)
+            check("a revoked key is refused within seconds", t is not None and t - t0 < 2.5, f"after {t - t0:.2f}s" if t else "still served")
+
+            rule = httpx.post(f"{py}/admin/governance/ip-rules", headers=adm, timeout=10,
+                              json={"cidr": "203.0.113.0/24", "action": "deny", "scope": "global"})
+            rule.raise_for_status()
+            t0 = time.time()
+            t = wait_until(lambda: not served_natively(keys["rs"]["key"]) and httpx.get(
+                f"{rs}/api/users", headers={"X-API-Key": keys["rs"]["key"]}, timeout=10).status_code == 200)
+            check("an IP rule hands keys back to Python (still answered)", t is not None, f"after {t - t0:.2f}s" if t else "still native")
+            httpx.delete(f"{py}/admin/governance/ip-rules/{rule.json()['id']}", headers=adm, timeout=10).raise_for_status()
+            t = wait_until(lambda: served_natively(keys["rs"]["key"]))
+            check("removing the rule makes keys native again", t is not None)
+
+            # Last: the control plane goes away. The data plane must stop serving natively.
+            procs[1].send_signal(signal.SIGTERM)
+            procs[1].wait(timeout=15)
+            t = wait_until(lambda: httpx.get(f"{rs}/api/users", headers={"X-API-Key": keys["rs"]["key"]}, timeout=10).status_code != 200, 6)
+            check("with the control plane down, native serving stops (fails closed)", t is not None)
 
             known = sorted(h for h in gaps if h not in PROMISED)
             print(f"\nheader names present on only one side (known gaps, not failures): {known or 'none'}")

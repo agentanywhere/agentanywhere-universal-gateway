@@ -613,6 +613,9 @@ class Settings(BaseSettings):
     sqlite_busy_timeout_ms: int = 0    # 0 keeps the driver's default (5 seconds)
     # Swappable parts of the request path (see app/adapters/__init__.py). Each takes a built-in
     # name or a "module:attribute" path to a factory that receives the settings.
+    # Shared secret the Rust data plane presents to read its snapshot from /internal/dataplane.
+    # Empty (the default) switches that endpoint off.
+    dataplane_token: str = ""
     json_codec: str = "stdlib"            # stdlib | orjson
     upstream_client: str = "httpx"        # httpx
     analytics_adapter: str = "full"       # full | off

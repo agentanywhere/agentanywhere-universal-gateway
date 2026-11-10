@@ -7,6 +7,7 @@ use crate::limits::Window;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::hash::{BuildHasherDefault, Hasher};
 
 /// Keys are already SHA-256 digests, so the first eight bytes are a perfectly good hash.
@@ -37,8 +38,9 @@ pub struct KeyEntry {
     pub native_ok: bool,
     pub per_minute: u32,
     pub per_hour: u32,
-    pub minute: Window,
-    pub hour: Window,
+    /// Shared across snapshot updates so a sync never resets a key's counters.
+    pub minute: Arc<Window>,
+    pub hour: Arc<Window>,
 }
 
 /// API versions as the data plane needs them: which are served as plain pass-through.
@@ -50,6 +52,10 @@ pub struct ApiVersions {
 }
 
 pub struct Snapshot {
+    /// The stock request-id plugin is on: forward an `X-Request-ID` the client did not send.
+    pub inject_request_id: bool,
+    /// The control plane's revision of this content, sent back as `since` to ask "anything new?".
+    pub revision: Option<String>,
     pub api_versions: ApiVersions,
     pub rate_limit_enabled: bool,
     pub keys: HashMap<Digest32, KeyEntry, BuildHasherDefault<DigestHasher>>,
@@ -59,12 +65,18 @@ pub struct Snapshot {
 
 #[derive(Deserialize)]
 struct SnapshotFile {
+    #[serde(default)]
     keys: Vec<KeyRecord>,
     #[serde(default)]
     fallthrough_prefixes: Vec<String>,
     #[serde(default = "yes")]
     rate_limit_enabled: bool,
     api_versions: Option<VersionsRecord>,
+    revision: Option<String>,
+    #[serde(default)]
+    unchanged: bool,
+    #[serde(default)]
+    inject_request_id: bool,
 }
 
 #[derive(Deserialize)]
@@ -120,12 +132,34 @@ pub fn parse_hex32(s: &str) -> Option<Digest32> {
     Some(out)
 }
 
+/// What a control-plane answer means: nothing new, or a complete new snapshot.
+pub enum Parsed {
+    Unchanged,
+    Full(Snapshot),
+}
+
 impl Snapshot {
+    pub fn empty() -> Snapshot {
+        Snapshot::from_json(r#"{"keys":[]}"#).expect("an empty snapshot is valid")
+    }
+
     pub fn from_json(text: &str) -> Result<Snapshot, String> {
+        match Snapshot::parse(text, None)? {
+            Parsed::Full(s) => Ok(s),
+            Parsed::Unchanged => Err("snapshot says unchanged but none was loaded".into()),
+        }
+    }
+
+    /// Parse a control-plane answer. Counters of keys already in `prev` are carried over.
+    pub fn parse(text: &str, prev: Option<&Snapshot>) -> Result<Parsed, String> {
         let file: SnapshotFile = serde_json::from_str(text).map_err(|e| format!("snapshot is not valid: {e}"))?;
+        if file.unchanged {
+            return Ok(Parsed::Unchanged);
+        }
         let mut keys: HashMap<Digest32, KeyEntry, BuildHasherDefault<DigestHasher>> = HashMap::default();
         for k in file.keys {
             let digest = parse_hex32(&k.hash).ok_or_else(|| format!("key {}: hash must be 64 hex characters", k.id))?;
+            let reused = prev.and_then(|p| p.keys.get(&digest));
             keys.insert(
                 digest,
                 KeyEntry {
@@ -135,8 +169,8 @@ impl Snapshot {
                     native_ok: k.native_ok,
                     per_minute: k.rate_limit_per_minute,
                     per_hour: k.rate_limit_per_hour,
-                    minute: Window::new(),
-                    hour: Window::new(),
+                    minute: reused.map(|e| e.minute.clone()).unwrap_or_else(|| Arc::new(Window::new())),
+                    hour: reused.map(|e| e.hour.clone()).unwrap_or_else(|| Arc::new(Window::new())),
                 },
             );
         }
@@ -151,7 +185,14 @@ impl Snapshot {
                 native_ok: [("1".to_string(), true), ("2".to_string(), true)].into_iter().collect(),
             },
         };
-        Ok(Snapshot { api_versions, rate_limit_enabled: file.rate_limit_enabled, keys, fallthrough_prefixes: file.fallthrough_prefixes })
+        Ok(Parsed::Full(Snapshot {
+            inject_request_id: file.inject_request_id,
+            revision: file.revision,
+            api_versions,
+            rate_limit_enabled: file.rate_limit_enabled,
+            keys,
+            fallthrough_prefixes: file.fallthrough_prefixes,
+        }))
     }
 }
 
@@ -184,6 +225,25 @@ mod tests {
         let snap = Snapshot::from_json(r#"{"keys":[]}"#).unwrap();
         assert_eq!(snap.api_versions.default.as_deref(), Some("1"));
         assert_eq!(snap.api_versions.native_ok.get("2"), Some(&true));
+    }
+
+    #[test]
+    fn counters_survive_an_update_and_unchanged_is_recognised() {
+        let d = hash_key(b"sk-test");
+        let hex: String = d.iter().map(|b| format!("{b:02x}")).collect();
+        let text = format!(
+            r#"{{"revision":"r1","keys":[{{"hash":"{hex}","id":"k1","rate_limit_per_minute":2,"rate_limit_per_hour":50}}]}}"#
+        );
+        let first = Snapshot::from_json(&text).unwrap();
+        let e = first.keys.get(&d).unwrap();
+        assert!(e.minute.allow(2, 60, 1000) && e.minute.allow(2, 60, 1000));
+        let Parsed::Full(second) = Snapshot::parse(&text, Some(&first)).unwrap() else { panic!("expected a full snapshot") };
+        assert!(!second.keys.get(&d).unwrap().minute.allow(2, 60, 1000), "the window was reset by the update");
+        assert_eq!(second.revision.as_deref(), Some("r1"));
+        assert!(matches!(
+            Snapshot::parse(r#"{"unchanged":true,"revision":"r1"}"#, Some(&first)).unwrap(),
+            Parsed::Unchanged
+        ));
     }
 
     #[test]

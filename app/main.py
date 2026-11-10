@@ -365,6 +365,8 @@ def _iter_request_db():
 
 # Include admin router
 app.include_router(admin_router)
+from app.dataplane_sync import router as dataplane_router  # noqa: E402
+app.include_router(dataplane_router)
 
 # Agent-edge control plane (DB-backed registry CRUD + hot reload).
 from admin.agents_api import router as agents_admin_router
@@ -1279,6 +1281,7 @@ async def auth_middleware_handler(request: Request, call_next):
     }
     if (request.url.path in public_paths or
         request.url.path.startswith("/admin") or
+        request.url.path.startswith("/internal/dataplane") or
         request.url.path.startswith("/oauth2")):
         return await call_next(request)
     

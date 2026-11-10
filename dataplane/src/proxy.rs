@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::snapshot::{hash_key, Snapshot};
+use crate::sync::Link;
 use std::time::Instant;
 
 pub type Body = BoxBody<Bytes, hyper::Error>;
@@ -26,6 +27,8 @@ pub struct State {
     pub backend: String,
     pub control: String,
     pub client: Client<HttpConnector, Incoming>,
+    /// Present when the snapshot comes from the control plane; native serving needs it fresh.
+    pub sync: Option<Arc<Link>>,
 }
 
 const HOP_BY_HOP: [&str; 8] = [
@@ -177,8 +180,17 @@ pub async fn handle(
     req: Request<Incoming>,
 ) -> Result<Response<Body>, Infallible> {
     let started = Instant::now();
+    // The control plane's internal endpoints are never reachable from clients.
+    if req.uri().path().starts_with("/internal/") {
+        let mut resp = Response::new(full("{\"detail\":\"Not Found\"}"));
+        *resp.status_mut() = StatusCode::NOT_FOUND;
+        resp.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        return Ok(resp);
+    }
     let snap = st.snapshot.load();
-    if is_native_path(req.uri().path(), &snap.fallthrough_prefixes) && !wants_html(req.headers()) {
+    // Fail closed: if the snapshot is not known to be current, the Python gateway decides.
+    let trusted = st.sync.as_ref().map(|s| s.fresh()).unwrap_or(true);
+    if trusted && is_native_path(req.uri().path(), &snap.fallthrough_prefixes) && !wants_html(req.headers()) {
         if let Some(entry) = req
             .headers()
             .get("x-api-key")
@@ -202,12 +214,15 @@ pub async fn handle(
                     None
                 };
                 let version = version.map(|(v, _)| v.to_owned());
+                let inject_request_id = snap.inject_request_id;
                 drop(snap);
                 let mut resp = match denied {
                     Some(r) => r,
-                    None => forward(&st, &st.backend, peer, req, Some(t), version.as_deref()).await,
+                    None => forward(&st, &st.backend, peer, req, Some(t), version.as_deref(), inject_request_id).await,
                 };
                 let h = resp.headers_mut();
+                // Tells operators (and the conformance suite) which plane answered.
+                h.insert("x-served-by", HeaderValue::from_static("dataplane"));
                 if let Ok(v) = HeaderValue::from_str(&format!("{:.3}", started.elapsed().as_secs_f64())) {
                     h.insert("x-response-time", v);
                 }
@@ -219,7 +234,7 @@ pub async fn handle(
         }
     }
     drop(snap);
-    Ok(forward(&st, &st.control, peer, req, None, None).await)
+    Ok(forward(&st, &st.control, peer, req, None, None, false).await)
 }
 
 /// Forward to `base`. With a trace, this is a native request: the Python gateway's
@@ -232,6 +247,7 @@ async fn forward(
     req: Request<Incoming>,
     native: Option<Trace>,
     version: Option<&str>,
+    inject_request_id: bool,
 ) -> Response<Body> {
     let (parts, body) = req.into_parts();
     let pq = parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
@@ -258,6 +274,11 @@ async fn forward(
             }
             if let Ok(v) = HeaderValue::from_str(&t.traceparent) {
                 headers.insert("traceparent", v);
+            }
+            if inject_request_id && !parts.headers.contains_key("x-request-id") {
+                if let Ok(v) = HeaderValue::from_str(&t.request_id) {
+                    headers.insert("x-request-id", v);
+                }
             }
         }
         None => {
