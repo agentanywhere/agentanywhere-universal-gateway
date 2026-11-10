@@ -4,6 +4,7 @@
 //!           --backend http://127.0.0.1:9100 --control http://127.0.0.1:8001
 mod limits;
 mod proxy;
+mod report;
 mod snapshot;
 mod sync;
 
@@ -25,6 +26,8 @@ struct Args {
     token: Option<String>,
     interval: Duration,
     max_staleness: Duration,
+    report_interval: Duration,
+    rows_per_second: u32,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -32,6 +35,7 @@ fn parse_args() -> Result<Args, String> {
         ("127.0.0.1:8000".to_string(), String::new(), String::new(), String::new());
     let mut token = std::env::var("DATAPLANE_TOKEN").ok().filter(|t| !t.is_empty());
     let (mut interval_ms, mut staleness_ms) = (500u64, 5000u64);
+    let (mut report_ms, mut rows_per_sec) = (1000u64, 1000u32);
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or_else(|| format!("{flag} needs a value"));
@@ -42,6 +46,8 @@ fn parse_args() -> Result<Args, String> {
             "--control" => control = value()?,
             "--control-token" => token = Some(value()?),
             "--sync-interval-ms" => interval_ms = value()?.parse().map_err(|e| format!("--sync-interval-ms: {e}"))?,
+            "--report-interval-ms" => report_ms = value()?.parse().map_err(|e| format!("--report-interval-ms: {e}"))?,
+            "--log-rows-per-second" => rows_per_sec = value()?.parse().map_err(|e| format!("--log-rows-per-second: {e}"))?,
             "--max-staleness-ms" => staleness_ms = value()?.parse().map_err(|e| format!("--max-staleness-ms: {e}"))?,
             other => return Err(format!("unknown option {other}")),
         }
@@ -57,6 +63,8 @@ fn parse_args() -> Result<Args, String> {
         token,
         interval: Duration::from_millis(interval_ms),
         max_staleness: Duration::from_millis(staleness_ms),
+        report_interval: Duration::from_millis(report_ms),
+        rows_per_second: rows_per_sec,
     })
 }
 
@@ -85,6 +93,7 @@ async fn main() {
         None => snapshot::Snapshot::empty(),
     };
     let link = args.token.as_ref().map(|_| Arc::new(sync::Link::new(args.max_staleness)));
+    let reporter = args.token.as_ref().map(|_| Arc::new(report::Reporter::new(args.rows_per_second, 5000)));
 
     let mut connector = HttpConnector::new();
     connector.set_nodelay(true);
@@ -98,8 +107,12 @@ async fn main() {
         control: args.control.clone(),
         client,
         sync: link,
+        reporter: reporter.clone(),
     });
     if let Some(token) = args.token.clone() {
+        if let Some(reporter) = reporter {
+            tokio::spawn(report::run(state.clone(), reporter, args.control.clone(), token.clone(), args.report_interval));
+        }
         tokio::spawn(sync::run(state.clone(), args.control.clone(), token, args.interval));
     }
 

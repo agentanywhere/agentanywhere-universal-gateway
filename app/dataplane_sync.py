@@ -24,7 +24,8 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException
-from sqlalchemy import func, select
+from pydantic import BaseModel, Field
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -145,6 +146,131 @@ def _authorize(token: Optional[str]) -> None:
         raise HTTPException(status_code=404, detail="Not Found")
     if not token or not constant_time_equals(token, expected):
         raise HTTPException(status_code=403, detail="Forbidden")
+
+
+# --- what the data plane served ----------------------------------------------------------------
+
+# Upper bounds of gateway_request_duration_seconds; the data plane buckets with the same ones.
+_BOUNDS = (0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0)
+
+
+class ReportedAggregate(BaseModel):
+    method: str
+    path: str  # one real path from the group; the label is derived here
+    status: int
+    rejected: bool = False
+    client_id: Optional[str] = None
+    buckets: list = Field(default_factory=list)  # [[count, seconds]] per bucket, then +Inf
+
+
+class ReportedRow(BaseModel):
+    request_id: str
+    method: str
+    path: str
+    client_ip: str = "0.0.0.0"
+    api_key_id: Optional[str] = None
+    status: int
+    duration_ms: float
+    user_agent: Optional[str] = None
+    error: Optional[str] = None
+
+
+class ReportedKeyUse(BaseModel):
+    id: str
+    at: int  # epoch seconds of the key's latest use
+
+
+class DataplaneReport(BaseModel):
+    keys_used: list[ReportedKeyUse] = Field(default_factory=list, max_length=5000)
+    aggregates: list[ReportedAggregate] = Field(default_factory=list, max_length=5000)
+    rows: list[ReportedRow] = Field(default_factory=list, max_length=5000)
+    rows_skipped: int = 0
+
+
+def apply_report(report: DataplaneReport) -> Dict[str, int]:
+    """Feed what the data plane served into the same metrics, SLOs and request log a request through
+    this gateway would have fed. Counts are exact; each latency bucket is applied as that many
+    observations at the bucket's mean, which keeps both the bucket counts and the sum exact."""
+    from app import main as gw
+    from app.models import RequestLog
+    from app.observability import slo_tracker
+
+    counted = 0
+    for agg in report.aggregates:
+        metric_path = gw._rejected_path_label(agg.path) if agg.rejected else gw.obs_metric_path_label(agg.path)
+        for i, pair in enumerate(agg.buckets[: len(_BOUNDS) + 1]):
+            n, total = int(pair[0]), float(pair[1])
+            if n <= 0:
+                continue
+            mean = total / n
+            counted += n
+            for _ in range(n):
+                gw.obs_record_request(
+                    method=agg.method, path=metric_path, status_code=agg.status,
+                    duration_seconds=mean, protocol="http", tenant=None,
+                )
+            if gw.settings.metrics_enabled:
+                gw.metrics.request_count.labels(
+                    method=agg.method, path=metric_path, status_code=agg.status, protocol="http"
+                ).inc(n)
+                hist = gw.metrics.request_duration.labels(method=agg.method, path=metric_path, protocol="http")
+                for _ in range(n):
+                    hist.observe(mean)
+                gw.metrics.dataplane_native_requests.labels(
+                    status_class=f"{agg.status // 100}xx"
+                ).inc(n)
+                if agg.rejected and agg.status == 429:
+                    gw.metrics.rate_limit_hits.labels(client_id=agg.client_id or "anonymous").inc(n)
+
+    skipped = max(0, int(report.rows_skipped))
+    for row in report.rows:
+        log = RequestLog(
+            request_id=row.request_id, method=row.method, path=row.path, client_ip=row.client_ip or "0.0.0.0",
+            api_key=None, status_code=row.status, response_time_ms=row.duration_ms,
+            user_agent=row.user_agent, error=row.error, protocol="http",
+        )
+        gw.request_log_writer.submit(log, row.api_key_id)
+        if gw.log_export_manager.exporters:
+            entry = {
+                "request_id": row.request_id, "method": row.method, "path": row.path,
+                "status_code": row.status, "duration_ms": row.duration_ms, "client_ip": row.client_ip,
+                "timestamp": gw.utcnow().isoformat(), "user_agent": row.user_agent,
+                "api_key_id": row.api_key_id, "tenant_id": None, "protocol": "http",
+            }
+            if gw.log_export_manager.is_running():
+                gw.log_export_manager.enqueue(entry)
+    if skipped and gw.settings.metrics_enabled:
+        gw.metrics.dataplane_rows_skipped.inc(skipped)
+    return {"requests": counted, "rows": len(report.rows), "rows_skipped": skipped}
+
+
+async def apply_key_usage(db: AsyncSession, uses: list) -> int:
+    """Move each key's ``last_used_at`` forward to the data plane's latest use (never backwards)."""
+    n = 0
+    for use in uses:
+        when = datetime.fromtimestamp(use.at, timezone.utc).replace(tzinfo=None)
+        result = await db.execute(
+            update(APIKeyModel)
+            .where(APIKeyModel.id == use.id)
+            .where(or_(APIKeyModel.last_used_at.is_(None), APIKeyModel.last_used_at < when))
+            .values(last_used_at=when)
+        )
+        n += result.rowcount or 0
+    if n:
+        await db.commit()
+    return n
+
+
+@router.post("/report")
+async def report(
+    body: DataplaneReport,
+    x_dataplane_token: Optional[str] = Header(default=None),
+    db: AsyncSession = Depends(get_db),
+) -> Dict[str, int]:
+    _authorize(x_dataplane_token)
+    out = apply_report(body)
+    out["keys_updated"] = await apply_key_usage(db, body.keys_used)
+    return out
 
 
 @router.get("/snapshot")

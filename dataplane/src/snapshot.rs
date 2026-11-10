@@ -28,8 +28,7 @@ impl Hasher for DigestHasher {
 pub type Digest32 = [u8; 32];
 
 pub struct KeyEntry {
-    /// Goes into the request-log row once the data plane emits logs (next step).
-    #[allow(dead_code)]
+    /// The key's id in the control plane's database; reported with each request.
     pub id: String,
     pub is_active: bool,
     pub expires_at: Option<i64>,

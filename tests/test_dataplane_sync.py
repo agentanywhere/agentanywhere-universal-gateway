@@ -175,3 +175,109 @@ def test_the_route_is_registered_and_hidden_from_the_schema():
     paths = {r.path for r in app.routes}
     assert "/internal/dataplane/snapshot" in paths
     assert "/internal/dataplane/snapshot" not in app.openapi().get("paths", {})
+
+
+# --- reports from the data plane ------------------------------------------------------------------
+
+def _sample(name, **labels):
+    from prometheus_client import REGISTRY
+
+    v = REGISTRY.get_sample_value(name, labels)
+    return 0.0 if v is None else v
+
+
+def _agg(status=200, path="/api/users/42", n=1000, secs=2.0, bucket=0, **kw):
+    buckets = [[0, 0.0] for _ in range(9)]
+    buckets[bucket] = [n, secs]
+    return dataplane_sync.ReportedAggregate(method="GET", path=path, status=status, buckets=buckets, **kw)
+
+
+def test_counts_and_latency_are_applied_exactly():
+    from app import main as gw
+
+    label = gw.obs_metric_path_label("/api/users/42")
+    before_c = _sample("gateway_requests_total", method="GET", path=label, status_code="200", protocol="http")
+    before_n = _sample("gateway_request_duration_seconds_count", method="GET", path=label, protocol="http")
+    before_s = _sample("gateway_request_duration_seconds_sum", method="GET", path=label, protocol="http")
+    before_native = _sample("gateway_dataplane_native_requests_total", status_class="2xx")
+    out = dataplane_sync.apply_report(dataplane_sync.DataplaneReport(aggregates=[_agg(n=1000, secs=2.0)]))
+    assert out["requests"] == 1000
+    assert _sample("gateway_requests_total", method="GET", path=label, status_code="200", protocol="http") - before_c == 1000
+    assert _sample("gateway_request_duration_seconds_count", method="GET", path=label, protocol="http") - before_n == 1000
+    assert abs(_sample("gateway_request_duration_seconds_sum", method="GET", path=label, protocol="http") - before_s - 2.0) < 1e-6
+    assert _sample("gateway_dataplane_native_requests_total", status_class="2xx") - before_native == 1000
+
+
+def test_latency_lands_in_the_right_histogram_bucket():
+    from app import main as gw
+
+    label = gw.obs_metric_path_label("/api/orders/9")
+    key = dict(method="GET", path=label, protocol="http")
+    b01 = _sample("gateway_request_duration_seconds_bucket", le="0.01", **key)
+    b05 = _sample("gateway_request_duration_seconds_bucket", le="0.05", **key)
+    dataplane_sync.apply_report(dataplane_sync.DataplaneReport(
+        aggregates=[_agg(path="/api/orders/9", n=10, secs=0.3, bucket=1)]  # ten requests of 30 ms
+    ))
+    assert _sample("gateway_request_duration_seconds_bucket", le="0.01", **key) - b01 == 0
+    assert _sample("gateway_request_duration_seconds_bucket", le="0.05", **key) - b05 == 10
+
+
+def test_a_rate_limited_batch_feeds_the_rate_limit_metric():
+    before = _sample("gateway_rate_limit_hits_total", client_id="key-xyz")
+    dataplane_sync.apply_report(dataplane_sync.DataplaneReport(
+        aggregates=[_agg(status=429, n=7, secs=0.007, rejected=True, client_id="key-xyz")]
+    ))
+    assert _sample("gateway_rate_limit_hits_total", client_id="key-xyz") - before == 7
+
+
+def test_errors_reach_the_red_error_counter():
+    from app import main as gw
+
+    route = gw.obs_normalize_route(gw.obs_metric_path_label("/api/boom"))
+    before = _sample("gateway_red_errors_total", method="GET", route=route, protocol="http", tenant="_", error_class="http_502")
+    dataplane_sync.apply_report(dataplane_sync.DataplaneReport(aggregates=[_agg(status=502, path="/api/boom", n=4, secs=0.04)]))
+    assert _sample("gateway_red_errors_total", method="GET", route=route, protocol="http", tenant="_", error_class="http_502") - before == 4
+
+
+def test_rows_go_to_the_request_log_sink_and_skips_are_counted(monkeypatch):
+    from app import main as gw
+
+    seen = []
+    monkeypatch.setattr(gw.request_log_writer, "submit", lambda entry, key_id: seen.append((entry, key_id)))
+    before = _sample("gateway_dataplane_rows_skipped_total")
+    out = dataplane_sync.apply_report(dataplane_sync.DataplaneReport(
+        rows=[dataplane_sync.ReportedRow(request_id="r1", method="GET", path="/api/x", client_ip="10.0.0.9",
+                                         api_key_id="k-1", status=200, duration_ms=3.5, user_agent="curl/8")],
+        rows_skipped=41,
+    ))
+    assert out["rows"] == 1 and out["rows_skipped"] == 41
+    (entry, key_id), = seen
+    assert key_id == "k-1" and entry.protocol == "http" and entry.status_code == 200
+    assert entry.client_ip == "10.0.0.9" and entry.response_time_ms == 3.5 and entry.api_key is None
+    assert _sample("gateway_dataplane_rows_skipped_total") - before == 41
+
+
+async def test_a_report_needs_the_token(db_session, monkeypatch):
+    monkeypatch.setattr(get_settings(), "dataplane_token", "s3cret")
+    with pytest.raises(HTTPException) as e:
+        await dataplane_sync.report(dataplane_sync.DataplaneReport(), x_dataplane_token="nope", db=db_session)
+    assert e.value.status_code == 403
+
+
+async def test_last_used_moves_forward_and_never_back(db_session):
+    from datetime import datetime, timezone
+
+    from sqlalchemy import select
+
+    from app.db_models import APIKeyModel
+
+    _, model = await _key(db_session)
+    later = int(datetime(2026, 11, 10, 12, 0, tzinfo=timezone.utc).timestamp())
+    assert await dataplane_sync.apply_key_usage(db_session, [dataplane_sync.ReportedKeyUse(id=model.id, at=later)]) == 1
+    row = (await db_session.execute(select(APIKeyModel).where(APIKeyModel.id == model.id))).scalars().one()
+    assert row.last_used_at == datetime(2026, 11, 10, 12, 0)
+    # An older report changes nothing; an unknown key is ignored.
+    assert await dataplane_sync.apply_key_usage(db_session, [
+        dataplane_sync.ReportedKeyUse(id=model.id, at=later - 3600),
+        dataplane_sync.ReportedKeyUse(id="no-such-key", at=later),
+    ]) == 0

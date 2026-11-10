@@ -42,6 +42,16 @@ for `/internal/...`. Tunables: `--sync-interval-ms` (default 500) and `--max-sta
   when dynamic routes, transformation rules or a request-altering plugin exist. The stock `request-id` plugin is
   reproduced natively.
 * **Native answers are labelled** with `X-Served-By: dataplane`, so you can see which plane answered.
+* **What it served is reported back**, so the console, metrics, SLOs and logs stay complete:
+  * Counts and latencies are aggregated per method, path pattern and status, in the same histogram buckets the Python
+    gateway uses, and sent exactly once per `--report-interval-ms` (default 1000). The cost does not grow with traffic.
+    The Python gateway applies them to `gateway_requests_total`, `gateway_request_duration_seconds`, the RED metrics, the
+    SLO tracker and `gateway_rate_limit_hits_total`, so a request answered natively counts like any other.
+    `gateway_dataplane_native_requests_total` shows how much traffic the data plane answered.
+  * Individual request-log rows (what the console's log view reads) are sent for every error and for successes up to
+    `--log-rows-per-second` (default 1000). Rows beyond the cap are not sent; they are counted in
+    `gateway_dataplane_rows_skipped_total`, never silently lost. Rows go through the normal request-log sink.
+  * If a report cannot be delivered, the counts are kept for the next one; the rows are dropped and counted.
 
 `snapshot.json` (`--snapshot`) is still accepted to bootstrap or to run without a control plane, for tests and benchmarks.
 Its format is the same as what the control plane serves; see `src/snapshot.rs`.
@@ -60,8 +70,9 @@ its answer is the answer.
 * **Runtime changes held only in a Python worker's memory are not visible to the snapshot:** transformation rules,
   API version changes and plugins are per process in the Python gateway. The snapshot reflects the worker that answers
   it, so with several workers, change them through configuration and restart, or run one worker, until these are stored.
-* **No request log, usage counters or Prometheus metrics for native requests.** They are recorded only for requests
-  that go through Python.
+* **Reporting is by aggregate and sample, not per request.** Counts, latency and SLOs are exact; the request-log view
+  shows every error but only a capped number of successes at high rates. There is no per-request `http_access` log line
+  for native requests. Each key's `last_used_at` is kept current (the latest use per key rides along with each report).
 * **Rate-limit webhooks and alerts are not fired** when the data plane returns a 429.
 * **Tenant quotas, IP rules and policies are not evaluated natively**; keys they apply to are served by Python.
 * **No per-backend circuit breaker**, and a failed upstream gives a simplified 502 body.

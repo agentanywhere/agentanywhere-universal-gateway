@@ -55,7 +55,7 @@ def main() -> int:
             # The data plane gets its keys from the Python gateway; a fast interval and a short
             # staleness limit keep the live scenarios quick.
             procs.append(subprocess.Popen([str(BIN), "--listen", f"127.0.0.1:{dport}", "--control-token", "conformance-token",
-                                           "--sync-interval-ms", "200", "--max-staleness-ms", "2000",
+                                           "--sync-interval-ms", "200", "--max-staleness-ms", "2000", "--report-interval-ms", "300",
                                            "--backend", f"http://127.0.0.1:{bport}", "--control", f"http://127.0.0.1:{gport}"]))
             time.sleep(1.5)
 
@@ -178,6 +178,51 @@ def main() -> int:
             httpx.delete(f"{py}/admin/governance/ip-rules/{rule.json()['id']}", headers=adm, timeout=10).raise_for_status()
             t = wait_until(lambda: served_natively(keys["rs"]["key"]))
             check("removing the rule makes keys native again", t is not None)
+
+            # --- what the data plane served is visible to the product --------------------------------
+            def metric(name, **labels):
+                want = ",".join(f'{k}="{v}"' for k, v in sorted(labels.items()))
+                total = 0.0
+                for line in httpx.get(f"{py}/metrics", timeout=10).text.splitlines():
+                    if line.startswith(name + "{") or line.startswith(name + " "):
+                        have = line[line.find("{") + 1: line.rfind("}")] if "{" in line else ""
+                        pairs = sorted(p for p in have.split(",") if p)
+                        if all(any(p == f'{k}="{v}"' for p in pairs) for k, v in labels.items()):
+                            total += float(line.rsplit(" ", 1)[1])
+                return total
+
+            time.sleep(1.5)  # let earlier reports land
+            probe = make_key("conf-probe", 1000)
+            assert wait_until(lambda: served_natively(probe["key"])), "probe key never became native"
+            time.sleep(1.5)
+            req_labels = dict(method="GET", path="/api/users", status_code="200", protocol="http")
+            before = metric("gateway_requests_total", **req_labels)
+            before_native = metric("gateway_dataplane_native_requests_total", status_class="2xx")
+            before_count = metric("gateway_request_duration_seconds_count", method="GET", path="/api/users", protocol="http")
+            N = 200
+            for i in range(N):
+                httpx.get(f"{rs}/api/users", headers={"X-API-Key": probe["key"]}, params={"i": i}, timeout=10)
+            time.sleep(2.0)
+            delta = metric("gateway_requests_total", **req_labels) - before
+            check("native requests are counted exactly in gateway_requests_total", delta == N, f"{delta:.0f} of {N}")
+            delta_n = metric("gateway_dataplane_native_requests_total", status_class="2xx") - before_native
+            check("native share is counted in gateway_dataplane_native_requests_total", delta_n == N, f"{delta_n:.0f} of {N}")
+            delta_h = metric("gateway_request_duration_seconds_count", method="GET", path="/api/users", protocol="http") - before_count
+            check("latency histogram count matches", delta_h == N, f"{delta_h:.0f} of {N}")
+
+            logs = httpx.get(f"{py}/admin/logs", params={"limit": 1000, "path": "/api/users"}, headers=adm, timeout=10).json()["logs"]
+            mine = [l for l in logs if l.get("api_key_id") == probe["id"]]
+            check("native requests appear in the request log with their key", len(mine) >= 1, f"{len(mine)} rows (rate-capped, errors always kept)")
+            check("native log rows carry the protocol", bool(mine) and all(l.get("protocol") == "http" for l in mine))
+
+            listed = httpx.get(f"{py}/admin/api-keys", headers=adm, timeout=10).json()
+            seen = next((k for k in listed if k["id"] == probe["id"]), {})
+            check("a natively used key shows a last-used time", bool(seen.get("last_used_at")), str(seen.get("last_used_at")))
+
+            lim = keys["rs_lim"]
+            logs429 = httpx.get(f"{py}/admin/logs", params={"limit": 1000, "status_code": 429}, headers=adm, timeout=10).json()["logs"]
+            check("a native 429 is logged with its key", any(l.get("api_key_id") == lim["id"] for l in logs429))
+            check("a native 429 feeds the rate-limit metric", metric("gateway_rate_limit_hits_total", client_id=lim["id"]) >= 1)
 
             # Last: the control plane goes away. The data plane must stop serving natively.
             procs[1].send_signal(signal.SIGTERM)

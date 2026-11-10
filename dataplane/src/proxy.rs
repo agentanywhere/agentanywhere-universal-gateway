@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::snapshot::{hash_key, Snapshot};
+use crate::report::{Reporter, Row};
 use crate::sync::Link;
 use std::time::Instant;
 
@@ -29,6 +30,8 @@ pub struct State {
     pub client: Client<HttpConnector, Incoming>,
     /// Present when the snapshot comes from the control plane; native serving needs it fresh.
     pub sync: Option<Arc<Link>>,
+    /// Present with a control-plane link: what was served is reported back.
+    pub reporter: Option<Arc<Reporter>>,
 }
 
 const HOP_BY_HOP: [&str; 8] = [
@@ -108,6 +111,15 @@ fn resolve_version<'a>(snap: &'a Snapshot, headers: &HeaderMap) -> Option<(&'a s
         snap.api_versions.default.as_deref().and_then(|d| snap.api_versions.native_ok.get_key_value(d))
     });
     found.map(|(k, ok)| (k.as_str(), *ok))
+}
+
+/// What the reporter needs from a request, captured before the request is consumed.
+struct Meta {
+    request_id: String,
+    method: String,
+    path: String,
+    user_agent: Option<String>,
+    key_id: String,
 }
 
 struct Trace {
@@ -202,6 +214,13 @@ pub async fn handle(
             let version_ok = version.map(|(_, ok)| ok).unwrap_or(true);
             if entry.is_active && !expired && entry.native_ok && version_ok {
                 let t = trace_for(req.headers());
+                let meta = st.reporter.as_ref().map(|_| Meta {
+                    request_id: t.request_id.clone(),
+                    method: req.method().as_str().to_owned(),
+                    path: req.uri().path().to_owned(),
+                    user_agent: req.headers().get("user-agent").and_then(|v| v.to_str().ok()).map(str::to_owned),
+                    key_id: entry.id.clone(),
+                });
                 let denied = if snap.rate_limit_enabled {
                     if !entry.minute.allow(entry.per_minute, 60, now as u32) {
                         Some(rate_limited("minute", entry.per_minute, 60, &t))
@@ -216,6 +235,7 @@ pub async fn handle(
                 let version = version.map(|(v, _)| v.to_owned());
                 let inject_request_id = snap.inject_request_id;
                 drop(snap);
+                let was_denied = denied.is_some();
                 let mut resp = match denied {
                     Some(r) => r,
                     None => forward(&st, &st.backend, peer, req, Some(t), version.as_deref(), inject_request_id).await,
@@ -228,6 +248,21 @@ pub async fn handle(
                 }
                 if let Some(v) = version.as_deref().and_then(|v| HeaderValue::from_str(v).ok()) {
                     h.insert("x-api-version", v);
+                }
+                if let (Some(reporter), Some(m)) = (&st.reporter, meta) {
+                    let status = resp.status().as_u16();
+                    let seconds = started.elapsed().as_secs_f64();
+                    reporter.record(&m.method, &m.path, status, seconds, &m.key_id, was_denied, || Row {
+                        request_id: m.request_id.clone(),
+                        method: m.method.clone(),
+                        path: m.path.clone(),
+                        client_ip: peer.ip().to_string(),
+                        api_key_id: Some(m.key_id.clone()),
+                        status,
+                        duration_ms: seconds * 1000.0,
+                        user_agent: m.user_agent.clone(),
+                        error: was_denied.then(|| "RATE_LIMIT_EXCEEDED".to_string()),
+                    });
                 }
                 return Ok(resp);
             }

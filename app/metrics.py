@@ -45,3 +45,16 @@ circuit_breaker_state = Gauge(
 )
 
 
+
+# Rust data plane (dataplane/): traffic it answered without reaching this gateway
+dataplane_native_requests = Counter(
+    "gateway_dataplane_native_requests_total",
+    "Requests answered by the Rust data plane itself",
+    ["status_class"]
+)
+
+dataplane_rows_skipped = Counter(
+    "gateway_dataplane_rows_skipped_total",
+    "Request-log rows the data plane did not report (rate cap, full buffer or failed delivery); "
+    "the requests are still counted in every other metric"
+)
