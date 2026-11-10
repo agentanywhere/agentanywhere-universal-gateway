@@ -54,8 +54,7 @@ generate the secrets). The first build takes a few minutes.
 git clone https://github.com/agentanywhere/agentanywhere-universal-gateway.git
 cd agentanywhere-universal-gateway
 cp env.example .env
-python3 scripts/generate_secret_key.py --update-env
-echo "ADMIN_TOKEN=$(python3 scripts/generate_secret_key.py 2>/dev/null)" >> .env
+python3 scripts/generate_secret_key.py --update-env --admin-token
 docker compose --profile backends up -d --build
 ```
 
@@ -90,8 +89,7 @@ cd agentanywhere-universal-gateway
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp env.example .env
-python3 scripts/generate_secret_key.py --update-env
-echo "ADMIN_TOKEN=$(python3 scripts/generate_secret_key.py 2>/dev/null)" >> .env
+python3 scripts/generate_secret_key.py --update-env --admin-token
 uvicorn app.main:app --port 8000
 ```
 

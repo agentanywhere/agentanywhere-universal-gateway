@@ -57,8 +57,7 @@ pip install -r requirements.txt
 
 ```bash
 cp env.example .env
-python3 scripts/generate_secret_key.py --update-env
-echo "ADMIN_TOKEN=$(python3 scripts/generate_secret_key.py 2>/dev/null)" >> .env
+python3 scripts/generate_secret_key.py --update-env --admin-token
 ```
 
 The first command copies the example settings. The second replaces the
