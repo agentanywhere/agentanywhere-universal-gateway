@@ -100,6 +100,17 @@ which credential opens the admin API, the supported protocols, the console and
 documentation links, and the logging settings. It never shows a secret. Turn it
 off with `STARTUP_BANNER=false`.
 
+**Admin console (optional).** The console is a separate React app; plain
+`uvicorn` does not serve it. In another terminal, with Node 20 (the version the Docker build uses):
+
+```bash
+cd admin-ui && npm ci && npm run dev
+```
+
+Open <http://127.0.0.1:3001> and sign in with the `ADMIN_TOKEN` from your
+`.env`. The dev server proxies `/admin` and `/api` to `127.0.0.1:8000`. With
+Docker Compose the console starts for you; see below.
+
 In a second terminal, start the sample HTTP backend (port 8003, where
 `HTTP_BACKEND_URL` in `env.example` points):
 
