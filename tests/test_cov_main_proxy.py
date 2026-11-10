@@ -96,7 +96,17 @@ def test_proxy_empty_body_response(gwdb, monkeypatch, H):
     assert r.status_code == 204 and r.content == b""
 
 
-def test_response_transformation_applied(gwdb, monkeypatch, H):
+@pytest.fixture
+def a_rule(monkeypatch):
+    """Register one (non-matching) rule: with no rule at all the proxy skips transformation."""
+    from app.transformers import TransformationRule, transformation_manager as tm
+
+    rule = TransformationRule(name="placeholder", path_pattern="/never-matches/*")
+    monkeypatch.setitem(tm.rules_by_id, rule.id, rule)
+    return rule
+
+
+def test_response_transformation_applied(gwdb, monkeypatch, H, a_rule):
     from app.transformers import transformation_manager as tm
     backend(monkeypatch, jresp(200, {"a": 1}))
     monkeypatch.setattr(tm, "transform_response", lambda **kw: (202, {"x-t": "1"}, {"wrapped": kw["body"]}))
@@ -106,7 +116,7 @@ def test_response_transformation_applied(gwdb, monkeypatch, H):
     assert gwdb.get("/api/t", headers=H).text == "as-text"
 
 
-def test_response_transformation_failure_is_not_fatal(gwdb, monkeypatch, H):
+def test_response_transformation_failure_is_not_fatal(gwdb, monkeypatch, H, a_rule):
     from app.transformers import transformation_manager as tm
     backend(monkeypatch, jresp(200, {"a": 1}))
     monkeypatch.setattr(tm, "transform_response", MagicMock(side_effect=RuntimeError("bad rule")))
@@ -848,3 +858,21 @@ def test_gateway_exception_handler_non_dict_detail_and_details_merge():
     body = json.loads(resp.body)
     assert resp.status_code == 502 and body["error"] == "BACKEND_ERROR"
     assert body["details"]["k"] == 1 and body["request_id"] == "rid-direct" and "timestamp" in body
+
+
+def test_json_body_is_forwarded_byte_for_byte_when_no_rule_is_registered(gwdb, monkeypatch, H):
+    body = '{ "name" :  "Zoë",\n  "n": 1.0,   "big": 12345678901234567890 }'.encode("utf-8")
+    backend(monkeypatch, httpx.Response(200, content=body, headers={"content-type": "application/json"}))
+    r = gwdb.get("/api/pretty", headers=H)
+    assert r.status_code == 200 and r.content == body
+
+
+def test_json_body_is_still_transformed_when_a_rule_exists(gwdb, monkeypatch, H):
+    from app.transformers import TransformConfig, TransformationRule, transformation_manager as tm
+
+    rule = TransformationRule(name="add field", path_pattern="*api/*",
+                              response_config=TransformConfig(body_set={"extra": "yes"}))
+    monkeypatch.setitem(tm.rules_by_id, rule.id, rule)
+    backend(monkeypatch, httpx.Response(200, content=b'{"a": 1}', headers={"content-type": "application/json"}))
+    r = gwdb.get("/api/x", headers=H)
+    assert r.status_code == 200 and r.json() == {"a": 1, "extra": "yes"}

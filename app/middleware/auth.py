@@ -93,6 +93,12 @@ class AuthMiddleware:
         # After a failed Redis call, skip the cache until this monotonic time
         # so an absent Redis costs one short timeout, not one per request.
         self._redis_down = (None, 0.0)  # (client, retry-at)
+        # In-process cache of validated keys, used only when Redis is not (or is no longer)
+        # available. Off by default: another worker's change to a key is not seen here until
+        # the entry expires, so a key can outlive its revocation by up to this many seconds.
+        self._local_ttl = float(getattr(settings, "api_key_local_cache_ttl_seconds", 0) or 0)
+        self._local_cache: dict = {}
+        self._tenant_cache: dict = {}   # key hash -> (expires, tenant dict or None), same TTL
         api_key_cache.register(self)
     
     def _get_api_key_from_header(self, request: Request) -> Optional[str]:
@@ -147,6 +153,12 @@ class AuthMiddleware:
 
     def _cache_get(self, key_hash: str) -> Optional[dict]:
         if not self._redis_available():
+            if self._local_ttl > 0:
+                entry = self._local_cache.get(key_hash)
+                if entry is not None:
+                    if entry[0] > time.monotonic():
+                        return entry[1]
+                    self._local_cache.pop(key_hash, None)
             return None
         try:
             cached = self.redis_client.get(api_key_cache.cache_key_for_hash(key_hash))
@@ -158,10 +170,13 @@ class AuthMiddleware:
             return None
 
     def _cache_put(self, key_hash: str, db_key) -> None:
-        if not self._redis_available():
+        use_local = not self._redis_available()
+        if use_local and self._local_ttl <= 0:
             return
         try:
             ttl = api_key_cache.CACHE_TTL_SECONDS
+            if use_local:
+                ttl = self._local_ttl
             if db_key.expires_at:
                 remaining = int((db_key.expires_at - utcnow()).total_seconds())
                 ttl = max(1, min(ttl, remaining))
@@ -181,6 +196,11 @@ class AuthMiddleware:
                 "expires_at": db_key.expires_at.isoformat() if db_key.expires_at else None,
                 "is_active": db_key.is_active,
             }
+            if use_local:
+                if len(self._local_cache) >= 10_000:
+                    self._local_cache.clear()
+                self._local_cache[key_hash] = (time.monotonic() + ttl, key_data)
+                return
             self.redis_client.setex(
                 api_key_cache.cache_key_for_hash(key_hash), ttl, json.dumps(key_data)
             )
@@ -290,10 +310,26 @@ class AuthMiddleware:
         if db is not None and hasattr(request, "state"):
             try:
                 from app.repositories.tenant_repo import TenantRepository
-                tenant = await TenantRepository.get_tenant_for_api_key(db, api_key)
-                if tenant and tenant.is_active:
-                    request.state.tenant_id = tenant.tenant_id
-                    request.state.tenant = TenantRepository.to_dict(tenant)
+                tenant_info = None
+                cached_at = None
+                if self._local_ttl > 0:
+                    cached_at = api_key_cache.hash_key(api_key)
+                    entry = self._tenant_cache.get(cached_at)
+                    if entry is not None and entry[0] > time.monotonic():
+                        tenant_info = entry[1]
+                        cached_at = False                       # served from the cache
+                if cached_at is not False:
+                    tenant = await TenantRepository.get_tenant_for_api_key(db, api_key)
+                    if tenant and tenant.is_active:
+                        tenant_info = TenantRepository.to_dict(tenant)
+                    if cached_at:
+                        if len(self._tenant_cache) >= 10_000:
+                            self._tenant_cache.clear()
+                        self._tenant_cache[cached_at] = (time.monotonic() + self._local_ttl, tenant_info)
+                request.state.tenant_lookup_done = True
+                if tenant_info:
+                    request.state.tenant_id = tenant_info.get("tenant_id")
+                    request.state.tenant = tenant_info
             except Exception:
                 pass
 
@@ -341,7 +377,10 @@ class AuthMiddleware:
             return
 
         client_ip = _client_ip(request) or ""
-        api_key_id = getattr(principal, "key", None)
+        # api_key-scoped IP rules store the key's database id, never the
+        # plaintext key. Principals without an id (OAuth2 / break-glass)
+        # are simply not subject to key-scoped rules.
+        api_key_id = getattr(principal, "id", None)
         tenant_id = getattr(request.state, "tenant_id", None)
 
         allowed, matched = ip_rule_engine.evaluate(

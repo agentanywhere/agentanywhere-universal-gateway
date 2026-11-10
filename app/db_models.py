@@ -1,5 +1,5 @@
 """SQLAlchemy database models."""
-from sqlalchemy import Column, String, Integer, Boolean, DateTime, JSON, Text, ForeignKey, Identity
+from sqlalchemy import Column, String, Integer, Boolean, DateTime, JSON, Text, ForeignKey, Identity, Index
 from app.time_utils import utcnow
 import uuid
 from app.database import Base
@@ -84,13 +84,22 @@ class RequestLogModel(Base):
     path = Column(String, nullable=False, index=True)
     client_ip = Column(String, nullable=False)
     api_key_id = Column(String, ForeignKey("api_keys.id"), nullable=True)
-    tenant_id = Column(String, ForeignKey("tenants.tenant_id", ondelete="SET NULL"), nullable=True, index=True)
-    status_code = Column(Integer, nullable=False, index=True)
+    # No index on tenant_id: nothing fills it in or filters on it, so an index only slows inserts.
+    tenant_id = Column(String, ForeignKey("tenants.tenant_id", ondelete="SET NULL"), nullable=True)
+    status_code = Column(Integer, nullable=False)
     response_time_ms = Column(Integer, nullable=False)
-    timestamp = Column(DateTime, default=utcnow, index=True)
+    timestamp = Column(DateTime, default=utcnow)
     user_agent = Column(String, nullable=True)
     error = Column(Text, nullable=True)
     protocol = Column(String, nullable=True)
+
+    __table_args__ = (
+        # Level filters (4xx/5xx) in the console's log view, newest first.
+        Index("ix_request_logs_status_code_timestamp", "status_code", "timestamp"),
+        # Covers the dashboard statistics (counts, errors, average latency over a time window)
+        # without reading the table, and serves plain time-range queries as its first column.
+        Index("ix_request_logs_timestamp_status_code_response_time_ms", "timestamp", "status_code", "response_time_ms"),
+    )
 
 
 class SettingsProfileModel(Base):

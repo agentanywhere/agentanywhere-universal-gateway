@@ -800,27 +800,17 @@ async def get_logs(
     admin_token: str = Depends(verify_admin_token),
     db: AsyncSession = Depends(get_db)
 ):
-    """Get request logs with filtering."""
-    # Map level to status_code range
-    if level == "error":
-        # Error level: 500+
-        db_logs, total = await LogRepository.list_logs(
-            db, limit=limit, offset=offset, status_code=None, path=path, start_date=None, end_date=None
-        )
-        # Filter in Python since list_logs doesn't support range queries
-        db_logs = [log for log in db_logs if log.status_code >= 500]
-        total = len(db_logs)
-    elif level == "warning":
-        # Warning level: 400-499
-        db_logs, total = await LogRepository.list_logs(
-            db, limit=limit, offset=offset, status_code=None, path=path, start_date=None, end_date=None
-        )
-        db_logs = [log for log in db_logs if 400 <= log.status_code < 500]
-        total = len(db_logs)
-    else:
-        db_logs, total = await LogRepository.list_logs(
-            db, limit=limit, offset=offset, status_code=status_code, path=path
-        )
+    """Get request logs with filtering.
+
+    ``level`` (``error`` for 5xx, ``warning`` for 4xx) is applied in the query, so a page is
+    full and ``total`` counts every matching row. ``limit`` is capped so one call cannot ask
+    for the whole table.
+    """
+    limit = max(1, min(int(limit), 1000))
+    offset = max(0, int(offset))
+    db_logs, total = await LogRepository.list_logs(
+        db, limit=limit, offset=offset, level=level, status_code=status_code, path=path
+    )
     # Convert SQLAlchemy models to dicts for JSON serialization
     logs = [
         {

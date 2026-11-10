@@ -245,6 +245,15 @@ The rate-limit values in this section are **not enforced yet**. They are shown b
 | `LOG_TIMESTAMP_FORMAT` | `iso` | `iso` (UTC, milliseconds) or `epoch` (seconds). |
 | `LOG_SAMPLE_ALWAYS_STATUS_GE` | `400` | Access logs with a status at or above this are never sampled out. |
 | `STARTUP_BANNER` | `true` | Print a configuration summary to stderr when the gateway is ready. It shows URLs and which admin credential applies, never a secret. Each worker process prints its own. |
+| `REQUEST_LOG_MODE` | `inline` | Where request-log rows go. `inline`: one write per request, as before. `batched`: rows go into a bounded queue and one background task writes them in batches (one transaction each); when the queue is full the newest row is dropped and counted, and rows still queued are lost if the process is killed. `off`: no rows are written, so the console's log views stay empty. |
+| `REQUEST_LOG_BATCH_SIZE` | `200` | `batched` mode: most rows per transaction. |
+| `REQUEST_LOG_FLUSH_INTERVAL` | `0.25` | `batched` mode: longest wait, in seconds, before a partly filled batch is written. |
+| `REQUEST_LOG_QUEUE_SIZE` | `20000` | `batched` mode: rows held in memory before new ones are dropped. |
+| `SQLITE_JOURNAL_MODE` | unset | SQLite only: `WAL`, `DELETE`, `TRUNCATE`, `PERSIST`, `MEMORY` or `OFF`, applied to every new connection. Unset keeps SQLite's default (`DELETE`). With several workers on one SQLite file, `WAL` avoids most "database is locked" errors. |
+| `SQLITE_SYNCHRONOUS` | unset | SQLite only: `OFF`, `NORMAL`, `FULL` or `EXTRA`. Unset keeps SQLite's default (`FULL`). `NORMAL` with `WAL` is the usual pairing; a power loss can then lose the last commits but not corrupt the file. |
+| `SQLITE_BUSY_TIMEOUT_MS` | `0` | SQLite only: how long a connection waits for a lock, in milliseconds. `0` keeps the driver's default of five seconds. |
+| `API_KEY_LOCAL_CACHE_TTL_SECONDS` | `0` (off) | Seconds a validated API key, and the tenant it belongs to, stay cached in each worker's memory when Redis is not used. While cached, authenticating a request needs no database read or write. A key revoked or changed through another worker can still be accepted here until the entry expires; changes made through the same worker take effect at once. |
+| `AI_ANALYTICS_ENABLED` | `true` | Run the per-request anomaly detection and usage analytics. They run inside the request path and cost several milliseconds of CPU per request; set `false` for throughput. |
 | `DOCUMENTATION_URL` | the project's `docs/` folder on GitHub | The documentation link in the start-up banner. Set it to your own docs site. |
 
 ## Tracing

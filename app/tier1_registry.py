@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import copy
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -18,6 +18,7 @@ from app.tier1_openapi import (
 
 class Tier1Registry:
     _rows: List[Dict[str, Any]] = []
+    _schema_index_cache: Optional[Tuple[tuple, Dict[str, Dict[str, Any]]]] = None
 
     @classmethod
     async def reload(cls, db: AsyncSession) -> None:
@@ -40,6 +41,7 @@ class Tier1Registry:
                 }
             )
         cls._rows = next_rows
+        cls.invalidate_index()
 
     @classmethod
     def list_registrations(cls) -> List[Dict[str, Any]]:
@@ -78,13 +80,44 @@ class Tier1Registry:
         return tools
 
     @classmethod
-    def tool_input_schema_index(cls) -> Dict[str, Dict[str, Any]]:
+    def _index_signature(cls) -> tuple:
+        """Cheap identity fingerprint of the registry contents (no parsing)."""
+        return (
+            id(cls._rows),
+            tuple(
+                (id(r), id(r.get("openapi_document")), bool(r.get("expose_mcp_tools", True)))
+                for r in cls._rows
+            ),
+        )
+
+    @classmethod
+    def invalidate_index(cls) -> None:
+        """Drop the cached tool schema index (rebuilt on next use)."""
+        cls._schema_index_cache = None
+
+    @classmethod
+    def _compute_tool_input_schema_index(cls) -> Dict[str, Dict[str, Any]]:
         idx: Dict[str, Dict[str, Any]] = {}
         for t in cls.aggregated_mcp_tools():
             name = t.get("name")
             sch = t.get("inputSchema")
             if isinstance(name, str) and isinstance(sch, dict):
                 idx[name] = sch
+        return idx
+
+    @classmethod
+    def tool_input_schema_index(cls) -> Dict[str, Dict[str, Any]]:
+        """Tool name -> input schema, cached until the registry changes.
+
+        Rebuilt after ``reload`` / ``invalidate_index`` or whenever the set of
+        registrations (or their documents) is replaced.
+        """
+        sig = cls._index_signature()
+        cached = cls._schema_index_cache
+        if cached is not None and cached[0] == sig:
+            return cached[1]
+        idx = cls._compute_tool_input_schema_index()
+        cls._schema_index_cache = (sig, idx)
         return idx
 
     @classmethod

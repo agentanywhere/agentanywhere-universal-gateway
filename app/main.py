@@ -48,6 +48,7 @@ from app.observability import (
     record_request as obs_record_request,
     tracer as obs_tracer,
     normalize_route as obs_normalize_route,
+    metric_path_label as obs_metric_path_label,
 )
 from app.database import init_db, close_db, get_db
 from app.ai_service import AIService
@@ -65,6 +66,8 @@ import structlog
 
 settings = get_settings()
 logger = setup_logging()
+from app.request_log_writer import writer_from_settings  # noqa: E402
+request_log_writer = writer_from_settings(settings)
 auth_middleware = AuthMiddleware()
 rate_limiter = RateLimiter()
 router = Router()
@@ -100,6 +103,8 @@ async def lifespan(app: FastAPI):
     # Initialize database
     await init_db()
     logger.info("database_initialized")
+    await request_log_writer.start()
+    logger.info("request_log_writer_started", mode=request_log_writer.mode)
 
     try:
         from app.database import AsyncSessionLocal
@@ -306,6 +311,11 @@ async def lifespan(app: FastAPI):
         grpc_handler.close()
     if graphql_handler:
         await graphql_handler.close()
+    await request_log_writer.stop()
+    logger.info(
+        "request_log_writer_stopped",
+        written=request_log_writer.written, dropped=request_log_writer.dropped, failed=request_log_writer.failed,
+    )
     await close_db()
 
 
@@ -847,11 +857,11 @@ async def logging_middleware(request: Request, call_next):
         process_time = time.time() - start_time
         # Set by the auth middleware when it answered the request itself.
         auth_rejected = bool(getattr(request.state, "auth_rejected", False))
-        metric_path = _rejected_path_label(request.url.path) if auth_rejected else request.url.path
+        metric_path = _rejected_path_label(request.url.path) if auth_rejected else obs_metric_path_label(request.url.path)
 
         # Process through AI service
         try:
-            if auth_rejected:
+            if auth_rejected or not settings.ai_analytics_enabled:
                 raise _SkipAI()
             request_data = {
                 "request_id": request_id,
@@ -1079,8 +1089,6 @@ async def logging_middleware(request: Request, call_next):
                 "/metrics",
             )
             if not any(persist_path.startswith(p) for p in skip_persist_prefixes):
-                from app.database import AsyncSessionLocal
-                from app.repositories.log_repo import LogRepository
                 from app.models import RequestLog as RequestLogPydantic
 
                 api_key_obj_for_log = getattr(request.state, "api_key", None)
@@ -1128,16 +1136,7 @@ async def logging_middleware(request: Request, call_next):
                 except Exception:
                     pass
 
-                async def _persist_request_log(log_entry_pyd, key_id):
-                    try:
-                        async with AsyncSessionLocal() as session:
-                            await LogRepository.create(session, log_entry_pyd, api_key_id=key_id)
-                    except Exception as exc:
-                        logger.debug("request_log_persist_failed", error=str(exc))
-
-                asyncio.create_task(
-                    _persist_request_log(pydantic_log, api_key_id_for_log)
-                )
+                request_log_writer.submit(pydantic_log, api_key_id_for_log)
         except Exception as exc:
             logger.debug("request_log_persist_dispatch_failed", error=str(exc))
 
@@ -1160,6 +1159,10 @@ async def logging_middleware(request: Request, call_next):
         raise
     finally:
         clear_request_context()
+
+
+class _NoTransformation(Exception):
+    """Internal: no response transformation rule is registered."""
 
 
 class _SkipAI(Exception):
@@ -1311,22 +1314,38 @@ async def auth_middleware_handler(request: Request, call_next):
                         # Resolve tenant + enforce quota (best-effort)
                         try:
                             from app.tenant import tenant_service
-                            tenant_dict = await tenant_service.get_tenant_for_api_key(
-                                db, api_key.key
-                            )
+                            if getattr(request.state, "tenant_lookup_done", False):
+                                # authenticate() already looked the tenant up for this request.
+                                tenant_dict = getattr(request.state, "tenant", None)
+                            else:
+                                tenant_dict = await tenant_service.get_tenant_for_api_key(
+                                    db, api_key.key
+                                )
                             if tenant_dict and tenant_dict.get("is_active", True):
                                 request.state.tenant_id = tenant_dict["tenant_id"]
                                 request.state.tenant = tenant_dict
-                                allowed_minute = await tenant_service.check_quota(
-                                    db,
-                                    tenant_dict["tenant_id"],
-                                    window="minute",
-                                )
-                                allowed_hour = await tenant_service.check_quota(
-                                    db,
-                                    tenant_dict["tenant_id"],
-                                    window="hour",
-                                )
+                                # One usage query shared by both checks (and none for
+                                # a tenant without limits); falls back to per-call reads.
+                                try:
+                                    await tenant_service.prime_quota(db, tenant_dict)
+                                except Exception as exc:
+                                    logger.debug("tenant_quota_prime_failed", error=str(exc))
+                                try:
+                                    allowed_minute = await tenant_service.check_quota(
+                                        db,
+                                        tenant_dict["tenant_id"],
+                                        window="minute",
+                                    )
+                                    allowed_hour = await tenant_service.check_quota(
+                                        db,
+                                        tenant_dict["tenant_id"],
+                                        window="hour",
+                                    )
+                                finally:
+                                    try:
+                                        tenant_service.clear_quota_prime(db)
+                                    except Exception:
+                                        pass
                                 if not (allowed_minute and allowed_hour):
                                     rid = getattr(request.state, "request_id", None)
                                     window = "minute" if not allowed_minute else "hour"
@@ -1597,7 +1616,11 @@ async def metrics_endpoint(request: Request):
     if not settings.metrics_enabled:
         raise HTTPException(status_code=404, detail="Metrics disabled")
     _require_ops_admin(request)
-    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+    from starlette.concurrency import run_in_threadpool
+
+    # Rendering can take hundreds of ms with many series; keep it off the event loop.
+    content = await run_in_threadpool(generate_latest)
+    return Response(content=content, media_type=CONTENT_TYPE_LATEST)
 
 
 @app.websocket("/ws/{path:path}")
@@ -2291,7 +2314,7 @@ async def gateway_proxy(request: Request, path: str):
             method=request.method,
             path=f"/{path}",
             raw_body=body if isinstance(body, bytes) else None,
-            tool_input_schemas=tier1_registry.tool_input_schema_index(),
+            tool_input_schemas=tier1_registry.tool_input_schema_index,
             request_id=request_id,
         )
         validate_a2a_http_payload(
@@ -2472,6 +2495,11 @@ async def gateway_proxy(request: Request, path: str):
         # bodies that are not UTF-8), so the upstream status passes through.
         status_code = None
         try:
+            if not transformation_manager.rules_by_id:
+                # No transformation rule is registered, so there is nothing to apply. Parsing the
+                # body and writing it back would change its bytes (spacing, escaping, number
+                # formatting) and cost time that grows with its size.
+                raise _NoTransformation()
             # Try to parse body as JSON for transformation
             body_json = None
             if content:
@@ -2495,6 +2523,8 @@ async def gateway_proxy(request: Request, path: str):
             
             response_headers = transformed_headers
             status_code = transformed_status
+        except _NoTransformation:
+            pass
         except Exception as e:
             logger.warning("response_transformation_error", error=str(e))
         

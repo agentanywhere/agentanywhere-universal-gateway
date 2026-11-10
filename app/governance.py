@@ -557,11 +557,74 @@ class IPRule:
         return asdict(self)
 
 
+class _RuleList(list):
+    """List that bumps a version counter on every mutation.
+
+    ``IPRuleEngine`` keeps a pre-parsed index of its rules; the version lets
+    it notice direct edits (``.clear()``, ``.append()``, ...) and rebuild.
+    """
+
+    version = 0
+
+    def _bump(self) -> None:
+        self.version += 1
+
+    def _mutator(name):  # type: ignore[no-redef]
+        base = getattr(list, name)
+
+        def wrapper(self, *a, **kw):
+            self._bump()
+            return base(self, *a, **kw)
+
+        wrapper.__name__ = name
+        return wrapper
+
+    for _n in (
+        "append", "extend", "insert", "remove", "pop", "clear", "sort",
+        "reverse", "__setitem__", "__delitem__", "__iadd__", "__imul__",
+    ):
+        locals()[_n] = _mutator(_n)
+    del _n, _mutator
+
+
+class _Bucket:
+    """Pre-parsed rules of one scope (and scope id), in load order."""
+
+    __slots__ = ("denies", "allows", "first_allow")
+
+    def __init__(self) -> None:
+        self.denies: List[Tuple[IPRule, Any]] = []
+        self.allows: List[Tuple[IPRule, Any]] = []
+        self.first_allow: Optional[IPRule] = None
+
+
+def _parse_network(cidr: str) -> Any:
+    try:
+        return ipaddress.ip_network(cidr, strict=False)
+    except (ValueError, TypeError):
+        return None
+
+
 class IPRuleEngine:
     """Decision engine for IP allow / deny rules."""
 
     def __init__(self) -> None:
-        self._rules: List[IPRule] = []
+        self._rules_list: _RuleList = _RuleList()
+        self._index_key: Optional[Tuple[int, int]] = None
+        self._global: Optional[_Bucket] = None
+        self._tenant: Dict[str, _Bucket] = {}
+        self._api_key: Dict[str, _Bucket] = {}
+
+    @property
+    def _rules(self) -> List[IPRule]:
+        return self._rules_list
+
+    @_rules.setter
+    def _rules(self, value: List[IPRule]) -> None:
+        old = self._rules_list
+        new = _RuleList(value)
+        new.version = old.version + 1
+        self._rules_list = new
 
     async def reload(self, db: AsyncSession) -> None:
         stmt = select(IPRuleModel).order_by(IPRuleModel.created_at.asc())
@@ -580,6 +643,59 @@ class IPRuleEngine:
             if r.enabled
         ]
 
+    def _ensure_index(self) -> None:
+        rules = self._rules_list
+        key = (id(rules), rules.version)
+        if key == self._index_key:
+            return
+        glob: Optional[_Bucket] = None
+        tenant: Dict[str, _Bucket] = {}
+        api_key: Dict[str, _Bucket] = {}
+        for r in rules:
+            if r.scope == "global":
+                if glob is None:
+                    glob = _Bucket()
+                bucket = glob
+            elif r.scope in ("tenant", "api_key"):
+                if r.scope_id is None:
+                    # A scoped rule with no scope id belongs to nobody.
+                    continue
+                table = tenant if r.scope == "tenant" else api_key
+                bucket = table.get(r.scope_id)
+                if bucket is None:
+                    bucket = table[r.scope_id] = _Bucket()
+            else:
+                continue
+            entry = (r, _parse_network(r.cidr))
+            if r.action == "deny":
+                bucket.denies.append(entry)
+            elif r.action == "allow":
+                bucket.allows.append(entry)
+                if bucket.first_allow is None:
+                    bucket.first_allow = r
+        self._global, self._tenant, self._api_key = glob, tenant, api_key
+        self._index_key = key
+
+    @staticmethod
+    def _check_bucket(
+        bucket: Optional[_Bucket], addr: Any
+    ) -> Optional[IPRule]:
+        """Return the rule that blocks *addr*, or None."""
+        if bucket is None:
+            return None
+        # Deny rules win.
+        if addr is not None:
+            for rule, net in bucket.denies:
+                if net is not None and addr in net:
+                    return rule
+        if bucket.allows:
+            if addr is not None:
+                for _rule, net in bucket.allows:
+                    if net is not None and addr in net:
+                        return None
+            return bucket.first_allow
+        return None
+
     def evaluate(
         self,
         ip: str,
@@ -592,39 +708,34 @@ class IPRuleEngine:
         Rules are evaluated in this order: global → tenant → api_key.
         If no rule matches, the default outcome is ``allowed``.
 
+        Global rules apply to everyone. A tenant-scoped rule applies only
+        to requests of that tenant, and an api_key-scoped rule only to
+        that API key id (so a request with no tenant / no key id is never
+        subject to a scoped rule).
+
         If *any* allow rule exists for a scope, that scope becomes
         allowlist-only (i.e. an IP not matching any allow rule is
         denied). Deny rules always win when matched.
         """
-        scopes: List[Tuple[str, Optional[str]]] = [
-            ("global", None),
-            ("tenant", tenant),
-            ("api_key", api_key_id),
-        ]
+        self._ensure_index()
+        addr: Any = None
+        if ip:
+            try:
+                addr = ipaddress.ip_address(ip)
+            except ValueError:
+                addr = None
 
-        for scope_name, scope_id in scopes:
-            scope_rules = [
-                r for r in self._rules
-                if r.scope == scope_name and (scope_id is None or r.scope_id == scope_id)
-            ]
-            if not scope_rules:
-                continue
-
-            # Deny rules win.
-            for rule in scope_rules:
-                if rule.action == "deny" and _ip_matches_any_cidr(ip, [rule.cidr]):
-                    return False, rule
-
-            allow_rules = [r for r in scope_rules if r.action == "allow"]
-            if allow_rules:
-                if not any(
-                    _ip_matches_any_cidr(ip, [r.cidr]) for r in allow_rules
-                ):
-                    return False, allow_rules[0]
+        blocked = self._check_bucket(self._global, addr)
+        if blocked is None and tenant is not None:
+            blocked = self._check_bucket(self._tenant.get(tenant), addr)
+        if blocked is None and api_key_id is not None:
+            blocked = self._check_bucket(self._api_key.get(api_key_id), addr)
+        if blocked is not None:
+            return False, blocked
         return True, None
 
     def list_rules(self) -> List[Dict[str, Any]]:
-        return [r.to_dict() for r in self._rules]
+        return [r.to_dict() for r in self._rules_list]
 
 
 ip_rule_engine = IPRuleEngine()

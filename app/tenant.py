@@ -323,6 +323,40 @@ class TenantService:
         )
         return {"current": current, "history": history}
 
+    _PRIME_KEY = "tenant_quota_prime"
+
+    async def prime_quota(
+        self,
+        db: AsyncSession,
+        tenant: Dict[str, Any],
+        windows: tuple = ("minute", "hour"),
+    ) -> None:
+        """Load what check_quota needs for ``windows`` in one query (none if unlimited).
+
+        Until :meth:`clear_quota_prime`, check_quota for this tenant on this
+        session answers from that snapshot instead of re-reading the tenant row
+        and re-summing usage on every call. ``tenant`` is the dict the caller
+        already resolved (it carries the quota and is_active).
+        """
+        quota = tenant.get("quota") or {}
+        limited = [
+            w for w in windows
+            if (quota.get(f"requests_per_{w}") or 0) > 0
+        ]
+        used = (
+            await self._repo.used_in_windows(db, tenant["tenant_id"], limited)
+            if limited and tenant.get("is_active", True) else {}
+        )
+        db.info[self._PRIME_KEY] = {
+            "tenant_id": tenant["tenant_id"],
+            "quota": quota,
+            "is_active": tenant.get("is_active", True),
+            "used": used,
+        }
+
+    def clear_quota_prime(self, db: AsyncSession) -> None:
+        db.info.pop(self._PRIME_KEY, None)
+
     async def check_quota(
         self,
         db: AsyncSession,
@@ -330,6 +364,17 @@ class TenantService:
         window: str = "minute",
         cost: int = 1,
     ) -> bool:
+        prime = db.info.get(self._PRIME_KEY)
+        if prime and prime["tenant_id"] == tenant_id and (
+            not prime["is_active"] or window in prime["used"]
+            or (prime["quota"].get(f"requests_per_{window}") or 0) <= 0
+        ):
+            if not prime["is_active"]:
+                return False
+            limit = prime["quota"].get(f"requests_per_{window}")
+            if limit is None or limit <= 0:
+                return True
+            return (prime["used"][window] + cost) <= int(limit)
         tenant = await self._repo.get_by_id(db, tenant_id)
         if not tenant or not tenant.is_active:
             return False

@@ -54,6 +54,12 @@ def invalidate(key_hash: Optional[str], plaintext: Optional[str] = None) -> None
     if plaintext:
         names.append(f"{CACHE_PREFIX}{plaintext}")
     for holder in list(_holders):
+        local = getattr(holder, "_local_cache", None)
+        if local and key_hash:
+            local.pop(key_hash, None)
+        tenants = getattr(holder, "_tenant_cache", None)
+        if tenants and key_hash:
+            tenants.pop(key_hash, None)
         client = getattr(holder, "redis_client", None)
         if client is None:
             continue
