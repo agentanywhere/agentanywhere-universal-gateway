@@ -19,9 +19,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 import redis
 import json
 import time
+import structlog
 
 settings = get_settings()
 security = HTTPBearer(auto_error=False)
+
+logger = structlog.get_logger()
 
 
 def _normalise_scope_path(path: str) -> Optional[str]:
@@ -243,9 +246,22 @@ class AuthMiddleware:
                     if not db_key.is_active:
                         return None
 
+                    # Built before the write: a failed commit expires the row.
+                    principal = APIKeyRepository.to_pydantic(db_key, presented_key=api_key)
+
                     # Update last used; a row from before hashed storage also
-                    # loses its plaintext copy here (see APIKeyRepository).
-                    await APIKeyRepository.mark_used(db, db_key)
+                    # loses its plaintext copy here (see APIKeyRepository). This is
+                    # bookkeeping: failing to record it (SQLite "database is locked"
+                    # under write load, say) must not reject a key just validated.
+                    try:
+                        await APIKeyRepository.mark_used(db, db_key)
+                    except Exception as exc:
+                        logger.warning("api_key_mark_used_failed", error=str(exc))
+                        try:
+                            await db.rollback()
+                        except Exception:
+                            pass
+                        return principal
 
                     self._cache_put(key_hash, db_key)
 

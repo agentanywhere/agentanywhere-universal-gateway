@@ -534,3 +534,27 @@ async def test_tenant_service_api_key_association_usage_and_quota(db_session):
         assert await svc.get_tenant_for_api_key(db_session, key) is None
     finally:
         await svc.delete(db_session, tid)
+
+
+async def test_valid_key_is_accepted_when_recording_last_use_fails(mw, db_session, monkeypatch):
+    """A failed 'last used' write (SQLite lock under load) must not turn a valid key into a 401."""
+    key, _ = await APIKeyRepository.create(db=db_session, name="lock-test")
+
+    async def locked(db, db_key):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(APIKeyRepository, "mark_used", staticmethod(locked))
+    principal = await mw._validate_api_key(key, db_session)
+    assert principal is not None and principal.key == key and principal.is_active
+
+
+async def test_inactive_key_is_still_rejected_when_recording_last_use_fails(mw, db_session, monkeypatch):
+    key, model = await APIKeyRepository.create(db=db_session, name="inactive-lock-test")
+    model.is_active = False
+    await db_session.commit()
+
+    async def locked(db, db_key):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(APIKeyRepository, "mark_used", staticmethod(locked))
+    assert await mw._validate_api_key(key, db_session) is None
