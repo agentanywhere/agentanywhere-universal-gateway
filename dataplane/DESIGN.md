@@ -89,6 +89,40 @@ definition of "same behaviour". New behaviour requires a scenario first.
 * **Memory safety and supply chain.** Rust removes a class of bugs in a proxy that parses untrusted input; dependencies
   are pinned and audited (`cargo audit` and `cargo deny` in CI).
 
+## Target: best in class across the open-source field
+
+Decided by the maintainers: the goal is not a fixed number but to lead the open-source field. That has to be
+measurable, so it is defined as a scorecard and proven on a public, repeatable rig.
+
+**The field.** Agent and MCP gateways: agentgateway (Rust, Linux Foundation), Bifrost, LiteLLM (including its Rust
+mode), IBM ContextForge, Docker's MCP gateway, Obot, Lasso. General API gateways and proxies as the speed reference:
+Envoy, NGINX, HAProxy, Traefik, Kong, Apache APISIX. Vendor-published throughput figures in this space are not
+comparable with each other (different hardware, backends and settings), so none of them are used here; every project is
+measured the same way by us.
+
+**Scorecard axes**
+
+1. **Throughput per core** and **p50, p99, p99.9 latency** with the same work switched on in every project: API-key
+   authentication, a per-key rate limit and a request log. A bare proxy that skips these is a different product.
+2. **Memory** at idle and under load.
+3. **Overhead per request** (time added over calling the backend directly) and **behaviour at saturation**: does it shed
+   load quickly or queue until timeouts?
+4. **Start-up time** and **configuration reload without dropping requests**.
+5. **Agent-protocol coverage** that actually passes through: MCP, A2A, AG-UI, ACP, GraphQL, WebSocket, gRPC.
+6. **Governance depth at wire speed:** tenant quotas, scoped IP rules, policies and the tamper-evident audit log
+   still on, not traded away for speed.
+
+**Rules of the benchmark.** Same machine or fleet for every project, pinned versions, one backend that is not the
+bottleneck, configurations and scripts published with the numbers, and anyone can re-run it. We report where we lose.
+
+**Proposed success criteria** (to be confirmed): on axis 1 the data plane is within 10% of the best project in the field
+or ahead of it, on axes 2 to 4 it is in the top tier, and on axes 5 and 6 it covers more than any single project in the
+field. Axes 5 and 6 are where a gateway built for governed agent traffic can lead outright, so the data plane is
+designed to keep governance on the fast path, not behind a switch.
+
+Realistic note: raw proxy speed against Rust and C proxies such as Envoy, NGINX and agentgateway is the hardest axis. The
+claim worth making is "as fast as the fastest, with more of the governance kept on".
+
 ## Open questions (need a decision before phase 1)
 
 1. **Where does the code live?** Proposal: a `dataplane/` crate in this repository, Apache-2.0, built in CI next to the
@@ -97,5 +131,6 @@ definition of "same behaviour". New behaviour requires a scenario first.
    control plane that provides that interface can drive it.
 3. **Deployment.** Proposal: the data plane takes the public port and the Python gateway moves to an internal port, in
    Docker Compose and the quick start, with a single `docker compose up` unchanged for users.
-4. **Target.** What request rate and p99 should one node reach? That sets how much of phase 2 is on the critical path.
+4. **Target.** Decided: best in class across the open-source field, defined by the scorecard above. Still to confirm: the
+   10% criterion on axis 1.
 5. **Ownership.** Who reviews and maintains the Rust code.
