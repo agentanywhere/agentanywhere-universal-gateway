@@ -73,8 +73,7 @@ The gateway's `environment:` block, which overrides `.env`, sets:
 
    ```bash
    cp env.example .env
-   python3 scripts/generate_secret_key.py --update-env
-   echo "ADMIN_TOKEN=$(python3 scripts/generate_secret_key.py 2>/dev/null)" >> .env
+   python3 scripts/generate_secret_key.py --update-env --admin-token
    ```
 
    On Windows, use `python` in place of `python3` (the `python3` command is the
