@@ -14,7 +14,10 @@ from app.tenant import TenantService
 
 @pytest_asyncio.fixture
 async def maker(tmp_path):
-    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'usage.db'}")
+    # 200 writers share one file; a slow CI runner can need longer than the driver's 5 s lock wait.
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'usage.db'}", connect_args={"timeout": 60}
+    )
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     mk = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
