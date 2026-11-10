@@ -115,13 +115,18 @@ measured the same way by us.
 **Rules of the benchmark.** Same machine or fleet for every project, pinned versions, one backend that is not the
 bottleneck, configurations and scripts published with the numbers, and anyone can re-run it. We report where we lose.
 
-**Proposed success criteria** (to be confirmed): on axis 1 the data plane is within 10% of the best project in the field
-or ahead of it, on axes 2 to 4 it is in the top tier, and on axes 5 and 6 it covers more than any single project in the
-field. Axes 5 and 6 are where a gateway built for governed agent traffic can lead outright, so the data plane is
-designed to keep governance on the fast path, not behind a switch.
+**Success criterion (decided).** On axis 1 the data plane is strictly **ahead**: higher throughput per core and lower
+p99 than every other project in the field, with the same work switched on. On axes 2 to 4 it is in the top tier, and on
+axes 5 and 6 it covers more than any single project in the field. Governance stays on the fast path, never behind a
+switch, so the speed is not bought by doing less.
 
-Realistic note: raw proxy speed against Rust and C proxies such as Envoy, NGINX and agentgateway is the hardest axis. The
-claim worth making is "as fast as the fastest, with more of the governance kept on".
+**How it gets there.** No async framework on the hot path beyond `hyper` and `tokio`; one pooled client per worker; the
+request body streamed in and out without buffering; API keys looked up in a prebuilt hash table keyed by the stored
+SHA-256 digest; rate-limit and quota counters as sharded atomics with no locks; headers copied once; allocation-free
+fast path measured by a benchmark that fails CI on regression; per-core runtimes with `SO_REUSEPORT` on Linux.
+
+Realistic note: raw proxy speed against Rust and C proxies such as Envoy, NGINX and agentgateway is the hardest axis, and
+"ahead" is only claimed if the shared rig shows it. If it does not, the results say so and we keep working.
 
 ## Open questions (need a decision before phase 1)
 
@@ -131,6 +136,6 @@ claim worth making is "as fast as the fastest, with more of the governance kept 
    control plane that provides that interface can drive it.
 3. **Deployment.** Proposal: the data plane takes the public port and the Python gateway moves to an internal port, in
    Docker Compose and the quick start, with a single `docker compose up` unchanged for users.
-4. **Target.** Decided: best in class across the open-source field, defined by the scorecard above. Still to confirm: the
-   10% criterion on axis 1.
+4. **Target.** Decided: best in class across the open-source field, defined by the scorecard above. The criterion on axis 1 is
+   decided: strictly ahead.
 5. **Ownership.** Who reviews and maintains the Rust code.
