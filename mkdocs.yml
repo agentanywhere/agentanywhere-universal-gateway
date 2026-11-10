@@ -105,6 +105,7 @@ nav:
       - "What the gateway is": explanation/overview.md
       - "Architecture": explanation/architecture.md
       - "Protocol support": explanation/protocol-support.md
+      - "Adapters": explanation/adapters.md
       - "Security model": explanation/security-model.md
       - "Design decisions": explanation/design-decisions.md
       - "Glossary": glossary.md

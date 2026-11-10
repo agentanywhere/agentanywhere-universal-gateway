@@ -51,7 +51,6 @@ from app.observability import (
     metric_path_label as obs_metric_path_label,
 )
 from app.database import init_db, close_db, get_db
-from app.ai_service import AIService
 from app.protocols import MQTTHandler, WebSocketHandler, GRPCHandler
 from app.protocols.graphql_handler import GraphQLHandler
 from app.log_exporters import log_export_manager
@@ -66,16 +65,17 @@ import structlog
 
 settings = get_settings()
 logger = setup_logging()
-from app.request_log_writer import writer_from_settings  # noqa: E402
-request_log_writer = writer_from_settings(settings)
+from app.adapters import build_adapters, json_response_class  # noqa: E402
+adapters = build_adapters(settings)
+request_log_writer = adapters.request_log
 auth_middleware = AuthMiddleware()
 rate_limiter = RateLimiter()
-router = Router()
+router = Router(client=adapters.upstream)
 
 # Agent edge: slug -> upstream map for `/agents/<slug>/...` routing.
 from app.agent_routes import AgentEdgeConfig
 agent_edge_config = AgentEdgeConfig.from_settings(settings)
-ai_service = AIService()  # Initialize AI service
+ai_service = adapters.analytics
 
 # Initialize protocol handlers
 mqtt_handler = None
@@ -323,6 +323,7 @@ app = FastAPI(
     title=settings.app_name,
     version=settings.app_version,
     lifespan=lifespan,
+    default_response_class=json_response_class(adapters.json_codec),
     # The interactive docs and the schema describe every route, admin ones
     # included, so they are served only with DEBUG=true. Without it the
     # gateway answers 404 for these paths itself (see DOCS_PATHS below)

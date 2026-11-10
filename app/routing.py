@@ -16,8 +16,12 @@ settings = get_settings()
 class Router:
     """Request router for MCP and A2A protocols."""
     
-    def __init__(self):
-        self.client = httpx.AsyncClient(timeout=settings.default_timeout)
+    def __init__(self, client=None):
+        if client is None:
+            from app.adapters import build_upstream_client
+
+            client = build_upstream_client(settings)
+        self.client = client
         self.circuit_breakers: Dict[str, Dict[str, Any]] = {}
     
     def _get_backend_url(self, path: str) -> Tuple[str, ProtocolType]:

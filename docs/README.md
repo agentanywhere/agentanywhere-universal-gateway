@@ -53,6 +53,7 @@ bug; please [report it](support.md).
 | [Architecture](explanation/architecture.md) | How a request flows; admin plane and data plane; where state lives. |
 | [Security model](explanation/security-model.md) | What authenticates what, key storage, the admin credential, the `SECRET_KEY` overload. |
 | [Protocol support](explanation/protocol-support.md) | What works for each protocol, and the evidence. |
+| [Adapters](explanation/adapters.md) | Swap the JSON codec, upstream client, analytics or request-log sink with a setting. |
 | [Design decisions and trade-offs](explanation/design-decisions.md) | Why it works the way it does, and running more than one worker. |
 
 ## Everything else
