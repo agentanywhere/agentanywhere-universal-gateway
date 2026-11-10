@@ -53,6 +53,17 @@ def _reset_metric_path_labels():
     yield
 
 
+@pytest.fixture(autouse=True)
+def _no_leftover_router_patch():
+    """`monkeypatch.setattr(main.router, "route_request", ...)` puts the original bound method
+    back as an *instance* attribute on undo, and that shadows the class-level
+    `patch("app.routing.Router.route_request")` other tests rely on. Drop it after each test."""
+    yield
+    from app import main
+
+    vars(main.router).pop("route_request", None)
+
+
 @pytest_asyncio.fixture(scope="function")
 async def db_session():
     """Create a test database session."""
