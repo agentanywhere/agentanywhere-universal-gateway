@@ -10,10 +10,27 @@ from __future__ import annotations
 
 import os
 import sys
-from typing import Any, Dict, List, Optional, TextIO, Tuple
+from typing import Any, Dict, List, Optional, Sequence, TextIO, Tuple
 from urllib.parse import urlsplit
 
 _RULE = "─" * 58
+
+# Protocols the gateway carries end to end, and the two whose routes exist but do
+# not forward yet. Keep in step with docs/explanation/protocol-support.md.
+SUPPORTED_PROTOCOLS = ("HTTP/REST", "MCP", "A2A", "AG-UI", "ACP", "GraphQL", "MQTT")
+UNSUPPORTED_PROTOCOLS = ("WebSocket", "gRPC")
+CONSOLE_URL = "http://127.0.0.1:3001"
+
+# Backend setting for each protocol, for the "Backends" row. Names only, never URLs.
+_BACKEND_SETTINGS = (
+    ("HTTP/REST", "http_backend_url"),
+    ("MCP", "mcp_backend_url"),
+    ("A2A", "a2a_backend_url"),
+    ("AG-UI", "ag_ui_backend_url"),
+    ("ACP", "acp_backend_url"),
+    ("GraphQL", "graphql_backend_url"),
+    ("MQTT", "mqtt_broker_url"),
+)
 
 
 def _local_host(host: str) -> str:
@@ -59,6 +76,10 @@ def _database(settings: Any) -> str:
     return scheme.split("+", 1)[0]
 
 
+def _configured_backends(settings: Any) -> List[str]:
+    return [name for name, attr in _BACKEND_SETTINGS if getattr(settings, attr, None)]
+
+
 def banner_facts(settings: Any) -> Dict[str, Any]:
     """The facts shown in the banner, also logged as one structured line."""
     host, port = _bind_address(settings)
@@ -71,6 +92,11 @@ def banner_facts(settings: Any) -> Dict[str, Any]:
         "listen": f"{host}:{port}",
         "health_url": f"{base}/health",
         "docs_url": f"{base}/docs" if docs_on else None,
+        "console_url": CONSOLE_URL,
+        "documentation_url": getattr(settings, "documentation_url", None),
+        "protocols": list(SUPPORTED_PROTOCOLS),
+        "protocols_not_yet": list(UNSUPPORTED_PROTOCOLS),
+        "backends": _configured_backends(settings),
         "admin_credential": _admin_credential(settings),
         "database": _database(settings),
         "redis": bool(getattr(settings, "redis_enabled", False)),
@@ -98,6 +124,10 @@ def _rows(facts: Dict[str, Any]) -> List[Tuple[str, str]]:
         ("Health check", facts["health_url"]),
         ("API docs", facts["docs_url"] or "off (set DEBUG=true to serve /docs)"),
         ("Admin API", _admin_row(facts["admin_credential"])),
+        ("Console", f"{facts['console_url']}  (Docker Compose, or: cd admin-ui && npm run dev)"),
+        ("Protocols", " · ".join(facts["protocols"])),
+        ("Not yet", " · ".join(facts["protocols_not_yet"]) + " (routes exist, no pass-through)"),
+        ("Backends", ", ".join(facts["backends"]) or "none configured: set HTTP_BACKEND_URL and the others"),
         ("Storage", f"{facts['database']} database, Redis {'enabled' if facts['redis'] else 'disabled'}"),
         (
             "Logging",
@@ -105,6 +135,7 @@ def _rows(facts: Dict[str, Any]) -> List[Tuple[str, str]]:
             f" · redaction {'on' if facts['log_redaction'] else 'OFF'}",
         ),
         ("Agent edge", "on" if facts["agent_edge"] else "off"),
+        ("Documentation", facts["documentation_url"] or "see docs/README.md"),
     ]
 
 
@@ -124,6 +155,25 @@ def render_banner(settings: Any, *, color: bool = False) -> str:
         lines.append(f"  {paint(label.ljust(width), '2')}  {value}")
     lines += [f"  {paint(_RULE, '2')}", ""]
     return "\n".join(lines)
+
+
+_announced = False
+
+
+def running_as_server(argv: Optional[Sequence[str]] = None) -> bool:
+    """True when this process was started by an ASGI server (uvicorn, gunicorn, hypercorn),
+    so importing the app from a script, a test or a tool does not print a banner."""
+    argv = list(sys.argv if argv is None else argv)[:2]
+    return any(name in arg.lower() for arg in argv for name in ("uvicorn", "gunicorn", "hypercorn"))
+
+
+def announce_startup(settings: Any, stream: Optional[TextIO] = None, argv: Optional[Sequence[str]] = None) -> bool:
+    """Print the banner once per process, only when started by a server."""
+    global _announced
+    if _announced or not running_as_server(argv):
+        return False
+    _announced = True
+    return print_banner(settings, stream)
 
 
 def print_banner(settings: Any, stream: Optional[TextIO] = None) -> bool:

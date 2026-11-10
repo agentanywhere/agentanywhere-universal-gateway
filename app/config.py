@@ -595,6 +595,8 @@ class Settings(BaseSettings):
     # Access logs with a status at or above this are never sampled out.
     log_sample_always_status_ge: int = 400
     startup_banner: bool = True
+    # Where the start-up banner points people for help; set it to your own docs site.
+    documentation_url: str = "https://github.com/agentanywhere/agentanywhere-universal-gateway/tree/main/docs"
 
     # Metrics
     metrics_enabled: bool = True
