@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+
+{% block extrahead %}
+  {% set title = page.title ~ " | " ~ config.site_name if page and page.title and not page.is_homepage else config.site_name %}
+  {% set description = (page.meta.description if page and page.meta and page.meta.description else config.site_description) | trim %}
+  {% set canonical = page.canonical_url if page and page.canonical_url else config.site_url %}
+  <meta property="og:type" content="{{ 'website' if page and page.is_homepage else 'article' }}">
+  <meta property="og:site_name" content="{{ config.site_name }}">
+  <meta property="og:title" content="{{ title }}">
+  <meta property="og:description" content="{{ description }}">
+  <meta property="og:url" content="{{ canonical }}">
+  <meta property="og:image" content="{{ config.site_url }}img/console/dashboard.png">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="{{ title }}">
+  <meta name="twitter:description" content="{{ description }}">
+  <meta name="twitter:image" content="{{ config.site_url }}img/console/dashboard.png">
+  <link rel="alternate" type="text/plain" href="{{ config.site_url }}llms.txt" title="llms.txt">
+  {% if page and page.is_homepage %}
+  <script type="application/ld+json">
+  {{ {
+    "@context": "https://schema.org",
+    "@graph": [
+      {"@type": "WebSite", "name": config.site_name, "url": config.site_url, "description": config.site_description | trim},
+      {"@type": "SoftwareSourceCode", "name": config.site_name, "description": config.site_description | trim,
+       "codeRepository": config.repo_url, "programmingLanguage": "Python",
+       "license": "https://www.apache.org/licenses/LICENSE-2.0",
+       "runtimePlatform": "Docker, Python 3.10 to 3.12",
+       "applicationCategory": "DeveloperApplication",
+       "author": {"@type": "Organization", "name": "ShepHertz Technologies Pvt. Ltd."}}
+    ]
+  } | tojson }}
+  </script>
+  {% elif page and page.meta and page.meta.faq_jsonld %}
+  <script type="application/ld+json">{{ page.meta.faq_jsonld | tojson }}</script>
+  {% elif page and page.title %}
+  <script type="application/ld+json">
+  {{ {
+    "@context": "https://schema.org",
+    "@type": "TechArticle",
+    "headline": page.title,
+    "description": description,
+    "url": canonical,
+    "inLanguage": "en",
+    "isPartOf": {"@type": "WebSite", "name": config.site_name, "url": config.site_url},
+    "publisher": {"@type": "Organization", "name": "ShepHertz Technologies Pvt. Ltd."}
+  } | tojson }}
+  </script>
+  {% endif %}
+{% endblock %}

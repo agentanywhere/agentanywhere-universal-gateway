@@ -1,0 +1,115 @@
+site_name: AgentAnywhere Universal Gateway
+site_description: >-
+  Open-source API gateway for AI agents. API keys, rate limits, tenant quotas, routing and
+  metrics in front of MCP, A2A, AG-UI, ACP, HTTP/REST, GraphQL and MQTT backends.
+  Documentation, tutorials, how-to guides and reference.
+# Set SITE_URL when you publish somewhere else (a custom domain, for example).
+site_url: !ENV [SITE_URL, "https://agentanywhere.github.io/agentanywhere-universal-gateway/"]
+repo_url: https://github.com/agentanywhere/agentanywhere-universal-gateway
+repo_name: agentanywhere/agentanywhere-universal-gateway
+edit_uri: edit/main/docs/
+copyright: Copyright 2026 ShepHertz Technologies Pvt. Ltd. Licensed under Apache-2.0.
+
+docs_dir: docs
+exclude_docs: |
+  overrides/
+
+theme:
+  name: material
+  custom_dir: docs/overrides
+  language: en
+  palette:
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: custom
+      accent: custom
+      toggle: { icon: material/weather-sunny, name: Switch to light mode }
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: custom
+      accent: custom
+      toggle: { icon: material/weather-night, name: Switch to dark mode }
+  font: false
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - navigation.indexes
+    - navigation.footer
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.action.edit
+    - toc.follow
+
+extra_css:
+  - stylesheets/extra.css
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - tables
+  - toc:
+      permalink: true
+      # Same anchors as GitHub, so a link works on both.
+      slugify: !!python/object/apply:pymdownx.slugs.slugify {kwds: {case: lower}}
+  - pymdownx.highlight:
+      anchor_linenums: false
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+
+plugins:
+  - search
+
+hooks:
+  - hooks/docs_site.py
+
+validation:
+  omitted_files: info
+  absolute_links: warn
+  unrecognized_links: warn
+  anchors: warn
+
+nav:
+  - Home: README.md
+  - Get started:
+      - "Your first authenticated request": tutorials/getting-started.md
+      - "Two backends, limits, quotas and metrics": tutorials/two-backends-end-to-end.md
+  - How-to guides:
+      - "Deploy with Docker Compose": how-to/deploy-with-docker-compose.md
+      - "Manage API keys": how-to/manage-api-keys.md
+      - "Configure routes and backends": how-to/configure-routes-and-backends.md
+      - "Set rate limits and tenant quotas": how-to/rate-limits-and-quotas.md
+      - "Run behind nginx with TLS": how-to/run-behind-nginx-tls.md
+      - "Secure the gateway for production": how-to/secure-for-production.md
+      - "Monitor the gateway": how-to/monitor.md
+      - "Send events to a webhook": how-to/configure-webhooks.md
+      - "Write a plugin": how-to/write-a-plugin.md
+      - "Back up and restore": how-to/back-up-and-restore.md
+      - "Upgrade the gateway": how-to/upgrade.md
+      - "Troubleshoot request errors": how-to/troubleshoot-401-502-429.md
+      - "Test performance": how-to/performance-testing.md
+      - "Run the tests": how-to/run-the-tests.md
+  - Reference:
+      - "Configuration": reference/configuration.md
+      - "HTTP API": reference/http-api.md
+      - "HTTP endpoints": reference/http-endpoints.md
+      - "CLI": reference/cli.md
+      - "Errors and status codes": reference/errors.md
+      - "Metrics": reference/metrics.md
+      - "Database": reference/database.md
+  - Concepts:
+      - "What the gateway is": explanation/overview.md
+      - "Architecture": explanation/architecture.md
+      - "Protocol support": explanation/protocol-support.md
+      - "Security model": explanation/security-model.md
+      - "Design decisions": explanation/design-decisions.md
+      - "Glossary": glossary.md
+  - Help:
+      - "FAQ": faq.md
+      - "Troubleshooting": troubleshooting.md
+      - "Known limitations": known-limitations.md
+      - "Support": support.md
