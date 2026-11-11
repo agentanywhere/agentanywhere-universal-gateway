@@ -378,6 +378,7 @@ def test_admin_and_oauth_prefixes_skip_api_key_check(gw):
 def test_break_glass_secret_key_authenticates(gw, monkeypatch):
     from app.middleware import auth as auth_mod
     monkeypatch.setattr(auth_mod.settings, "secret_key", "break-glass-operator-secret-0001")
+    monkeypatch.setattr(auth_mod.settings, "allow_secret_key_api_key", True)
     backend(monkeypatch, jresp())
     r = gw.get("/mcp/t", headers={"X-API-Key": "break-glass-operator-secret-0001"})
     assert r.status_code == 200
@@ -548,6 +549,7 @@ def test_db_failure_falls_back_to_break_glass_key(monkeypatch):
 
     app.dependency_overrides[get_db] = broken_db
     monkeypatch.setattr(auth_mod.settings, "secret_key", "break-glass-operator-secret-0003")
+    monkeypatch.setattr(auth_mod.settings, "allow_secret_key_api_key", True)
     backend(monkeypatch, jresp())
     try:
         with TestClient(app, raise_server_exceptions=False) as c:

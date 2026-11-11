@@ -53,8 +53,7 @@ It has an automated test suite that continuous integration runs on every
 push, and the repository includes a Dockerfile, a Compose file and an nginx
 configuration.
 It also has settings that look like controls but are not enforced yet (admin
-roles, per-protocol rate limits), and `SECRET_KEY` remains a break-glass API
-key. Read the
+roles, per-protocol rate limits). Read the
 [known limitations](known-limitations.md) and work through
 [Secure the gateway for production](how-to/secure-for-production.md), then
 decide. Version 1.0.0 is marked unreleased in the changelog.
@@ -86,8 +85,8 @@ admin API refuses everything.
 ## Why do I have both `SECRET_KEY` and `ADMIN_TOKEN`?
 
 `ADMIN_TOKEN` is the operators' credential. `SECRET_KEY` is a break-glass
-credential: accepted as an API key on the data plane, and on the admin API
-only while `ADMIN_TOKEN` is empty. Keep it in your secret store. See
+credential: accepted on the admin API only while `ADMIN_TOKEN` is empty, and
+as an API key on the data plane only with `ALLOW_SECRET_KEY_API_KEY=true`. Keep it in your secret store. See
 [the SECRET_KEY break-glass credential](explanation/security-model.md#the-secret_key-break-glass-credential).
 
 ## Can I restrict a key to some paths?

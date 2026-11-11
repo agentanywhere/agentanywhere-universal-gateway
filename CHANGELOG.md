@@ -103,6 +103,8 @@ See [docs/known-limitations.md](docs/known-limitations.md) for the full list.
 
 ### Changed (may need action on upgrade; see docs/how-to/upgrade.md)
 
+- `SECRET_KEY` on the data plane now gets 401. Create API keys, or set
+  `ALLOW_SECRET_KEY_API_KEY=true` for a first boot with no keys.
 - With `ADMIN_TOKEN` set, `SECRET_KEY` is no longer an admin credential
   (`ADMIN_ACCEPT_SECRET_KEY=true` restores it).
 - `GET /admin/api-keys` no longer returns keys; new keys are shown once.
@@ -112,6 +114,14 @@ See [docs/known-limitations.md](docs/known-limitations.md) for the full list.
 
 ### Security
 
+- `SECRET_KEY` is no longer accepted as an API key on the data plane unless
+  `ALLOW_SECRET_KEY_API_KEY=true` (off by default). When it is on, every use
+  is counted (`gateway_secret_key_api_key_uses_total`), logged and written to
+  the governance audit log.
+- Audit entries name the admin principal (`admin-token`, `secret-key` or
+  `sso:<user>`), never the last characters of the credential.
+- Concurrent writes to the governance audit log can no longer fork its hash
+  chain.
 - The admin API accepts only the configured `ADMIN_TOKEN`, or `SECRET_KEY`
   when it is not the placeholder from `env.example`. There is no default
   admin password, and no credential is accepted because of its prefix or length.

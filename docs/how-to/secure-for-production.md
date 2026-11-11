@@ -57,8 +57,9 @@ gateway audited or certified.
    unset or `false`.
 
 With `ADMIN_TOKEN` set, operators use `ADMIN_TOKEN` and the admin API refuses
-`SECRET_KEY`. `SECRET_KEY` remains a break-glass API key on the data plane, so
-keep it secret anyway.
+`SECRET_KEY`. Leave `ALLOW_SECRET_KEY_API_KEY` unset or `false`, so that
+`SECRET_KEY` is not an API key on the data plane either, and keep it secret
+anyway.
 
 If `ADMIN_TOKEN` leaks, change it and restart; the console and CLI need to
 sign in again.
@@ -149,7 +150,6 @@ credentials off and logs `cors_wildcard_credentials_disabled` at start-up.
 
 These need code changes. Plan around them:
 
-- `SECRET_KEY` is accepted as an API key on every data-plane route.
 - Admin roles are not enforced yet. Every admin credential has full access.
 - `PROTOCOL_*_RATE_LIMIT_*`, policy `rate_limit` actions and tenant
   `requests_per_day` are not enforced yet.
@@ -167,5 +167,7 @@ curl -s -o /dev/null -w "%{http_code}\n" https://gateway.example.com/docs       
 curl -s -o /dev/null -w "%{http_code}\n" https://gateway.example.com/api/anything       # expect 401
 curl -s -o /dev/null -w "%{http_code}\n" -H "Authorization: Bearer $SECRET_KEY" \
   https://gateway.example.com/admin/tenants                                             # expect 401 with ADMIN_TOKEN set
+curl -s -o /dev/null -w "%{http_code}\n" -H "X-API-Key: $SECRET_KEY" \
+  https://gateway.example.com/api/anything                                              # expect 401
 curl -s -o /dev/null -w "%{http_code}\n" --max-time 5 http://gateway.example.com:8000/health   # expect a timeout or refusal
 ```
