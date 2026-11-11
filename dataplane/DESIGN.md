@@ -129,8 +129,10 @@ Realistic note: raw proxy speed against Rust and C proxies such as Envoy, NGINX 
 "ahead" is only claimed if the shared rig shows it. If it does not, the results say so and we keep working.
 
 **Where the code stands.** Phase 1 is implemented in `dataplane/` except the data plane's own health and metrics
-endpoints (those still come from the Python gateway), and with one breaker for the single backend. From phase 2,
-governance policies are already native. See [README.md](README.md) for what is handled, what is not, and the known gaps.
+endpoints (those still come from the Python gateway). From phase 2, governance policies and the checks at the MCP,
+A2A, AG-UI and ACP boundaries are native, with one rule that differs from the plan above: the data plane only decides
+that a body passes, and a body that does not is answered by the Python gateway, so refusals cannot drift. Those four
+protocols are forwarded natively, each to its own backend with its own breaker. Transformations are not moved yet. See [README.md](README.md) for what is handled, what is not, and the known gaps.
 
 ## Open questions (need a decision before phase 1)
 

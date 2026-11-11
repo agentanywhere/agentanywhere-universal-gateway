@@ -4,9 +4,11 @@
 //! never holds a usable credential. The control plane compiles everything that decides a
 //! request (key scopes, tenants and their quotas, IP rules, policies) into the forms used here;
 //! anything it cannot express that way it marks as not native, and the Python gateway keeps it.
+use crate::boundary::{Boundary, BoundaryRecord};
 use crate::breaker;
 use crate::govern::{IpRule, IpRules, Net, Policy, Scope, ScopeRule};
 use crate::limits::Window;
+use crate::proxy::{Backend, ROUTED};
 use crate::tenant::{Tenant, Usage};
 use hyper::header::HeaderValue;
 use serde::Deserialize;
@@ -83,10 +85,21 @@ pub struct Snapshot {
     pub policies: Vec<Policy>,
     /// Path prefixes the control plane must handle (dynamic routes, transformation rules, ...).
     pub fallthrough_prefixes: Vec<String>,
+    /// Where each protocol in `ROUTED` is sent, as the control plane has it configured.
+    pub protocol_urls: [Option<String>; 4],
+    /// The backends at those addresses, filled in when the snapshot is put to use. A protocol
+    /// without one is the control plane's to serve.
+    pub routes: [Option<Arc<Backend>>; 4],
+    /// What the Python gateway checks in a request body before forwarding it.
+    pub boundary: Boundary,
 }
 
 #[derive(Deserialize)]
 struct SnapshotFile {
+    /// Protocol name -> backend address. Without it only plain HTTP is served natively.
+    #[serde(default)]
+    backends: HashMap<String, Option<String>>,
+    boundary: Option<BoundaryRecord>,
     #[serde(default)]
     keys: Vec<KeyRecord>,
     #[serde(default)]
@@ -371,6 +384,10 @@ impl Snapshot {
             ip_rules,
             policies,
             fallthrough_prefixes: file.fallthrough_prefixes,
+            protocol_urls: ROUTED.map(|p| file.backends.get(p.name()).cloned().flatten().filter(|u| !u.is_empty())),
+            routes: Default::default(),
+            // Without the section, the gateway's shipped defaults apply.
+            boundary: file.boundary.map(Boundary::from_record).unwrap_or_else(Boundary::defaults),
         };
         Ok(Parsed::Full(snap, file.tenant_usage))
     }

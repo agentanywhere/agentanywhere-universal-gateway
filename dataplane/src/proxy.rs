@@ -1,20 +1,22 @@
 //! Request handling: serve what the data plane owns, hand the rest to the control plane.
 //!
 //! A request is handled natively only when everything that decides its outcome is something
-//! the data plane reproduces exactly: a plain HTTP path, a key present in the snapshot that is
-//! active and unexpired, and a client that is not a browser. For such a request the key's
-//! allowed paths, the IP rules, the policies, the key's rate limit and its tenant's quota are
-//! all decided here, in the Python gateway's order and with its answers. Every other request
-//! is forwarded unchanged to the control plane, so behaviour never differs; only speed does.
+//! the data plane reproduces exactly: a path that belongs to plain HTTP, MCP, A2A, AG-UI or ACP,
+//! a key present in the snapshot that is active and unexpired, and a client that is not a
+//! browser. For such a request the key's allowed paths, the IP rules, the policies, the checks on
+//! the body at the protocol boundary, the key's rate limit and its tenant's quota are all
+//! decided here, in the Python gateway's order and with its answers. Every other request is
+//! forwarded unchanged to the control plane, so behaviour never differs; only speed does.
 //! See DESIGN.md.
 use bytes::Bytes;
-use http_body_util::{Either, Full};
+use http_body_util::{BodyExt, Either, Full};
 use hyper::body::{Body as _, Incoming};
 use hyper::header::{HeaderName, HeaderValue, ACCEPT, CONTENT_LENGTH, CONTENT_TYPE, HOST, REFERER, USER_AGENT};
 use hyper::http::uri::{Authority, Scheme};
 use hyper::{HeaderMap, Method, Request, Response, StatusCode, Uri, Version};
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use hyper_util::rt::TokioExecutor;
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -22,14 +24,49 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::accesslog::{self, AccessLog};
+use crate::boundary::Verdict;
 use crate::breaker::{self, Breaker};
 use crate::govern::{self, IpRule, Policy, Scope, Subject};
 use crate::report::{Event, Reporter, Row, Served};
 use crate::snapshot::{hash_key, KeyEntry, Snapshot};
 use crate::sync::Link;
 
-/// A response is either streamed from upstream or a small body made here; neither is boxed.
+/// A body is either streamed from the other side or held here whole; neither is boxed. Responses
+/// are streamed from upstream or made here; requests are streamed from the client, or read whole
+/// when the gateway looks inside them.
 pub type Body = Either<Incoming, Full<Bytes>>;
+
+/// The protocols served natively. Each has its own backend; which one a path belongs to is
+/// decided as the Python gateway's router decides it.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Protocol {
+    Http,
+    Mcp,
+    A2a,
+    AgUi,
+    Acp,
+}
+
+/// The protocols whose backends come from the snapshot, in the order `Snapshot::routes` holds them.
+pub const ROUTED: [Protocol; 4] = [Protocol::Mcp, Protocol::A2a, Protocol::AgUi, Protocol::Acp];
+
+impl Protocol {
+    /// The name the Python gateway gives the protocol: the `X-Protocol` header sent upstream and
+    /// the key of its backend in the snapshot.
+    pub fn name(self) -> &'static str {
+        match self {
+            Protocol::Http => "http",
+            Protocol::Mcp => "mcp",
+            Protocol::A2a => "a2a",
+            Protocol::AgUi => "ag_ui",
+            Protocol::Acp => "acp",
+        }
+    }
+
+    fn route_index(self) -> Option<usize> {
+        ROUTED.iter().position(|p| *p == self)
+    }
+}
 
 /// Where requests are sent, parsed once so that no request pays for it.
 pub struct Upstream {
@@ -56,14 +93,59 @@ impl Upstream {
     }
 }
 
+/// Somewhere native requests are sent, with the circuit breaker that protects it. The control
+/// plane keeps breakers of its own for what it serves.
+pub struct Backend {
+    pub upstream: Upstream,
+    pub breaker: Breaker,
+}
+
+impl Backend {
+    pub fn parse(text: &str) -> Result<Arc<Backend>, String> {
+        Ok(Arc::new(Backend { upstream: Upstream::parse(text)?, breaker: Breaker::new() }))
+    }
+}
+
+/// Every backend seen so far, by address. Two protocols sent to one address share its breaker,
+/// as they do in the Python gateway, and a backend keeps its breaker across snapshots.
+#[derive(Default)]
+pub struct Backends(Mutex<HashMap<String, Arc<Backend>>>);
+
+impl Backends {
+    pub fn with(first: &Arc<Backend>) -> Backends {
+        let known = Backends::default();
+        known.0.lock().unwrap().insert(first.upstream.text.clone(), first.clone());
+        known
+    }
+
+    /// The backend at this address, or `None` if it is not one this side can reach (not http://).
+    fn at(&self, url: &str) -> Option<Arc<Backend>> {
+        let key = url.trim_end_matches('/');
+        let mut known = self.0.lock().unwrap();
+        if let Some(found) = known.get(key) {
+            return Some(found.clone());
+        }
+        let made = Backend::parse(key).ok()?;
+        known.insert(key.to_owned(), made.clone());
+        Some(made)
+    }
+
+    /// Give each protocol in the snapshot its backend.
+    pub fn resolve(&self, snap: &mut Snapshot) {
+        for (route, url) in snap.routes.iter_mut().zip(&snap.protocol_urls) {
+            *route = url.as_deref().and_then(|u| self.at(u));
+        }
+    }
+}
+
 pub struct State {
     pub snapshot: arc_swap::ArcSwap<Snapshot>,
     /// Counts snapshot replacements, so a worker can tell cheaply that the one it holds is current.
     pub generation: AtomicU64,
-    pub backend: Upstream,
+    /// Where plain HTTP requests go.
+    pub backend: Arc<Backend>,
+    pub backends: Backends,
     pub control: Upstream,
-    /// For the backend native requests go to. The control plane keeps its own for what it serves.
-    pub breaker: Breaker,
     /// Present when the snapshot comes from the control plane; native serving needs it fresh.
     pub sync: Option<Arc<Link>>,
     /// Present with a control-plane link: what was served is reported back.
@@ -73,7 +155,8 @@ pub struct State {
 }
 
 impl State {
-    pub fn replace(&self, snap: Snapshot) {
+    pub fn replace(&self, mut snap: Snapshot) {
+        self.backends.resolve(&mut snap);
         self.snapshot.store(Arc::new(snap));
         self.generation.fetch_add(1, Ordering::Release);
     }
@@ -84,7 +167,7 @@ impl State {
 /// is writing to.
 pub struct Worker {
     pub shared: Arc<State>,
-    client: Client<HttpConnector, Incoming>,
+    client: Client<HttpConnector, Body>,
     /// The snapshot as of `generation`, behind a reference count only this worker touches.
     held: Mutex<(u64, Arc<Arc<Snapshot>>)>,
     index: usize,
@@ -123,16 +206,66 @@ const HOP_BY_HOP: [&str; 8] = [
     "upgrade",
 ];
 
-/// First path segments after `/api/` that belong to other protocols (and so to the control plane).
-const OTHER_PROTOCOLS: [&str; 9] = ["mcp", "a2a", "agui", "acp", "mqtt", "ws", "grpc", "graphql", "agents"];
+/// First path segments after `/api/` that the control plane keeps although its router would call
+/// them plain HTTP.
+const KEPT_BY_CONTROL: [&str; 2] = ["ws", "agents"];
 
-fn is_native_path(path: &str, fallthrough: &[String]) -> bool {
-    let Some(rest) = path.strip_prefix("/api/") else { return false };
-    let first = rest.split('/').next().unwrap_or("");
-    if OTHER_PROTOCOLS.contains(&first) {
+/// The protocol a path belongs to, decided in the order the Python gateway's router decides it
+/// (prefixes are compared as text, so `/mcpx` is MCP there and here). `None` for what the control
+/// plane keeps: MQTT, WebSocket, gRPC, GraphQL, its own endpoints and anything without a prefix.
+fn classify(path: &str) -> Option<Protocol> {
+    let under = |name: &str| path.starts_with(name) || path.strip_prefix("/api").map(|rest| rest.starts_with(name)).unwrap_or(false);
+    if under("/mcp") {
+        Some(Protocol::Mcp)
+    } else if under("/a2a") {
+        Some(Protocol::A2a)
+    } else if under("/agui") {
+        Some(Protocol::AgUi)
+    } else if under("/acp") {
+        Some(Protocol::Acp)
+    } else if under("/mqtt") || path.starts_with("/ws") || path.starts_with("/websocket") || under("/grpc") || under("/graphql") {
+        None
+    } else {
+        let first = path.strip_prefix("/api/")?.split('/').next().unwrap_or("");
+        (!KEPT_BY_CONTROL.contains(&first)).then_some(Protocol::Http)
+    }
+}
+
+/// The path an ACP or AG-UI backend is sent: the gateway's prefix (`/acp`, `/api/acp`, `/agui`,
+/// `/api/agui`) is taken off, so the server sees the paths its specification names.
+fn upstream_path(path: &str, protocol: Protocol) -> &str {
+    let segment = match protocol {
+        Protocol::Acp => "/acp",
+        Protocol::AgUi => "/agui",
+        _ => return path,
+    };
+    for base in [path, path.strip_prefix("/api").unwrap_or("")] {
+        match base.strip_prefix(segment) {
+            Some("") => return "/",
+            Some(rest) if rest.starts_with('/') => return rest,
+            _ => {}
+        }
+    }
+    path
+}
+
+/// `/v<digits>[.<digits>]` followed by `/` or nothing: a path that names its API version, which
+/// the Python gateway resolves differently from one that does not.
+fn names_a_version(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/v") else { return false };
+    let digits = |s: &str| s.bytes().take_while(u8::is_ascii_digit).count();
+    let whole = digits(rest);
+    if whole == 0 {
         return false;
     }
-    !fallthrough.iter().any(|p| path.starts_with(p.as_str()))
+    let mut rest = &rest[whole..];
+    if let Some(fraction) = rest.strip_prefix('.') {
+        let n = digits(fraction);
+        if n > 0 {
+            rest = &fraction[n..];
+        }
+    }
+    rest.is_empty() || rest.starts_with('/')
 }
 
 fn wants_html(headers: &HeaderMap) -> bool {
@@ -225,6 +358,9 @@ fn trace_for(headers: &HeaderMap) -> Trace {
 
 /// A request the data plane serves itself.
 struct Native<'a> {
+    protocol: Protocol,
+    /// The protocol's backend, when it is not the plain HTTP one.
+    backend: Option<&'a Backend>,
     entry: &'a KeyEntry,
     version: Option<&'a str>,
     /// The client's address, as the Python gateway would resolve it.
@@ -242,7 +378,16 @@ fn route<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, now: u64
     if uri.authority().is_some() || !path.is_ascii() || path.contains('%') {
         return None;
     }
-    if !is_native_path(path, &snap.fallthrough_prefixes) || wants_html(req.headers()) {
+    let protocol = classify(path)?;
+    if snap.fallthrough_prefixes.iter().any(|p| path.starts_with(p.as_str())) || wants_html(req.headers()) {
+        return None;
+    }
+    // A protocol without a backend this side can reach is the Python gateway's to answer.
+    let backend = match protocol.route_index() {
+        Some(i) => Some(snap.routes[i].as_deref()?),
+        None => None,
+    };
+    if names_a_version(upstream_path(path, protocol)) {
         return None;
     }
     let m = req.method();
@@ -268,7 +413,7 @@ fn route<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, now: u64
         return None;
     }
     let ip = govern::client_ip(peer, req.headers(), &snap.trusted_proxies)?;
-    Some(Native { entry, version: version.map(|(v, _)| v), ip, method })
+    Some(Native { protocol, backend, entry, version: version.map(|(v, _)| v), ip, method })
 }
 
 /// Why a request with a valid key is refused with a 403.
@@ -387,13 +532,21 @@ fn control_unreachable() -> Response<Body> {
     resp
 }
 
-fn announce(st: &State, cfg: &breaker::Config, tr: breaker::Transition) {
-    eprintln!("dataplane: circuit breaker for {} is {} (was {})", st.backend.text, tr.state.name(), tr.previous.name());
+/// The client stopped sending its body part-way; there is no one left to answer properly.
+fn body_unreadable() -> Response<Body> {
+    let mut resp = Response::new(full("{\"detail\":\"There was an error parsing the body\"}"));
+    *resp.status_mut() = StatusCode::BAD_REQUEST;
+    resp.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    resp
+}
+
+fn announce(st: &State, backend: &Backend, cfg: &breaker::Config, tr: breaker::Transition) {
+    eprintln!("dataplane: circuit breaker for {} is {} (was {})", backend.upstream.text, tr.state.name(), tr.previous.name());
     if let Some(reporter) = &st.reporter {
         reporter.event(Event::CircuitBreaker {
             state: tr.state.name(),
             previous_state: tr.previous.name(),
-            backend_url: st.backend.text.clone(),
+            backend_url: backend.upstream.text.clone(),
             failure_count: tr.failures,
             failure_threshold: cfg.threshold,
             opened_at: wall().as_secs_f64(),
@@ -431,7 +584,7 @@ pub async fn handle(w: Arc<Worker>, peer: SocketAddr, req: Request<Incoming>) ->
     // Fail closed: if the snapshot is not known to be current, the Python gateway decides.
     let trusted = st.sync.as_ref().map(|s| s.fresh()).unwrap_or(true);
     let Some(n) = trusted.then(|| route(&snap, peer, &req, now)).flatten() else {
-        return Ok(forward(&w, &st.control, peer, req, None, None).await.unwrap_or_else(|_| control_unreachable()));
+        return Ok(to_control(&w, peer, req.map(Either::Left)).await);
     };
     let entry = n.entry;
     if entry.last_used.load(Ordering::Relaxed) != now {
@@ -444,9 +597,33 @@ pub async fn handle(w: Arc<Worker>, peer: SocketAddr, req: Request<Incoming>) ->
     let user_agent = (st.reporter.is_some() || st.access_log.is_some()).then(|| req.headers().get(USER_AGENT).cloned()).flatten();
     let referrer = st.access_log.as_ref().and_then(|_| req.headers().get(REFERER).cloned());
     let cb = snap.circuit_breaker;
+    let backend = n.backend.unwrap_or(&st.backend);
+
+    let refused = refusal(&snap, &n, path, at);
+    let mut req = req.map(Either::Left);
+    // Where the Python gateway looks inside the body, so does this side, before anything is
+    // counted. A body that is certain to pass goes on; anything else is the Python gateway's to
+    // answer, in its own words, so the request is handed over whole.
+    if refused.is_none() && snap.boundary.reads_body(n.method, path) {
+        match req.body().size_hint().exact() {
+            Some(0) => {}
+            Some(len) if len <= snap.boundary.max_body(n.method, path) => {
+                let (parts, body) = req.into_parts();
+                let Ok(read) = body.collect().await else { return Ok(body_unreadable()) };
+                let bytes = read.to_bytes();
+                let verdict = snap.boundary.check(n.method, path, &bytes);
+                req = Request::from_parts(parts, full(bytes));
+                if verdict == Verdict::AskPython {
+                    return Ok(to_control(&w, peer, req).await);
+                }
+            }
+            // No length given, or too long to hold here.
+            _ => return Ok(to_control(&w, peer, req).await),
+        }
+    }
 
     let (mut ticket, mut rejected, mut error_type) = (None, false, None);
-    let (mut resp, error) = if let Some(r) = refusal(&snap, &n, path, at) {
+    let (mut resp, error) = if let Some(r) = refused {
         rejected = true;
         (forbidden(&r, path, n.ip, &t), Some("AUTHORIZATION_ERROR"))
     } else if let Some((window, limit, retry_after)) = key_limit(&snap, entry, now) {
@@ -464,20 +641,26 @@ pub async fn handle(w: Arc<Worker>, peer: SocketAddr, req: Request<Incoming>) ->
             }
             Ok(admitted) => {
                 ticket = admitted;
-                if !st.breaker.allow(&cb, Instant::now()) {
+                if !backend.breaker.allow(&cb, Instant::now()) {
                     (circuit_open(&t), Some("SERVICE_UNAVAILABLE"))
                 } else {
-                    let native = Sent { trace: &t, version: n.version, inject_request_id: snap.inject_request_id };
-                    match forward(&w, &st.backend, peer, req, Some(native), Some(snap.upstream_timeout)).await {
+                    let native = Sent {
+                        trace: &t,
+                        version: n.version,
+                        inject_request_id: snap.inject_request_id,
+                        protocol: n.protocol,
+                        path: Some(upstream_path(path, n.protocol)).filter(|p| *p != path),
+                    };
+                    match forward(&w, &backend.upstream, peer, req, Some(native), Some(snap.upstream_timeout)).await {
                         Ok(resp) => {
-                            if let Some(tr) = st.breaker.success(&cb) {
-                                announce(st, &cb, tr);
+                            if let Some(tr) = backend.breaker.success(&cb) {
+                                announce(st, backend, &cb, tr);
                             }
                             (resp, None)
                         }
                         Err(unanswered) => {
-                            if let Some(tr) = st.breaker.failure(&cb, Instant::now()) {
-                                announce(st, &cb, tr);
+                            if let Some(tr) = backend.breaker.failure(&cb, Instant::now()) {
+                                announce(st, backend, &cb, tr);
                             }
                             error_type = Some(unanswered.name());
                             (backend_unavailable(&t), Some("BACKEND_ERROR"))
@@ -593,6 +776,14 @@ struct Sent<'a> {
     trace: &'a Trace,
     version: Option<&'a str>,
     inject_request_id: bool,
+    protocol: Protocol,
+    /// The path to ask the backend for, when it is not the one the client asked for.
+    path: Option<&'a str>,
+}
+
+/// Hand a request to the Python gateway as it came; its answer is the answer.
+async fn to_control(w: &Worker, peer: SocketAddr, req: Request<Body>) -> Response<Body> {
+    forward(w, &w.shared.control, peer, req, None, None).await.unwrap_or_else(|_| control_unreachable())
 }
 
 /// Forward to `to`. With `native`, the Python gateway's upstream headers are reproduced.
@@ -602,16 +793,24 @@ async fn forward(
     w: &Worker,
     to: &Upstream,
     peer: SocketAddr,
-    mut req: Request<Incoming>,
+    mut req: Request<Body>,
     native: Option<Sent<'_>>,
     timeout: Option<Duration>,
 ) -> Result<Response<Body>, Unanswered> {
     let mut parts = std::mem::take(req.uri_mut()).into_parts();
     parts.scheme = Some(to.scheme.clone());
     parts.authority = Some(to.authority.clone());
-    if parts.path_and_query.is_none() || !to.prefix.is_empty() {
-        let pq = parts.path_and_query.as_ref().map(|p| p.as_str()).unwrap_or("/");
-        parts.path_and_query = Some(format!("{}{pq}", to.prefix).parse().map_err(|_| Unanswered::Broken)?);
+    let asked = parts.path_and_query.as_ref();
+    let target = match native.as_ref().and_then(|sent| sent.path) {
+        Some(path) => Some(match asked.and_then(|p| p.query()) {
+            Some(query) => format!("{}{path}?{query}", to.prefix),
+            None => format!("{}{path}", to.prefix),
+        }),
+        None if asked.is_none() || !to.prefix.is_empty() => Some(format!("{}{}", to.prefix, asked.map(|p| p.as_str()).unwrap_or("/"))),
+        None => None,
+    };
+    if let Some(target) = target {
+        parts.path_and_query = Some(target.parse().map_err(|_| Unanswered::Broken)?);
     }
     *req.uri_mut() = Uri::from_parts(parts).map_err(|_| Unanswered::Broken)?;
     *req.version_mut() = Version::HTTP_11;
@@ -626,7 +825,7 @@ async fn forward(
             for name in internal {
                 headers.remove(name);
             }
-            headers.insert("x-protocol", HeaderValue::from_static("http"));
+            headers.insert("x-protocol", HeaderValue::from_static(sent.protocol.name()));
             if let Some(v) = sent.version.and_then(|v| HeaderValue::from_str(v).ok()) {
                 headers.insert("x-api-version", v);
             }
@@ -675,18 +874,58 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_plain_http_api_paths_are_native() {
-        let none: Vec<String> = vec![];
-        assert!(is_native_path("/api/users", &none));
-        assert!(is_native_path("/api/v1/orders/7", &none));
-        for p in ["/admin/keys", "/oauth2/token", "/health", "/mcp/x", "/api/mcp/x", "/api/a2a", "/api/graphql", "/docs"] {
-            assert!(!is_native_path(p, &none), "{p}");
+    fn a_path_belongs_to_the_protocol_the_python_router_gives_it() {
+        for (path, protocol) in [
+            ("/api/users", Some(Protocol::Http)),
+            ("/api/v1/orders/7", Some(Protocol::Http)),
+            ("/mcp", Some(Protocol::Mcp)),
+            ("/mcp/tools", Some(Protocol::Mcp)),
+            ("/api/mcp/x", Some(Protocol::Mcp)),
+            ("/api/mcpx/y", Some(Protocol::Mcp)),
+            ("/a2a/v1/message:send", Some(Protocol::A2a)),
+            ("/api/a2a", Some(Protocol::A2a)),
+            ("/agui", Some(Protocol::AgUi)),
+            ("/api/agui/run", Some(Protocol::AgUi)),
+            ("/acp/runs", Some(Protocol::Acp)),
+            ("/api/acp/agents", Some(Protocol::Acp)),
+        ] {
+            assert_eq!(classify(path), protocol, "{path}");
+        }
+        for path in [
+            "/admin/keys", "/oauth2/token", "/health", "/docs", "/", "/api", "/apix/y", "/rest/x", "/users",
+            "/mqtt/publish", "/api/mqtt/x", "/ws/x", "/websocket", "/wss", "/grpc/x", "/api/grpc", "/graphql", "/api/graphql",
+            "/api/ws/x", "/api/agents/a", "/agents/a/mcp",
+        ] {
+            assert_eq!(classify(path), None, "{path}");
         }
     }
 
     #[test]
-    fn control_plane_prefixes_win() {
-        assert!(!is_native_path("/api/custom/x", &["/api/custom".to_string()]));
+    fn acp_and_ag_ui_backends_see_their_own_paths() {
+        for (path, protocol, sent) in [
+            ("/acp", Protocol::Acp, "/"),
+            ("/acp/runs/7", Protocol::Acp, "/runs/7"),
+            ("/api/acp/runs", Protocol::Acp, "/runs"),
+            ("/acpx/runs", Protocol::Acp, "/acpx/runs"),
+            ("/agui/", Protocol::AgUi, "/"),
+            ("/api/agui", Protocol::AgUi, "/"),
+            ("/agui/run", Protocol::AgUi, "/run"),
+            ("/mcp/tools", Protocol::Mcp, "/mcp/tools"),
+            ("/a2a/x", Protocol::A2a, "/a2a/x"),
+            ("/api/users", Protocol::Http, "/api/users"),
+        ] {
+            assert_eq!(upstream_path(path, protocol), sent, "{path}");
+        }
+    }
+
+    #[test]
+    fn a_version_in_the_path_is_recognised_as_python_recognises_it() {
+        for path in ["/v1", "/v1/", "/v2/runs", "/v10.5/x", "/v1./x"] {
+            assert_eq!(names_a_version(path), path != "/v1./x", "{path}");
+        }
+        for path in ["/", "/runs", "/v", "/vx/1", "/v1x", "/v1.2.3", "/version"] {
+            assert!(!names_a_version(path), "{path}");
+        }
     }
 
     #[test]
@@ -754,10 +993,12 @@ mod tests {
 
     fn governed(extra: &str, key_extra: &str) -> Snapshot {
         let hex: String = hash_key(KEY.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
-        Snapshot::from_json(&format!(
+        let mut snap = Snapshot::from_json(&format!(
             r#"{{"keys":[{{"hash":"{hex}","id":"k1","rate_limit_per_minute":100,"rate_limit_per_hour":1000{key_extra}}}]{extra}}}"#
         ))
-        .unwrap()
+        .unwrap();
+        Backends::default().resolve(&mut snap);
+        snap
     }
 
     fn request(method: &str, uri: &str) -> Request<()> {
@@ -773,6 +1014,35 @@ mod tests {
         let snap = governed("", "");
         let n = route(&snap, peer(), &request("GET", "/api/users?x=1"), 0).unwrap();
         assert_eq!((&*n.entry.id, n.method, n.version, n.ip.to_string().as_str()), ("k1", "GET", Some("1"), "203.0.113.7"));
+    }
+
+    #[test]
+    fn a_protocol_is_served_here_only_with_a_backend_this_side_can_reach() {
+        let snap = governed(r#","backends":{"mcp":"http://127.0.0.1:9201/","a2a":"http://127.0.0.1:9201","ag_ui":"https://agui.example","acp":null}"#, "");
+        let n = route(&snap, peer(), &request("POST", "/mcp/rpc"), 0).unwrap();
+        assert_eq!((n.protocol, n.backend.unwrap().upstream.text.as_str()), (Protocol::Mcp, "http://127.0.0.1:9201"));
+        let a2a = route(&snap, peer(), &request("GET", "/api/a2a/tasks"), 0).unwrap();
+        assert!(std::ptr::eq(n.backend.unwrap(), a2a.backend.unwrap()), "one address, one breaker");
+        assert!(route(&snap, peer(), &request("POST", "/agui/run"), 0).is_none(), "https: Python's");
+        assert!(route(&snap, peer(), &request("POST", "/acp/runs"), 0).is_none(), "not configured: Python's");
+        let http = route(&snap, peer(), &request("GET", "/api/users"), 0).unwrap();
+        assert!(http.protocol == Protocol::Http && http.backend.is_none());
+        assert!(route(&governed("", ""), peer(), &request("POST", "/mcp/rpc"), 0).is_none(), "no backends in the snapshot");
+    }
+
+    #[test]
+    fn a_stripped_path_that_names_a_version_goes_to_python() {
+        let snap = governed(r#","backends":{"acp":"http://127.0.0.1:9201"}"#, "");
+        assert!(route(&snap, peer(), &request("GET", "/acp/runs"), 0).is_some());
+        assert!(route(&snap, peer(), &request("GET", "/acp/v2/runs"), 0).is_none());
+        assert!(route(&snap, peer(), &request("GET", "/api/acp/v1"), 0).is_none());
+    }
+
+    #[test]
+    fn control_plane_prefixes_win() {
+        let snap = governed(r#","fallthrough_prefixes":["/api/custom"]"#, "");
+        assert!(route(&snap, peer(), &request("GET", "/api/custom/x"), 0).is_none());
+        assert!(route(&snap, peer(), &request("GET", "/api/other"), 0).is_some());
     }
 
     #[test]
@@ -880,6 +1150,16 @@ mod tests {
         );
         assert_eq!(body_of(rate_limited("hour", 9, 3600, None, &t))["details"], serde_json::json!({"limit":9,"window":"hour","retry_after":3600}));
         assert_eq!(led_by("\"a\":1", "{}"), "{\"a\":1}");
+    }
+
+    #[test]
+    fn a_backend_keeps_its_breaker_across_snapshots() {
+        let known = Backends::default();
+        let (mut one, mut two) = (governed(r#","backends":{"mcp":"http://b:1"}"#, ""), governed(r#","backends":{"mcp":"http://b:1/","acp":"http://b:2"}"#, ""));
+        known.resolve(&mut one);
+        known.resolve(&mut two);
+        assert!(Arc::ptr_eq(one.routes[0].as_ref().unwrap(), two.routes[0].as_ref().unwrap()));
+        assert!(!Arc::ptr_eq(two.routes[0].as_ref().unwrap(), two.routes[3].as_ref().unwrap()));
     }
 
     #[test]

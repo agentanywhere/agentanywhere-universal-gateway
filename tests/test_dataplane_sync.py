@@ -539,3 +539,106 @@ async def test_an_event_of_an_unknown_kind_is_ignored_not_refused(db_session, an
     assert await dataplane_sync.apply_events(db_session, events) == 0
     await _settle()
     assert announced == {"webhooks": [], "breaker_alerts": [], "limit_alerts": []}
+
+
+# --- MCP, A2A, AG-UI and ACP: backends, body checks and labels ------------------------------------
+
+
+async def test_the_snapshot_names_each_protocols_backend(db_session, monkeypatch):
+    s = get_settings()
+    monkeypatch.setattr(s, "mcp_backend_url", "http://mcp.internal:9000")
+    monkeypatch.setattr(s, "a2a_backend_url", "http://a2a.internal:9001/")
+    monkeypatch.setattr(s, "ag_ui_backend_url", None)
+    monkeypatch.setattr(s, "acp_backend_url", "")
+    snap = await dataplane_sync.build_snapshot(db_session)
+    assert snap["backends"] == {
+        "mcp": "http://mcp.internal:9000", "a2a": "http://a2a.internal:9001/", "ag_ui": None, "acp": None,
+    }
+
+
+async def test_the_snapshot_carries_the_body_checks_as_they_are_shipped(db_session, monkeypatch):
+    from app.tier1_registry import tier1_registry
+
+    # Other tests register tools; the shipped state has none.
+    monkeypatch.setattr(tier1_registry, "tool_input_schema_index", classmethod(lambda cls: {}))
+    snap = await dataplane_sync.build_snapshot(db_session)
+    assert snap["boundary"] == {
+        "mcp": {
+            "enabled": True, "max_body_bytes": 2_097_152, "blocked_methods": [], "allowed_methods": [],
+            "block_injection": True, "default_patterns": True, "schema_tools": [],
+        },
+        "a2a": {"enabled": True, "enforce_send_message_shape": True},
+        "acp": {"enabled": True},
+        "ag_ui": {"enabled": True},
+    }
+
+
+async def test_a_change_to_the_body_checks_changes_the_revision(db_session, monkeypatch):
+    before = await dataplane_sync.build_snapshot(db_session)
+    monkeypatch.setattr(get_settings(), "mcp_boundary_blocked_methods", ["Tools/Call", "tools/call", "Shutdown"])
+    after = await dataplane_sync.build_snapshot(db_session)
+    assert after["boundary"]["mcp"]["blocked_methods"] == ["shutdown", "tools/call"]
+    assert after["revision"] != before["revision"]
+
+
+def test_method_lists_are_lower_cased_as_the_checks_compare_them(monkeypatch):
+    s = get_settings()
+    monkeypatch.setattr(s, "mcp_boundary_allowed_methods", ["Tools/List", "PING"])
+    monkeypatch.setattr(s, "mcp_boundary_prompt_injection_action", "Audit")
+    monkeypatch.setattr(s, "mcp_boundary_max_body_bytes", 0)
+    mcp = dataplane_sync._boundary(s)["mcp"]
+    assert mcp["allowed_methods"] == ["ping", "tools/list"]
+    assert mcp["block_injection"] is False and mcp["max_body_bytes"] == 0
+
+
+def test_custom_injection_patterns_keep_mcp_bodies_with_python(monkeypatch):
+    s = get_settings()
+    monkeypatch.setattr(s, "mcp_boundary_injection_patterns", [r"drop\s+table"])
+    assert dataplane_sync._boundary(s)["mcp"]["default_patterns"] is False
+
+
+def test_only_tools_with_a_schema_are_named(monkeypatch):
+    from app.tier1_registry import tier1_registry
+
+    monkeypatch.setattr(
+        tier1_registry, "tool_input_schema_index",
+        classmethod(lambda cls: {"add": {"type": "object"}, "noop": {}, "zeta": {"required": ["a"]}}),
+    )
+    assert dataplane_sync._boundary(get_settings())["mcp"]["schema_tools"] == ["add", "zeta"]
+
+
+def test_a_registry_that_cannot_be_read_keeps_mcp_bodies_with_python(monkeypatch):
+    from app.tier1_registry import tier1_registry
+
+    def broken(cls):
+        raise RuntimeError("registry unavailable")
+
+    monkeypatch.setattr(tier1_registry, "tool_input_schema_index", classmethod(broken))
+    mcp = dataplane_sync._boundary(get_settings())["mcp"]
+    assert mcp["default_patterns"] is False and mcp["schema_tools"] == []
+
+
+@pytest.mark.parametrize("path, metric, log", [
+    ("/api/users", "http", "http"),
+    ("/mcp/tools", "mcp", "mcp"),
+    ("/api/mcp", "mcp", "mcp"),
+    ("/a2a/v1/message:send", "a2a", "a2a"),
+    ("/agui/run", "ag_ui", "ag_ui"),
+    ("/api/acp/runs", "acp", "acp"),
+    ("/api/items/ws", "websocket", "websocket"),
+    ("/api/graphql-proxy", "http", "graphql"),
+    ("/api/mcp/acp", "mcp", "mcp"),
+])
+def test_protocol_labels_follow_the_logging_middleware(path, metric, log):
+    assert dataplane_sync.metric_protocol(path) == metric
+    assert dataplane_sync.log_protocol(path) == log
+
+
+def test_native_mcp_requests_are_counted_under_their_protocol():
+    label = "/mcp/tools"
+    before = _sample("gateway_requests_total", method="POST", path=label, status_code="200", protocol="mcp")
+    report = dataplane_sync.DataplaneReport(aggregates=[dataplane_sync.ReportedAggregate(
+        method="POST", path=label, status=200, buckets=[[3, 0.006]],
+    )])
+    dataplane_sync.apply_report(report)
+    assert _sample("gateway_requests_total", method="POST", path=label, status_code="200", protocol="mcp") - before == 3

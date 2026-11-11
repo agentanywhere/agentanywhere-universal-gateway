@@ -14,6 +14,11 @@ the keys it applies to ``native_ok: false``. Dynamic routes, transformation rule
 plugins turn native serving off for every path. When in doubt the answer is "ask the Python gateway",
 which is always correct and only slower.
 
+MCP, A2A, AG-UI and ACP requests are served by the data plane too, so the snapshot names each protocol's
+backend and the settings of the checks this gateway runs on their bodies (``app/tier1_mcp.py`` and its
+siblings). The data plane forwards a body only when it is certain to pass them and hands every other
+request here, so the refusals, and their wording, stay this gateway's.
+
 Tenant usage is shared through the database: the data plane reports the requests it served per tenant,
 they are added to the same counters this gateway's own requests feed, and every snapshot answer carries
 the current totals, so a tenant's quota holds across both.
@@ -81,6 +86,62 @@ def _versions() -> Dict[str, Any]:
             for v in version_manager.versions.values()
         ],
     }
+
+
+def _backends(settings) -> Dict[str, Optional[str]]:
+    """Where the router sends each protocol the data plane can carry (``Router._get_backend_url``)."""
+    return {
+        "mcp": settings.mcp_backend_url or None,
+        "a2a": settings.a2a_backend_url or None,
+        "ag_ui": settings.ag_ui_backend_url or None,
+        "acp": settings.acp_backend_url or None,
+    }
+
+
+def _boundary(settings) -> Dict[str, Any]:
+    """The settings of the body checks, in the form the data plane applies them. Names are lower-cased
+    here because that is how the checks compare them."""
+    from app.tier1_registry import tier1_registry
+
+    try:
+        # Only a tool with a non-empty schema has its arguments validated.
+        schema_tools = sorted(name for name, schema in tier1_registry.tool_input_schema_index().items() if schema)
+        schemas_known = True
+    except Exception:  # noqa: BLE001 - a registry this code cannot read: let Python judge MCP bodies
+        schema_tools, schemas_known = [], False
+    return {
+        "mcp": {
+            "enabled": bool(settings.mcp_boundary_enabled),
+            "max_body_bytes": max(0, int(settings.mcp_boundary_max_body_bytes or 0)),
+            "blocked_methods": sorted({str(m).lower() for m in (settings.mcp_boundary_blocked_methods or [])}),
+            "allowed_methods": sorted({str(m).lower() for m in (settings.mcp_boundary_allowed_methods or [])}),
+            "block_injection": (settings.mcp_boundary_prompt_injection_action or "block").lower() != "audit",
+            # The data plane carries the default patterns only; with others, MCP bodies are judged here.
+            "default_patterns": schemas_known and not list(settings.mcp_boundary_injection_patterns or []),
+            "schema_tools": schema_tools,
+        },
+        "a2a": {
+            "enabled": bool(settings.a2a_boundary_enabled),
+            "enforce_send_message_shape": bool(settings.a2a_enforce_send_message_shape),
+        },
+        "acp": {"enabled": bool(getattr(settings, "acp_boundary_enabled", True))},
+        "ag_ui": {"enabled": bool(getattr(settings, "ag_ui_boundary_enabled", True))},
+    }
+
+
+def metric_protocol(path: str) -> str:
+    """The protocol label this gateway's request metrics give a path (the logging middleware's rule)."""
+    for part, name in (("/mcp", "mcp"), ("/a2a", "a2a"), ("/agui", "ag_ui"), ("/acp", "acp"), ("/mqtt", "mqtt"),
+                       ("/ws", "websocket"), ("/websocket", "websocket"), ("/grpc", "grpc")):
+        if part in path:
+            return name
+    return "http"
+
+
+def log_protocol(path: str) -> str:
+    """The protocol this gateway's request log gives a path: as the metrics, and GraphQL by name."""
+    name = metric_protocol(path)
+    return "graphql" if name == "http" and "/graphql" in path else name
 
 
 class _NotReproducible(Exception):
@@ -347,6 +408,8 @@ async def build_snapshot(db: AsyncSession) -> Dict[str, Any]:
         },
         "upstream_timeout_seconds": float(settings.default_timeout),
         "api_versions": _versions(),
+        "backends": _backends(settings),
+        "boundary": _boundary(settings),
     }
     snap["revision"] = hashlib.sha256(json.dumps(snap, sort_keys=True).encode()).hexdigest()
     return snap
@@ -489,6 +552,7 @@ def apply_report(report: DataplaneReport) -> Dict[str, int]:
     counted = 0
     for agg in report.aggregates:
         metric_path = gw._rejected_path_label(agg.path) if agg.rejected else gw.obs_metric_path_label(agg.path)
+        protocol = metric_protocol(agg.path)
         for i, pair in enumerate(agg.buckets[: len(_BOUNDS) + 1]):
             n, total = int(pair[0]), float(pair[1])
             if n <= 0:
@@ -502,9 +566,9 @@ def apply_report(report: DataplaneReport) -> Dict[str, int]:
                 )
             if gw.settings.metrics_enabled:
                 gw.metrics.request_count.labels(
-                    method=agg.method, path=metric_path, status_code=agg.status, protocol="http"
+                    method=agg.method, path=metric_path, status_code=agg.status, protocol=protocol
                 ).inc(n)
-                hist = gw.metrics.request_duration.labels(method=agg.method, path=metric_path, protocol="http")
+                hist = gw.metrics.request_duration.labels(method=agg.method, path=metric_path, protocol=protocol)
                 for _ in range(n):
                     hist.observe(mean)
                 gw.metrics.dataplane_native_requests.labels(
@@ -523,7 +587,7 @@ def apply_report(report: DataplaneReport) -> Dict[str, int]:
         log = RequestLog(
             request_id=row.request_id, method=row.method, path=row.path, client_ip=row.client_ip or "0.0.0.0",
             api_key=None, status_code=row.status, response_time_ms=row.duration_ms,
-            user_agent=row.user_agent, error=row.error, protocol="http",
+            user_agent=row.user_agent, error=row.error, protocol=log_protocol(row.path),
         )
         gw.request_log_writer.submit(log, row.api_key_id)
         if gw.log_export_manager.exporters:
@@ -531,7 +595,7 @@ def apply_report(report: DataplaneReport) -> Dict[str, int]:
                 "request_id": row.request_id, "method": row.method, "path": row.path,
                 "status_code": row.status, "duration_ms": row.duration_ms, "client_ip": row.client_ip,
                 "timestamp": gw.utcnow().isoformat(), "user_agent": row.user_agent,
-                "api_key_id": row.api_key_id, "tenant_id": row.tenant_id, "protocol": "http",
+                "api_key_id": row.api_key_id, "tenant_id": row.tenant_id, "protocol": log_protocol(row.path),
             }
             if gw.log_export_manager.is_running():
                 gw.log_export_manager.enqueue(entry)

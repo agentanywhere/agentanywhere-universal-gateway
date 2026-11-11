@@ -1,4 +1,4 @@
-//! AgentAnywhere data plane, phase 1 (experimental): see DESIGN.md.
+//! AgentAnywhere data plane (experimental): see DESIGN.md.
 //!
 //! dataplane --listen 127.0.0.1:8000 --control http://127.0.0.1:8001 \
 //!           --backend http://127.0.0.1:9100 --control-token <DATAPLANE_TOKEN>
@@ -6,6 +6,7 @@
 //! One thread per core, each with its own runtime, connections and counters; one more for the
 //! conversation with the control plane.
 mod accesslog;
+mod boundary;
 mod breaker;
 mod govern;
 mod limits;
@@ -189,6 +190,11 @@ fn fail(message: String) -> ! {
 }
 
 fn main() {
+    // `dataplane --judge-bodies` answers, for cases on stdin, what the boundary checks make of
+    // each body. The conformance suite compares the answers with the Python gateway's.
+    if std::env::args().nth(1).as_deref() == Some("--judge-bodies") {
+        return boundary::judge_stdin().unwrap_or_else(|e| fail(e));
+    }
     let args = parse_args().unwrap_or_else(|e| fail(e));
     // A file bootstraps the snapshot; with a token it is replaced by the control plane's, and until
     // the first answer arrives nothing is served natively.
@@ -201,16 +207,18 @@ fn main() {
     };
     let link = args.token.as_ref().map(|_| Arc::new(sync::Link::new(args.max_staleness)));
     let reporter = args.token.as_ref().map(|_| Arc::new(report::Reporter::new(args.rows_per_second, 5000, args.workers)));
+    let backend = proxy::Backend::parse(&args.backend).unwrap_or_else(|e| fail(format!("--backend {e}")));
     let state = Arc::new(proxy::State {
-        snapshot: ArcSwap::from_pointee(snap),
+        snapshot: ArcSwap::from_pointee(snapshot::Snapshot::empty()),
         generation: AtomicU64::new(0),
-        backend: proxy::Upstream::parse(&args.backend).unwrap_or_else(|e| fail(format!("--backend {e}"))),
+        backends: proxy::Backends::with(&backend),
+        backend,
         control: proxy::Upstream::parse(&args.control).unwrap_or_else(|e| fail(format!("--control {e}"))),
-        breaker: breaker::Breaker::new(),
         sync: link,
         reporter,
         access_log: args.access_log.then(accesslog::AccessLog::start),
     });
+    state.replace(snap);
     let sockets = intakes(args.listen, args.workers).unwrap_or_else(|e| fail(format!("cannot listen on {}: {e}", args.listen)));
 
     // The conversation with the control plane has a thread of its own, so no amount of traffic

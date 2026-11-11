@@ -1,10 +1,11 @@
 # AgentAnywhere data plane (experimental)
 
 A Rust proxy that sits in front of the Python gateway and handles the hot path itself: it authenticates API keys,
-applies per-key rate limits, path scopes, IP rules, governance policies and tenant quotas, and forwards plain HTTP
-requests, streaming bodies in both directions. Everything else is handed to the Python gateway unchanged. Design, goals and phases: [DESIGN.md](DESIGN.md).
+applies per-key rate limits, path scopes, IP rules, governance policies and tenant quotas, and forwards plain HTTP,
+MCP, A2A, AG-UI and ACP requests, each to its own backend, streaming bodies and event streams in both directions.
+Everything else is handed to the Python gateway unchanged. Design, goals and phases: [DESIGN.md](DESIGN.md).
 
-**Status: phase 1, not for production.** The limits below are real; read them before using it.
+**Status: phases 1 and 2 in part, not for production.** The limits below are real; read them before using it.
 
 ## Build and run
 
@@ -23,7 +24,9 @@ DATAPLANE_TOKEN=change-me TRUSTED_PROXIES=127.0.0.1 uvicorn app.main:app --port 
     --backend http://127.0.0.1:9100 --control http://127.0.0.1:8001 --control-token change-me
 ```
 
-`--backend` is the HTTP backend, `--control` the Python gateway. The token can also come from `DATAPLANE_TOKEN`.
+`--backend` is the HTTP backend, `--control` the Python gateway. The MCP, A2A, AG-UI and ACP backends are the ones
+the Python gateway is configured with (`MCP_BACKEND_URL`, `A2A_BACKEND_URL`, `AG_UI_BACKEND_URL`, `ACP_BACKEND_URL`);
+they arrive with the snapshot, so they are set in one place. The token can also come from `DATAPLANE_TOKEN`.
 `/internal/dataplane` is served only when the token is set, and the data plane answers `404` to any client that asks
 for `/internal/...`. Tunables: `--sync-interval-ms` (default 500), `--max-staleness-ms` (default 5000), `--workers N` (default: one per
 core) and `--access-log` (off by default).
@@ -54,6 +57,18 @@ as it has workers, or set `--workers` below the core count on a shared machine, 
   minute and hour; the data plane adds what it admitted since and reports completed requests back, where they are added
   to the same usage rows the console reads. The two planes can disagree by up to about one sync interval, and a request
   in flight already counts here, so under concurrency the data plane is the stricter side, never the looser.
+* **Bodies are checked at the protocol boundary, and refused in Python's words.** Where the Python gateway looks
+  inside a request body (MCP JSON-RPC envelopes, method allow and block lists and prompt-injection patterns; the A2A
+  send-message shape; ACP run requests; AG-UI envelopes), the data plane reads the body and decides one thing: is it
+  certain to pass? If so it is forwarded natively. If not, because it fails a check or because this side cannot judge
+  it exactly as Python would, the whole request is handed to the Python gateway, which answers it. So a refusal always
+  carries the Python gateway's status, message and details, and a difference between the two implementations can only
+  cost speed. `conformance/boundary.py` checks the one property this rests on (nothing the Python checks refuse is
+  passed here) over tens of thousands of generated bodies.
+* **Each protocol has its backend and its breaker.** A path belongs to the protocol the Python router gives it
+  (`/mcp`, `/a2a`, `/agui`, `/acp` and the same under `/api`), ACP and AG-UI backends are sent the path without the
+  gateway's prefix, and `X-Protocol` names the protocol. Two protocols configured with one address share a circuit
+  breaker, as they do in Python.
 * **Anything it cannot reproduce goes to Python.** The snapshot marks a key `native_ok: false` when something about it
   cannot be reproduced exactly (a policy that matches on headers or uses a character class in its path, a scoped IPv6
   network, a key linked to more than one tenant), and turns native serving off for every path when dynamic routes,
@@ -88,17 +103,38 @@ Its format is the same as what the control plane serves; see `src/snapshot.rs`.
 
 ## What it handles itself
 
-A request is served natively only when **all** of these hold: the link is fresh; the path is `/api/...` and not another
-protocol's; no `fallthrough_prefixes` entry matches; the client is not a browser (`Accept: text/html`);
-`X-API-Version` or `Accept-Version` resolves to an active version with no backend of its own; and the `X-API-Key` is in
-the snapshot, active, unexpired and `native_ok`. Anything else, including unknown keys, `Authorization: Bearer`
-credentials, `/health`, `/admin`, `/oauth2`, WebSocket and the other protocols, goes to the Python gateway untouched, so
-its answer is the answer.
+A request is served natively only when **all** of these hold: the link is fresh; the path is `/api/...`, or belongs to
+MCP, A2A, AG-UI or ACP and that protocol has an `http://` backend configured; no `fallthrough_prefixes` entry matches;
+the client is not a browser (`Accept: text/html`); `X-API-Version` or `Accept-Version` resolves to an active version
+with no backend of its own; the `X-API-Key` is in the snapshot, active, unexpired and `native_ok`; and, where the
+gateway checks the body, the body has a `Content-Length`, fits in memory (4 MiB, or the MCP limit if lower) and is
+certain to pass. Anything else, including unknown keys, `Authorization: Bearer` credentials, `/health`, `/admin`,
+`/oauth2`, GraphQL, MQTT, gRPC, WebSocket and `/agents/...`, goes to the Python gateway untouched, so its answer is
+the answer.
+
+| Traffic | Served by |
+|---|---|
+| Plain HTTP under `/api/` | data plane |
+| MCP (`/mcp`, `/api/mcp`), including the boundary checks | data plane; bodies that fail or cannot be judged: Python |
+| A2A (`/a2a`, `/api/a2a`), including `message:stream` | data plane; same rule |
+| AG-UI (`/agui`, `/api/agui`) and ACP (`/acp`, `/api/acp`), including event streams | data plane; same rule |
+| MCP `tools/call` for a tool with a registered JSON Schema; custom injection patterns | Python |
+| Requests without a key, with an unknown key, or with `Authorization: Bearer` | Python |
+| Browsers (HTML error pages) | Python |
+| GraphQL, MQTT, gRPC, WebSocket, `/agents/<slug>` | Python |
+| Dynamic routes, transformation rules, request-altering plugins (when any exist) | Python, for every path |
+| `/health`, `/ready`, `/live`, `/metrics`, `/oauth2`, `/admin` and the console | Python |
 
 ## Known gaps (why this is not production-ready)
 
+* **Some MCP traffic is still judged by Python.** A string that contains one of four letters Python's
+  case-insensitive matching treats as `i`, `s` or `k` (U+0130, U+0131, U+017F, U+212A), a method name that is not ASCII
+  while a method list is configured, a `tools/call` for a tool with a JSON Schema, any MCP body when custom injection
+  patterns are configured, and any checked body sent without a `Content-Length`: all correct, none fast.
+* **The four protocols have not been benchmarked.** Reading and parsing a body to check it costs time the plain HTTP
+  path does not spend; how much has not been measured.
 * **Runtime changes held only in a Python worker's memory are not visible to the snapshot:** transformation rules,
-  API version changes and plugins are per process in the Python gateway. The snapshot reflects the worker that answers
+  API version changes, plugins and the MCP tool registry are per process in the Python gateway. The snapshot reflects the worker that answers
   it, so with several workers, change them through configuration and restart, or run one worker, until these are stored.
 * **Reporting is by aggregate and sample, not per request.** Counts, latency and SLOs are exact; the request-log view
   shows every error but only a capped number of successes at high rates. Each key's `last_used_at` is kept current.
@@ -124,6 +160,7 @@ its answer is the answer.
 cargo test                              # unit tests
 python dataplane/conformance/run.py     # same scenarios against Python and the data plane, plus the live-link
                                         # scenarios (needs the build above)
+python dataplane/conformance/boundary.py  # the body checks against the Python functions, on generated bodies
 ```
 
 The conformance suite is the definition of "same behaviour": a scenario must pass on both before the data plane may

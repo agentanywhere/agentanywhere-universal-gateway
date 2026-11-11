@@ -92,3 +92,5 @@ jobs:
         run: cargo build --release --locked
       - name: Conformance against the Python gateway
         run: python dataplane/conformance/run.py
+      - name: Body checks against the Python functions
+        run: python dataplane/conformance/boundary.py
