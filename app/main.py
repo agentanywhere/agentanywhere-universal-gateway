@@ -251,6 +251,13 @@ async def lifespan(app: FastAPI):
         except Exception as rr_exc:  # noqa: BLE001
             logger.warning("route_registry_init_failed", error=str(rr_exc))
 
+    # Retention: prune request logs and per-minute usage rows on a schedule.
+    try:
+        from app.retention import retention_loop
+        app.state.retention_task = asyncio.create_task(retention_loop())
+    except Exception as ret_exc:  # noqa: BLE001
+        logger.warning("retention_init_failed", error=str(ret_exc))
+
     # Live agent health/traffic monitor for the console Mission Control board.
     try:
         from app.agent_monitor import agent_monitor
@@ -277,7 +284,7 @@ async def lifespan(app: FastAPI):
     yield
     
     logger.info("gateway_shutting_down")
-    for _task_attr in ("agent_registry_task", "agent_monitor_task"):
+    for _task_attr in ("agent_registry_task", "agent_monitor_task", "retention_task"):
         _task = getattr(app.state, _task_attr, None)
         if _task is not None:
             _task.cancel()

@@ -182,12 +182,15 @@ shared between processes.
 
 **Workaround.** Re-apply them at start-up from your deployment tooling.
 
-### `request_logs` is never pruned
+### `request_logs` keeps 30 days by default
 
 Every request, including rejected ones, writes a row. The `protocol` column is
-always null.
+always null. Rows older than `REQUEST_LOG_RETENTION_DAYS` (default 30) are
+deleted at start-up and then every `RETENTION_INTERVAL_HOURS`. SQLite reuses
+the freed pages, but the file does not shrink without a `VACUUM`.
 
-**Workaround.** Delete old rows on a schedule.
+**Workaround.** Set `REQUEST_LOG_RETENTION_DAYS=0` to keep every row, or export
+logs before they expire if you need them for longer.
 
 ### `docker compose down -v` deletes the database
 

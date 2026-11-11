@@ -109,6 +109,9 @@ See [docs/known-limitations.md](docs/known-limitations.md) for the full list.
 - `allowed_paths` is enforced (403 outside it).
 - `X-Forwarded-For` is ignored unless `TRUSTED_PROXIES` lists the peer.
 - `/docs`, `/redoc`, `/openapi.json` answer 404 with `DEBUG=false`.
+- Request log rows older than `REQUEST_LOG_RETENTION_DAYS` (default 30) are
+  deleted at start-up and daily; `0` keeps them. Per-minute tenant usage rows
+  older than a day are deleted. The audit log is not pruned.
 
 ### Security
 
