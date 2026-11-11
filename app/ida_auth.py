@@ -49,7 +49,7 @@ def is_ida_token(token: str) -> bool:
     if not enabled():
         return False
     try:
-        from jose import jwt
+        import jwt
 
         alg = (jwt.get_unverified_header(token) or {}).get("alg", "")
         return str(alg).upper().startswith("RS")
@@ -112,28 +112,60 @@ def _token_roles(claims: dict) -> set[str]:
     return roles
 
 
+# Clock skew tolerated on exp/nbf/iat, in seconds.
+_LEEWAY_SECONDS = 30
+
+
+def _signing_keys(token: str, jwks: dict) -> List[Any]:
+    """RSA keys from the JWKS that may have signed this token.
+
+    The key whose ``kid`` matches the token header, or every RSA signing key
+    when the token carries no ``kid``.
+    """
+    import jwt
+
+    kid = (jwt.get_unverified_header(token) or {}).get("kid")
+    keys = []
+    for jwk in (jwks or {}).get("keys") or []:
+        if jwk.get("kty") != "RSA" or jwk.get("use", "sig") != "sig":
+            continue
+        if kid and jwk.get("kid") != kid:
+            continue
+        keys.append(jwt.PyJWK.from_dict(jwk, algorithm="RS256").key)
+    if not keys:
+        raise jwt.InvalidTokenError("no matching signing key in JWKS")
+    return keys
+
+
 def verify_admin_token(token: str) -> dict:
     """Validate an IDA access token for admin-console access."""
-    from jose import jwt
-    from jose.exceptions import JWTError
+    import jwt
 
     s = _settings()
     issuer = _issuer()
     audience = getattr(s, "ida_admin_audience", None) or "gateway-admin"
-    # python-jose's jwt.decode() has no `leeway` kwarg (unlike PyJWT). Clock skew
-    # is typically small enough that we rely on Keycloak's short-lived tokens.
 
     try:
         jwks = _fetch_jwks()
-        claims = jwt.decode(
-            token,
-            jwks,
-            algorithms=["RS256"],
-            audience=audience,
-            issuer=issuer,
-            options={"verify_aud": bool(audience), "verify_iss": bool(issuer)},
-        )
-    except JWTError as exc:
+        claims = None
+        last_error: Optional[Exception] = None
+        for key in _signing_keys(token, jwks):
+            try:
+                claims = jwt.decode(
+                    token,
+                    key,
+                    algorithms=["RS256"],
+                    audience=audience or None,
+                    issuer=issuer or None,
+                    leeway=_LEEWAY_SECONDS,
+                    options={"verify_aud": bool(audience), "verify_iss": bool(issuer)},
+                )
+                break
+            except jwt.InvalidSignatureError as exc:
+                last_error = exc
+        if claims is None:
+            raise last_error or jwt.InvalidTokenError("token could not be verified")
+    except jwt.PyJWTError as exc:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=f"Invalid token: {exc}",

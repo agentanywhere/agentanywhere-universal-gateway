@@ -181,10 +181,10 @@ def admin_principal(token: Optional[str]) -> Optional[str]:
 
     if ida_auth.enabled() and ida_auth.is_ida_token(token):
         try:
-            from jose import jwt
+            import jwt
 
             # The signature was checked by verify_admin_token; this only reads it.
-            claims = jwt.get_unverified_claims(token)
+            claims = jwt.decode(token, options={"verify_signature": False})
         except Exception:
             return "sso:unknown"
         who = claims.get("preferred_username") or claims.get("email") or claims.get("sub")
