@@ -132,7 +132,9 @@ Realistic note: raw proxy speed against Rust and C proxies such as Envoy, NGINX 
 endpoints (those still come from the Python gateway). From phase 2, governance policies and the checks at the MCP,
 A2A, AG-UI and ACP boundaries are native, with one rule that differs from the plan above: the data plane only decides
 that a body passes, and a body that does not is answered by the Python gateway, so refusals cannot drift. Those four
-protocols are forwarded natively, each to its own backend with its own breaker. Transformations are not moved yet. See [README.md](README.md) for what is handled, what is not, and the known gaps.
+protocols are forwarded natively, each to its own backend with its own breaker. Keys sent as `Authorization: Bearer`
+are read here, and the 401 for a request without a working credential is answered here: at once when there is none,
+and for an unknown one only after the Python gateway has refused it. Transformations are not moved yet. See [README.md](README.md) for what is handled, what is not, and the known gaps.
 
 ## Open questions (need a decision before phase 1)
 

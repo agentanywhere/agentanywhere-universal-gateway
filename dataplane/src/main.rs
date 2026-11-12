@@ -211,6 +211,7 @@ fn main() {
     let state = Arc::new(proxy::State {
         snapshot: ArcSwap::from_pointee(snapshot::Snapshot::empty()),
         generation: AtomicU64::new(0),
+        denied: Default::default(),
         backends: proxy::Backends::with(&backend),
         backend,
         control: proxy::Upstream::parse(&args.control).unwrap_or_else(|e| fail(format!("--control {e}"))),

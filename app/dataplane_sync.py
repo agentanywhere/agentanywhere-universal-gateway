@@ -14,6 +14,11 @@ the keys it applies to ``native_ok: false``. Dynamic routes, transformation rule
 plugins turn native serving off for every path. When in doubt the answer is "ask the Python gateway",
 which is always correct and only slower.
 
+A key may arrive in the configured header or as ``Authorization: Bearer``; the data plane reads both as
+this gateway does. It also answers the 401 for a request with no credential, and for a credential this
+gateway has just refused (it learns that from the ``X-Dataplane-Auth`` response header, never from the
+snapshot, so a key created a moment ago is never refused by mistake). The wording comes from here.
+
 MCP, A2A, AG-UI and ACP requests are served by the data plane too, so the snapshot names each protocol's
 backend and the settings of the checks this gateway runs on their bodies (``app/tier1_mcp.py`` and its
 siblings). The data plane forwards a body only when it is certain to pass them and hands every other
@@ -142,6 +147,19 @@ def log_protocol(path: str) -> str:
     """The protocol this gateway's request log gives a path: as the metrics, and GraphQL by name."""
     name = metric_protocol(path)
     return "graphql" if name == "http" and "/graphql" in path else name
+
+
+def _refusals(auth_plugins: bool) -> Optional[Dict[str, Any]]:
+    """The two 401s for a request without a usable credential, as this gateway words them. ``None``
+    when a plugin can authenticate a request by other means: then only this gateway can tell."""
+    from app.middleware import auth
+
+    if auth_plugins:
+        return None
+    return {
+        "missing_key": {"message_json": _dumps(auth.MISSING_KEY_MESSAGE), "details_json": _dumps(auth.missing_key_details())},
+        "invalid_key": {"message_json": _dumps(auth.INVALID_KEY_MESSAGE), "details_json": _dumps(auth.invalid_key_details())},
+    }
 
 
 class _NotReproducible(Exception):
@@ -345,6 +363,13 @@ async def build_snapshot(db: AsyncSession) -> Dict[str, Any]:
         p.plugin_type != PluginType.AUTH_PROVIDER and p.name != "request-id" for p in active
     )
     all_paths_via_python = bool(routes or transformation_manager.list_rules() or request_plugins)
+    auth_plugins = any(p.plugin_type == PluginType.AUTH_PROVIDER for p in active)
+    # The health and metrics endpoints are this gateway's own and need no key, wherever they are
+    # configured to live: if that is under a prefix the data plane serves, it must leave them alone.
+    own_paths = sorted({
+        p for p in (settings.health_check_path, settings.metrics_path)
+        if p and p.startswith(("/api", "/mcp", "/a2a", "/agui", "/acp"))
+    })
 
     # This gateway finds a key's tenant by the key's digest (TenantRepository.get_tenant_for_api_key).
     by_hash: Dict[str, list] = {}
@@ -398,7 +423,7 @@ async def build_snapshot(db: AsyncSession) -> Dict[str, Any]:
         "trusted_proxies": trusted,
         "ip_rules": ip_rules,
         "policies": policies,
-        "fallthrough_prefixes": ["/"] if all_paths_via_python else [],
+        "fallthrough_prefixes": ["/"] if all_paths_via_python else own_paths,
         "rate_limit_enabled": bool(settings.rate_limit_enabled),
         "inject_request_id": inject_request_id,
         "circuit_breaker": {
@@ -410,6 +435,10 @@ async def build_snapshot(db: AsyncSession) -> Dict[str, Any]:
         "api_versions": _versions(),
         "backends": _backends(settings),
         "boundary": _boundary(settings),
+        # Where a key is read from (the Authorization header is always the second place), and how a
+        # request without a usable one is refused.
+        "key_header": settings.api_key_header,
+        "refusals": _refusals(auth_plugins),
     }
     snap["revision"] = hashlib.sha256(json.dumps(snap, sort_keys=True).encode()).hexdigest()
     return snap

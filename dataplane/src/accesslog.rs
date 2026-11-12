@@ -56,7 +56,7 @@ pub struct Entry<'a> {
     pub at: Duration,
     pub request_id: &'a str,
     pub traceparent: &'a str,
-    pub key_id: &'a str,
+    pub key_id: Option<&'a str>,
     pub tenant: Option<&'a str>,
     pub ip: IpAddr,
     pub method: &'a str,
@@ -93,7 +93,7 @@ pub fn line(e: &Entry) -> String {
     text(&mut out, "trace.id", e.traceparent.get(3..35));
     text(&mut out, "span.id", e.traceparent.get(36..52));
     text(&mut out, "tenant_id", e.tenant);
-    text(&mut out, "api_key_id", Some(e.key_id));
+    text(&mut out, "api_key_id", e.key_id);
     out.push_str(&format!(",\"client.ip\":\"{}\"", e.ip));
     text(&mut out, "http.request.method", Some(e.method));
     text(&mut out, "http.request.path", Some(e.path));
@@ -120,7 +120,7 @@ mod tests {
             at: Duration::new(1_700_000_000, 123_000_000),
             request_id: "req-1",
             traceparent: "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
-            key_id: "k1",
+            key_id: Some("k1"),
             tenant: None,
             ip: "10.0.0.9".parse().unwrap(),
             method: "GET",

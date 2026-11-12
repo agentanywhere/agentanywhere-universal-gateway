@@ -10,7 +10,7 @@ use crate::govern::{IpRule, IpRules, Net, Policy, Scope, ScopeRule};
 use crate::limits::Window;
 use crate::proxy::{Backend, ROUTED};
 use crate::tenant::{Tenant, Usage};
-use hyper::header::HeaderValue;
+use hyper::header::{HeaderName, HeaderValue};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -92,6 +92,26 @@ pub struct Snapshot {
     pub routes: [Option<Arc<Backend>>; 4],
     /// What the Python gateway checks in a request body before forwarding it.
     pub boundary: Boundary,
+    /// The header a key is read from first; `Authorization` is always the second place.
+    pub key_header: HeaderName,
+    /// How a request without a usable credential is refused. `None` when only the Python gateway
+    /// can tell (a plugin may authenticate the request some other way): it then answers them all.
+    pub refusals: Option<Refusals>,
+}
+
+/// The Python gateway's words for one refusal, ready to put into its error envelope.
+#[derive(Deserialize)]
+pub struct Wording {
+    pub message_json: String,
+    pub details_json: String,
+}
+
+#[derive(Deserialize)]
+pub struct Refusals {
+    /// No credential was sent.
+    pub missing_key: Wording,
+    /// The credential is not a key that works.
+    pub invalid_key: Wording,
 }
 
 #[derive(Deserialize)]
@@ -100,6 +120,8 @@ struct SnapshotFile {
     #[serde(default)]
     backends: HashMap<String, Option<String>>,
     boundary: Option<BoundaryRecord>,
+    key_header: Option<String>,
+    refusals: Option<Refusals>,
     #[serde(default)]
     keys: Vec<KeyRecord>,
     #[serde(default)]
@@ -367,7 +389,19 @@ impl Snapshot {
                 native_ok: [("1".to_string(), true), ("2".to_string(), true)].into_iter().collect(),
             },
         };
+        let key_header = file.key_header.as_deref().unwrap_or("x-api-key");
+        let key_header = HeaderName::from_bytes(key_header.to_ascii_lowercase().as_bytes())
+            .map_err(|_| format!("{key_header} is not a header name"))?;
+        if let Some(r) = &file.refusals {
+            for w in [&r.missing_key, &r.invalid_key] {
+                if !w.message_json.starts_with('"') || !w.details_json.starts_with('{') {
+                    return Err("refusals: a message must be a JSON string and details a JSON object".into());
+                }
+            }
+        }
         let snap = Snapshot {
+            key_header,
+            refusals: file.refusals,
             inject_request_id: file.inject_request_id,
             revision: file.revision,
             api_versions,
@@ -403,6 +437,21 @@ mod tests {
         let hex: String = d.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(parse_hex32(&hex), Some(d));
         assert_eq!(parse_hex32("zz"), None);
+    }
+
+    #[test]
+    fn the_key_header_and_the_refusal_wording_are_read() {
+        let snap = Snapshot::from_json(r#"{"keys":[]}"#).unwrap();
+        assert!(snap.key_header == "x-api-key" && snap.refusals.is_none());
+        let snap = Snapshot::from_json(
+            r#"{"keys":[],"key_header":"X-Gateway-Key","refusals":{
+                "missing_key":{"message_json":"\"m\"","details_json":"{}"},"invalid_key":{"message_json":"\"i\"","details_json":"{\"a\":1}"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(snap.key_header, "x-gateway-key");
+        assert_eq!(snap.refusals.unwrap().invalid_key.details_json, r#"{"a":1}"#);
+        assert!(Snapshot::from_json(r#"{"keys":[],"key_header":"not a header"}"#).is_err());
+        assert!(Snapshot::from_json(r#"{"keys":[],"refusals":{"missing_key":{"message_json":"m","details_json":"{}"},"invalid_key":{"message_json":"\"i\"","details_json":"{}"}}}"#).is_err());
     }
 
     #[test]

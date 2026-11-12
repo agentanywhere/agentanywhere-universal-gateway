@@ -1,7 +1,7 @@
 # AgentAnywhere data plane (experimental)
 
-A Rust proxy that sits in front of the Python gateway and handles the hot path itself: it authenticates API keys,
-applies per-key rate limits, path scopes, IP rules, governance policies and tenant quotas, and forwards plain HTTP,
+A Rust proxy that sits in front of the Python gateway and handles the hot path itself: it authenticates API keys
+(sent in the key header or as `Authorization: Bearer`), refuses requests without a working one, applies per-key rate limits, path scopes, IP rules, governance policies and tenant quotas, and forwards plain HTTP,
 MCP, A2A, AG-UI and ACP requests, each to its own backend, streaming bodies and event streams in both directions.
 Everything else is handed to the Python gateway unchanged. Design, goals and phases: [DESIGN.md](DESIGN.md).
 
@@ -57,6 +57,16 @@ as it has workers, or set `--workers` below the core count on a shared machine, 
   minute and hour; the data plane adds what it admitted since and reports completed requests back, where they are added
   to the same usage rows the console reads. The two planes can disagree by up to about one sync interval, and a request
   in flight already counts here, so under concurrency the data plane is the stricter side, never the looser.
+* **A key is read where the Python gateway reads it:** the configured header (`API_KEY_HEADER`, `X-API-Key` by
+  default), and when that is absent or empty, the `Authorization` header with `Bearer ` taken out.
+* **Requests without a working credential are refused here, in Python's words.** A request with no credential gets
+  the gateway's `401 AUTHENTICATION_ERROR` at once. A credential this side does not know proves nothing (the key may
+  have been created a moment ago), so it is handed to the Python gateway; only when that answers with its "invalid key"
+  401 does the data plane remember the credential (as a digest) and refuse it itself, for ten seconds, and only while
+  the snapshot is unchanged and the link unbroken. So a key works the moment it is created, a key switched back on
+  works again within about one sync interval, and a client hammering with a bad key costs the Python gateway one
+  request every ten seconds. A key more than two seconds past its expiry is refused here too. The wording of both
+  401s arrives with the snapshot. When an authentication plugin is enabled, every such request goes to Python.
 * **Bodies are checked at the protocol boundary, and refused in Python's words.** Where the Python gateway looks
   inside a request body (MCP JSON-RPC envelopes, method allow and block lists and prompt-injection patterns; the A2A
   send-message shape; ACP run requests; AG-UI envelopes), the data plane reads the body and decides one thing: is it
@@ -106,11 +116,12 @@ Its format is the same as what the control plane serves; see `src/snapshot.rs`.
 A request is served natively only when **all** of these hold: the link is fresh; the path is `/api/...`, or belongs to
 MCP, A2A, AG-UI or ACP and that protocol has an `http://` backend configured; no `fallthrough_prefixes` entry matches;
 the client is not a browser (`Accept: text/html`); `X-API-Version` or `Accept-Version` resolves to an active version
-with no backend of its own; the `X-API-Key` is in the snapshot, active, unexpired and `native_ok`; and, where the
+with no backend of its own; the key is in the snapshot, active, unexpired and `native_ok`; and, where the
 gateway checks the body, the body has a `Content-Length`, fits in memory (4 MiB, or the MCP limit if lower) and is
-certain to pass. Anything else, including unknown keys, `Authorization: Bearer` credentials, `/health`, `/admin`,
-`/oauth2`, GraphQL, MQTT, gRPC, WebSocket and `/agents/...`, goes to the Python gateway untouched, so its answer is
-the answer.
+certain to pass. On those same paths, a request with no credential, or with one the Python gateway has just refused,
+is answered here with the gateway's 401. Anything else, including OAuth2 tokens, credentials seen for the first time,
+`/health`, `/admin`, `/oauth2`, GraphQL, MQTT, gRPC, WebSocket and `/agents/...`, goes to the Python gateway untouched,
+so its answer is the answer.
 
 | Traffic | Served by |
 |---|---|
@@ -119,7 +130,9 @@ the answer.
 | A2A (`/a2a`, `/api/a2a`), including `message:stream` | data plane; same rule |
 | AG-UI (`/agui`, `/api/agui`) and ACP (`/acp`, `/api/acp`), including event streams | data plane; same rule |
 | MCP `tools/call` for a tool with a registered JSON Schema; custom injection patterns | Python |
-| Requests without a key, with an unknown key, or with `Authorization: Bearer` | Python |
+| A key sent as `Authorization: Bearer <key>` | data plane |
+| No credential; a credential Python refused in the last ten seconds; a key clearly past its expiry | data plane (401) |
+| A credential seen for the first time; OAuth2 tokens; two credentials of which the key does not work | Python |
 | Browsers (HTML error pages) | Python |
 | GraphQL, MQTT, gRPC, WebSocket, `/agents/<slug>` | Python |
 | Dynamic routes, transformation rules, request-altering plugins (when any exist) | Python, for every path |
@@ -127,6 +140,9 @@ the answer.
 
 ## Known gaps (why this is not production-ready)
 
+* **A refused credential stays refused for up to ten seconds after the Python gateway would accept it** in one case
+  this side cannot see: the gateway was restarted with a new `SECRET_KEY` or OAuth2 state so quickly that no sync
+  failed in between. Key changes made through the admin API are not affected (they change the snapshot).
 * **Some MCP traffic is still judged by Python.** A string that contains one of four letters Python's
   case-insensitive matching treats as `i`, `s` or `k` (U+0130, U+0131, U+017F, U+212A), a method name that is not ASCII
   while a method list is configured, a `tools/call` for a tool with a JSON Schema, any MCP body when custom injection

@@ -617,6 +617,82 @@ def main() -> int:
             mine = [l for l in logs if l.get("api_key_id") == probe["id"]]
             check("native MCP requests are logged with protocol mcp", bool(mine) and all(l.get("protocol") == "mcp" for l in mine), f"{len(mine)} rows")
 
+            # --- credentials: where a key is read from, and who says no ----------------------------
+            print()
+
+            def said_by(r):
+                return "data plane" if r.headers.get("x-served-by") == "dataplane" else "python"
+
+            def same_refusal(name, a, b, by):
+                compare(name, a, b)
+                same_body = a.status_code == b.status_code == 401 and all(a.json().get(k) == b.json().get(k) for k in ("error", "message", "details"))
+                check(f"{name}: same words, keys in the same order, answered by the {by}",
+                      same_body and list(a.json()) == list(b.json()) and said_by(b) == by and "x-dataplane-auth" not in b.headers,
+                      f"[{a.status_code}/{b.status_code}] by the {said_by(b)} {b.text[:100]}")
+
+            for path in ("/api/users", "/mcp", "/a2a/v1/tasks/1", "/acp/runs", "/agui/run", "/api/mcp/x"):
+                same_refusal(f"no key on {path}", httpx.get(py + path, timeout=10), httpx.get(rs + path, timeout=10), "data plane")
+            same_refusal("an empty key header", httpx.get(f"{py}/api/users", headers={"X-API-Key": ""}, timeout=10),
+                         httpx.get(f"{rs}/api/users", headers={"X-API-Key": ""}, timeout=10), "data plane")
+            a, b = httpx.post(f"{py}/mcp", json=rpc("tools/list"), timeout=10), httpx.post(f"{rs}/mcp", json=rpc("tools/list"), timeout=10)
+            same_refusal("no key on an MCP call", a, b, "data plane")
+            a, b = httpx.get(f"{py}/health", timeout=10), httpx.get(f"{rs}/health", timeout=10)
+            check("a path that needs no key is still Python's", a.status_code == b.status_code == 200 and said_by(b) == "python")
+
+            for name, value in (("Authorization: Bearer <key>", "Bearer {key}"), ("Authorization: <key>", "{key}")):
+                a = httpx.get(f"{py}/api/users", headers={"Authorization": value.format(key=keys["py"]["key"])}, timeout=10)
+                b = httpx.get(f"{rs}/api/users", headers={"Authorization": value.format(key=keys["rs"]["key"])}, timeout=10)
+                compare(f"key sent as {name}", a, b)
+                check(f"key sent as {name}: served by the data plane", b.status_code == 200 and said_by(b) == "data plane", f"[{b.status_code}] by the {said_by(b)}")
+            a, b = both("POST", "/mcp", rpc("tools/list"), headers={"Authorization": "Bearer not-a-key-or-a-token"})
+            compare("a working key beside a useless Authorization header", a, b)
+            check("a working key beside a useless Authorization header: served by the data plane", said_by(b) == "data plane")
+
+            for name, headers in (("a key that does not exist", {"X-API-Key": "sk-" + secrets.token_hex(16)}),
+                                  ("a Bearer credential that does not exist", {"Authorization": "Bearer " + secrets.token_hex(16)})):
+                a = httpx.get(f"{py}/api/users", headers=headers, timeout=10)
+                same_refusal(f"{name}, first time", a, httpx.get(f"{rs}/api/users", headers=headers, timeout=10), "python")
+                same_refusal(f"{name}, again", a, httpx.get(f"{rs}/mcp", headers=headers, timeout=10), "data plane")
+            two = {"X-API-Key": "sk-" + secrets.token_hex(16), "Authorization": "Bearer " + secrets.token_hex(16)}
+            a = httpx.get(f"{py}/api/users", headers=two, timeout=10)
+            httpx.get(f"{rs}/api/users", headers=two, timeout=10)
+            same_refusal("two credentials, neither works: always asked", a, httpx.get(f"{rs}/api/users", headers=two, timeout=10), "python")
+
+            # A key made a moment ago is not in the snapshot yet. It must work at once all the same.
+            fresh = []
+            for i in range(5):
+                k = make_key(f"conf-fresh-{i}", 1000)
+                fresh.append(httpx.get(f"{rs}/api/users", headers={"X-API-Key": k["key"]}, timeout=10).status_code)
+            check("a key works the moment it is created", fresh == [200] * 5, str(fresh))
+
+            # A key switched off is refused by both, and works again soon after it is switched back on.
+            off = make_key("conf-toggle", 1000)
+            assert wait_until(lambda: served_natively(off["key"])), "key never became native"
+            httpx.put(f"{py}/admin/api-keys/{off['id']}/toggle", headers=adm, timeout=10).raise_for_status()
+            use = lambda: httpx.get(f"{rs}/api/users", headers={"X-API-Key": off["key"]}, timeout=10)
+            t = wait_until(lambda: use().status_code == 401 and said_by(use()) == "data plane")
+            check("a key switched off is refused, in time by the data plane itself", t is not None)
+            a = httpx.get(f"{py}/api/users", headers={"X-API-Key": off["key"]}, timeout=10)
+            same_refusal("a key switched off", a, use(), "data plane")
+            t0 = time.time()
+            httpx.put(f"{py}/admin/api-keys/{off['id']}/toggle", headers=adm, timeout=10).raise_for_status()
+            t = wait_until(lambda: use().status_code == 200)
+            check("switched back on, it works again within seconds", t is not None and t - t0 < 2.5, f"after {t - t0:.2f}s" if t else "still refused")
+
+            # What the data plane refused is counted and logged as Python records its own refusals.
+            time.sleep(1.5)
+            labels = dict(method="GET", path="/api", status_code="401", protocol="http")
+            before = metric("gateway_requests_total", **labels)
+            for i in range(20):
+                r = httpx.get(f"{rs}/api/unauth-probe", timeout=10)
+            check("these were refused by the data plane", r.status_code == 401 and said_by(r) == "data plane")
+            time.sleep(2.0)
+            delta = metric("gateway_requests_total", **labels) - before
+            check("native 401s are counted under the bounded path label", delta == 20, f"{delta:.0f} of 20")
+            logs = httpx.get(f"{py}/admin/logs", params={"limit": 1000, "path": "/api/unauth-probe"}, headers=adm, timeout=10).json()["logs"]
+            check("native 401s are logged with their error and no key",
+                  len(logs) == 20 and all(l.get("error") == "AUTHENTICATION_ERROR" and not l.get("api_key_id") for l in logs), f"{len(logs)} rows")
+
             # Last: the control plane goes away. The data plane must stop serving natively.
             procs[1].send_signal(signal.SIGTERM)
             procs[1].wait(timeout=15)

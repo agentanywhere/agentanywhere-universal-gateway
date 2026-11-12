@@ -104,6 +104,9 @@ pub async fn run(state: Arc<State>, token: String, interval: Duration, report_in
                 }
             }
             Err(e) => {
+                // What workers learned from the control plane's answers may no longer hold once it
+                // has been away (it may have been restarted with other settings): make them forget.
+                state.generation.fetch_add(1, Ordering::Release);
                 if healthy {
                     eprintln!("dataplane: control plane link lost ({e}); native serving stops after the staleness limit");
                     healthy = false;

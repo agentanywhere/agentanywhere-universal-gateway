@@ -26,6 +26,22 @@ security = HTTPBearer(auto_error=False)
 
 logger = structlog.get_logger()
 
+# The two ways a request without a usable credential is refused. Defined once: the handler in
+# app/main.py raises the first, authenticate() below the second, and the data plane is given both
+# (app/dataplane_sync.py) so that it answers in the same words.
+MISSING_KEY_MESSAGE = "API key required"
+MISSING_KEY_HINT = "Include your API key in the X-API-Key header or Authorization header."
+INVALID_KEY_MESSAGE = "Invalid or inactive API key. Please check your API key and try again."
+INVALID_KEY_HINT = "Ensure your API key is correct and active. You can check your API keys in the admin console."
+
+
+def missing_key_details() -> dict:
+    return {"hint": MISSING_KEY_HINT, "documentation": docs_link("authentication")}
+
+
+def invalid_key_details() -> dict:
+    return {"hint": INVALID_KEY_HINT, "documentation": docs_link("authentication")}
+
 
 def _normalise_scope_path(path: str) -> Optional[str]:
     """Collapse repeated slashes and drop a trailing one.
@@ -314,11 +330,8 @@ class AuthMiddleware:
 
             request_id = getattr(request.state, "request_id", None)
             raise AuthenticationError(
-                message="Invalid or inactive API key. Please check your API key and try again.",
-                details={
-                    "hint": "Ensure your API key is correct and active. You can check your API keys in the admin console.",
-                    "documentation": docs_link("authentication")
-                },
+                message=INVALID_KEY_MESSAGE,
+                details=invalid_key_details(),
                 request_id=request_id
             )
 

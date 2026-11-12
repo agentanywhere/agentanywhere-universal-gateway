@@ -642,3 +642,87 @@ def test_native_mcp_requests_are_counted_under_their_protocol():
     )])
     dataplane_sync.apply_report(report)
     assert _sample("gateway_requests_total", method="POST", path=label, status_code="200", protocol="mcp") - before == 3
+
+
+# --- credentials: where a key is read from, and the 401s ------------------------------------------
+
+
+async def test_the_snapshot_says_where_a_key_is_read_from_and_how_a_request_without_one_is_refused(db_session, monkeypatch):
+    import json
+
+    from app.middleware import auth
+
+    monkeypatch.setattr(get_settings(), "api_key_header", "X-Gateway-Key")
+    snap = await dataplane_sync.build_snapshot(db_session)
+    assert snap["key_header"] == "X-Gateway-Key"
+    missing, invalid = snap["refusals"]["missing_key"], snap["refusals"]["invalid_key"]
+    assert json.loads(missing["message_json"]) == auth.MISSING_KEY_MESSAGE == "API key required"
+    assert json.loads(invalid["message_json"]) == auth.INVALID_KEY_MESSAGE
+    assert list(json.loads(missing["details_json"])) == list(json.loads(invalid["details_json"])) == ["hint", "documentation"]
+    assert json.loads(missing["details_json"]) == auth.missing_key_details()
+    assert json.loads(invalid["details_json"]) == auth.invalid_key_details()
+
+
+async def test_with_an_auth_plugin_only_this_gateway_refuses(db_session, monkeypatch):
+    from types import SimpleNamespace
+
+    from app.plugins import PluginType, plugin_registry
+
+    monkeypatch.setattr(get_settings(), "plugins_enabled", True)
+    provider = SimpleNamespace(name="a", enabled=True, plugin_type=PluginType.AUTH_PROVIDER)
+    monkeypatch.setattr(plugin_registry, "list", lambda: [provider])
+    assert (await dataplane_sync.build_snapshot(db_session))["refusals"] is None
+    monkeypatch.setattr(plugin_registry, "list", lambda: [SimpleNamespace(name="a", enabled=False, plugin_type=PluginType.AUTH_PROVIDER)])
+    assert (await dataplane_sync.build_snapshot(db_session))["refusals"] is not None
+
+
+def _client():
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    return TestClient(app, raise_server_exceptions=False)
+
+
+def test_a_refused_credential_is_marked_for_the_data_plane_only_behind_one(monkeypatch):
+    import app.main as main
+
+    with _client() as c:
+        plain = c.get("/api/users", headers={"X-API-Key": "sk-not-a-key"})
+        assert plain.status_code == 401 and "x-dataplane-auth" not in plain.headers
+        monkeypatch.setattr(main.settings, "dataplane_token", "t")
+        refused = c.get("/api/users", headers={"X-API-Key": "sk-not-a-key"})
+        assert refused.status_code == 401 and refused.headers["x-dataplane-auth"] == "invalid-key"
+        assert refused.json()["message"] == main.INVALID_KEY_MESSAGE
+        # No credential at all is not about a credential: nothing for the data plane to remember.
+        missing = c.get("/api/users")
+        assert missing.status_code == 401 and "x-dataplane-auth" not in missing.headers
+        assert missing.json()["message"] == main.MISSING_KEY_MESSAGE
+
+
+def test_a_backend_cannot_mark_its_own_answer(monkeypatch):
+    import httpx
+
+    import app.main as main
+
+    async def route_request(**kw):
+        return httpx.Response(401, json={"detail": "no"}, headers={"X-Dataplane-Auth": "invalid-key", "X-Other": "kept"})
+
+    monkeypatch.setattr(main.router, "route_request", route_request)
+    # The configured secret stands in for a key here; where that needs switching on, switch it on.
+    if "allow_secret_key_api_key" in type(main.settings).model_fields:
+        monkeypatch.setattr(main.settings, "allow_secret_key_api_key", True)
+    key = {"X-API-Key": main.settings.secret_key}
+    with _client() as c:
+        monkeypatch.setattr(main.settings, "dataplane_token", "t")
+        r = c.get("/api/users", headers=key)
+        assert r.status_code == 401 and r.json() == {"detail": "no"}
+        assert "x-dataplane-auth" not in r.headers and r.headers["x-other"] == "kept"
+
+
+async def test_the_gateways_own_endpoints_stay_with_python_wherever_they_live(db_session, monkeypatch):
+    s = get_settings()
+    assert (await dataplane_sync.build_snapshot(db_session))["fallthrough_prefixes"] == []
+    monkeypatch.setattr(s, "health_check_path", "/api/health")
+    monkeypatch.setattr(s, "metrics_path", "/mcp/metrics")
+    assert (await dataplane_sync.build_snapshot(db_session))["fallthrough_prefixes"] == ["/api/health", "/mcp/metrics"]

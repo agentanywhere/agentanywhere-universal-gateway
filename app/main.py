@@ -34,6 +34,11 @@ from app.exceptions import (
     NotFoundError, InternalServerError
 )
 from app.middleware import AuthMiddleware, RateLimiter
+from app.middleware.auth import INVALID_KEY_MESSAGE, MISSING_KEY_MESSAGE, missing_key_details
+
+# Response header that tells the data plane a 401 was about the credential itself. Set only when
+# DATAPLANE_TOKEN is configured; the data plane removes it before answering the client.
+DATAPLANE_AUTH_HEADER = "X-Dataplane-Auth"
 from app.routing import Router
 from app.logging_config import (
     setup_logging,
@@ -973,6 +978,10 @@ async def logging_middleware(request: Request, call_next):
                 except Exception:  # noqa: BLE001
                     pass
         
+        # Only this gateway's own refusals may carry the note for the data plane: never a backend's answer.
+        if settings.dataplane_token and not auth_rejected and DATAPLANE_AUTH_HEADER in response.headers:
+            del response.headers[DATAPLANE_AUTH_HEADER]
+
         # Add response headers
         response.headers["X-Request-ID"] = request_id
         response.headers["X-Response-Time"] = f"{process_time:.3f}"
@@ -1193,6 +1202,10 @@ def _auth_reject(request: Request, status_code: int, data: Dict[str, Any], heade
         pass
     if not data.get("request_id"):
         data["request_id"] = getattr(request.state, "request_id", None)
+    # Behind the data plane, say which refusals are about the credential itself, so that it can
+    # answer the next request with the same credential without asking (it removes the header).
+    if settings.dataplane_token and status_code == 401 and data.get("message") == INVALID_KEY_MESSAGE:
+        headers = {**(headers or {}), DATAPLANE_AUTH_HEADER: "invalid-key"}
     return render_error_response(request, status_code, data, headers)
 
 
@@ -1384,11 +1397,8 @@ async def auth_middleware_handler(request: Request, call_next):
                             message="API key required"
                         )
                         exc = AuthenticationError(
-                            message="API key required",
-                            details={
-                                "hint": "Include your API key in the X-API-Key header or Authorization header.",
-                                "documentation": docs_link("authentication")
-                            },
+                            message=MISSING_KEY_MESSAGE,
+                            details=missing_key_details(),
                             request_id=request_id
                         )
                         logger.info(
@@ -1483,11 +1493,8 @@ async def auth_middleware_handler(request: Request, call_next):
                     path=request.url.path
                 )
                 raise AuthenticationError(
-                    message="API key required",
-                    details={
-                        "hint": "Include your API key in the X-API-Key header or Authorization header.",
-                        "documentation": docs_link("authentication")
-                    },
+                    message=MISSING_KEY_MESSAGE,
+                    details=missing_key_details(),
                     request_id=request_id
                 )
         except (HTTPException, GatewayException) as e:

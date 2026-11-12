@@ -11,11 +11,12 @@
 use bytes::Bytes;
 use http_body_util::{BodyExt, Either, Full};
 use hyper::body::{Body as _, Incoming};
-use hyper::header::{HeaderName, HeaderValue, ACCEPT, CONTENT_LENGTH, CONTENT_TYPE, HOST, REFERER, USER_AGENT};
+use hyper::header::{HeaderName, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HOST, REFERER, UPGRADE, USER_AGENT};
 use hyper::http::uri::{Authority, Scheme};
 use hyper::{HeaderMap, Method, Request, Response, StatusCode, Uri, Version};
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use hyper_util::rt::TokioExecutor;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
@@ -28,7 +29,7 @@ use crate::boundary::Verdict;
 use crate::breaker::{self, Breaker};
 use crate::govern::{self, IpRule, Policy, Scope, Subject};
 use crate::report::{Event, Reporter, Row, Served};
-use crate::snapshot::{hash_key, KeyEntry, Snapshot};
+use crate::snapshot::{hash_key, Digest32, KeyEntry, Snapshot, Wording};
 use crate::sync::Link;
 
 /// A body is either streamed from the other side or held here whole; neither is boxed. Responses
@@ -142,6 +143,8 @@ pub struct State {
     pub snapshot: arc_swap::ArcSwap<Snapshot>,
     /// Counts snapshot replacements, so a worker can tell cheaply that the one it holds is current.
     pub generation: AtomicU64,
+    /// Credentials the Python gateway has just refused.
+    pub denied: Mutex<Denied>,
     /// Where plain HTTP requests go.
     pub backend: Arc<Backend>,
     pub backends: Backends,
@@ -173,6 +176,35 @@ pub struct Worker {
     index: usize,
 }
 
+/// How long a credential the Python gateway refused is refused here without asking again.
+const DENIED_FOR: Duration = Duration::from_secs(10);
+/// The most refused credentials remembered. Past it, they are all forgotten and asked about again.
+const DENIED_MAX: usize = 65_536;
+
+/// Credentials (as digests) the Python gateway answered with its "invalid key" 401, each with the
+/// generation it was learned under and when. An entry counts only while that generation is still
+/// the current one, so any change to the snapshot (a key re-enabled, an expiry moved) and any
+/// break in the link to the control plane makes every worker ask again. A key that does not exist
+/// yet cannot be in here: nobody can present a key before the gateway has made it up.
+///
+/// Shared by all workers, so one answer from the Python gateway serves them all. Only requests
+/// with a credential this side does not know come here; requests with a working key never do.
+#[derive(Default)]
+pub struct Denied(HashMap<Digest32, (u64, Instant)>);
+
+impl Denied {
+    fn holds(&self, digest: &Digest32, generation: u64, now: Instant) -> bool {
+        matches!(self.0.get(digest), Some((g, at)) if *g == generation && now.duration_since(*at) < DENIED_FOR)
+    }
+
+    fn learn(&mut self, digest: Digest32, generation: u64, now: Instant) {
+        if self.0.len() >= DENIED_MAX {
+            self.0.clear();
+        }
+        self.0.insert(digest, (generation, now));
+    }
+}
+
 impl Worker {
     pub fn new(shared: Arc<State>, index: usize) -> Worker {
         let mut connector = HttpConnector::new();
@@ -185,13 +217,14 @@ impl Worker {
         Worker { shared, client, held, index }
     }
 
-    fn snapshot(&self) -> Arc<Arc<Snapshot>> {
+    /// The current snapshot and the generation it belongs to.
+    fn snapshot(&self) -> (u64, Arc<Arc<Snapshot>>) {
         let generation = self.shared.generation.load(Ordering::Acquire);
         let mut held = self.held.lock().unwrap();
         if held.0 != generation {
             *held = (generation, Arc::new(self.shared.snapshot.load_full()));
         }
-        held.1.clone()
+        (generation, held.1.clone())
     }
 }
 
@@ -368,27 +401,64 @@ struct Native<'a> {
     method: &'static str,
 }
 
-/// Decide whether a request is served here. `None` hands it to the Python gateway, which is
-/// always right: it is the answer whenever this side cannot be sure of deciding the same.
-fn route<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, now: u64) -> Option<Native<'a>> {
+/// A request refused here with a 401: it carries no credential that works.
+struct Unauthenticated<'a> {
+    wording: &'a Wording,
+    version: Option<&'a str>,
+    ip: IpAddr,
+    method: &'static str,
+}
+
+/// What to do with a request.
+enum Decision<'a> {
+    Native(Native<'a>),
+    Refuse(Unauthenticated<'a>),
+    /// The Python gateway answers, which is always right: it is the answer whenever this side
+    /// cannot be sure of deciding the same. With a digest: the request carries one credential this
+    /// side does not know, and if the Python gateway refuses it, that is worth remembering.
+    Ask(Option<Digest32>),
+}
+
+/// How long past its expiry a key must be before it is refused here; nearer than that, the two
+/// clocks might disagree, and the Python gateway decides.
+const EXPIRY_MARGIN_SECS: i64 = 2;
+
+/// An `Authorization` value as the Python gateway turns it into a key: every `Bearer ` taken out.
+fn without_bearer(value: &[u8]) -> Cow<'_, [u8]> {
+    const WORD: &[u8] = b"Bearer ";
+    if !value.windows(WORD.len()).any(|w| w == WORD) {
+        return Cow::Borrowed(value);
+    }
+    let (mut out, mut i) = (Vec::with_capacity(value.len()), 0);
+    while i < value.len() {
+        if value[i..].starts_with(WORD) {
+            i += WORD.len();
+        } else {
+            out.push(value[i]);
+            i += 1;
+        }
+    }
+    Cow::Owned(out)
+}
+
+/// Decide what happens to a request. `denied` says whether the Python gateway has just refused
+/// the credential with this digest.
+fn decide<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, now: u64, denied: impl Fn(&Digest32) -> bool) -> Decision<'a> {
+    const PYTHON: Decision<'static> = Decision::Ask(None);
     let uri = req.uri();
     let path = uri.path();
     // An escaped or non-ASCII path reads differently once decoded, and what the key may reach
     // and what a policy matches are decided on the decoded one.
     if uri.authority().is_some() || !path.is_ascii() || path.contains('%') {
-        return None;
+        return PYTHON;
     }
-    let protocol = classify(path)?;
+    let Some(protocol) = classify(path) else { return PYTHON };
     if snap.fallthrough_prefixes.iter().any(|p| path.starts_with(p.as_str())) || wants_html(req.headers()) {
-        return None;
+        return PYTHON;
     }
-    // A protocol without a backend this side can reach is the Python gateway's to answer.
-    let backend = match protocol.route_index() {
-        Some(i) => Some(snap.routes[i].as_deref()?),
-        None => None,
-    };
-    if names_a_version(upstream_path(path, protocol)) {
-        return None;
+    // A request to change protocol (a WebSocket handshake) is not an ordinary request there.
+    if req.headers().contains_key(UPGRADE) {
+        return PYTHON;
     }
     let m = req.method();
     let method = if m == Method::GET {
@@ -404,16 +474,63 @@ fn route<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, now: u64
     } else if m == Method::HEAD {
         "HEAD"
     } else {
-        return None;
+        return PYTHON;
     };
-    let entry = snap.keys.get(&hash_key(req.headers().get("x-api-key")?.as_bytes()))?;
-    let expired = entry.expires_at.map(|e| e <= now as i64).unwrap_or(false);
-    let version = resolve_version(snap, req.headers());
-    if !entry.is_active || expired || !entry.native_ok || !version.map(|(_, ok)| ok).unwrap_or(true) {
-        return None;
+    // The version is echoed on every answer, refusals included; one that adds more than its
+    // number (a deprecation, a sunset) is the Python gateway's to announce.
+    let version = match resolve_version(snap, req.headers()) {
+        Some((_, false)) => return PYTHON,
+        found => found.map(|(v, _)| v),
+    };
+    let Some(ip) = govern::client_ip(peer, req.headers(), &snap.trusted_proxies) else { return PYTHON };
+    let refuse = |wording: &'a Wording| Decision::Refuse(Unauthenticated { wording, version, ip, method });
+
+    // The key: the gateway's own header first, `Authorization` when that one is absent or empty.
+    let header = |name: &HeaderName| req.headers().get(name).map(|v| v.as_bytes()).filter(|v| !v.is_empty());
+    let (own, authorization) = (header(&snap.key_header), header(&AUTHORIZATION));
+    let (credential, source) = match (own, authorization) {
+        (None, None) => return snap.refusals.as_ref().map(|r| refuse(&r.missing_key)).unwrap_or(PYTHON),
+        (Some(key), _) => (Cow::Borrowed(key), b'K'),
+        (None, Some(value)) => (without_bearer(value), b'A'),
+    };
+    // Beyond ASCII the two sides would not hash the same bytes.
+    if credential.is_empty() || !credential.is_ascii() {
+        return PYTHON;
     }
-    let ip = govern::client_ip(peer, req.headers(), &snap.trusted_proxies)?;
-    Some(Native { protocol, backend, entry, version: version.map(|(v, _)| v), ip, method })
+    // With a key in its own header that does not work, an `Authorization` header may still let
+    // the request in (an OAuth2 token): only the Python gateway can tell.
+    let only_credential = own.is_none() || authorization.is_none();
+    let invalid = snap.refusals.as_ref().filter(|_| only_credential).map(|r| &r.invalid_key);
+    let Some(entry) = snap.keys.get(&hash_key(&credential)) else {
+        let Some(wording) = invalid else { return PYTHON };
+        // Not a key this side knows. That alone proves nothing: it may have been created a
+        // moment ago. It is refused here only once the Python gateway has refused it.
+        let mut text = Vec::with_capacity(credential.len() + 1);
+        text.push(source);
+        text.extend_from_slice(own.or(authorization).unwrap_or_default());
+        let digest = hash_key(&text);
+        return if denied(&digest) { refuse(wording) } else { Decision::Ask(Some(digest)) };
+    };
+    if !entry.is_active || !entry.native_ok {
+        return PYTHON;
+    }
+    match entry.expires_at {
+        Some(e) if e + EXPIRY_MARGIN_SECS < now as i64 => return invalid.map(refuse).unwrap_or(PYTHON),
+        Some(e) if e <= now as i64 => return PYTHON,
+        _ => {}
+    }
+    // A protocol without a backend this side can reach is the Python gateway's to answer.
+    let backend = match protocol.route_index() {
+        Some(i) => match snap.routes[i].as_deref() {
+            Some(backend) => Some(backend),
+            None => return PYTHON,
+        },
+        None => None,
+    };
+    if names_a_version(upstream_path(path, protocol)) {
+        return PYTHON;
+    }
+    Decision::Native(Native { protocol, backend, entry, version, ip, method })
 }
 
 /// Why a request with a valid key is refused with a 403.
@@ -540,6 +657,82 @@ fn body_unreadable() -> Response<Body> {
     resp
 }
 
+/// The headers every answer made or passed on here carries.
+fn stamp(resp: &mut Response<Body>, t: &Trace, seconds: f64, version: Option<&str>) {
+    let h = resp.headers_mut();
+    // Tells operators (and the conformance suite) which plane answered.
+    h.insert("x-served-by", HeaderValue::from_static("dataplane"));
+    if let Ok(v) = HeaderValue::from_str(&format!("{seconds:.3}")) {
+        h.insert("x-response-time", v);
+    }
+    if let Some(v) = version.and_then(|v| HeaderValue::from_str(v).ok()) {
+        h.insert("x-api-version", v);
+    }
+    if let Ok(v) = HeaderValue::from_str(&t.request_id) {
+        h.insert("x-request-id", v);
+    }
+    if let Ok(v) = HeaderValue::from_str(&t.traceparent) {
+        h.insert("traceparent", v);
+    }
+}
+
+/// Answer a request that carries no credential that works, and report it as the Python gateway
+/// records the ones it refuses: counted under a bounded path label, logged without a key.
+fn unauthenticated<B>(w: &Worker, u: &Unauthenticated, req: &Request<B>, started: Instant, at: Duration) -> Response<Body> {
+    let st = &*w.shared;
+    let t = trace_for(req.headers());
+    let path = req.uri().path();
+    let mut resp = envelope(StatusCode::UNAUTHORIZED, "AUTHENTICATION_ERROR", &u.wording.message_json, &u.wording.details_json, &t, true);
+    let seconds = started.elapsed().as_secs_f64();
+    let bytes_out = resp.body().size_hint().exact().unwrap_or(0);
+    stamp(&mut resp, &t, seconds, u.version);
+    let user_agent = req.headers().get(USER_AGENT).and_then(|v| v.to_str().ok());
+    if let Some(reporter) = &st.reporter {
+        let served = Served {
+            method: u.method,
+            path,
+            status: 401,
+            seconds,
+            key_id: "",
+            tenant: None,
+            rejected: true,
+            error_code: None,
+            error_type: None,
+        };
+        reporter.record(w.index, &served, at.as_secs(), || Row {
+            request_id: t.request_id.clone(),
+            method: u.method,
+            path: path.to_owned(),
+            client_ip: u.ip.to_string(),
+            api_key_id: None,
+            tenant_id: None,
+            status: 401,
+            duration_ms: seconds * 1000.0,
+            user_agent: user_agent.map(str::to_owned),
+            error: Some("AUTHENTICATION_ERROR".to_owned()),
+        });
+    }
+    if let Some(log) = &st.access_log {
+        log.write(accesslog::line(&accesslog::Entry {
+            at,
+            request_id: &t.request_id,
+            traceparent: &t.traceparent,
+            key_id: None,
+            tenant: None,
+            ip: u.ip,
+            method: u.method,
+            path,
+            query: req.uri().query().unwrap_or(""),
+            status: 401,
+            bytes: bytes_out,
+            seconds,
+            user_agent,
+            referrer: req.headers().get(REFERER).and_then(|v| v.to_str().ok()),
+        }));
+    }
+    resp
+}
+
 fn announce(st: &State, backend: &Backend, cfg: &breaker::Config, tr: breaker::Transition) {
     eprintln!("dataplane: circuit breaker for {} is {} (was {})", backend.upstream.text, tr.state.name(), tr.previous.name());
     if let Some(reporter) = &st.reporter {
@@ -578,13 +771,25 @@ pub async fn handle(w: Arc<Worker>, peer: SocketAddr, req: Request<Incoming>) ->
         resp.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         return Ok(resp);
     }
-    let snap = w.snapshot();
+    let (generation, snap) = w.snapshot();
     let at = wall();
     let now = at.as_secs();
     // Fail closed: if the snapshot is not known to be current, the Python gateway decides.
     let trusted = st.sync.as_ref().map(|s| s.fresh()).unwrap_or(true);
-    let Some(n) = trusted.then(|| route(&snap, peer, &req, now)).flatten() else {
-        return Ok(to_control(&w, peer, req.map(Either::Left)).await);
+    let decision = match trusted {
+        true => decide(&snap, peer, &req, now, |digest| st.denied.lock().unwrap().holds(digest, generation, started)),
+        false => Decision::Ask(None),
+    };
+    let n = match decision {
+        Decision::Native(n) => n,
+        Decision::Refuse(u) => return Ok(unauthenticated(&w, &u, &req, started, at)),
+        Decision::Ask(credential) => {
+            let (resp, refused) = ask_control(&w, peer, req.map(Either::Left)).await;
+            if let Some(digest) = credential.filter(|_| refused && resp.status() == StatusCode::UNAUTHORIZED) {
+                st.denied.lock().unwrap().learn(digest, generation, Instant::now());
+            }
+            return Ok(resp);
+        }
     };
     let entry = n.entry;
     if entry.last_used.load(Ordering::Relaxed) != now {
@@ -680,23 +885,9 @@ pub async fn handle(w: Arc<Worker>, peer: SocketAddr, req: Request<Incoming>) ->
         .and_then(|v| v.parse().ok())
         .or_else(|| resp.body().size_hint().exact())
         .unwrap_or(0);
-    let h = resp.headers_mut();
-    // Tells operators (and the conformance suite) which plane answered.
-    h.insert("x-served-by", HeaderValue::from_static("dataplane"));
-    if let Ok(v) = HeaderValue::from_str(&format!("{seconds:.3}")) {
-        h.insert("x-response-time", v);
-    }
-    if let Some(v) = n.version.and_then(|v| HeaderValue::from_str(v).ok()) {
-        h.insert("x-api-version", v);
-    }
+    stamp(&mut resp, &t, seconds, n.version);
     if let Some(v) = tenant.and_then(|tn| tn.header.clone()) {
-        h.insert("x-tenant-id", v);
-    }
-    if let Ok(v) = HeaderValue::from_str(&t.request_id) {
-        h.insert("x-request-id", v);
-    }
-    if let Ok(v) = HeaderValue::from_str(&t.traceparent) {
-        h.insert("traceparent", v);
+        resp.headers_mut().insert("x-tenant-id", v);
     }
     // An answered request is usage, whatever the answer; a refused one never is.
     if let Some(ticket) = ticket {
@@ -733,7 +924,7 @@ pub async fn handle(w: Arc<Worker>, peer: SocketAddr, req: Request<Incoming>) ->
             at,
             request_id: &t.request_id,
             traceparent: &t.traceparent,
-            key_id: &entry.id,
+            key_id: Some(&entry.id),
             tenant: tenant.map(|tn| &*tn.id),
             ip: n.ip,
             method: n.method,
@@ -781,9 +972,21 @@ struct Sent<'a> {
     path: Option<&'a str>,
 }
 
-/// Hand a request to the Python gateway as it came; its answer is the answer.
+/// Hand a request to the Python gateway as it came; its answer is the answer. Also says whether
+/// the Python gateway marked the answer as its refusal of the credential itself (a note for this
+/// side only, taken off before the answer goes to the client).
+async fn ask_control(w: &Worker, peer: SocketAddr, req: Request<Body>) -> (Response<Body>, bool) {
+    match forward(w, &w.shared.control, peer, req, None, None).await {
+        Ok(mut resp) => {
+            let refused = resp.headers_mut().remove("x-dataplane-auth").is_some();
+            (resp, refused)
+        }
+        Err(_) => (control_unreachable(), false),
+    }
+}
+
 async fn to_control(w: &Worker, peer: SocketAddr, req: Request<Body>) -> Response<Body> {
-    forward(w, &w.shared.control, peer, req, None, None).await.unwrap_or_else(|_| control_unreachable())
+    ask_control(w, peer, req).await.0
 }
 
 /// Forward to `to`. With `native`, the Python gateway's upstream headers are reproduced.
@@ -814,6 +1017,7 @@ async fn forward(
     }
     *req.uri_mut() = Uri::from_parts(parts).map_err(|_| Unanswered::Broken)?;
     *req.version_mut() = Version::HTTP_11;
+    let native_answer = native.is_some();
     let headers = req.headers_mut();
     for h in HOP_BY_HOP {
         headers.remove(h);
@@ -861,6 +1065,10 @@ async fn forward(
             let (mut rp, rb) = resp.into_parts();
             for h in HOP_BY_HOP {
                 rp.headers.remove(h);
+            }
+            // A backend cannot leave notes for this side; the Python gateway drops this one too.
+            if native_answer {
+                rp.headers.remove("x-dataplane-auth");
             }
             Ok(Response::from_parts(rp, Either::Left(rb)))
         }
@@ -999,6 +1207,14 @@ mod tests {
         .unwrap();
         Backends::default().resolve(&mut snap);
         snap
+    }
+
+    /// The request as served here, or `None` for anything else.
+    fn route<'a>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<()>, now: u64) -> Option<Native<'a>> {
+        match decide(snap, peer, req, now, |_| false) {
+            Decision::Native(n) => Some(n),
+            _ => None,
+        }
     }
 
     fn request(method: &str, uri: &str) -> Request<()> {
@@ -1150,6 +1366,148 @@ mod tests {
         );
         assert_eq!(body_of(rate_limited("hour", 9, 3600, None, &t))["details"], serde_json::json!({"limit":9,"window":"hour","retry_after":3600}));
         assert_eq!(led_by("\"a\":1", "{}"), "{\"a\":1}");
+    }
+
+    const REFUSALS: &str = r#","refusals":{"missing_key":{"message_json":"\"API key required\"","details_json":"{\"hint\":\"h1\"}"},
+        "invalid_key":{"message_json":"\"Invalid or inactive API key.\"","details_json":"{\"hint\":\"h2\"}"}}"#;
+
+    fn with_headers(headers: &[(&str, &str)]) -> Request<()> {
+        let mut b = Request::builder().uri("/api/users");
+        for (name, value) in headers {
+            b = b.header(*name, *value);
+        }
+        b.body(()).unwrap()
+    }
+
+    /// "native", "ask", "learn" (ask, and remember a refusal) or the message of the 401 made here.
+    fn outcome(snap: &Snapshot, req: &Request<()>, now: u64, denied: bool) -> String {
+        match decide(snap, peer(), req, now, |_| denied) {
+            Decision::Native(_) => "native".into(),
+            Decision::Ask(None) => "ask".into(),
+            Decision::Ask(Some(_)) => "learn".into(),
+            Decision::Refuse(u) => u.wording.message_json.clone(),
+        }
+    }
+
+    #[test]
+    fn a_key_is_read_from_its_header_or_from_authorization() {
+        let snap = governed(REFUSALS, "");
+        for headers in [
+            vec![("x-api-key", KEY)],
+            vec![("authorization", "Bearer sk-test")],
+            vec![("authorization", "sk-test")],
+            vec![("x-api-key", ""), ("authorization", "Bearer sk-test")],
+            vec![("x-api-key", KEY), ("authorization", "Bearer something-else")],
+            vec![("authorization", "Bearer Bearer sk-test")],
+            vec![("authorization", "sk-Bearer test")],
+        ] {
+            assert_eq!(outcome(&snap, &with_headers(&headers), 0, false), "native", "{headers:?}");
+        }
+        // `bearer` in another case is not taken out, as in Python: this is not the key.
+        assert_eq!(outcome(&snap, &with_headers(&[("authorization", "bearer sk-test")]), 0, false), "learn");
+    }
+
+    #[test]
+    fn the_key_header_is_the_one_the_gateway_is_configured_with() {
+        let snap = governed(&format!(r#","key_header":"X-Gateway-Key"{REFUSALS}"#), "");
+        assert_eq!(outcome(&snap, &with_headers(&[("x-gateway-key", KEY)]), 0, false), "native");
+        assert_eq!(outcome(&snap, &with_headers(&[("x-api-key", KEY)]), 0, false), "\"API key required\"");
+    }
+
+    #[test]
+    fn a_request_without_a_credential_is_refused_here() {
+        let snap = governed(REFUSALS, "");
+        assert_eq!(outcome(&snap, &with_headers(&[]), 0, false), "\"API key required\"");
+        assert_eq!(outcome(&snap, &with_headers(&[("x-api-key", "")]), 0, false), "\"API key required\"");
+        // Without the wording (a plugin may authenticate some other way), the Python gateway answers.
+        assert_eq!(outcome(&governed("", ""), &with_headers(&[]), 0, false), "ask");
+        // What the Python gateway does not treat as a gateway request is not refused here either.
+        for (method, uri) in [("GET", "/health"), ("GET", "/admin/api-keys"), ("OPTIONS", "/api/users"), ("GET", "/agents/a"), ("GET", "/api/a%20b")] {
+            let req = Request::builder().method(method).uri(uri).body(()).unwrap();
+            assert_eq!(outcome(&snap, &req, 0, false), "ask", "{method} {uri}");
+        }
+        let browser = Request::builder().uri("/api/users").header("accept", "text/html").body(()).unwrap();
+        assert_eq!(outcome(&snap, &browser, 0, false), "ask");
+        let handshake = Request::builder().uri("/api/users").header("upgrade", "websocket").header("x-api-key", KEY).body(()).unwrap();
+        assert_eq!(outcome(&snap, &handshake, 0, false), "ask");
+        // A path the gateway answers itself without a key (its health check, moved under /api).
+        let moved = governed(&format!(r#","fallthrough_prefixes":["/api/health"]{REFUSALS}"#), "");
+        assert_eq!(outcome(&moved, &Request::builder().uri("/api/health").body(()).unwrap(), 0, false), "ask");
+    }
+
+    #[test]
+    fn an_unknown_credential_is_refused_here_only_after_python_refused_it() {
+        let snap = governed(REFUSALS, "");
+        let unknown = with_headers(&[("x-api-key", "sk-other")]);
+        assert_eq!(outcome(&snap, &unknown, 0, false), "learn");
+        assert_eq!(outcome(&snap, &unknown, 0, true), "\"Invalid or inactive API key.\"");
+        assert_eq!(outcome(&snap, &with_headers(&[("authorization", "Bearer sk-other")]), 0, true), "\"Invalid or inactive API key.\"");
+        // With a second credential the Python gateway may still let the request in.
+        let two = with_headers(&[("x-api-key", "sk-other"), ("authorization", "Bearer token")]);
+        assert_eq!(outcome(&snap, &two, 0, true), "ask");
+        // Beyond ASCII, and without the wording, it is not this side's call.
+        assert_eq!(outcome(&snap, &with_headers(&[("x-api-key", "sk-caf\u{e9}")]), 0, true), "ask");
+        assert_eq!(outcome(&governed("", ""), &unknown, 0, true), "ask");
+    }
+
+    #[test]
+    fn the_same_text_in_another_header_is_another_credential() {
+        let snap = governed(REFUSALS, "");
+        let digest = |req: &Request<()>| match decide(&snap, peer(), req, 0, |_| false) {
+            Decision::Ask(Some(d)) => d,
+            _ => panic!("an unknown credential"),
+        };
+        let own = digest(&with_headers(&[("x-api-key", "token-1")]));
+        assert_ne!(own, digest(&with_headers(&[("authorization", "token-1")])));
+        assert_ne!(digest(&with_headers(&[("authorization", "Bearer token-1")])), digest(&with_headers(&[("authorization", "token-1")])));
+        assert_eq!(own, digest(&with_headers(&[("x-api-key", "token-1")])));
+    }
+
+    #[test]
+    fn an_expired_key_is_refused_here_once_it_is_clearly_past() {
+        let snap = governed(REFUSALS, r#","expires_at":1000"#);
+        let req = with_headers(&[("x-api-key", KEY)]);
+        assert_eq!(outcome(&snap, &req, 999, false), "native");
+        assert_eq!(outcome(&snap, &req, 1000, false), "ask", "at the boundary the clocks may differ");
+        assert_eq!(outcome(&snap, &req, 1002, false), "ask");
+        assert_eq!(outcome(&snap, &req, 1003, false), "\"Invalid or inactive API key.\"");
+        let two = with_headers(&[("x-api-key", KEY), ("authorization", "Bearer token")]);
+        assert_eq!(outcome(&snap, &two, 1003, false), "ask");
+    }
+
+    #[test]
+    fn a_refusal_is_remembered_for_a_while_and_only_under_its_generation() {
+        let (mut denied, digest, t0) = (Denied::default(), hash_key(b"Ksk-other"), Instant::now());
+        assert!(!denied.holds(&digest, 7, t0));
+        denied.learn(digest, 7, t0);
+        assert!(denied.holds(&digest, 7, t0 + Duration::from_secs(9)));
+        assert!(!denied.holds(&digest, 7, t0 + DENIED_FOR));
+        assert!(!denied.holds(&digest, 8, t0), "the snapshot changed, or the link broke: ask again");
+        assert!(!denied.holds(&hash_key(b"Ask-other"), 7, t0));
+        for i in 0..DENIED_MAX as u32 {
+            denied.learn(hash_key(&i.to_le_bytes()), 7, t0);
+        }
+        assert!(denied.0.len() <= DENIED_MAX && !denied.holds(&digest, 7, t0), "full: everything is forgotten");
+    }
+
+    #[test]
+    fn the_401_is_the_python_envelope() {
+        let snap = governed(REFUSALS, "");
+        let req = with_headers(&[]);
+        let Decision::Refuse(u) = decide(&snap, peer(), &req, 0, |_| false) else { panic!("refused") };
+        let t = Trace { request_id: "r1".into(), traceparent: String::new() };
+        let resp = envelope(StatusCode::UNAUTHORIZED, "AUTHENTICATION_ERROR", &u.wording.message_json, &u.wording.details_json, &t, true);
+        assert_eq!(resp.status(), 401);
+        let v = body_of(resp);
+        assert_eq!((v["error"].as_str(), v["message"].as_str(), &v["details"]), (Some("AUTHENTICATION_ERROR"), Some("API key required"), &serde_json::json!({"hint":"h1"})));
+        assert_eq!(u.version, Some("1"));
+    }
+
+    #[test]
+    fn bearer_is_taken_out_wherever_it_stands() {
+        for (value, key) in [("Bearer abc", "abc"), ("abc", "abc"), ("Bearer Bearer abc", "abc"), ("aBearer bc", "abc"), ("Bearer", "Bearer"), ("BearerBearer  x", "Bearer x"), ("bearer abc", "bearer abc")] {
+            assert_eq!(&*without_bearer(value.as_bytes()), key.as_bytes(), "{value}");
+        }
     }
 
     #[test]
