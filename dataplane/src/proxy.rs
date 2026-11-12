@@ -11,11 +11,11 @@
 use bytes::Bytes;
 use http_body_util::{BodyExt, Either, Full};
 use hyper::body::{Body as _, Incoming};
-use hyper::header::{HeaderName, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HOST, ORIGIN, REFERER, UPGRADE, USER_AGENT};
+use hyper::header::{HeaderName, HeaderValue, ACCEPT, AUTHORIZATION, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST, ORIGIN, REFERER, UPGRADE, USER_AGENT};
 use hyper::http::uri::{Authority, Scheme};
 use hyper::{HeaderMap, Method, Request, Response, StatusCode, Uri, Version};
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
-use hyper_util::rt::TokioExecutor;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -1104,9 +1104,17 @@ async fn forward(
     *req.uri_mut() = Uri::from_parts(parts).map_err(|_| Unanswered::Broken)?;
     *req.version_mut() = Version::HTTP_11;
     let native_answer = native.is_some();
+    // A request to change protocol (a WebSocket handshake) keeps the headers that ask for it, and
+    // this side's end of the connection is held ready for the tunnel.
+    let asked_for = req.headers().get(UPGRADE).cloned();
+    let client_end = asked_for.as_ref().map(|_| hyper::upgrade::on(&mut req));
     let headers = req.headers_mut();
     for h in HOP_BY_HOP {
         headers.remove(h);
+    }
+    if let Some(protocol) = asked_for {
+        headers.insert(CONNECTION, HeaderValue::from_static("upgrade"));
+        headers.insert(UPGRADE, protocol);
     }
     match native {
         Some(sent) => {
@@ -1148,6 +1156,9 @@ async fn forward(
     };
     match answer {
         Ok(resp) => {
+            if let Some(client_end) = client_end.filter(|_| resp.status() == StatusCode::SWITCHING_PROTOCOLS) {
+                return Ok(tunnel(client_end, resp));
+            }
             let (mut rp, rb) = resp.into_parts();
             for h in HOP_BY_HOP {
                 rp.headers.remove(h);
@@ -1161,6 +1172,29 @@ async fn forward(
         Err(e) if e.is_connect() => Err(Unanswered::Refused),
         Err(_) => Err(Unanswered::Broken),
     }
+}
+
+/// The upstream agreed to change protocol: pass its answer on and, once the client has it, carry
+/// bytes both ways until either side closes. What is spoken inside (WebSocket frames, pings,
+/// compression) is between the two ends.
+fn tunnel(client_end: hyper::upgrade::OnUpgrade, mut resp: Response<Incoming>) -> Response<Body> {
+    let upstream_end = hyper::upgrade::on(&mut resp);
+    tokio::spawn(async move {
+        // The upstream's end is ready already; the client's is once it has been sent the answer.
+        if let (Ok(upstream), Ok(client)) = (upstream_end.await, client_end.await) {
+            let _ = tokio::io::copy_bidirectional(&mut TokioIo::new(client), &mut TokioIo::new(upstream)).await;
+        }
+    });
+    let (mut parts, _) = resp.into_parts();
+    let protocol = parts.headers.remove(UPGRADE);
+    for h in HOP_BY_HOP {
+        parts.headers.remove(h);
+    }
+    parts.headers.insert(CONNECTION, HeaderValue::from_static("upgrade"));
+    if let Some(protocol) = protocol {
+        parts.headers.insert(UPGRADE, protocol);
+    }
+    Response::from_parts(parts, full(Bytes::new()))
 }
 
 #[cfg(test)]

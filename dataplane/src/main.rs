@@ -151,7 +151,8 @@ fn connected(worker: &Arc<proxy::Worker>, stream: tokio::net::TcpStream, peer: S
     let worker = worker.clone();
     tokio::spawn(async move {
         let svc = service_fn(move |req| proxy::handle(worker.clone(), peer, req));
-        let _ = http1::Builder::new().serve_connection(TokioIo::new(stream), svc).await;
+        // With upgrades: a WebSocket handshake that is accepted turns the connection into a tunnel.
+        let _ = http1::Builder::new().serve_connection(TokioIo::new(stream), svc).with_upgrades().await;
     });
 }
 

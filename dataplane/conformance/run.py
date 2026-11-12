@@ -97,6 +97,7 @@ def main() -> int:
                "DATABASE_URL": f"sqlite+aiosqlite:///{tmp}/g.db", "HTTP_BACKEND_URL": f"http://127.0.0.1:{bport}",
                "REDIS_ENABLED": "false", "LOG_LEVEL": "WARNING", "STARTUP_BANNER": "false", "DEBUG": "false",
                "TRUSTED_PROXIES": "127.0.0.1", "DATAPLANE_TOKEN": "conformance-token",
+               "WEBSOCKET_BACKEND_URL": f"http://127.0.0.1:{bport}",
                "MCP_BACKEND_URL": agents, "A2A_BACKEND_URL": agents, "AG_UI_BACKEND_URL": agents, "ACP_BACKEND_URL": agents,
                "CIRCUIT_BREAKER_TIMEOUT": "2", "DEFAULT_TIMEOUT": "2"}  # short, so the breaker and timeout scenarios can wait them out
 
@@ -692,6 +693,47 @@ def main() -> int:
             logs = httpx.get(f"{py}/admin/logs", params={"limit": 1000, "path": "/api/unauth-probe"}, headers=adm, timeout=10).json()["logs"]
             check("native 401s are logged with their error and no key",
                   len(logs) == 20 and all(l.get("error") == "AUTHENTICATION_ERROR" and not l.get("api_key_id") for l in logs), f"{len(logs)} rows")
+
+            # --- WebSocket ---------------------------------------------------------------------------
+            print()
+            from websockets.exceptions import ConnectionClosed, InvalidStatus
+            from websockets.sync.client import connect as ws_connect
+
+            def ws_talk(base, path, key, messages=(), headers=None, **kw):
+                """Open a WebSocket, send each message and collect one answer to each. Returns what
+                happened: the answers and how it closed, or the status that refused the handshake."""
+                url = "ws" + base[4:] + path.replace("{key}", key)
+                h = {k: v.replace("{key}", key) for k, v in (headers or {}).items()}
+                try:
+                    with ws_connect(url, additional_headers=h, open_timeout=5, close_timeout=2, **kw) as ws:
+                        got = []
+                        try:
+                            for m in messages:
+                                ws.send(m)
+                                got.append(ws.recv(timeout=3))
+                        except (ConnectionClosed, TimeoutError) as e:
+                            got.append(type(e).__name__)
+                        return {"answers": got, "subprotocol": ws.subprotocol}
+                except InvalidStatus as e:
+                    return {"refused": e.response.status_code}
+
+            def ws_same(name, path, messages=(), headers=None, want=None, **kw):
+                a = ws_talk(py, path, keys["py"]["key"], messages, headers, **kw)
+                b = ws_talk(rs, path, keys["rs"]["key"], messages, headers, **kw)
+                ok = a == b and (want is None or want(b))
+                check(f"websocket: {name}", ok, str(b) if a == b else f"python {a} vs data plane {b}")
+
+            ws_same("a text message comes back", "/ws/chat", ["hello", "again"], {"X-API-Key": "{key}"},
+                    want=lambda r: r.get("answers") == ["hello", "again"])
+            ws_same("the key may be given in the query", "/ws/chat?api_key={key}", ["hello"],
+                    want=lambda r: r.get("answers") == ["hello"])
+            ws_same("without a key the handshake is refused", "/ws/chat", want=lambda r: "refused" in r)
+            ws_same("with a wrong key the handshake is refused", "/ws/chat", headers={"X-API-Key": "sk-nope"}, want=lambda r: "refused" in r)
+            ws_same("a path that is no WebSocket endpoint is refused", "/api/users", headers={"X-API-Key": "{key}"}, want=lambda r: "refused" in r)
+            big = "x" * 200_000
+            ws_same("a large message comes back whole", "/ws/chat", [big], {"X-API-Key": "{key}"}, want=lambda r: r.get("answers") == [big])
+            r = httpx.get(f"{rs}/api/users", headers={"X-API-Key": keys["rs"]["key"]}, timeout=10)
+            check("ordinary requests are unaffected afterwards", r.status_code == 200 and said_by(r) == "data plane")
 
             # --- the gateway's own endpoints ---------------------------------------------------------
             print()
