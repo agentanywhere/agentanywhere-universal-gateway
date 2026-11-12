@@ -746,6 +746,7 @@ def main() -> int:
                 h = {k: v.replace("{key}", key) for k, v in (headers or {}).items()}
                 try:
                     with ws_connect(url, additional_headers=h, open_timeout=5, close_timeout=2, max_size=None, **kw) as ws:
+                        relayed_by.append("data plane" if ws.response.headers.get("x-served-by") == "dataplane" else "python")
                         got, closed = [], None
                         try:
                             for m in messages:
@@ -759,32 +760,41 @@ def main() -> int:
                 except InvalidStatus as e:
                     return {"refused": e.response.status_code}
 
-            def ws_same(name, path, messages=(), headers=None, want=None, **kw):
-                a = ws_talk(py, path, keys["py"]["key"], messages, headers, **kw)
-                b = ws_talk(rs, path, keys["rs"]["key"], messages, headers, **kw)
-                ok = a == b and (want is None or want(b))
+            relayed_by = []
+
+            def ws_same(name, path, messages=(), headers=None, want=None, by=None, pair=None, **kw):
+                """The same conversation through both. `by` names who must have relayed the one
+                through the data plane: the data plane itself, or the Python gateway behind it."""
+                pair = pair or keys
+                a = ws_talk(py, path, pair["py"]["key"], messages, headers, **kw)
+                del relayed_by[:]
+                b = ws_talk(rs, path, pair["rs"]["key"], messages, headers, **kw)
+                ok = a == b and (want is None or want(b)) and (by is None or relayed_by == [by])
                 shown = str(b) if a == b else f"python {a} vs data plane {b}"
-                check(f"websocket: {name}", ok, shown[:160])
+                check(f"websocket: {name}", ok, (f"relayed by {relayed_by[0]}  " if relayed_by else "") + shown[:140])
 
             with_key = {"X-API-Key": "{key}"}
-            ws_same("text comes back as text, JSON included", "/ws/chat", ["hello", '{"a": 1}', "again"], with_key,
+            ws_same("text comes back as text, JSON included", "/ws/chat", ["hello", '{"a": 1}', "again"], with_key, by="data plane",
                     want=lambda r: r.get("answers") == ["hello", '{"a": 1}', "again"])
-            ws_same("bytes come back as bytes", "/ws/chat", [b"\x00\x01\xff"], with_key, want=lambda r: r.get("answers") == [b"\x00\x01\xff"])
-            ws_same("the key may be given in the query", "/ws/chat?api_key={key}", ["hello"], want=lambda r: r.get("answers") == ["hello"])
-            ws_same("the backend sees the path and the query, without the gateway's key", "/ws/rooms/7?room=blue&api_key={key}", ["where"],
+            ws_same("bytes come back as bytes", "/ws/chat", [b"\x00\x01\xff"], with_key, by="data plane", want=lambda r: r.get("answers") == [b"\x00\x01\xff"])
+            ws_same("the key may be given in the query", "/ws/chat?api_key={key}", ["hello"], by="python", want=lambda r: r.get("answers") == ["hello"])
+            ws_same("the backend sees the path and the query", "/ws/rooms/7?room=blue&n=1", ["where"], with_key, by="data plane",
+                    want=lambda r: r.get("answers") == ["/base/rooms/7?room=blue&n=1"])
+            ws_same("the backend sees the path and the query, without the gateway's key", "/ws/rooms/7?room=blue&api_key={key}", ["where"], by="python",
                     want=lambda r: r.get("answers") == ["/base/rooms/7?room=blue"])
             ws_same("the backend sees Authorization and Cookie, never the gateway's key", "/ws/chat", ["who"],
-                    {**with_key, "Authorization": "Bearer t", "Cookie": "s=1"}, want=lambda r: r.get("answers") == ['["Bearer t", "s=1", null]'])
-            ws_same("the subprotocol is the one the backend chose", "/ws/chat", ["hello"], with_key, subprotocols=["chat.v1", "chat.v2"],
+                    {**with_key, "Authorization": "Bearer t", "Cookie": "s=1"}, by="data plane", want=lambda r: r.get("answers") == ['["Bearer t", "s=1", null]'])
+            ws_same("the subprotocol is the one the backend chose", "/ws/chat", ["hello"], with_key, subprotocols=["chat.v1", "chat.v2"], by="data plane",
                     want=lambda r: r.get("subprotocol") == "chat.v2")
-            ws_same("the backend's close code and reason reach the client", "/ws/chat", ["hello", "close:4001"], with_key,
+            ws_same("the backend's close code and reason reach the client", "/ws/chat", ["hello", "close:4001"], with_key, by="data plane",
                     want=lambda r: r.get("closed") == [4001, "bye"])
             ws_same("without a key the handshake is refused", "/ws/chat", want=lambda r: "refused" in r)
             ws_same("with a wrong key the handshake is refused", "/ws/chat", headers={"X-API-Key": "sk-nope"}, want=lambda r: "refused" in r)
             ws_same("a handshake the backend refuses is refused", "/ws/refuse", headers=with_key, want=lambda r: "refused" in r)
             ws_same("a path that is no WebSocket endpoint is refused", "/api/users", headers=with_key, want=lambda r: "refused" in r)
+            ws_same("a key not allowed this path is refused", "/ws/chat", headers=with_key, pair=scoped, want=lambda r: "refused" in r)
             big = "x" * 2_000_000
-            ws_same("a large message comes back whole", "/ws/chat", [big], with_key, want=lambda r: r.get("answers") == [big])
+            ws_same("a large message comes back whole", "/ws/chat", [big], with_key, by="data plane", want=lambda r: r.get("answers") == [big])
             r = httpx.get(f"{rs}/api/users", headers={"X-API-Key": keys["rs"]["key"]}, timeout=10)
             check("ordinary requests are unaffected afterwards", r.status_code == 200 and said_by(r) == "data plane")
 

@@ -130,7 +130,10 @@ Realistic note: raw proxy speed against Rust and C proxies such as Envoy, NGINX 
 
 **Where the code stands.** Phase 1 is implemented in `dataplane/` except a metrics endpoint of the data plane's own
 (`/metrics` still comes from the Python gateway, which is told what was served here). The health path, `/ready` and
-`/live` are answered here: alive for this process alone, healthy and ready only on the Python gateway's latest word. From phase 2, governance policies and the checks at the MCP,
+`/live` are answered here: alive for this process alone, healthy and ready only on the Python gateway's latest word.
+From phase 3, WebSocket: every handshake is carried, to the backend directly for `/ws/...` with a key that is certain
+to be let in, and otherwise through a tunnel to the Python gateway. gRPC pass-through needs HTTP/2 on both sides of
+the data plane and is not started. From phase 2, governance policies and the checks at the MCP,
 A2A, AG-UI and ACP boundaries are native, with one rule that differs from the plan above: the data plane only decides
 that a body passes, and a body that does not is answered by the Python gateway, so refusals cannot drift. Those four
 protocols are forwarded natively, each to its own backend with its own breaker. Keys sent as `Authorization: Bearer`

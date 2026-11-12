@@ -136,6 +136,8 @@ impl Backends {
         for (route, url) in snap.routes.iter_mut().zip(&snap.protocol_urls) {
             *route = url.as_deref().and_then(|u| self.at(u));
         }
+        // A WebSocket is opened with an HTTP request to the same address.
+        snap.websocket = snap.websocket_url.as_deref().and_then(|u| self.at(&u.replacen("ws://", "http://", 1)));
     }
 }
 
@@ -537,6 +539,88 @@ fn decide<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, now: u6
     Decision::Native(Native { protocol, backend, entry, version, ip, method })
 }
 
+/// A WebSocket handshake this side relays itself.
+struct Relay<'a> {
+    backend: &'a Backend,
+    entry: &'a KeyEntry,
+    /// What the backend is asked for: the path after `/ws`, and the query.
+    target: String,
+}
+
+/// Whether a request is a WebSocket handshake for `/ws/...` that is certain to be let in: the
+/// key is in its header, known, working and allowed this path. Anything else, a key in the query
+/// included, is the Python gateway's to judge; it relays or refuses in its own way.
+fn relay<'a, B>(snap: &'a Snapshot, req: &Request<B>, now: u64) -> Option<Relay<'a>> {
+    let backend = snap.websocket.as_deref()?;
+    let (uri, headers) = (req.uri(), req.headers());
+    let path = uri.path();
+    let rest = path.strip_prefix("/ws/")?;
+    if req.method() != Method::GET || uri.authority().is_some() || !path.is_ascii() || path.contains('%') {
+        return None;
+    }
+    let one = |name: &str| {
+        let mut all = headers.get_all(name).iter();
+        all.next().filter(|_| all.next().is_none())
+    };
+    let handshake = one("upgrade").is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"))
+        && one("sec-websocket-version").is_some_and(|v| v == "13")
+        && one("sec-websocket-key").is_some();
+    let query = uri.query().unwrap_or("");
+    if !handshake || query.contains("api_key") {
+        return None;
+    }
+    let key = one("x-api-key").map(|v| v.as_bytes()).filter(|k| !k.is_empty() && k.is_ascii())?;
+    let entry = snap.keys.get(&hash_key(key))?;
+    let expired = entry.expires_at.is_some_and(|e| e <= now as i64);
+    if !entry.is_active || !entry.native_ok || expired || entry.scope.as_ref().is_some_and(|s| !s.allows(path)) {
+        return None;
+    }
+    let prefix = &backend.upstream.prefix;
+    let target = if query.is_empty() { format!("{prefix}/{rest}") } else { format!("{prefix}/{rest}?{query}") };
+    Some(Relay { backend, entry, target })
+}
+
+/// What of the caller's handshake the backend is sent, as the Python gateway's relay sends it:
+/// the handshake itself, the subprotocols offered, and the caller's own credentials for the
+/// backend. Never the gateway's key.
+const RELAYED: [&str; 6] =
+    ["sec-websocket-key", "sec-websocket-version", "sec-websocket-protocol", "sec-websocket-extensions", "authorization", "cookie"];
+
+/// How long the backend may take to accept a WebSocket handshake.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Open the connection to the backend and, if it accepts, join the two. If it cannot be reached
+/// or refuses, the caller's handshake is refused, as the Python gateway refuses it.
+async fn relay_websocket(w: &Worker, r: &Relay<'_>, mut req: Request<Incoming>) -> Response<Body> {
+    let refused = || {
+        let mut resp = Response::new(full(Bytes::new()));
+        *resp.status_mut() = StatusCode::FORBIDDEN;
+        resp
+    };
+    let to = &r.backend.upstream;
+    let Ok(uri) = Uri::builder().scheme(to.scheme.clone()).authority(to.authority.clone()).path_and_query(r.target.as_str()).build() else {
+        return refused();
+    };
+    let client_end = hyper::upgrade::on(&mut req);
+    let mut out = Request::new(full(Bytes::new()));
+    *out.uri_mut() = uri;
+    for name in RELAYED {
+        for value in req.headers().get_all(name) {
+            out.headers_mut().append(HeaderName::from_static(name), value.clone());
+        }
+    }
+    out.headers_mut().insert(CONNECTION, HeaderValue::from_static("upgrade"));
+    out.headers_mut().insert(UPGRADE, HeaderValue::from_static("websocket"));
+    match tokio::time::timeout(HANDSHAKE_TIMEOUT, w.client.request(out)).await {
+        Ok(Ok(resp)) if resp.status() == StatusCode::SWITCHING_PROTOCOLS => {
+            let mut resp = tunnel(client_end, resp);
+            resp.headers_mut().insert("x-served-by", HeaderValue::from_static("dataplane"));
+            resp
+        }
+        _ => refused(),
+    }
+}
+
 /// One of the gateway's own endpoints, answered here.
 #[derive(Debug, PartialEq)]
 enum Own<'a> {
@@ -862,6 +946,14 @@ pub async fn handle(w: Arc<Worker>, peer: SocketAddr, req: Request<Incoming>) ->
     }
     // Fail closed: if the snapshot is not known to be current, the Python gateway decides.
     let trusted = st.sync.as_ref().map(|s| s.fresh()).unwrap_or(true);
+    if trusted && req.headers().contains_key(UPGRADE) {
+        if let Some(r) = relay(&snap, &req, now) {
+            if r.entry.last_used.load(Ordering::Relaxed) != now {
+                r.entry.last_used.store(now, Ordering::Relaxed);
+            }
+            return Ok(relay_websocket(&w, &r, req).await);
+        }
+    }
     let decision = match trusted {
         true => decide(&snap, peer, &req, now, |digest| st.denied.lock().unwrap().holds(digest, generation, started)),
         false => Decision::Ask(None),
@@ -1687,6 +1779,72 @@ mod tests {
             assert_eq!(probe(snap, Method::GET, "/health", &[], true, None), None);
             assert_eq!(probe(snap, Method::GET, "/live", &[], true, None).as_deref(), Some("live"));
         }
+    }
+
+    fn handshake(uri: &str, headers: &[(&str, &str)]) -> Request<()> {
+        let mut b = Request::builder().uri(uri);
+        for (name, value) in [("upgrade", "websocket"), ("connection", "Upgrade"), ("sec-websocket-version", "13"), ("sec-websocket-key", "a2V5")] {
+            if !headers.iter().any(|(n, _)| n.eq_ignore_ascii_case(name)) {
+                b = b.header(name, value);
+            }
+        }
+        for (name, value) in headers.iter().filter(|(_, v)| !v.is_empty()) {
+            b = b.header(*name, *value);
+        }
+        b.body(()).unwrap()
+    }
+
+    const WS: &str = r#","websocket":"ws://127.0.0.1:7000/base/""#;
+
+    #[test]
+    fn a_websocket_handshake_with_a_working_key_is_relayed_here() {
+        let snap = governed(WS, "");
+        let target = |uri: &str, headers: &[(&str, &str)]| relay(&snap, &handshake(uri, headers), 100).map(|r| r.target);
+        let key = [("x-api-key", KEY)];
+        assert_eq!(target("/ws/chat", &key).as_deref(), Some("/base/chat"));
+        assert_eq!(target("/ws/rooms/7?room=blue&x=1", &key).as_deref(), Some("/base/rooms/7?room=blue&x=1"));
+        assert_eq!(target("/ws/", &key).as_deref(), Some("/base/"));
+        assert_eq!(target("/ws/chat", &[("x-api-key", KEY), ("upgrade", "WebSocket"), ("authorization", "Bearer t")]).as_deref(), Some("/base/chat"));
+        // Whatever is not certain to be let in is the Python gateway's to judge.
+        for (why, uri, headers) in [
+            ("no key", "/ws/chat", vec![]),
+            ("unknown key", "/ws/chat", vec![("x-api-key", "sk-nope")]),
+            ("key in the query", "/ws/chat?api_key=sk-test", vec![]),
+            ("key in both", "/ws/chat?api_key=sk-test", key.to_vec()),
+            ("key as a Bearer token", "/ws/chat", vec![("authorization", "Bearer sk-test")]),
+            ("not under /ws/", "/ws", key.to_vec()),
+            ("not under /ws/", "/wsx/chat", key.to_vec()),
+            ("an agent's socket", "/agents/a/ws/chat", key.to_vec()),
+            ("an escaped path", "/ws/a%2Fb", key.to_vec()),
+            ("not a WebSocket", "/ws/chat", vec![("x-api-key", KEY), ("upgrade", "h2c")]),
+            ("another version", "/ws/chat", vec![("x-api-key", KEY), ("sec-websocket-version", "8")]),
+            ("no handshake key", "/ws/chat", vec![("x-api-key", KEY), ("sec-websocket-key", "")]),
+        ] {
+            assert!(target(uri, &headers).is_none(), "{why}");
+        }
+        let twice = Request::builder().uri("/ws/chat").header("upgrade", "websocket").header("sec-websocket-version", "13")
+            .header("sec-websocket-key", "a2V5").header("x-api-key", KEY).header("x-api-key", "sk-other").body(()).unwrap();
+        assert!(relay(&snap, &twice, 100).is_none());
+        let post = Request::builder().method("POST").uri("/ws/chat").header("upgrade", "websocket").header("sec-websocket-version", "13")
+            .header("sec-websocket-key", "a2V5").header("x-api-key", KEY).body(()).unwrap();
+        assert!(relay(&snap, &post, 100).is_none());
+    }
+
+    #[test]
+    fn a_websocket_is_relayed_here_only_with_a_backend_and_a_key_that_may() {
+        let req = handshake("/ws/chat", &[("x-api-key", KEY)]);
+        // No WebSocket backend this side can reach.
+        assert!(relay(&governed("", ""), &req, 100).is_none());
+        assert!(relay(&governed(r#","websocket":"wss://secure.example/base""#, ""), &req, 100).is_none());
+        assert!(relay(&governed(r#","websocket":"http://127.0.0.1:7000""#, ""), &req, 100).is_none());
+        // A key that is off, not reproducible here, expired, or not allowed this path.
+        for key_extra in [r#","is_active":false"#, r#","native_ok":false"#, r#","expires_at":100"#, r#","expires_at":99"#] {
+            assert!(relay(&governed(WS, key_extra), &req, 100).is_none(), "{key_extra}");
+        }
+        assert!(relay(&governed(WS, r#","expires_at":101"#), &req, 100).is_some());
+        let scoped = governed(WS, r#","allowed_paths":{"rules":[["under","/ws/chat"]],"patterns_json":"[\"/ws/chat\"]"}"#);
+        assert!(relay(&scoped, &req, 100).is_some());
+        assert!(relay(&scoped, &handshake("/ws/other", &[("x-api-key", KEY)]), 100).is_none());
     }
 
     #[test]

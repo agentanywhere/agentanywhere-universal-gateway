@@ -103,6 +103,20 @@ def _backends(settings) -> Dict[str, Optional[str]]:
     }
 
 
+def _websocket(settings, governed: bool) -> Optional[str]:
+    """The WebSocket server ``/ws/...`` connections are relayed to, when the data plane may relay
+    them itself: a plain ``ws://`` address, the key read from the stock header, and no IP rule or
+    policy to evaluate (this gateway evaluates those for a handshake in a way of its own)."""
+    from app import main as gw
+
+    url = getattr(gw.websocket_handler, "backend_url", None)
+    if not isinstance(url, str) or not url.startswith("ws://") or not url.isascii() or "?" in url or "#" in url:
+        return None
+    if governed or settings.api_key_header != "X-API-Key":
+        return None
+    return url
+
+
 def _boundary(settings) -> Dict[str, Any]:
     """The settings of the body checks, in the form the data plane applies them. Names are lower-cased
     here because that is how the checks compare them."""
@@ -465,6 +479,7 @@ async def build_snapshot(db: AsyncSession) -> Dict[str, Any]:
         "key_header": settings.api_key_header,
         "refusals": _refusals(auth_plugins),
         "ops": _ops(settings),
+        "websocket": _websocket(settings, bool(rules) or bool(policy_rows)),
     }
     snap["revision"] = hashlib.sha256(json.dumps(snap, sort_keys=True).encode()).hexdigest()
     return snap

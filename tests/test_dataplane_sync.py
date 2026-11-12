@@ -783,3 +783,26 @@ async def test_every_answer_carries_this_gateways_own_answer_to_ready(db_session
 
     monkeypatch.setattr(dataplane_sync, "readiness_note", broken)
     assert (await dataplane_sync.snapshot(since=None, x_dataplane_token="s3cret", db=db_session))["ready"] is None
+
+
+async def test_the_snapshot_names_the_websocket_backend_only_when_the_data_plane_may_relay(db_session, monkeypatch):
+    from types import SimpleNamespace
+
+    from app import main as gw
+
+    async def named():
+        return (await dataplane_sync.build_snapshot(db_session))["websocket"]
+
+    monkeypatch.setattr(gw, "websocket_handler", None)
+    assert await named() is None
+    for url in ("http://b:7000", "wss://b:7000", "ws://b:7000/x?token=1", "ws://b\u00e9:7000"):
+        monkeypatch.setattr(gw, "websocket_handler", SimpleNamespace(backend_url=url))
+        assert await named() is None, url
+    monkeypatch.setattr(gw, "websocket_handler", SimpleNamespace(backend_url="ws://b:7000/base"))
+    assert await named() == "ws://b:7000/base"
+    # A key read from another header, or any rule or policy to evaluate: this gateway relays.
+    monkeypatch.setattr(get_settings(), "api_key_header", "X-Gateway-Key")
+    assert await named() is None
+    monkeypatch.setattr(get_settings(), "api_key_header", "X-API-Key")
+    assert dataplane_sync._websocket(get_settings(), governed=True) is None
+    assert dataplane_sync._websocket(get_settings(), governed=False) == "ws://b:7000/base"

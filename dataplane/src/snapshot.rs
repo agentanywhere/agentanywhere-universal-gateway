@@ -99,6 +99,11 @@ pub struct Snapshot {
     pub refusals: Option<Refusals>,
     /// What the gateway's health path answers with. `None` when the control plane did not say.
     pub ops: Option<Ops>,
+    /// The WebSocket server `/ws/...` connections go to (a `ws://` address), when this side may
+    /// relay them itself.
+    pub websocket_url: Option<String>,
+    /// The backend at that address, filled in when the snapshot is put to use.
+    pub websocket: Option<Arc<Backend>>,
 }
 
 /// The gateway's health endpoint, as the Python gateway serves it.
@@ -148,6 +153,7 @@ struct SnapshotFile {
     key_header: Option<String>,
     refusals: Option<Refusals>,
     ops: Option<Ops>,
+    websocket: Option<String>,
     ready: Option<Readiness>,
     #[serde(default)]
     keys: Vec<KeyRecord>,
@@ -438,6 +444,8 @@ impl Snapshot {
             key_header,
             refusals: file.refusals,
             ops: file.ops,
+            websocket_url: file.websocket.filter(|u| u.starts_with("ws://")),
+            websocket: None,
             inject_request_id: file.inject_request_id,
             revision: file.revision,
             api_versions,

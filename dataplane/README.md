@@ -121,7 +121,7 @@ gateway checks the body, the body has a `Content-Length`, fits in memory (4 MiB,
 certain to pass. On those same paths, a request with no credential, or with one the Python gateway has just refused,
 is answered here with the gateway's 401. Anything else, including OAuth2 tokens, credentials seen for the first time,
 a request from a web page in another origin (one with an `Origin` header), `/metrics`, `/admin`, `/oauth2`, GraphQL,
-MQTT, gRPC, WebSocket and `/agents/...`, goes to the Python gateway untouched, so its answer is the answer.
+MQTT, gRPC and `/agents/...`, goes to the Python gateway untouched, so its answer is the answer.
 
 The gateway's own health endpoints are answered here on a plain `GET`, each for what this side can vouch for:
 
@@ -134,6 +134,14 @@ The gateway's own health endpoints are answered here on a plain `GET`, each for 
 
 With the Python gateway down, the health path and `/ready` therefore answer 502 and `/live` still answers 200.
 
+**WebSocket.** A handshake for `/ws/...` is relayed here when `WEBSOCKET_BACKEND_URL` is a `ws://` address and the
+key is certain to be let in: sent in `X-API-Key`, known, working and allowed that path, with no IP rule or policy
+configured. The backend is asked for the rest of the path and the query, and sent only the handshake, the subprotocols
+offered and the caller's `Authorization` and `Cookie`; never the gateway's key. Once it accepts, the connection is a
+tunnel: bytes go both ways until either side closes. If it refuses or cannot be reached, the caller gets 403. Every
+other handshake (a key in `?api_key=`, an unknown key, `/agents/<slug>/...`, any IP rule or policy in force) is tunnelled
+to the Python gateway, which relays or refuses as it always does.
+
 | Traffic | Served by |
 |---|---|
 | Plain HTTP under `/api/` | data plane |
@@ -145,13 +153,23 @@ With the Python gateway down, the health path and `/ready` therefore answer 502 
 | No credential; a credential Python refused in the last ten seconds; a key clearly past its expiry | data plane (401) |
 | A credential seen for the first time; OAuth2 tokens; two credentials of which the key does not work | Python |
 | Browsers (HTML error pages) | Python |
-| GraphQL, MQTT, gRPC, WebSocket, `/agents/<slug>` | Python |
+| WebSocket under `/ws/`, key in `X-API-Key`, no IP rules or policies | data plane |
+| Any other WebSocket (`?api_key=`, `/agents/<slug>`, rules or policies in force) | Python, through a tunnel |
+| GraphQL, MQTT, gRPC, `/agents/<slug>` | Python |
 | Dynamic routes, transformation rules, request-altering plugins (when any exist) | Python, for every path |
 | The health path, `/ready` and `/live`, on a plain `GET` | data plane |
 | A request with an `Origin` header (the cross-origin headers are Python's) | Python |
 | `/health/detailed`, `/metrics`, `/oauth2`, `/admin` and the console | Python |
 
 ## Known gaps (why this is not production-ready)
+
+* **A WebSocket relayed here is a tunnel, not two conversations.** The Python gateway ends the caller's WebSocket and
+  opens its own to the backend, so it answers pings itself, sends the backend a keep-alive ping every 20 seconds, and
+  takes no message above 16 MiB from the caller. Here pings, compression and message size are between the caller
+  and the backend. Messages, subprotocol and close codes are the same either way.
+* **A WebSocket is checked when it opens, not while it is open.** A key revoked afterwards keeps its open connections,
+  here and in the Python gateway alike. Connections are not counted, limited or written to the request log by either.
+* **`wss://` backends and WebSockets with IP rules or policies are relayed by the Python gateway**, not here.
 
 * **`/ready` can be one sync interval behind** (500 ms by default), or as long as a sync that hangs takes to fail
   (five seconds), because it repeats the Python gateway's last answer instead of asking the database itself.
