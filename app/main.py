@@ -1593,26 +1593,30 @@ async def detailed_health_check(request: Request):
     )
 
 
-@app.get("/ready")
-async def readiness_check():
-    """Readiness probe — green only if critical dependencies are up.
+async def readiness() -> tuple:
+    """What ``/ready`` answers, as ``(status code, body)``.
 
     The database is the only hard requirement; cache / backends /
     exporters being down only flag a degraded state but the gateway
-    can still serve.
+    can still serve. The data plane is given the same answer with every
+    snapshot, so that it can serve ``/ready`` itself.
     """
     from app.observability import dependency_probes
 
     db_result = await dependency_probes.check("database")
     if db_result is None or db_result.status == "unhealthy":
-        return JSONResponse(
-            content={
-                "status": "not_ready",
-                "reason": db_result.message if db_result else "no probe registered",
-            },
-            status_code=503,
-        )
-    return {"status": "ready", "database": db_result.to_dict()}
+        return 503, {
+            "status": "not_ready",
+            "reason": db_result.message if db_result else "no probe registered",
+        }
+    return 200, {"status": "ready", "database": db_result.to_dict()}
+
+
+@app.get("/ready")
+async def readiness_check():
+    """Readiness probe: green only if critical dependencies are up."""
+    status_code, body = await readiness()
+    return JSONResponse(content=body, status_code=status_code)
 
 
 @app.get("/live")

@@ -163,7 +163,7 @@ def main() -> int:
                  {"name": "Ada", "email": "ada@example.com"}, "py", "rs"),
                 ("request id echoed", "GET", "/api/users", {"X-API-Key": "{key}", "X-Request-ID": "conf-123"}, None, "py", "rs"),
                 ("traceparent kept", "GET", "/api/users", {"X-API-Key": "{key}", "traceparent": tp_in}, None, "py", "rs"),
-                ("health (control plane)", "GET", "/health", {}, None, "py", "rs"),
+                ("health", "GET", "/health", {}, None, "py", "rs"),
                 ("admin passes through", "GET", "/admin/api-keys", {"Authorization": f"Bearer {admin}"}, None, "py", "rs"),
                 ("browser without key", "GET", "/api/users", {"Accept": "text/html"}, None, "py", "rs"),
             ]
@@ -173,7 +173,7 @@ def main() -> int:
                 h = {k: (v.replace("{key}", key) if isinstance(v, str) else v) for k, v in headers.items()}
                 return httpx.request(method, base + path, headers=h, json=body, timeout=15, follow_redirects=False)
 
-            VOLATILE = {"id", "created_at", "timestamp", "request_id", "updated_at"}
+            VOLATILE = {"id", "created_at", "timestamp", "request_id", "updated_at", "pid", "latency_ms", "last_checked", "checked_at"}
 
             def mask(x):
                 if isinstance(x, dict):
@@ -636,8 +636,8 @@ def main() -> int:
                          httpx.get(f"{rs}/api/users", headers={"X-API-Key": ""}, timeout=10), "data plane")
             a, b = httpx.post(f"{py}/mcp", json=rpc("tools/list"), timeout=10), httpx.post(f"{rs}/mcp", json=rpc("tools/list"), timeout=10)
             same_refusal("no key on an MCP call", a, b, "data plane")
-            a, b = httpx.get(f"{py}/health", timeout=10), httpx.get(f"{rs}/health", timeout=10)
-            check("a path that needs no key is still Python's", a.status_code == b.status_code == 200 and said_by(b) == "python")
+            a, b = httpx.get(f"{py}/health/detailed", timeout=10), httpx.get(f"{rs}/health/detailed", timeout=10)
+            check("a path that needs no key is not refused", a.status_code == b.status_code == 200 and said_by(b) == "python")
 
             for name, value in (("Authorization: Bearer <key>", "Bearer {key}"), ("Authorization: <key>", "{key}")):
                 a = httpx.get(f"{py}/api/users", headers={"Authorization": value.format(key=keys["py"]["key"])}, timeout=10)
@@ -693,11 +693,73 @@ def main() -> int:
             check("native 401s are logged with their error and no key",
                   len(logs) == 20 and all(l.get("error") == "AUTHENTICATION_ERROR" and not l.get("api_key_id") for l in logs), f"{len(logs)} rows")
 
+            # --- the gateway's own endpoints ---------------------------------------------------------
+            print()
+            import re
+
+            def own(path, method="GET", headers=None):
+                return (httpx.request(method, py + path, headers=headers, timeout=10),
+                        httpx.request(method, rs + path, headers=headers, timeout=10))
+
+            for name, path in (("health", "/health"), ("ready", "/ready"), ("live", "/live")):
+                a, b = own(path)
+                compare(name, a, b)
+                check(f"{name}: answered by the data plane", said_by(b) == "data plane", f"[{b.status_code}]")
+                check(f"{name}: the same fields in the same order", list(a.json()) == list(b.json()), str(list(b.json())))
+            a, b = own("/health")
+            stamp = r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d{6})?"
+            check("health: the timestamp has Python's shape",
+                  bool(re.fullmatch(stamp, a.json()["timestamp"]) and re.fullmatch(stamp, b.json()["timestamp"])), b.json()["timestamp"])
+            check("health: the version is the gateway's", a.json()["version"] == b.json()["version"], b.json()["version"])
+            a, b = own("/ready")
+            check("ready: the database probe is the Python gateway's own, in full",
+                  list(a.json()["database"]) == list(b.json()["database"]) and mask(a.json()) == mask(b.json()), str(b.json()))
+            a, b = own("/live")
+            check("live: each process answers for itself", b.json()["pid"] == procs[2].pid and a.json()["pid"] == procs[1].pid,
+                  f"python {a.json()['pid']}, data plane {b.json()['pid']}")
+            a, b = own("/health", headers={"X-Request-ID": "probe-7", "traceparent": tp_in})
+            check("health: the request id and the trace are kept",
+                  b.headers.get("x-request-id") == "probe-7" and b.headers["traceparent"].split("-")[1] == tp_in.split("-")[1]
+                  and a.headers["traceparent"].split("-")[1] == tp_in.split("-")[1])
+            for name, method, path in (("HEAD on health", "HEAD", "/health"), ("POST to live", "POST", "/live"),
+                                       ("health with a trailing slash", "GET", "/health/"), ("detailed health", "GET", "/health/detailed")):
+                a, b = own(path, method)
+                compare(name, a, b)
+                check(f"{name}: left to Python", said_by(b) == "python", f"[{b.status_code}]")
+
+            # A page in another origin: the gateway's cross-origin headers, which only Python writes.
+            web = {"Origin": "http://localhost:3001"}
+            for name, path, extra in (("health from a web page", "/health", {}), ("an API call from a web page", "/api/users", {"X-API-Key": "{key}"})):
+                a = call(py, "GET", path, {**web, **extra}, None, keys["py"]["key"])
+                b = call(rs, "GET", path, {**web, **extra}, None, keys["rs"]["key"])
+                compare(name, a, b)
+                cors = lambda r: {h: v for h, v in r.headers.items() if h.startswith("access-control-") or h == "vary"}
+                check(f"{name}: the same cross-origin headers", cors(a) == cors(b) and "access-control-allow-origin" in cors(b), str(cors(b)))
+
+            # What this side answered is counted and logged as Python records its own.
+            time.sleep(1.5)
+            labels = dict(method="GET", path="/live", status_code="200", protocol="http")
+            before = metric("gateway_requests_total", **labels)
+            for i in range(20):
+                r = httpx.get(f"{rs}/live", timeout=10)
+            check("these were answered by the data plane", r.status_code == 200 and said_by(r) == "data plane")
+            time.sleep(2.0)
+            delta = metric("gateway_requests_total", **labels) - before
+            check("native probes are counted in gateway_requests_total", delta == 20, f"{delta:.0f} of 20")
+            logs = httpx.get(f"{py}/admin/logs", params={"limit": 1000, "path": "/live"}, headers=adm, timeout=10).json()["logs"]
+            check("native probes are logged without a key or an error",
+                  len(logs) >= 1 and all(not l.get("error") and not l.get("api_key_id") for l in logs), f"{len(logs)} rows")
+
             # Last: the control plane goes away. The data plane must stop serving natively.
             procs[1].send_signal(signal.SIGTERM)
             procs[1].wait(timeout=15)
             t = wait_until(lambda: httpx.get(f"{rs}/api/users", headers={"X-API-Key": keys["rs"]["key"]}, timeout=10).status_code != 200, 6)
             check("with the control plane down, native serving stops (fails closed)", t is not None)
+            h, r, l = (httpx.get(f"{rs}{path}", timeout=10) for path in ("/health", "/ready", "/live"))
+            check("with the control plane down, health and ready stop saying yes",
+                  h.status_code >= 500 and r.status_code >= 500, f"[{h.status_code}, {r.status_code}]")
+            check("with the control plane down, the data plane still says it is alive",
+                  l.status_code == 200 and said_by(l) == "data plane" and l.json() == {"status": "alive", "pid": procs[2].pid}, f"[{l.status_code}]")
 
             known = sorted(h for h in gaps if h not in PROMISED)
             print(f"\nheader names present on only one side (known gaps, not failures): {known or 'none'}")

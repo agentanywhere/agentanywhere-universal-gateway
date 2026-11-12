@@ -120,8 +120,19 @@ with no backend of its own; the key is in the snapshot, active, unexpired and `n
 gateway checks the body, the body has a `Content-Length`, fits in memory (4 MiB, or the MCP limit if lower) and is
 certain to pass. On those same paths, a request with no credential, or with one the Python gateway has just refused,
 is answered here with the gateway's 401. Anything else, including OAuth2 tokens, credentials seen for the first time,
-`/health`, `/admin`, `/oauth2`, GraphQL, MQTT, gRPC, WebSocket and `/agents/...`, goes to the Python gateway untouched,
-so its answer is the answer.
+a request from a web page in another origin (one with an `Origin` header), `/metrics`, `/admin`, `/oauth2`, GraphQL,
+MQTT, gRPC, WebSocket and `/agents/...`, goes to the Python gateway untouched, so its answer is the answer.
+
+The gateway's own health endpoints are answered here on a plain `GET`, each for what this side can vouch for:
+
+* **`/live`** says this process is running, with its own process id. It needs nothing from the Python gateway, so
+  restarting that one never makes this one look dead.
+* **The health path** (`/health`, or wherever `HEALTH_CHECK_PATH` puts it) says healthy only while the Python gateway
+  answered the latest sync. One failed sync and the question goes to the Python gateway itself.
+* **`/ready`** gives the Python gateway's own answer, database probe included, as of the latest sync (every
+  `--sync-interval-ms`). Not ready there is not ready here, with the same 503. After a failed sync it is asked directly.
+
+With the Python gateway down, the health path and `/ready` therefore answer 502 and `/live` still answers 200.
 
 | Traffic | Served by |
 |---|---|
@@ -136,9 +147,19 @@ so its answer is the answer.
 | Browsers (HTML error pages) | Python |
 | GraphQL, MQTT, gRPC, WebSocket, `/agents/<slug>` | Python |
 | Dynamic routes, transformation rules, request-altering plugins (when any exist) | Python, for every path |
-| `/health`, `/ready`, `/live`, `/metrics`, `/oauth2`, `/admin` and the console | Python |
+| The health path, `/ready` and `/live`, on a plain `GET` | data plane |
+| A request with an `Origin` header (the cross-origin headers are Python's) | Python |
+| `/health/detailed`, `/metrics`, `/oauth2`, `/admin` and the console | Python |
 
 ## Known gaps (why this is not production-ready)
+
+* **`/ready` can be one sync interval behind** (500 ms by default), or as long as a sync that hangs takes to fail
+  (five seconds), because it repeats the Python gateway's last answer instead of asking the database itself.
+* **`/metrics` is still the Python gateway's.** It is the registry for the whole gateway, including everything this
+  side reports to it, so there is one place to scrape. The data plane has no metrics endpoint of its own yet: with the
+  Python gateway down, nothing can be scraped.
+* **Calls from web pages in another origin are not fast.** Any request with an `Origin` header is handed to the Python
+  gateway, which writes the cross-origin headers.
 
 * **A refused credential stays refused for up to ten seconds after the Python gateway would accept it** in one case
   this side cannot see: the gateway was restarted with a new `SECRET_KEY` or OAuth2 state so quickly that no sync

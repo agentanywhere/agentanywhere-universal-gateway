@@ -166,6 +166,31 @@ class _NotReproducible(Exception):
     """Something the data plane cannot evaluate exactly as this gateway does."""
 
 
+# Paths this gateway answers before its health route is reached, or under which it is never looked for.
+_NOT_A_HEALTH_PATH = ("/admin", "/internal", "/oauth2", "/agents/")
+
+
+def _ops(settings) -> Dict[str, Any]:
+    """What the data plane needs to answer the health path itself: the path and the version it
+    reports. No path when this gateway would not answer it with its health route."""
+    from app import main as gw
+
+    path = settings.health_check_path
+    plain = isinstance(path, str) and path.startswith("/") and path.isascii() and "%" not in path and "?" not in path
+    if not plain or path in gw.DOCS_PATHS or path.startswith(_NOT_A_HEALTH_PATH):
+        path = None
+    return {"health_path": path, "version_json": _dumps(settings.app_version)}
+
+
+async def readiness_note() -> Dict[str, Any]:
+    """This gateway's answer to ``/ready`` right now, for the data plane to give in its place until
+    the next snapshot answer. Sent with every answer; never part of the revision."""
+    from app import main as gw
+
+    status_code, body = await gw.readiness()
+    return {"status": status_code, "body_json": _dumps(body)}
+
+
 def _dumps(value: Any) -> str:
     """JSON exactly as this gateway's error responses render it, for the data plane to embed as is."""
     return json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
@@ -439,6 +464,7 @@ async def build_snapshot(db: AsyncSession) -> Dict[str, Any]:
         # request without a usable one is refused.
         "key_header": settings.api_key_header,
         "refusals": _refusals(auth_plugins),
+        "ops": _ops(settings),
     }
     snap["revision"] = hashlib.sha256(json.dumps(snap, sort_keys=True).encode()).hexdigest()
     return snap
@@ -762,6 +788,10 @@ async def snapshot(
     snap = await current_snapshot(db)
     limited = {t for t, entry in snap["tenants"].items() if entry["minute"] or entry["hour"]}
     usage = await tenant_usage(db, limited)
+    try:
+        ready = await readiness_note()
+    except Exception:  # noqa: BLE001 - without it the data plane asks this gateway each time
+        ready = None
     if since and since == snap["revision"]:
-        return {"unchanged": True, "revision": snap["revision"], "tenant_usage": usage}
-    return {**snap, "tenant_usage": usage}
+        return {"unchanged": True, "revision": snap["revision"], "tenant_usage": usage, "ready": ready}
+    return {**snap, "tenant_usage": usage, "ready": ready}

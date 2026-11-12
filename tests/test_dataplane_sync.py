@@ -248,6 +248,7 @@ async def test_tenant_usage_reported_by_the_data_plane_counts_against_the_quota(
     # Only the three served in the current minute count now; the forty belong to an hour long past.
     assert usage["minute_start"] == minute and usage["used"]["t1"] == [3, 3]
     same = await dataplane_sync.snapshot(since=full["revision"], x_dataplane_token="s3cret", db=db_session)
+    assert same.pop("ready")["status"] in (200, 503)
     assert same == {"unchanged": True, "revision": full["revision"], "tenant_usage": usage}
     tenant = await TenantRepository.get_by_id(db_session, "t1")
     assert await TenantRepository.check_quota(db_session, tenant, "minute", 2)
@@ -320,6 +321,7 @@ async def test_since_the_current_revision_answers_unchanged(db_session, monkeypa
     full = await dataplane_sync.snapshot(since=None, x_dataplane_token="s3cret", db=db_session)
     assert "keys" in full
     same = await dataplane_sync.snapshot(since=full["revision"], x_dataplane_token="s3cret", db=db_session)
+    assert same.pop("ready")["status"] in (200, 503)
     assert same == {"unchanged": True, "revision": full["revision"], "tenant_usage": full["tenant_usage"]}
     assert full["tenant_usage"]["used"] == {}
     stale = await dataplane_sync.snapshot(since="old", x_dataplane_token="s3cret", db=db_session)
@@ -726,3 +728,58 @@ async def test_the_gateways_own_endpoints_stay_with_python_wherever_they_live(db
     monkeypatch.setattr(s, "health_check_path", "/api/health")
     monkeypatch.setattr(s, "metrics_path", "/mcp/metrics")
     assert (await dataplane_sync.build_snapshot(db_session))["fallthrough_prefixes"] == ["/api/health", "/mcp/metrics"]
+
+
+async def test_the_snapshot_says_where_health_lives_and_which_version_it_reports(db_session, monkeypatch):
+    settings = get_settings()
+    monkeypatch.setattr(settings, "app_version", '2.0 "beta"')
+    snap = await dataplane_sync.build_snapshot(db_session)
+    assert snap["ops"] == {"health_path": settings.health_check_path, "version_json": '"2.0 \\"beta\\""'}
+    # A path this gateway answers some other way, or would read differently, is not offered.
+    for path in ("/docs", "/admin/health", "/agents/x", "/internal/health", "health", "/h%65alth", "/héalth", "/health?x=1"):
+        monkeypatch.setattr(settings, "health_check_path", path)
+        assert (await dataplane_sync.build_snapshot(db_session))["ops"]["health_path"] is None, path
+    monkeypatch.setattr(settings, "health_check_path", "/api/status")
+    moved = await dataplane_sync.build_snapshot(db_session)
+    assert moved["ops"]["health_path"] == "/api/status" and moved["revision"] != snap["revision"]
+
+
+async def test_every_answer_carries_this_gateways_own_answer_to_ready(db_session, monkeypatch):
+    import json
+
+    from app import main as gw
+    from app.observability import ProbeResult, dependency_probes
+
+    monkeypatch.setattr(get_settings(), "dataplane_token", "s3cret")
+    results = {"database": ProbeResult(name="database", kind="database", status="healthy", latency_ms=1.5)}
+
+    async def check(name):
+        return results.get(name)
+
+    monkeypatch.setattr(dependency_probes, "check", check)
+    full = await dataplane_sync.snapshot(since=None, x_dataplane_token="s3cret", db=db_session)
+    assert full["ready"]["status"] == 200
+    body = json.loads(full["ready"]["body_json"])
+    assert list(body) == ["status", "database"] and body["status"] == "ready"
+    assert body["database"] == results["database"].to_dict()
+    # It is what /ready itself answers, byte for byte.
+    answer = await gw.readiness_check()
+    assert (answer.status_code, answer.body.decode()) == (200, full["ready"]["body_json"])
+
+    # Not ready: the same answer, and it never changes the revision.
+    results["database"] = ProbeResult(name="database", kind="database", status="unhealthy", latency_ms=None, message="db is down")
+    same = await dataplane_sync.snapshot(since=full["revision"], x_dataplane_token="s3cret", db=db_session)
+    assert same["unchanged"] is True
+    assert same["ready"] == {"status": 503, "body_json": '{"status":"not_ready","reason":"db is down"}'}
+    answer = await gw.readiness_check()
+    assert (answer.status_code, answer.body.decode()) == (503, same["ready"]["body_json"])
+    results.clear()
+    gone = await dataplane_sync.readiness_note()
+    assert gone == {"status": 503, "body_json": '{"status":"not_ready","reason":"no probe registered"}'}
+
+    # If the answer cannot be worked out, the snapshot still goes out, and the data plane asks each time.
+    async def broken():
+        raise RuntimeError("no answer")
+
+    monkeypatch.setattr(dataplane_sync, "readiness_note", broken)
+    assert (await dataplane_sync.snapshot(since=None, x_dataplane_token="s3cret", db=db_session))["ready"] is None

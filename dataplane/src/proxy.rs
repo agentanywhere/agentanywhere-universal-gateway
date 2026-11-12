@@ -11,7 +11,7 @@
 use bytes::Bytes;
 use http_body_util::{BodyExt, Either, Full};
 use hyper::body::{Body as _, Incoming};
-use hyper::header::{HeaderName, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HOST, REFERER, UPGRADE, USER_AGENT};
+use hyper::header::{HeaderName, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HOST, ORIGIN, REFERER, UPGRADE, USER_AGENT};
 use hyper::http::uri::{Authority, Scheme};
 use hyper::{HeaderMap, Method, Request, Response, StatusCode, Uri, Version};
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
@@ -29,7 +29,7 @@ use crate::boundary::Verdict;
 use crate::breaker::{self, Breaker};
 use crate::govern::{self, IpRule, Policy, Scope, Subject};
 use crate::report::{Event, Reporter, Row, Served};
-use crate::snapshot::{hash_key, Digest32, KeyEntry, Snapshot, Wording};
+use crate::snapshot::{hash_key, Digest32, KeyEntry, Readiness, Snapshot, Wording};
 use crate::sync::Link;
 
 /// A body is either streamed from the other side or held here whole; neither is boxed. Responses
@@ -318,7 +318,8 @@ fn json(text: &str) -> String {
 }
 
 /// A time since the epoch as UTC text: `YYYY-MM-DDTHH:MM:SS.ffffff`, the shape the Python gateway
-/// puts in error bodies, or with `log`, `YYYY-MM-DDTHH:MM:SS.mmmZ`, the shape of its log lines.
+/// puts in error bodies (it leaves the fraction out when it is zero), or with `log`,
+/// `YYYY-MM-DDTHH:MM:SS.mmmZ`, the shape of its log lines.
 pub fn timestamp(d: Duration, log: bool) -> String {
     let (secs, micros) = (d.as_secs() as i64, d.subsec_micros());
     let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
@@ -335,6 +336,8 @@ pub fn timestamp(d: Duration, log: bool) -> String {
     let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
     if log {
         format!("{year:04}-{month:02}-{day:02}T{h:02}:{m:02}:{s:02}.{:03}Z", micros / 1000)
+    } else if micros == 0 {
+        format!("{year:04}-{month:02}-{day:02}T{h:02}:{m:02}:{s:02}")
     } else {
         format!("{year:04}-{month:02}-{day:02}T{h:02}:{m:02}:{s:02}.{micros:06}")
     }
@@ -456,8 +459,9 @@ fn decide<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, now: u6
     if snap.fallthrough_prefixes.iter().any(|p| path.starts_with(p.as_str())) || wants_html(req.headers()) {
         return PYTHON;
     }
-    // A request to change protocol (a WebSocket handshake) is not an ordinary request there.
-    if req.headers().contains_key(UPGRADE) {
+    // A request to change protocol (a WebSocket handshake) is not an ordinary request there, and
+    // one from a web page in another origin is answered with the gateway's cross-origin headers.
+    if req.headers().contains_key(UPGRADE) || req.headers().contains_key(ORIGIN) {
         return PYTHON;
     }
     let m = req.method();
@@ -531,6 +535,63 @@ fn decide<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, now: u6
         return PYTHON;
     }
     Decision::Native(Native { protocol, backend, entry, version, ip, method })
+}
+
+/// One of the gateway's own endpoints, answered here.
+#[derive(Debug, PartialEq)]
+enum Own<'a> {
+    /// The health path: this side is serving and the Python gateway is answering. Holds the
+    /// version to report, as JSON.
+    Health(&'a str),
+    /// `/ready`: the Python gateway's own answer, as of its latest word.
+    Ready(Arc<Readiness>),
+    /// `/live`: this process is running. Needs nothing from the Python gateway, so a restart of
+    /// that one never makes this one look dead.
+    Live,
+}
+
+/// Which of the gateway's own endpoints a request is for, if this side may answer it. `up` says
+/// whether the Python gateway is known to be answering, and `ready` gives its answer to `/ready`.
+/// The health path comes first, as its route does in the Python gateway.
+fn own<'a, B>(snap: &'a Snapshot, req: &Request<B>, up: impl FnOnce() -> bool, ready: impl FnOnce() -> Option<Arc<Readiness>>) -> Option<Own<'a>> {
+    let (uri, headers) = (req.uri(), req.headers());
+    let path = uri.path();
+    // The path first: almost every request is for none of these, and is done here.
+    let health = snap.ops.as_ref().filter(|o| o.health_path.as_deref() == Some(path));
+    if health.is_none() && path != "/ready" && path != "/live" {
+        return None;
+    }
+    if req.method() != Method::GET || uri.authority().is_some() || headers.contains_key(UPGRADE) || headers.contains_key(ORIGIN) {
+        return None;
+    }
+    match (health, path) {
+        (Some(ops), _) => up().then_some(Own::Health(&ops.version_json)),
+        (None, "/ready") => ready().map(Own::Ready),
+        (None, _) => Some(Own::Live),
+    }
+}
+
+/// Answer one of the gateway's own endpoints, counted and logged as the Python gateway does its
+/// own. `None` when the request is one only the Python gateway can describe.
+fn answer_own<B>(w: &Worker, snap: &Snapshot, own: &Own, peer: SocketAddr, req: &Request<B>, started: Instant, at: Duration) -> Option<Response<Body>> {
+    let version = match resolve_version(snap, req.headers()) {
+        Some((_, false)) => return None,
+        found => found.map(|(v, _)| v),
+    };
+    let ip = govern::client_ip(peer, req.headers(), &snap.trusted_proxies)?;
+    let (status, body) = match own {
+        Own::Health(version_json) => (
+            StatusCode::OK,
+            format!("{{\"status\":\"healthy\",\"version\":{version_json},\"timestamp\":\"{}\",\"services\":{{}}}}", timestamp(at, false)),
+        ),
+        Own::Ready(r) => (StatusCode::from_u16(r.status).ok()?, r.body_json.clone()),
+        Own::Live => (StatusCode::OK, format!("{{\"status\":\"alive\",\"pid\":{}}}", std::process::id())),
+    };
+    let mut resp = Response::new(full(body));
+    *resp.status_mut() = status;
+    resp.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    let a = Answered { method: "GET", ip, version, rejected: false, error: None };
+    Some(finish(w, resp, &a, req, &trace_for(req.headers()), started, at))
 }
 
 /// Why a request with a valid key is refused with a 403.
@@ -676,40 +737,50 @@ fn stamp(resp: &mut Response<Body>, t: &Trace, seconds: f64, version: Option<&st
     }
 }
 
-/// Answer a request that carries no credential that works, and report it as the Python gateway
-/// records the ones it refuses: counted under a bounded path label, logged without a key.
-fn unauthenticated<B>(w: &Worker, u: &Unauthenticated, req: &Request<B>, started: Instant, at: Duration) -> Response<Body> {
+/// An answer made here for a request that never reached a backend or a key.
+struct Answered<'a> {
+    method: &'static str,
+    ip: IpAddr,
+    version: Option<&'a str>,
+    /// A refusal: counted under a bounded path label, as the Python gateway counts its own.
+    rejected: bool,
+    /// The error code of the body, for the log row.
+    error: Option<&'static str>,
+}
+
+/// Stamp an answer made here, and report and log it as the Python gateway records its own:
+/// counted, and logged without a key.
+fn finish<B>(w: &Worker, mut resp: Response<Body>, a: &Answered, req: &Request<B>, t: &Trace, started: Instant, at: Duration) -> Response<Body> {
     let st = &*w.shared;
-    let t = trace_for(req.headers());
     let path = req.uri().path();
-    let mut resp = envelope(StatusCode::UNAUTHORIZED, "AUTHENTICATION_ERROR", &u.wording.message_json, &u.wording.details_json, &t, true);
+    let status = resp.status().as_u16();
     let seconds = started.elapsed().as_secs_f64();
     let bytes_out = resp.body().size_hint().exact().unwrap_or(0);
-    stamp(&mut resp, &t, seconds, u.version);
+    stamp(&mut resp, t, seconds, a.version);
     let user_agent = req.headers().get(USER_AGENT).and_then(|v| v.to_str().ok());
     if let Some(reporter) = &st.reporter {
         let served = Served {
-            method: u.method,
+            method: a.method,
             path,
-            status: 401,
+            status,
             seconds,
             key_id: "",
             tenant: None,
-            rejected: true,
+            rejected: a.rejected,
             error_code: None,
             error_type: None,
         };
         reporter.record(w.index, &served, at.as_secs(), || Row {
             request_id: t.request_id.clone(),
-            method: u.method,
+            method: a.method,
             path: path.to_owned(),
-            client_ip: u.ip.to_string(),
+            client_ip: a.ip.to_string(),
             api_key_id: None,
             tenant_id: None,
-            status: 401,
+            status,
             duration_ms: seconds * 1000.0,
             user_agent: user_agent.map(str::to_owned),
-            error: Some("AUTHENTICATION_ERROR".to_owned()),
+            error: a.error.map(str::to_owned),
         });
     }
     if let Some(log) = &st.access_log {
@@ -719,11 +790,11 @@ fn unauthenticated<B>(w: &Worker, u: &Unauthenticated, req: &Request<B>, started
             traceparent: &t.traceparent,
             key_id: None,
             tenant: None,
-            ip: u.ip,
-            method: u.method,
+            ip: a.ip,
+            method: a.method,
             path,
             query: req.uri().query().unwrap_or(""),
-            status: 401,
+            status,
             bytes: bytes_out,
             seconds,
             user_agent,
@@ -731,6 +802,14 @@ fn unauthenticated<B>(w: &Worker, u: &Unauthenticated, req: &Request<B>, started
         }));
     }
     resp
+}
+
+/// Answer a request that carries no credential that works.
+fn unauthenticated<B>(w: &Worker, u: &Unauthenticated, req: &Request<B>, started: Instant, at: Duration) -> Response<Body> {
+    let t = trace_for(req.headers());
+    let resp = envelope(StatusCode::UNAUTHORIZED, "AUTHENTICATION_ERROR", &u.wording.message_json, &u.wording.details_json, &t, true);
+    let a = Answered { method: u.method, ip: u.ip, version: u.version, rejected: true, error: Some("AUTHENTICATION_ERROR") };
+    finish(w, resp, &a, req, &t, started, at)
 }
 
 fn announce(st: &State, backend: &Backend, cfg: &breaker::Config, tr: breaker::Transition) {
@@ -774,6 +853,13 @@ pub async fn handle(w: Arc<Worker>, peer: SocketAddr, req: Request<Incoming>) ->
     let (generation, snap) = w.snapshot();
     let at = wall();
     let now = at.as_secs();
+    // The gateway's own health endpoints, where this side can speak for it.
+    let link = st.sync.as_deref();
+    if let Some(own) = own(&snap, &req, || link.map(Link::up).unwrap_or(true), || link.and_then(Link::readiness)) {
+        if let Some(resp) = answer_own(&w, &snap, &own, peer, &req, started, at) {
+            return Ok(resp);
+        }
+    }
     // Fail closed: if the snapshot is not known to be current, the Python gateway decides.
     let trusted = st.sync.as_ref().map(|s| s.fresh()).unwrap_or(true);
     let decision = match trusted {
@@ -1142,6 +1228,8 @@ mod tests {
         assert_eq!(timestamp(at, false), "2023-11-14T22:13:20.123456");
         assert_eq!(timestamp(at, true), "2023-11-14T22:13:20.123Z");
         assert_eq!(timestamp(Duration::new(951_782_400, 0), true), "2000-02-29T00:00:00.000Z");
+        // Python leaves a zero fraction out.
+        assert_eq!(timestamp(Duration::new(951_782_400, 0), false), "2000-02-29T00:00:00");
     }
 
     #[test]
@@ -1508,6 +1596,70 @@ mod tests {
         for (value, key) in [("Bearer abc", "abc"), ("abc", "abc"), ("Bearer Bearer abc", "abc"), ("aBearer bc", "abc"), ("Bearer", "Bearer"), ("BearerBearer  x", "Bearer x"), ("bearer abc", "bearer abc")] {
             assert_eq!(&*without_bearer(value.as_bytes()), key.as_bytes(), "{value}");
         }
+    }
+
+    fn probe(snap: &Snapshot, method: Method, uri: &str, headers: &[(&str, &str)], up: bool, ready: Option<u16>) -> Option<String> {
+        let mut req = Request::builder().method(method).uri(uri);
+        for (name, value) in headers {
+            req = req.header(*name, *value);
+        }
+        let req = req.body(()).unwrap();
+        let ready = ready.map(|status| Arc::new(Readiness { status, body_json: "{}".into() }));
+        own(snap, &req, || up, || ready).map(|o| match o {
+            Own::Health(v) => format!("health {v}"),
+            Own::Ready(r) => format!("ready {}", r.status),
+            Own::Live => "live".into(),
+        })
+    }
+
+    #[test]
+    fn the_gateways_own_endpoints_are_answered_here_when_this_side_can_speak_for_it() {
+        let snap = Snapshot::from_json(r#"{"keys":[],"ops":{"health_path":"/health","version_json":"\"1.2\""}}"#).unwrap();
+        let get = |uri: &str, up: bool, ready: Option<u16>| probe(&snap, Method::GET, uri, &[], up, ready);
+        assert_eq!(get("/health", true, None).as_deref(), Some("health \"1.2\""));
+        assert_eq!(get("/health?verbose=1", true, None).as_deref(), Some("health \"1.2\""));
+        assert_eq!(get("/ready", true, Some(200)).as_deref(), Some("ready 200"));
+        assert_eq!(get("/ready", true, Some(503)).as_deref(), Some("ready 503"));
+        // Health and readiness speak for the Python gateway: not without its word.
+        assert_eq!(get("/health", false, None), None);
+        assert_eq!(get("/ready", true, None), None);
+        // Being alive is this process's own business.
+        assert_eq!(get("/live", false, None).as_deref(), Some("live"));
+        // Only these paths, exactly.
+        for uri in ["/health/", "/health/detailed", "/healthz", "/ready/", "/live/x", "/metrics", "/api/health", "/"] {
+            assert_eq!(get(uri, true, Some(200)), None, "{uri}");
+        }
+        // Anything but a plain GET is the Python gateway's to answer (405, a preflight, a handshake).
+        for method in [Method::HEAD, Method::POST, Method::OPTIONS] {
+            assert_eq!(probe(&snap, method, "/live", &[], true, None), None);
+        }
+        assert_eq!(probe(&snap, Method::GET, "/live", &[("Origin", "https://app.example")], true, None), None);
+        assert_eq!(probe(&snap, Method::GET, "/health", &[("Upgrade", "websocket")], true, None), None);
+        assert_eq!(probe(&snap, Method::GET, "http://other.example/live", &[], true, None), None);
+    }
+
+    #[test]
+    fn the_health_path_is_wherever_the_gateway_has_it_and_comes_first() {
+        let moved = Snapshot::from_json(r#"{"keys":[],"ops":{"health_path":"/api/status","version_json":"\"1\""}}"#).unwrap();
+        assert_eq!(probe(&moved, Method::GET, "/api/status", &[], true, None).as_deref(), Some("health \"1\""));
+        assert_eq!(probe(&moved, Method::GET, "/health", &[], true, None), None);
+        // Configured onto another endpoint's path, the health route wins there, as it does in Python.
+        let shadowing = Snapshot::from_json(r#"{"keys":[],"ops":{"health_path":"/live","version_json":"\"1\""}}"#).unwrap();
+        assert_eq!(probe(&shadowing, Method::GET, "/live", &[], true, None).as_deref(), Some("health \"1\""));
+        assert_eq!(probe(&shadowing, Method::GET, "/live", &[], false, None), None);
+        // No path, or no word from the control plane at all: health is Python's, alive is still ours.
+        let hidden = Snapshot::from_json(r#"{"keys":[],"ops":{"health_path":null,"version_json":"\"1\""}}"#).unwrap();
+        for snap in [&hidden, &Snapshot::empty()] {
+            assert_eq!(probe(snap, Method::GET, "/health", &[], true, None), None);
+            assert_eq!(probe(snap, Method::GET, "/live", &[], true, None).as_deref(), Some("live"));
+        }
+    }
+
+    #[test]
+    fn a_request_from_another_origin_is_left_to_python() {
+        let snap = Snapshot::from_json(r#"{"keys":[]}"#).unwrap();
+        let req = Request::builder().uri("/api/users").header("origin", "https://app.example").body(()).unwrap();
+        assert!(matches!(decide(&snap, "127.0.0.1:9".parse().unwrap(), &req, 0, |_| false), Decision::Ask(None)));
     }
 
     #[test]

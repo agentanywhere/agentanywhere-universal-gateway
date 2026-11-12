@@ -97,6 +97,31 @@ pub struct Snapshot {
     /// How a request without a usable credential is refused. `None` when only the Python gateway
     /// can tell (a plugin may authenticate the request some other way): it then answers them all.
     pub refusals: Option<Refusals>,
+    /// What the gateway's health path answers with. `None` when the control plane did not say.
+    pub ops: Option<Ops>,
+}
+
+/// The gateway's health endpoint, as the Python gateway serves it.
+#[derive(Deserialize)]
+pub struct Ops {
+    /// Where it lives. `None` when only the Python gateway can answer there.
+    pub health_path: Option<String>,
+    /// The version it reports, as a JSON string.
+    pub version_json: String,
+}
+
+/// The Python gateway's own answer to `/ready`, as of one snapshot answer.
+#[derive(Deserialize, Debug, PartialEq)]
+pub struct Readiness {
+    pub status: u16,
+    pub body_json: String,
+}
+
+/// What comes with every control-plane answer, changed or not.
+#[derive(Default)]
+pub struct Extras {
+    pub usage: Option<UsageBase>,
+    pub ready: Option<Readiness>,
 }
 
 /// The Python gateway's words for one refusal, ready to put into its error envelope.
@@ -122,6 +147,8 @@ struct SnapshotFile {
     boundary: Option<BoundaryRecord>,
     key_header: Option<String>,
     refusals: Option<Refusals>,
+    ops: Option<Ops>,
+    ready: Option<Readiness>,
     #[serde(default)]
     keys: Vec<KeyRecord>,
     #[serde(default)]
@@ -268,8 +295,8 @@ pub fn parse_hex32(s: &str) -> Option<Digest32> {
 
 /// What a control-plane answer means: nothing new, or a complete new snapshot.
 pub enum Parsed {
-    Unchanged(Option<UsageBase>),
-    Full(Snapshot, Option<UsageBase>),
+    Unchanged(Extras),
+    Full(Snapshot, Extras),
 }
 
 fn net(text: &str) -> Result<Net, String> {
@@ -297,8 +324,8 @@ impl Snapshot {
 
     pub fn from_json(text: &str) -> Result<Snapshot, String> {
         match Snapshot::parse(text, None)? {
-            Parsed::Full(s, usage) => {
-                if let Some(u) = usage {
+            Parsed::Full(s, extras) => {
+                if let Some(u) = extras.usage {
                     u.apply(&s);
                 }
                 Ok(s)
@@ -312,8 +339,16 @@ impl Snapshot {
     /// and, once it is too old, everything goes to the Python gateway.
     pub fn parse(text: &str, prev: Option<&Snapshot>) -> Result<Parsed, String> {
         let file: SnapshotFile = serde_json::from_str(text).map_err(|e| format!("snapshot is not valid: {e}"))?;
+        // Both are put into answers as they are: they must be what they claim to be.
+        if file.ready.as_ref().is_some_and(|r| !matches!(r.status, 200 | 503) || !r.body_json.starts_with('{')) {
+            return Err("ready: not an answer to /ready".into());
+        }
+        if file.ops.as_ref().is_some_and(|o| !o.version_json.starts_with('"')) {
+            return Err("ops: the version must be a JSON string".into());
+        }
+        let extras = Extras { usage: file.tenant_usage, ready: file.ready };
         if file.unchanged {
-            return Ok(Parsed::Unchanged(file.tenant_usage));
+            return Ok(Parsed::Unchanged(extras));
         }
         let mut tenants: HashMap<String, Arc<Tenant>> = HashMap::with_capacity(file.tenants.len());
         for (id, t) in file.tenants {
@@ -402,6 +437,7 @@ impl Snapshot {
         let snap = Snapshot {
             key_header,
             refusals: file.refusals,
+            ops: file.ops,
             inject_request_id: file.inject_request_id,
             revision: file.revision,
             api_versions,
@@ -423,7 +459,7 @@ impl Snapshot {
             // Without the section, the gateway's shipped defaults apply.
             boundary: file.boundary.map(Boundary::from_record).unwrap_or_else(Boundary::defaults),
         };
-        Ok(Parsed::Full(snap, file.tenant_usage))
+        Ok(Parsed::Full(snap, extras))
     }
 }
 
@@ -474,6 +510,33 @@ mod tests {
     }
 
     #[test]
+    fn the_health_path_and_readiness_are_read_and_checked() {
+        let snap = Snapshot::from_json(r#"{"keys":[]}"#).unwrap();
+        assert!(snap.ops.is_none());
+        let text = r#"{"keys":[],"ops":{"health_path":"/health","version_json":"\"1.2\""},"ready":{"status":200,"body_json":"{\"status\":\"ready\"}"}}"#;
+        let Parsed::Full(snap, extras) = Snapshot::parse(text, None).unwrap() else { panic!("expected a full snapshot") };
+        let ops = snap.ops.unwrap();
+        assert_eq!((ops.health_path.as_deref(), ops.version_json.as_str()), (Some("/health"), "\"1.2\""));
+        assert_eq!(extras.ready, Some(Readiness { status: 200, body_json: r#"{"status":"ready"}"#.into() }));
+        // Readiness comes with an answer that says nothing else changed, too.
+        let same = r#"{"unchanged":true,"revision":"r","ready":{"status":503,"body_json":"{}"}}"#;
+        let Parsed::Unchanged(extras) = Snapshot::parse(same, Some(&snap_with_nothing())).unwrap() else { panic!("expected unchanged") };
+        assert_eq!(extras.ready.unwrap().status, 503);
+        // Neither is taken on trust: both are put into answers as they are.
+        for bad in [
+            r#"{"keys":[],"ops":{"health_path":"/health","version_json":"1.2"}}"#,
+            r#"{"keys":[],"ready":{"status":204,"body_json":"{}"}}"#,
+            r#"{"keys":[],"ready":{"status":200,"body_json":"ready"}}"#,
+        ] {
+            assert!(Snapshot::from_json(bad).is_err(), "{bad}");
+        }
+    }
+
+    fn snap_with_nothing() -> Snapshot {
+        Snapshot::from_json(r#"{"keys":[]}"#).unwrap()
+    }
+
+    #[test]
     fn counters_survive_an_update_and_unchanged_is_recognised() {
         let d = hash_key(b"sk-test");
         let hex: String = d.iter().map(|b| format!("{b:02x}")).collect();
@@ -488,7 +551,7 @@ mod tests {
         assert_eq!(second.revision.as_deref(), Some("r1"));
         assert!(matches!(
             Snapshot::parse(r#"{"unchanged":true,"revision":"r1"}"#, Some(&first)).unwrap(),
-            Parsed::Unchanged(None)
+            Parsed::Unchanged(Extras { usage: None, ready: None })
         ));
     }
 
@@ -544,11 +607,11 @@ mod tests {
     #[test]
     fn a_tenants_counts_survive_an_update_and_an_unchanged_answer_carries_usage() {
         let first = Snapshot::from_json(&governed()).unwrap();
-        let Parsed::Full(second, usage) = Snapshot::parse(&governed(), Some(&first)).unwrap() else { panic!("expected a full snapshot") };
+        let Parsed::Full(second, Extras { usage, .. }) = Snapshot::parse(&governed(), Some(&first)).unwrap() else { panic!("expected a full snapshot") };
         assert!(Arc::ptr_eq(&first.tenants["acme"].usage, &second.tenants["acme"].usage));
         assert!(usage.is_some());
         let answer = r#"{"unchanged":true,"revision":"r1","tenant_usage":{"minute_start":660,"hour_start":0,"used":{}}}"#;
-        let Parsed::Unchanged(Some(usage)) = Snapshot::parse(answer, Some(&second)).unwrap() else { panic!("expected usage") };
+        let Parsed::Unchanged(Extras { usage: Some(usage), .. }) = Snapshot::parse(answer, Some(&second)).unwrap() else { panic!("expected usage") };
         usage.apply(&second);
         let t = &second.tenants["acme"];
         assert!(t.usage.admit(t.minute, t.hour, 661).is_ok());
