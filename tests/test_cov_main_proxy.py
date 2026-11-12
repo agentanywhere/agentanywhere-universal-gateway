@@ -4,6 +4,7 @@ OAuth2 endpoints, WebSocket endpoints and the logging middleware's outputs.
 All upstreams are fakes; nothing leaves the process.
 """
 import asyncio
+import time
 import json
 from datetime import timedelta
 from types import SimpleNamespace
@@ -716,6 +717,132 @@ class FakeWS:
 
     async def close(self):
         self.closed = True
+
+
+class BackendWS(FakeWS):
+    """A WebSocket backend that closes with a code of its own after its messages."""
+
+    def __init__(self, *a, close_code=None, close_reason=None, **kw):
+        super().__init__(*a, **kw)
+        self.close_code, self.close_reason, self.closed_with, self.answered = close_code, close_reason, None, 0
+
+    def __aiter__(self):
+        async def gen():
+            for m in self._incoming:
+                yield m
+            while self.echo and not self.closed:      # answer each frame until closed, as a real one would
+                if len(self.sent) > self.answered:
+                    self.answered += 1
+                    yield f"echo:{self.sent[self.answered - 1]}"
+                await asyncio.sleep(0.01)
+        return gen()
+
+    async def close(self, code=1000, reason=""):
+        if self.closed_with is None:
+            self.closed_with = (code, reason)
+        self.closed = True
+
+
+def _ws_backend(monkeypatch, up, url="ws://10.0.0.9:7000/base/"):
+    import websockets
+    seen = {}
+
+    async def fake_connect(uri, **kw):
+        seen["uri"], seen["kw"] = uri, kw
+        if isinstance(up, Exception):
+            raise up
+        return up
+
+    monkeypatch.setattr(websockets, "connect", fake_connect)
+    monkeypatch.setattr(main, "websocket_handler", SimpleNamespace(backend_url=url, handle_connection=AsyncMock()))
+    return seen
+
+
+def test_ws_backend_gets_the_connection_frame_for_frame(gwdb, monkeypatch, key):
+    up = BackendWS(incoming=["from-backend", b"bin"], echo=True, subprotocol="chat.v2")
+    seen = _ws_backend(monkeypatch, up)
+    with gwdb.websocket_connect(f"/ws/rooms/7?api_key={key}&room=blue", subprotocols=["chat.v1", "chat.v2"],
+                                headers={"Authorization": "Bearer t", "Cookie": "s=1", "X-Other": "no"}) as ws:
+        assert ws.accepted_subprotocol == "chat.v2"
+        assert ws.receive_text() == "from-backend"
+        assert ws.receive_bytes() == b"bin"
+        ws.send_text("to-backend")
+        assert ws.receive_text() == "echo:to-backend"
+    assert up.sent == ["to-backend"]
+    # The gateway's key stays with the gateway; the rest of the query and the path go on.
+    assert seen["uri"] == "ws://10.0.0.9:7000/base/rooms/7?room=blue"
+    assert seen["kw"]["additional_headers"] == {"Authorization": "Bearer t", "Cookie": "s=1"}
+    assert seen["kw"]["subprotocols"] == ["chat.v1", "chat.v2"]
+    main.websocket_handler.handle_connection.assert_not_awaited()
+
+
+def test_ws_backend_close_code_reaches_the_client(gwdb, monkeypatch, key):
+    _ws_backend(monkeypatch, BackendWS(incoming=["bye"], close_code=4001, close_reason="done"))
+    with gwdb.websocket_connect("/ws/chat", headers={"X-API-Key": key}) as ws:
+        assert ws.receive_text() == "bye"
+        with pytest.raises(WebSocketDisconnect) as ei:
+            ws.receive_text()
+    assert (ei.value.code, ei.value.reason) == (4001, "done")
+
+
+def test_ws_client_close_code_reaches_the_backend(gwdb, monkeypatch, key):
+    up = BackendWS(echo=True)
+    _ws_backend(monkeypatch, up)
+    with gwdb.websocket_connect("/ws/chat", headers={"X-API-Key": key}) as ws:
+        ws.send_text("one")
+        assert ws.receive_text() == "echo:one"
+        ws.close(code=4002)
+        for _ in range(100):                     # the relay hears of the close a moment later
+            if up.closed_with:
+                break
+            time.sleep(0.01)
+    assert up.closed_with == (4002, "")
+
+
+def test_ws_backend_that_cannot_be_reached_refuses_the_handshake(gwdb, monkeypatch, key):
+    _ws_backend(monkeypatch, OSError("refused"))
+    assert _ws_closes_with(gwdb, "/ws/chat", headers={"X-API-Key": key}) == 1011
+    # Still only for callers with a key.
+    assert _ws_closes_with(gwdb, "/ws/chat") == 1008
+
+
+def test_ws_backend_old_websockets_signature_falls_back(gwdb, monkeypatch, key):
+    import websockets
+    up, attempts = BackendWS(incoming=["x"]), []
+
+    async def fake_connect(uri, **kw):
+        attempts.append(sorted(kw))
+        if "additional_headers" in kw:
+            raise TypeError("unexpected keyword 'additional_headers'")
+        return up
+
+    monkeypatch.setattr(main, "websocket_handler", SimpleNamespace(backend_url="ws://10.0.0.9:7000"))
+    monkeypatch.setattr(websockets, "connect", fake_connect)
+    with gwdb.websocket_connect("/ws/chat", headers={"X-API-Key": key}) as ws:
+        assert ws.receive_text() == "x"
+    assert len(attempts) == 2 and "extra_headers" in attempts[1]
+
+
+def test_ws_an_http_backend_keeps_the_old_handler(gwdb, monkeypatch, key):
+    async def handle(ws, path):
+        await ws.accept()
+        await ws.send_text(f"old {path}")
+        await ws.close()
+
+    monkeypatch.setattr(main, "websocket_handler", SimpleNamespace(backend_url="http://10.0.0.9:7000", handle_connection=handle))
+    with gwdb.websocket_connect("/ws/room", headers={"X-API-Key": key}) as ws:
+        assert ws.receive_text() == "old /room"
+
+
+def test_ws_backend_uri_and_close_codes():
+    uri = main.websocket_backend_uri
+    assert uri("ws://b:1", "chat", "") == "ws://b:1/chat"
+    assert uri("wss://b/x/", "a/b", "api_key=k") == "wss://b/x/a/b"
+    assert uri("ws://b", "c", "a=1&api_key=k&b=2&api_keys=3&=x") == "ws://b/c?a=1&b=2&api_keys=3&=x"
+    assert [main._close_code_to_pass_on(c) for c in (None, 1000, 1001, 1005, 1006, 1015, 3000, 4999, 5000, 7)] == \
+        [1000, 1000, 1001, 1000, 1011, 1011, 3000, 4999, 1011, 1011]
+    assert main.websocket_backend_is_a_websocket("wss://b") and not main.websocket_backend_is_a_websocket("https://b")
+    assert not main.websocket_backend_is_a_websocket(None)
 
 
 def test_agent_ws_closed_when_edge_disabled_or_unknown_slug(gw, monkeypatch):

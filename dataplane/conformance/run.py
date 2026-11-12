@@ -84,6 +84,45 @@ def protocol_backend():
     return f"http://127.0.0.1:{server.server_port}"
 
 
+def websocket_backend():
+    """A local WebSocket server. It sends back what it is sent, text as text and bytes as bytes, and
+    answers a few words: `where` with the path and query it was asked for, `who` with the
+    Authorization, Cookie and X-API-Key headers it saw, and `close:<code>` by closing with that
+    code. It picks the subprotocol `chat.v2` when offered, and refuses a handshake on `/base/refuse`.
+    Returns its URL."""
+    from http import HTTPStatus
+    from websockets.sync.server import serve
+
+    def refuse(connection, request):
+        if request.path.startswith("/base/refuse"):
+            respond = getattr(connection, "respond", None) or connection.protocol.reject  # by library version
+            return respond(HTTPStatus.NOT_FOUND, "no such room\n")
+
+    def pick(connection, offered):
+        return "chat.v2" if "chat.v2" in offered else None
+
+    def handler(ws):
+        try:
+            answer(ws)
+        except Exception:  # the other side left without a goodbye
+            pass
+
+    def answer(ws):
+        for message in ws:
+            if message == "where":
+                ws.send(ws.request.path)
+            elif message == "who":
+                ws.send(json.dumps([ws.request.headers.get(h) for h in ("Authorization", "Cookie", "X-API-Key")]))
+            elif isinstance(message, str) and message.startswith("close:"):
+                ws.close(int(message[6:]), "bye")
+            else:
+                ws.send(message)
+
+    server = serve(handler, "127.0.0.1", 0, process_request=refuse, select_subprotocol=pick, max_size=None)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return f"ws://127.0.0.1:{server.socket.getsockname()[1]}/base"
+
+
 def main() -> int:
     if not BIN.exists():
         print(f"build first: cargo build --release  (in {BIN.parent.parent.parent})")
@@ -97,7 +136,7 @@ def main() -> int:
                "DATABASE_URL": f"sqlite+aiosqlite:///{tmp}/g.db", "HTTP_BACKEND_URL": f"http://127.0.0.1:{bport}",
                "REDIS_ENABLED": "false", "LOG_LEVEL": "WARNING", "STARTUP_BANNER": "false", "DEBUG": "false",
                "TRUSTED_PROXIES": "127.0.0.1", "DATAPLANE_TOKEN": "conformance-token",
-               "WEBSOCKET_BACKEND_URL": f"http://127.0.0.1:{bport}",
+               "WEBSOCKET_BACKEND_URL": websocket_backend(),
                "MCP_BACKEND_URL": agents, "A2A_BACKEND_URL": agents, "AG_UI_BACKEND_URL": agents, "ACP_BACKEND_URL": agents,
                "CIRCUIT_BREAKER_TIMEOUT": "2", "DEFAULT_TIMEOUT": "2"}  # short, so the breaker and timeout scenarios can wait them out
 
@@ -701,19 +740,22 @@ def main() -> int:
 
             def ws_talk(base, path, key, messages=(), headers=None, **kw):
                 """Open a WebSocket, send each message and collect one answer to each. Returns what
-                happened: the answers and how it closed, or the status that refused the handshake."""
+                happened: the answers, the subprotocol and how it closed, or the status that
+                refused the handshake."""
                 url = "ws" + base[4:] + path.replace("{key}", key)
                 h = {k: v.replace("{key}", key) for k, v in (headers or {}).items()}
                 try:
-                    with ws_connect(url, additional_headers=h, open_timeout=5, close_timeout=2, **kw) as ws:
-                        got = []
+                    with ws_connect(url, additional_headers=h, open_timeout=5, close_timeout=2, max_size=None, **kw) as ws:
+                        got, closed = [], None
                         try:
                             for m in messages:
                                 ws.send(m)
                                 got.append(ws.recv(timeout=3))
-                        except (ConnectionClosed, TimeoutError) as e:
-                            got.append(type(e).__name__)
-                        return {"answers": got, "subprotocol": ws.subprotocol}
+                        except ConnectionClosed as e:
+                            closed = [e.rcvd.code, e.rcvd.reason] if e.rcvd else "dropped"
+                        except TimeoutError:
+                            closed = "no answer"
+                        return {"answers": got, "subprotocol": ws.subprotocol, "closed": closed}
                 except InvalidStatus as e:
                     return {"refused": e.response.status_code}
 
@@ -721,17 +763,28 @@ def main() -> int:
                 a = ws_talk(py, path, keys["py"]["key"], messages, headers, **kw)
                 b = ws_talk(rs, path, keys["rs"]["key"], messages, headers, **kw)
                 ok = a == b and (want is None or want(b))
-                check(f"websocket: {name}", ok, str(b) if a == b else f"python {a} vs data plane {b}")
+                shown = str(b) if a == b else f"python {a} vs data plane {b}"
+                check(f"websocket: {name}", ok, shown[:160])
 
-            ws_same("a text message comes back", "/ws/chat", ["hello", "again"], {"X-API-Key": "{key}"},
-                    want=lambda r: r.get("answers") == ["hello", "again"])
-            ws_same("the key may be given in the query", "/ws/chat?api_key={key}", ["hello"],
-                    want=lambda r: r.get("answers") == ["hello"])
+            with_key = {"X-API-Key": "{key}"}
+            ws_same("text comes back as text, JSON included", "/ws/chat", ["hello", '{"a": 1}', "again"], with_key,
+                    want=lambda r: r.get("answers") == ["hello", '{"a": 1}', "again"])
+            ws_same("bytes come back as bytes", "/ws/chat", [b"\x00\x01\xff"], with_key, want=lambda r: r.get("answers") == [b"\x00\x01\xff"])
+            ws_same("the key may be given in the query", "/ws/chat?api_key={key}", ["hello"], want=lambda r: r.get("answers") == ["hello"])
+            ws_same("the backend sees the path and the query, without the gateway's key", "/ws/rooms/7?room=blue&api_key={key}", ["where"],
+                    want=lambda r: r.get("answers") == ["/base/rooms/7?room=blue"])
+            ws_same("the backend sees Authorization and Cookie, never the gateway's key", "/ws/chat", ["who"],
+                    {**with_key, "Authorization": "Bearer t", "Cookie": "s=1"}, want=lambda r: r.get("answers") == ['["Bearer t", "s=1", null]'])
+            ws_same("the subprotocol is the one the backend chose", "/ws/chat", ["hello"], with_key, subprotocols=["chat.v1", "chat.v2"],
+                    want=lambda r: r.get("subprotocol") == "chat.v2")
+            ws_same("the backend's close code and reason reach the client", "/ws/chat", ["hello", "close:4001"], with_key,
+                    want=lambda r: r.get("closed") == [4001, "bye"])
             ws_same("without a key the handshake is refused", "/ws/chat", want=lambda r: "refused" in r)
             ws_same("with a wrong key the handshake is refused", "/ws/chat", headers={"X-API-Key": "sk-nope"}, want=lambda r: "refused" in r)
-            ws_same("a path that is no WebSocket endpoint is refused", "/api/users", headers={"X-API-Key": "{key}"}, want=lambda r: "refused" in r)
-            big = "x" * 200_000
-            ws_same("a large message comes back whole", "/ws/chat", [big], {"X-API-Key": "{key}"}, want=lambda r: r.get("answers") == [big])
+            ws_same("a handshake the backend refuses is refused", "/ws/refuse", headers=with_key, want=lambda r: "refused" in r)
+            ws_same("a path that is no WebSocket endpoint is refused", "/api/users", headers=with_key, want=lambda r: "refused" in r)
+            big = "x" * 2_000_000
+            ws_same("a large message comes back whole", "/ws/chat", [big], with_key, want=lambda r: r.get("answers") == [big])
             r = httpx.get(f"{rs}/api/users", headers={"X-API-Key": keys["rs"]["key"]}, timeout=10)
             check("ordinary requests are unaffected afterwards", r.status_code == 200 and said_by(r) == "data plane")
 

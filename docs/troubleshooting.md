@@ -61,8 +61,9 @@ errors there is a step-by-step guide:
 
 | What you see | Why | What to do |
 |---|---|---|
-| WebSocket closes immediately with 1008 | `/ws/*` does not work as shipped | Connect to the backend directly, or use the agent edge. |
-| WebSocket closes with 1003 | `WEBSOCKET_BACKEND_URL` is not set | (It would still not work; see above.) |
+| WebSocket handshake refused with 403 | No working API key, or the backend at `WEBSOCKET_BACKEND_URL` could not be reached or refused | Send `X-API-Key` or `?api_key=`; check the backend address and that it is up. |
+| WebSocket opens but nothing comes back | `WEBSOCKET_BACKEND_URL` is an `http://` address | Give the backend's `ws://` or `wss://` address. |
+| WebSocket closes with 1003 | `WEBSOCKET_BACKEND_URL` is not set | Set it. |
 | `/grpc` answers 200 with `"status": "unsupported"` | The gRPC bridge does not work | Call the gRPC service directly. |
 | 503 `MQTT broker not connected` | The broker was down when the gateway started | Start the broker, restart the gateway. |
 | `/mqtt/subscribe` succeeds but no messages arrive | Messages are only logged | Subscribe to the broker directly. |

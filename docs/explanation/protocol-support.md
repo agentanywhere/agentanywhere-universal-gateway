@@ -42,7 +42,7 @@ Python 3.11; they were not repeated for this page.
 | ACP | `/acp/*`, `/api/acp/*` | `ACP_BACKEND_URL` | Working (HTTP and SSE) | `tests/test_tier2_protocols.py`; earlier manual check |
 | GraphQL | `POST /graphql` | `GRAPHQL_BACKEND_URL` | Working (queries over HTTP; no subscriptions) | `tests/test_gateway.py::test_graphql_routing`, `tests/test_protocols.py`; earlier manual check |
 | MQTT | `POST /mqtt/publish`, `POST /mqtt/subscribe` | `MQTT_BROKER_URL` | Partial: publish works; subscribe registers a subscription but messages are not delivered to the HTTP caller | `tests/test_protocols.py`; earlier manual check of publish |
-| WebSocket | `/ws/*` | `WEBSOCKET_BACKEND_URL` | Not working | Reproduced for this page: every connection is closed with 1008 |
+| WebSocket | `/ws/*` | `WEBSOCKET_BACKEND_URL` (a `ws://` or `wss://` address) | Working, with an API key; governance by key scope, IP rules and policies, no rate limit or quota | `tests/test_cov_main_proxy.py`, `dataplane/conformance/run.py` |
 | gRPC | `/grpc*`, `/api/grpc*` | `GRPC_BACKEND_URL` | Not working | `tests/test_protocols.py::test_call_unary_does_not_fabricate_success`; earlier manual check |
 | Agent edge | `/agents/<slug>/*` (HTTP and WebSocket) | `AGENT_EDGE_ENABLED`, `AGENT_ROUTES_JSON`, or `/admin/agents` | Working, without gateway credentials (off by default) | `tests/test_agent_edge_proxy.py`, `tests/test_agent_routes.py` |
 | Plugin protocols | Any prefix a `ProtocolPlugin` claims | Plugin | Working (request and response, no streaming) | `tests/test_plugins.py` |
@@ -116,13 +116,26 @@ log as `mqtt_message_received`.
 
 ## WebSocket
 
-`/ws/{path}` is meant to authenticate an API key from `?api_key=` or
-`X-API-Key` and relay frames to `WEBSOCKET_BACKEND_URL`. It closes every
-connection: with no key, code 1008 `API key required`; with a valid key, code
-1008 `Authentication failed`, because the route passes a stand-in request
-object without `state` to the authentication code. If `WEBSOCKET_BACKEND_URL`
-is unset, it closes with 1003. Use the agent edge, or connect to the backend
-directly.
+`/ws/{path}` relays a WebSocket connection to the server at
+`WEBSOCKET_BACKEND_URL`, which must be a `ws://` or `wss://` address. The
+caller gives an API key in `X-API-Key` or in `?api_key=`. The key's path
+scope, IP rules and policies apply to the handshake; rate limits and tenant
+quotas do not, and connections are not written to the request log.
+
+* The backend is asked for `<backend>/{path}` with the caller's query, without
+  `api_key`. It is sent the caller's `Authorization` and `Cookie` headers and
+  the subprotocols offered, never the gateway's key.
+* The backend is connected first. If it cannot be reached or refuses, the
+  caller's handshake is refused with 403; so is a handshake without a working
+  key.
+* Text stays text and binary stays binary. The subprotocol is the one the
+  backend chose. When either side closes, its close code and reason are passed
+  to the other.
+
+With an `http://` or `https://` address the old handler is used instead: it
+accepts the connection and sends back text that is not JSON, and nothing else.
+That is not a relay; use a `ws://` address. If `WEBSOCKET_BACKEND_URL` is
+unset, connections are closed with 1003.
 
 ## gRPC
 

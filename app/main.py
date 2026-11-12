@@ -1673,8 +1673,120 @@ async def websocket_proxy(websocket: WebSocket, path: str):
         await websocket.close(code=1008, reason="Authentication failed")
         return
     
+    # A WebSocket backend (ws:// or wss://) gets the connection itself, frame for frame.
+    backend_url = getattr(websocket_handler, "backend_url", None)
+    if websocket_backend_is_a_websocket(backend_url):
+        await _relay_backend_ws(websocket, backend_url, path)
+        return
+
     # Handle WebSocket connection
     await websocket_handler.handle_connection(websocket, f"/{path}")
+
+
+def websocket_backend_is_a_websocket(url: Optional[str]) -> bool:
+    """True when ``WEBSOCKET_BACKEND_URL`` names a WebSocket server, which connections are relayed to."""
+    return isinstance(url, str) and url.startswith(("ws://", "wss://"))
+
+
+def websocket_backend_uri(backend_url: str, path: str, query: str) -> str:
+    """Where a ``/ws/<path>`` connection goes: the backend, the rest of the path, and the query
+    without the gateway's own ``api_key``, which is not the backend's to see."""
+    kept = "&".join(p for p in (query or "").split("&") if p and p.split("=", 1)[0] != "api_key")
+    uri = f"{backend_url.rstrip('/')}/{path}"
+    return f"{uri}?{kept}" if kept else uri
+
+
+def _close_code_to_pass_on(code: Optional[int]) -> int:
+    """The close code to give one side when the other closed with ``code``. Codes that say "none
+    was sent" or "the connection dropped" cannot be sent; those become a plain close or an error."""
+    if code is None or code == 1005:
+        return 1000
+    if code in (1006, 1015) or not (1000 <= code <= 4999):
+        return 1011
+    return code
+
+
+async def _relay_backend_ws(client_ws: WebSocket, backend_url: str, path: str):
+    """Relay a ``/ws/<path>`` connection to the WebSocket backend until either side closes.
+
+    The backend is connected first: if it cannot be reached or refuses, the client's handshake is
+    refused. The subprotocol is the one the backend chose, text stays text and binary stays binary,
+    and the close code of whichever side closes first is passed on to the other.
+    """
+    import websockets
+    from websockets.exceptions import ConnectionClosed
+
+    uri = websocket_backend_uri(backend_url, path, websocket_query(client_ws))
+    fwd_headers = {
+        name.title(): client_ws.headers[name] for name in ("authorization", "cookie") if client_ws.headers.get(name)
+    }
+    requested = client_ws.scope.get("subprotocols") or []
+    try:
+        options = {"subprotocols": requested or None, "max_size": None, "open_timeout": 10}
+        try:
+            upstream = await websockets.connect(uri, additional_headers=fwd_headers or None, **options)
+        except TypeError:
+            # websockets < 13 uses `extra_headers`
+            upstream = await websockets.connect(uri, extra_headers=fwd_headers or None, **options)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("ws_backend_connect_failed", upstream=uri.split("?", 1)[0], error=str(exc))
+        await client_ws.close(code=1011)
+        return
+
+    await client_ws.accept(subprotocol=getattr(upstream, "subprotocol", None))
+
+    async def client_to_upstream():
+        code, reason = 1000, ""
+        try:
+            while True:
+                msg = await client_ws.receive()
+                if msg.get("type") == "websocket.disconnect":
+                    code, reason = _close_code_to_pass_on(msg.get("code")), msg.get("reason") or ""
+                    break
+                if msg.get("text") is not None:
+                    await upstream.send(msg["text"])
+                elif msg.get("bytes") is not None:
+                    await upstream.send(msg["bytes"])
+        except Exception:  # noqa: BLE001
+            code = 1011
+        finally:
+            try:
+                await upstream.close(code=code, reason=reason)
+            except Exception:  # noqa: BLE001
+                pass
+
+    async def upstream_to_client():
+        try:
+            async for message in upstream:
+                if isinstance(message, (bytes, bytearray)):
+                    await client_ws.send_bytes(bytes(message))
+                else:
+                    await client_ws.send_text(message)
+        except ConnectionClosed:
+            pass
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            try:
+                await client_ws.close(
+                    code=_close_code_to_pass_on(getattr(upstream, "close_code", None)),
+                    reason=getattr(upstream, "close_reason", None) or "",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
+    try:
+        await asyncio.gather(client_to_upstream(), upstream_to_client())
+    finally:
+        try:
+            await upstream.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def websocket_query(websocket: WebSocket) -> str:
+    """The query string of a WebSocket handshake, as it was sent."""
+    return (websocket.scope.get("query_string") or b"").decode("latin-1")
 
 
 async def _relay_agent_ws(client_ws: WebSocket, upstream, slug: str):
