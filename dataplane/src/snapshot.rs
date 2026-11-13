@@ -37,8 +37,12 @@ impl Hasher for DigestHasher {
 pub type Digest32 = [u8; 32];
 
 pub struct KeyEntry {
-    /// The key's id in the control plane's database; reported with each request.
+    /// The key's id in the control plane's database; reported with each request. For an OAuth2
+    /// token, what the Python gateway counts its refusals under.
     pub id: Arc<str>,
+    /// For an OAuth2 token, the name the Python gateway gives its caller (`oauth2:<provider>`).
+    /// `None` for a key.
+    pub token: Option<Arc<str>>,
     pub is_active: bool,
     pub expires_at: Option<i64>,
     /// False when something that applies to the key cannot be decided here exactly as the Python
@@ -77,6 +81,10 @@ pub struct Snapshot {
     /// How long the backend may take to start answering before the request fails with a 502.
     pub upstream_timeout: Duration,
     pub keys: HashMap<Digest32, KeyEntry, BuildHasherDefault<DigestHasher>>,
+    /// The OAuth2 access tokens the Python gateway accepts as `Authorization: Bearer <token>`, by
+    /// digest. A token has no tenant, no allowed paths, and passes over IP rules and policies
+    /// there, so the control plane lists none while any is in force.
+    pub tokens: HashMap<Digest32, KeyEntry, BuildHasherDefault<DigestHasher>>,
     pub tenants: HashMap<String, Arc<Tenant>>,
     /// Peers whose `X-Forwarded-For` is believed.
     pub trusted_proxies: Vec<Net>,
@@ -289,6 +297,8 @@ struct SnapshotFile {
     #[serde(default)]
     keys: Vec<KeyRecord>,
     #[serde(default)]
+    tokens: Vec<TokenRecord>,
+    #[serde(default)]
     fallthrough_prefixes: Vec<String>,
     #[serde(default = "yes")]
     rate_limit_enabled: bool,
@@ -402,6 +412,16 @@ struct KeyRecord {
     native_ok: bool,
     tenant: Option<String>,
     allowed_paths: Option<ScopeRecord>,
+}
+
+#[derive(Deserialize)]
+struct TokenRecord {
+    hash: String,
+    id: String,
+    name: String,
+    expires_at: i64,
+    rate_limit_per_minute: u32,
+    rate_limit_per_hour: u32,
 }
 
 fn yes() -> bool {
@@ -551,6 +571,7 @@ impl Snapshot {
                 digest,
                 KeyEntry {
                     id: Arc::from(k.id.as_str()),
+                    token: None,
                     is_active: k.is_active,
                     expires_at: k.expires_at,
                     native_ok: k.native_ok,
@@ -559,6 +580,28 @@ impl Snapshot {
                     last_used: reused.map(|e| e.last_used.clone()).unwrap_or_default(),
                     per_minute: k.rate_limit_per_minute,
                     per_hour: k.rate_limit_per_hour,
+                    minute: reused.map(|e| e.minute.clone()).unwrap_or_else(|| Arc::new(Window::new())),
+                    hour: reused.map(|e| e.hour.clone()).unwrap_or_else(|| Arc::new(Window::new())),
+                },
+            );
+        }
+        let mut tokens: HashMap<Digest32, KeyEntry, BuildHasherDefault<DigestHasher>> = HashMap::default();
+        for t in file.tokens {
+            let digest = parse_hex32(&t.hash).ok_or("token: hash must be 64 hex characters")?;
+            let reused = prev.and_then(|p| p.tokens.get(&digest));
+            tokens.insert(
+                digest,
+                KeyEntry {
+                    id: Arc::from(t.id.as_str()),
+                    token: Some(Arc::from(t.name.as_str())),
+                    is_active: true,
+                    expires_at: Some(t.expires_at),
+                    native_ok: true,
+                    tenant: None,
+                    scope: None,
+                    last_used: Arc::default(),
+                    per_minute: t.rate_limit_per_minute,
+                    per_hour: t.rate_limit_per_hour,
                     minute: reused.map(|e| e.minute.clone()).unwrap_or_else(|| Arc::new(Window::new())),
                     hour: reused.map(|e| e.hour.clone()).unwrap_or_else(|| Arc::new(Window::new())),
                 },
@@ -611,6 +654,7 @@ impl Snapshot {
                 .unwrap_or_default(),
             upstream_timeout: Duration::from_secs_f64(file.upstream_timeout_seconds.filter(|s| *s > 0.0 && s.is_finite()).unwrap_or(30.0)),
             keys,
+            tokens,
             tenants,
             trusted_proxies,
             ip_rules,

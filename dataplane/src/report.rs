@@ -150,6 +150,9 @@ pub enum Event {
     },
     RateLimitExceeded {
         api_key_id: String,
+        /// For an OAuth2 token, which has no key id: the name its caller goes by.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        api_key_name: Option<String>,
         client_ip: String,
         limit: u32,
         window: &'static str,
@@ -213,7 +216,7 @@ pub struct Reporter {
     row_cap: usize,
     events: Mutex<Vec<Event>>,
     /// Refusals since the last report, per (key id, window).
-    limited: Mutex<HashMap<(String, &'static str), Limited>>,
+    limited: Mutex<HashMap<(String, Option<String>, &'static str), Limited>>,
 }
 
 pub fn bucket_index(seconds: f64) -> usize {
@@ -344,13 +347,14 @@ impl Reporter {
     }
 
     /// A request was refused with a 429. Only reached on refusals, so the lock is off the hot path.
-    pub fn rate_limited(&self, key_id: &str, window: &'static str, limit: u32, path: &str, ip: IpAddr) {
+    pub fn rate_limited(&self, key_id: &str, name: Option<&str>, window: &'static str, limit: u32, path: &str, ip: IpAddr) {
         let mut limited = self.limited.lock().unwrap();
-        if let Some(l) = limited.get_mut(&(key_id.to_owned(), window)) {
+        let who = (key_id.to_owned(), name.map(str::to_owned), window);
+        if let Some(l) = limited.get_mut(&who) {
             l.count += 1;
         } else if limited.len() < MAX_EVENTS {
             limited.insert(
-                (key_id.to_owned(), window),
+                who,
                 Limited { client_ip: ip.to_string(), limit, path: path.to_owned(), count: 1 },
             );
         }
@@ -358,9 +362,10 @@ impl Reporter {
 
     fn take_events(&self) -> Vec<Event> {
         let mut events = std::mem::take(&mut *self.events.lock().unwrap());
-        for ((api_key_id, window), l) in std::mem::take(&mut *self.limited.lock().unwrap()) {
+        for ((api_key_id, api_key_name, window), l) in std::mem::take(&mut *self.limited.lock().unwrap()) {
             events.push(Event::RateLimitExceeded {
                 api_key_id,
+                api_key_name,
                 client_ip: l.client_ip,
                 limit: l.limit,
                 window,
@@ -722,14 +727,15 @@ mod tests {
         let r = Reporter::new(1000, 100, 1);
         let ip: IpAddr = "10.0.0.9".parse().unwrap();
         for _ in 0..50 {
-            r.rate_limited("k1", "minute", 3, "/api/users", ip);
+            r.rate_limited("k1", None, "minute", 3, "/api/users", ip);
         }
-        r.rate_limited("k1", "hour", 100, "/api/orders", ip);
-        r.rate_limited("k2", "minute", 3, "/api/users", ip);
+        r.rate_limited("k1", None, "hour", 100, "/api/orders", ip);
+        r.rate_limited("k2", None, "minute", 3, "/api/users", ip);
         let events = r.take_events();
         assert_eq!(events.len(), 3);
         assert!(events.contains(&Event::RateLimitExceeded {
             api_key_id: "k1".into(),
+            api_key_name: None,
             client_ip: "10.0.0.9".into(),
             limit: 3,
             window: "minute",

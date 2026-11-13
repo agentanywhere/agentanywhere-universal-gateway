@@ -571,6 +571,21 @@ fn without_bearer(value: &[u8]) -> Cow<'_, [u8]> {
     Cow::Owned(out)
 }
 
+/// The token of an `Authorization: Bearer <token>` header, as the Python gateway reads one when
+/// looking for an OAuth2 token: the word in any case, and the rest without the white space
+/// around it. `None` when the header is not of that form or names no token.
+fn bearer_token(value: &[u8]) -> Option<&[u8]> {
+    let (word, rest) = value.split_at_checked(7)?;
+    if !word.eq_ignore_ascii_case(b"bearer ") {
+        return None;
+    }
+    // What Python's `str.strip` takes off an ASCII string.
+    let blank = |b: &u8| matches!(b, b' ' | b'\t'..=b'\r' | 0x1c..=0x1f);
+    let start = rest.iter().position(|b| !blank(b))?;
+    let end = rest.iter().rposition(|b| !blank(b))?;
+    Some(&rest[start..=end])
+}
+
 /// Decide what happens to a request. `denied` says whether the Python gateway has just refused
 /// the credential with this digest.
 fn decide<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, now: u64, denied: impl Fn(&Digest32) -> bool) -> Decision<'a> {
@@ -642,7 +657,18 @@ fn decide<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, now: u6
     // the request in (an OAuth2 token): only the Python gateway can tell.
     let only_credential = own.is_none() || authorization.is_none();
     let invalid = snap.refusals.as_ref().filter(|_| only_credential).map(|r| &r.invalid_key);
-    let Some(entry) = snap.keys.get(&hash_key(&credential)) else {
+    // What is not a key may be an OAuth2 token, which the Python gateway looks for in
+    // `Authorization` once the key has failed. With a key header as well, which of the two lets
+    // the request in is its to say. A token passes over IP rules and policies there; this side
+    // passes over none, so with any in force the request is handed over. One that has run out
+    // is treated as unknown: the Python gateway refuses it first.
+    let token = || match (own, authorization) {
+        (None, Some(value)) if snap.ip_rules.is_empty() && snap.policies.is_empty() => bearer_token(value)
+            .and_then(|token| snap.tokens.get(&hash_key(token)))
+            .filter(|t| t.expires_at.is_some_and(|e| (now as i64) < e)),
+        _ => None,
+    };
+    let Some(entry) = snap.keys.get(&hash_key(&credential)).or_else(token) else {
         let Some(wording) = invalid else { return PYTHON };
         // Not a key this side knows. That alone proves nothing: it may have been created a
         // moment ago. It is refused here only once the Python gateway has refused it.
@@ -1616,7 +1642,7 @@ pub async fn handle(w: Arc<Worker>, peer: SocketAddr, mut req: Request<Incoming>
     } else if let Some((window, limit, retry_after)) = key_limit(&snap, entry, now) {
         rejected = true;
         if let Some(reporter) = &st.reporter {
-            reporter.rate_limited(&entry.id, window, limit, path, n.ip);
+            reporter.rate_limited(&entry.id, entry.token.as_deref(), window, limit, path, n.ip);
         }
         (rate_limited(window, u64::from(limit), retry_after, None, &t), Some("RATE_LIMIT_EXCEEDED"))
     } else {
@@ -1705,7 +1731,8 @@ pub async fn handle(w: Arc<Worker>, peer: SocketAddr, mut req: Request<Incoming>
             method: n.method,
             path: path.to_owned(),
             client_ip: n.ip.to_string(),
-            api_key_id: Some(entry.id.to_string()),
+            // A token is no row of the keys table, and the request log names none for it.
+            api_key_id: entry.token.is_none().then(|| entry.id.to_string()),
             tenant_id: tenant.map(|tn| tn.id.to_string()),
             status,
             duration_ms: seconds * 1000.0,
@@ -1718,7 +1745,7 @@ pub async fn handle(w: Arc<Worker>, peer: SocketAddr, mut req: Request<Incoming>
             at,
             request_id: &t.request_id,
             traceparent: &t.traceparent,
-            key_id: Some(&entry.id),
+            key_id: entry.token.as_deref().or(Some(&entry.id)),
             tenant: tenant.map(|tn| &*tn.id),
             ip: n.ip,
             method: n.method,
@@ -2284,6 +2311,89 @@ mod tests {
             Decision::Ask(None) => "ask".into(),
             Decision::Ask(Some(_)) => "learn".into(),
             Decision::Refuse(u) => u.wording.message_json.clone(),
+        }
+    }
+
+    const TOKEN: &str = "tok-abc";
+
+    /// A snapshot that also lists `TOKEN`, good until second 1000.
+    fn with_token(extra: &str) -> Snapshot {
+        let hex: String = hash_key(TOKEN.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
+        governed(
+            &format!(
+                r#"{REFUSALS},"tokens":[{{"hash":"{hex}","id":"non-database-key","name":"oauth2:idp","expires_at":1000,"rate_limit_per_minute":7,"rate_limit_per_hour":70}}]{extra}"#
+            ),
+            "",
+        )
+    }
+
+    #[test]
+    fn an_oauth2_token_is_a_credential_in_authorization_only() {
+        let snap = with_token("");
+        for value in ["Bearer tok-abc", "bearer tok-abc", "BEARER tok-abc", "Bearer   tok-abc", "Bearer \ttok-abc \t"] {
+            let req = with_headers(&[("authorization", value)]);
+            let Decision::Native(n) = decide(&snap, peer(), &req, 0, |_| false) else { panic!("{value}") };
+            assert_eq!((n.entry.token.as_deref(), &*n.entry.id, n.entry.per_minute, n.entry.per_hour), (Some("oauth2:idp"), "non-database-key", 7, 70));
+        }
+        // Not without the word, not in the key's own header, not twice the word, not another scheme.
+        for headers in [
+            vec![("authorization", TOKEN)],
+            vec![("x-api-key", TOKEN)],
+            vec![("authorization", "Bearer Bearer tok-abc")],
+            vec![("authorization", "Basic tok-abc")],
+            vec![("authorization", "Bearertok-abc")],
+            vec![("authorization", "Bearer tok-abd")],
+        ] {
+            assert_eq!(outcome(&snap, &with_headers(&headers), 0, false), "learn", "{headers:?}");
+        }
+        // With a key header as well, the Python gateway says which of the two lets the request in.
+        assert_eq!(outcome(&snap, &with_headers(&[("x-api-key", "sk-other"), ("authorization", "Bearer tok-abc")]), 0, false), "ask");
+        // A key in the same header is still a key.
+        let both = format!("Bearer {KEY}");
+        let Decision::Native(n) = decide(&snap, peer(), &with_headers(&[("authorization", &both)]), 0, |_| false) else { panic!() };
+        assert_eq!((n.entry.token.as_deref(), &*n.entry.id), (None, "k1"));
+    }
+
+    #[test]
+    fn a_token_that_has_run_out_is_the_python_gateways_to_refuse_first() {
+        let snap = with_token("");
+        let req = with_headers(&[("authorization", "Bearer tok-abc")]);
+        assert_eq!(outcome(&snap, &req, 999, false), "native");
+        for now in [1000, 1001, 5000] {
+            assert_eq!(outcome(&snap, &req, now, false), "learn", "{now}");
+            assert_eq!(outcome(&snap, &req, now, true), "\"Invalid or inactive API key.\"", "{now}");
+        }
+    }
+
+    #[test]
+    fn with_a_rule_or_a_policy_in_force_a_token_is_handed_over() {
+        let req = with_headers(&[("authorization", "Bearer tok-abc")]);
+        let rule = r#","ip_rules":[{"scope":"global","allow":false,"net":"198.51.100.0/24","details_json":"{}"}]"#;
+        let keyed = r#","ip_rules":[{"scope":"api_key","scope_id":"k9","allow":true,"net":"198.51.100.0/24","details_json":"{}"}]"#;
+        let policy = r#","policies":[{"path":null,"methods":[],"tenants":[],"cidrs":null,"time":[60,120],"deny":true,"message_json":"\"closed\"","details_json":"{}"}]"#;
+        for extra in [rule, keyed, policy] {
+            let snap = with_token(extra);
+            assert_eq!(outcome(&snap, &req, 0, false), "learn", "{extra}");
+            // A key is decided here all the same.
+            assert_eq!(outcome(&snap, &with_headers(&[("x-api-key", KEY)]), 0, false), "native", "{extra}");
+        }
+    }
+
+    #[test]
+    fn the_token_is_read_as_python_reads_it() {
+        for (value, token) in [
+            ("Bearer abc", Some("abc")),
+            ("bEaReR  abc  ", Some("abc")),
+            ("Bearer a b", Some("a b")),
+            ("Bearer ", None),
+            ("Bearer    ", None),
+            ("Bearer", None),
+            ("Bearerabc", None),
+            ("Basic abc", None),
+            ("abc", None),
+            ("", None),
+        ] {
+            assert_eq!(bearer_token(value.as_bytes()), token.map(str::as_bytes), "{value:?}");
         }
     }
 

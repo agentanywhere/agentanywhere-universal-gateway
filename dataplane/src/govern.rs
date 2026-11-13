@@ -148,6 +148,10 @@ pub struct IpRules {
 }
 
 impl IpRules {
+    pub fn is_empty(&self) -> bool {
+        self.global.rules.is_empty() && self.tenant.is_empty() && self.key.is_empty()
+    }
+
     pub fn add(&mut self, scope: &str, scope_id: Option<String>, rule: IpRule) -> Result<(), String> {
         let bucket = match (scope, scope_id) {
             ("global", _) => &mut self.global,
