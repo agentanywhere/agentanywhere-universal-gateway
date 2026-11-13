@@ -11,7 +11,10 @@
 use bytes::Bytes;
 use http_body_util::{BodyExt, Either, Full};
 use hyper::body::{Body as _, Incoming};
-use hyper::header::{HeaderName, HeaderValue, ACCEPT, AUTHORIZATION, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST, ORIGIN, REFERER, UPGRADE, USER_AGENT};
+use hyper::header::{
+    HeaderName, HeaderValue, ACCEPT, ACCESS_CONTROL_ALLOW_CREDENTIALS, ACCESS_CONTROL_ALLOW_ORIGIN, AUTHORIZATION, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE,
+    HOST, ORIGIN, REFERER, UPGRADE, USER_AGENT, VARY,
+};
 use hyper::http::uri::{Authority, Scheme};
 use hyper::{HeaderMap, Method, Request, Response, StatusCode, Uri, Version};
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
@@ -549,7 +552,7 @@ fn decide<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, now: u6
     }
     // A request to change protocol (a WebSocket handshake) is not an ordinary request there, and
     // one from a web page in another origin is answered with the gateway's cross-origin headers.
-    if req.headers().contains_key(UPGRADE) || req.headers().contains_key(ORIGIN) {
+    if req.headers().contains_key(UPGRADE) || cross_origin(snap, req.headers()).is_err() {
         return PYTHON;
     }
     let m = req.method();
@@ -636,6 +639,58 @@ fn decide<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, now: u6
     Decision::Native(Native { protocol, backend, entry, route, version, ip, method })
 }
 
+/// What the answer to a request from another origin is given, as the Python gateway's CORS
+/// middleware gives it to the answers that pass through it.
+#[derive(Debug, PartialEq)]
+struct Granted {
+    /// `Access-Control-Allow-Origin: *`.
+    any_origin: bool,
+    credentials: bool,
+    /// The request's own origin, named back (with `Vary: Origin`): it is on the list, or every
+    /// origin is welcome and the request carries a cookie.
+    named: Option<HeaderValue>,
+}
+
+/// What a request's `Origin` header earns its answer. `Ok(None)`: there is none, and nothing is
+/// added. `Err`: this side cannot tell (no word from the control plane, the header twice or not
+/// text), and the request is the Python gateway's.
+fn cross_origin(snap: &Snapshot, headers: &HeaderMap) -> Result<Option<Granted>, ()> {
+    let mut sent = headers.get_all(ORIGIN).iter();
+    let Some(origin) = sent.next() else { return Ok(None) };
+    let rules = snap.cross_origin.as_ref().ok_or(())?;
+    let text = origin.to_str().map_err(|_| ())?;
+    if sent.next().is_some() {
+        return Err(());
+    }
+    let named = match rules.any_origin {
+        true => headers.contains_key(COOKIE),
+        false => rules.origins.contains(text),
+    };
+    Ok(Some(Granted { any_origin: rules.any_origin, credentials: rules.credentials, named: named.then(|| origin.clone()) }))
+}
+
+impl Granted {
+    /// Write the headers onto an answer, over whatever the backend sent under the same names.
+    fn onto(&self, resp: &mut Response<Body>) {
+        let h = resp.headers_mut();
+        if self.any_origin {
+            h.insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+        }
+        if self.credentials {
+            h.insert(ACCESS_CONTROL_ALLOW_CREDENTIALS, HeaderValue::from_static("true"));
+        }
+        if let Some(origin) = &self.named {
+            h.insert(ACCESS_CONTROL_ALLOW_ORIGIN, origin.clone());
+            // After the first `Vary` the answer has; any further ones are dropped, as there.
+            let vary = match h.get(VARY).map(|v| v.as_bytes()) {
+                Some(first) => HeaderValue::from_bytes(&[first, b", Origin"].concat()).unwrap_or(HeaderValue::from_static("Origin")),
+                None => HeaderValue::from_static("Origin"),
+            };
+            h.insert(VARY, vary);
+        }
+    }
+}
+
 /// A request for `/agents/<slug>/...` this side forwards itself.
 struct AgentCall<'a> {
     backend: &'a Backend,
@@ -711,7 +766,7 @@ fn agent_call<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, aft
     }
     // A browser is forwarded for like anyone else; only a failure is answered differently.
     let html = prefers_html(headers)?;
-    if headers.contains_key(UPGRADE) || headers.contains_key(ORIGIN) || NOT_FORWARDED_ALIKE.iter().any(|h| headers.contains_key(*h)) {
+    if headers.contains_key(UPGRADE) || cross_origin(snap, headers).is_err() || NOT_FORWARDED_ALIKE.iter().any(|h| headers.contains_key(*h)) {
         return None;
     }
     // Of a header sent twice, the Python gateway forwards the last one only.
@@ -771,7 +826,15 @@ fn agent_failed(failure: &AgentFailure, html: bool, t: &Trace, at: Duration) -> 
 /// additions. The agent's answer is streamed back as it comes. An agent that cannot be reached
 /// was sent nothing, so the request goes to the Python gateway, which answers (and counts the
 /// failure) in its own way.
-async fn serve_agent(w: &Worker, a: &AgentCall<'_>, peer: SocketAddr, req: Request<Incoming>, started: Instant, at: Duration) -> Response<Body> {
+async fn serve_agent(
+    w: &Worker,
+    a: &AgentCall<'_>,
+    granted: Option<&Granted>,
+    peer: SocketAddr,
+    req: Request<Incoming>,
+    started: Instant,
+    at: Duration,
+) -> Response<Body> {
     let has_body = matches!(a.method, "POST" | "PUT" | "PATCH" | "DELETE");
     let fits = match req.body().size_hint().exact() {
         Some(0) => true,
@@ -824,6 +887,10 @@ async fn serve_agent(w: &Worker, a: &AgentCall<'_>, peer: SocketAddr, req: Reque
         }
         Err(_) => (agent_failed(a.failure, a.html, &t, at), true),
     };
+    // The agent's answer passes through the Python gateway's CORS middleware; its own 500 does not.
+    if let Some(granted) = granted.filter(|_| !failed) {
+        granted.onto(&mut resp);
+    }
     let answered = Answered { method: a.method, ip: a.ip, version: a.version, rejected: false, error: failed.then_some("INTERNAL_ERROR") };
     resp = finish(w, resp, &answered, &original, &t, started, at);
     if failed {
@@ -1098,7 +1165,7 @@ fn own<'a, B>(snap: &'a Snapshot, req: &Request<B>, up: impl FnOnce() -> bool, r
     if health.is_none() && path != "/ready" && path != "/live" {
         return None;
     }
-    if req.method() != Method::GET || uri.authority().is_some() || headers.contains_key(UPGRADE) || headers.contains_key(ORIGIN) {
+    if req.method() != Method::GET || uri.authority().is_some() || headers.contains_key(UPGRADE) || cross_origin(snap, headers).is_err() {
         return None;
     }
     match (health, path) {
@@ -1127,6 +1194,9 @@ fn answer_own<B>(w: &Worker, snap: &Snapshot, own: &Own, peer: SocketAddr, req: 
     let mut resp = Response::new(full(body));
     *resp.status_mut() = status;
     resp.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    if let Ok(Some(granted)) = cross_origin(snap, req.headers()) {
+        granted.onto(&mut resp);
+    }
     let a = Answered { method: "GET", ip, version, rejected: false, error: None };
     Some(finish(w, resp, &a, req, &trace_for(req.headers()), started, at))
 }
@@ -1414,6 +1484,9 @@ pub async fn handle(w: Arc<Worker>, peer: SocketAddr, mut req: Request<Incoming>
             return Ok(resp);
         }
     }
+    // What a web page in another origin is told. Where this side cannot say, the request goes
+    // to the Python gateway further down, so nothing is lost by not knowing here.
+    let granted = cross_origin(&snap, req.headers()).ok().flatten();
     // Fail closed: if the snapshot is not known to be current, the Python gateway decides.
     let trusted = st.sync.as_ref().map(|s| s.fresh()).unwrap_or(true);
     if trusted && req.headers().contains_key(UPGRADE) {
@@ -1440,7 +1513,7 @@ pub async fn handle(w: Arc<Worker>, peer: SocketAddr, mut req: Request<Incoming>
     };
     let n = match decision {
         Decision::Native(n) => n,
-        Decision::Agent(a) => return Ok(serve_agent(&w, &a, peer, req, started, at).await),
+        Decision::Agent(a) => return Ok(serve_agent(&w, &a, granted.as_ref(), peer, req, started, at).await),
         Decision::Refuse(u) => return Ok(unauthenticated(&w, &u, &req, started, at)),
         Decision::Ask(credential) => {
             let (resp, refused) = ask_control(&w, peer, req.map(Either::Left)).await;
@@ -1604,6 +1677,11 @@ pub async fn handle(w: Arc<Worker>, peer: SocketAddr, mut req: Request<Incoming>
             user_agent,
             referrer: referrer.as_ref().and_then(|v| v.to_str().ok()),
         }));
+    }
+    // An answer from the backend, or the 502 or 503 that stands in for one, passes through the
+    // Python gateway's CORS middleware. Its refusals (401, 403, 429) are made outside it.
+    if let Some(granted) = granted.as_ref().filter(|_| !rejected && !grpc) {
+        granted.onto(&mut resp);
     }
     // A gRPC client reads a refusal in gRPC's own form; it was counted and logged above as the
     // HTTP answer it stands for.
@@ -2578,10 +2656,75 @@ mod tests {
     }
 
     #[test]
-    fn a_request_from_another_origin_is_left_to_python() {
-        let snap = Snapshot::from_json(r#"{"keys":[]}"#).unwrap();
-        let req = Request::builder().uri("/api/users").header("origin", "https://app.example").body(()).unwrap();
-        assert!(matches!(decide(&snap, "127.0.0.1:9".parse().unwrap(), &req, 0, |_| false), Decision::Ask(None)));
+    fn a_request_from_another_origin_is_left_to_python_unless_this_side_knows_the_answer() {
+        let from = |snap: &Snapshot, origins: &[&str]| {
+            let mut b = Request::builder().uri("/api/users").header("x-api-key", KEY);
+            for o in origins {
+                b = b.header("origin", *o);
+            }
+            outcome(snap, &b.body(()).unwrap(), 100, false)
+        };
+        // No word from the control plane on how such requests are answered.
+        assert_eq!(from(&governed("", ""), &["https://app.example"]), "ask");
+        let told = governed(r#","cross_origin":{"any_origin":false,"origins":["https://app.example"],"credentials":true}"#, "");
+        assert_eq!(from(&told, &["https://app.example"]), "native");
+        assert_eq!(from(&told, &["https://other.example"]), "native");
+        assert_eq!(from(&told, &["https://app.example", "https://app.example"]), "ask");
+        assert_eq!(from(&told, &[]), "native");
+    }
+
+    fn granted(rules: &str, headers: &[(&str, &str)]) -> Result<Option<Granted>, ()> {
+        let snap = Snapshot::from_json(&format!(r#"{{"keys":[],"cross_origin":{rules}}}"#)).unwrap();
+        let mut h = HeaderMap::new();
+        for (k, v) in headers {
+            h.append(HeaderName::from_bytes(k.as_bytes()).unwrap(), HeaderValue::from_str(v).unwrap());
+        }
+        cross_origin(&snap, &h)
+    }
+
+    #[test]
+    fn an_origin_earns_what_the_cors_middleware_gives_it() {
+        let listed = r#"{"any_origin":false,"origins":["https://app.example"],"credentials":true}"#;
+        let app = HeaderValue::from_static("https://app.example");
+        assert_eq!(granted(listed, &[]), Ok(None));
+        assert_eq!(granted(listed, &[("origin", "https://app.example")]), Ok(Some(Granted { any_origin: false, credentials: true, named: Some(app.clone()) })));
+        // An origin that is not listed is still told about credentials, and nothing else.
+        assert_eq!(granted(listed, &[("origin", "https://APP.example")]), Ok(Some(Granted { any_origin: false, credentials: true, named: None })));
+        let any = r#"{"any_origin":true,"origins":[],"credentials":false}"#;
+        assert_eq!(granted(any, &[("origin", "https://x.example")]), Ok(Some(Granted { any_origin: true, credentials: false, named: None })));
+        // With a cookie, the star gives way to the origin itself.
+        let x = HeaderValue::from_static("https://x.example");
+        assert_eq!(granted(any, &[("origin", "https://x.example"), ("cookie", "s=1")]), Ok(Some(Granted { any_origin: true, credentials: false, named: Some(x) })));
+        assert_eq!(granted("null", &[("origin", "https://x.example")]), Err(()));
+        assert_eq!(granted("null", &[]), Ok(None));
+    }
+
+    #[test]
+    fn the_cross_origin_headers_go_over_the_backends_own() {
+        let headers_of = |g: &Granted, sent: &[(&str, &str)]| {
+            let mut resp = Response::new(full(Bytes::new()));
+            for (k, v) in sent {
+                resp.headers_mut().append(HeaderName::from_bytes(k.as_bytes()).unwrap(), HeaderValue::from_str(v).unwrap());
+            }
+            g.onto(&mut resp);
+            let mut all: Vec<String> = resp.headers().iter().map(|(k, v)| format!("{k}: {}", v.to_str().unwrap())).collect();
+            all.sort();
+            all
+        };
+        let named = Granted { any_origin: false, credentials: true, named: Some(HeaderValue::from_static("https://app.example")) };
+        assert_eq!(headers_of(&named, &[]), ["access-control-allow-credentials: true", "access-control-allow-origin: https://app.example", "vary: Origin"]);
+        assert_eq!(
+            headers_of(&named, &[("vary", "Accept-Encoding"), ("vary", "Cookie"), ("access-control-allow-origin", "https://backend.example")]),
+            ["access-control-allow-credentials: true", "access-control-allow-origin: https://app.example", "vary: Accept-Encoding, Origin"]
+        );
+        // Not listed: the backend's own answer to the question stands.
+        let unlisted = Granted { any_origin: false, credentials: true, named: None };
+        assert_eq!(
+            headers_of(&unlisted, &[("vary", "Accept-Encoding"), ("access-control-allow-origin", "https://backend.example")]),
+            ["access-control-allow-credentials: true", "access-control-allow-origin: https://backend.example", "vary: Accept-Encoding"]
+        );
+        let any = Granted { any_origin: true, credentials: false, named: None };
+        assert_eq!(headers_of(&any, &[("access-control-allow-origin", "https://backend.example")]), ["access-control-allow-origin: *"]);
     }
 
     #[test]

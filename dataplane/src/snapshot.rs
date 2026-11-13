@@ -116,6 +116,8 @@ pub struct Snapshot {
     pub agent_failure: Option<AgentFailure>,
     /// The dynamic routes in force, in the order the Python gateway tries them.
     pub dynamic_routes: Vec<DynamicRoute>,
+    /// `None` when the control plane did not say: requests from other origins are then its own.
+    pub cross_origin: Option<CrossOrigin>,
 }
 
 /// The gateway's health endpoint, as the Python gateway serves it.
@@ -125,6 +127,17 @@ pub struct Ops {
     pub health_path: Option<String>,
     /// The version it reports, as a JSON string.
     pub version_json: String,
+}
+
+/// How the Python gateway answers a request from a web page in another origin.
+#[derive(Deserialize, Debug, PartialEq)]
+pub struct CrossOrigin {
+    /// Every origin is welcome (`*`).
+    pub any_origin: bool,
+    /// The origins named back to their own requests.
+    pub origins: std::collections::HashSet<String>,
+    /// Whether answers say credentials are allowed.
+    pub credentials: bool,
 }
 
 /// A route registered through the admin API: where a matching request goes instead.
@@ -215,6 +228,7 @@ struct SnapshotFile {
     agent_failure: Option<AgentFailure>,
     #[serde(default)]
     dynamic_routes: Vec<DynamicRoute>,
+    cross_origin: Option<CrossOrigin>,
     ready: Option<Readiness>,
     #[serde(default)]
     keys: Vec<KeyRecord>,
@@ -513,6 +527,7 @@ impl Snapshot {
             agents: HashMap::new(),
             agent_failure: file.agent_failure.filter(|f| f.message_json.starts_with('"')),
             dynamic_routes: file.dynamic_routes,
+            cross_origin: file.cross_origin,
             inject_request_id: file.inject_request_id,
             revision: file.revision,
             api_versions,

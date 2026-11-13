@@ -196,6 +196,11 @@ def agent_backend(tls=None):
             self.send_header("Set-Cookie", "session=alice; Path=/")
             self.send_header("Set-Cookie", "csrf=1")
             self.send_header("X-Agent", "echo")
+            if path.endswith("/vary"):
+                self.send_header("Vary", "Accept-Encoding")
+            if path.endswith("/acao"):
+                self.send_header("Access-Control-Allow-Origin", "http://backend.example")
+                self.send_header("Access-Control-Expose-Headers", "X-Agent")
             self.end_headers()
             if self.command != "HEAD":
                 self.wfile.write(out)
@@ -343,6 +348,7 @@ def main() -> int:
                                            "--sync-interval-ms", "200", "--max-staleness-ms", "2000", "--report-interval-ms", "300",
                                            "--backend", f"http://127.0.0.1:{bport}", "--control", f"http://127.0.0.1:{gport}"], env=env))
             time.sleep(1.5)
+            assert procs[-1].poll() is None, f"the data plane exited at once (code {procs[-1].returncode})"
 
             py, rs = f"http://127.0.0.1:{gport}", f"http://127.0.0.1:{dport}"
             tp_in = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
@@ -1105,7 +1111,7 @@ def main() -> int:
             agent_same("a header given twice", "GET", "/agents/echo/a", [("Accept", "text/plain"), ("Accept", "application/json")], by="python")
             agent_same("a path that names an API version", "GET", "/agents/echo/v1/a", by="python")
             agent_same("a caller that names a protocol", "GET", "/agents/echo/a", {"X-Protocol": "mcp"}, by="python")
-            agent_same("a request from a web page in another origin", "GET", "/agents/echo/a", {"Origin": "http://localhost:3001"}, by="python")
+            agent_same("a request from a web page in another origin", "GET", "/agents/echo/a", {"Origin": "http://localhost:3001"})
             agent_same("a body too large to hold here", "POST", "/agents/echo/upload", {"Content-Type": "application/octet-stream"}, b"z" * 2_000_000, by="python")
             page = {"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "User-Agent": "Mozilla/5.0"}
             agent_same("a browser is forwarded for like anyone else", "GET", "/agents/echo/a", page)
@@ -1155,6 +1161,7 @@ def main() -> int:
                           {"path": "/api/routed/quick/*", "backend_url": agent, "timeout": 1},
                           {"path": "/api/routed/tls/*", "backend_url": secure_agent},
                           {"path": "/api/routed/stranger/*", "backend_url": strange_agent},
+                          {"path": "/api/routed/dead/*", "backend_url": "http://127.0.0.1:7"},  # its own address: a breaker of its own
                           {"path": "/acp/routed/*", "backend_url": agent, "protocol": "acp"}):
                 post("/admin/routes", {"protocol": "http", "timeout": 30, **route})
 
@@ -1206,6 +1213,58 @@ def main() -> int:
             compare("dynamic routes: a routed path still needs a key", a, b)
             r = httpx.get(f"{rs}/api/users", headers={"X-API-Key": keys["rs"]["key"]}, timeout=10)
             check("dynamic routes: paths no route matches are served here as before", r.status_code == 200 and said_by(r) == "data plane" and "x-agent" not in r.headers)
+
+            # --- requests from web pages in other origins --------------------------------------------
+            # The gateway lists http://localhost:3001 (its default). Each request goes to both planes
+            # with an Origin header; the status and the headers a browser acts on must be the same.
+            print()
+
+            def page_headers(r):
+                return sorted((k, v) for k, v in r.headers.multi_items() if k.startswith("access-control-") or k == "vary")
+
+            def from_page(name, origin, method, path, headers=None, by="data plane", pair=None, wants=None):
+                pair = pair or plain
+                send = lambda base, key: httpx.request(method, base + path, timeout=15, headers={
+                    "Origin": origin, **{k: v.replace("{key}", key) for k, v in (headers or {}).items()}})
+                a, b = send(py, pair["py"]["key"]), send(rs, pair["rs"]["key"])
+                bad = []
+                if a.status_code != b.status_code:
+                    bad.append(f"status {a.status_code} vs {b.status_code}")
+                if page_headers(a) != page_headers(b):
+                    bad.append(f"python {page_headers(a)} vs data plane {page_headers(b)}")
+                if said_by(b) != by:
+                    bad.append(f"answered by {said_by(b)}")
+                if wants is not None and not wants(dict(page_headers(b))):
+                    bad.append(f"not the expected headers: {page_headers(b)}")
+                check(f"from a web page ({name})", not bad, f"[{b.status_code}] {dict(page_headers(b))}" if not bad else "; ".join(bad))
+
+            with_key = {"X-API-Key": "{key}"}
+            for whose, origin in (("a listed origin", "http://localhost:3001"), ("another origin", "http://elsewhere.example")):
+                listed = whose == "a listed origin"
+                named = (lambda h: h.get("access-control-allow-origin") == origin and h.get("vary") == "Origin") if listed \
+                    else (lambda h: "access-control-allow-origin" not in h and "vary" not in h)
+                from_page(f"{whose}: an API call", origin, "GET", "/api/users", with_key, wants=named)
+                from_page(f"{whose}: with a cookie", origin, "GET", "/api/users", {**with_key, "Cookie": "s=1"}, wants=named)
+                from_page(f"{whose}: with a body", origin, "POST", "/api/users", {**with_key, "Content-Type": "application/json"})
+                from_page(f"{whose}: a backend that varies its answer keeps that", origin, "GET", "/api/routed/vary", with_key,
+                          wants=lambda h: h.get("vary") == ("Accept-Encoding, Origin" if listed else "Accept-Encoding"))
+                from_page(f"{whose}: a backend with an answer of its own to the question", origin, "GET", "/api/routed/acao", with_key,
+                          wants=lambda h: h.get("access-control-allow-origin") == (origin if listed else "http://backend.example"))
+                from_page(f"{whose}: a backend that cannot be reached", origin, "GET", "/api/routed/dead/a", with_key,
+                          wants=lambda h: h.get("access-control-allow-credentials") == "true")
+                from_page(f"{whose}: no key", origin, "GET", "/api/users", wants=lambda h: h == {})
+                from_page(f"{whose}: a key outside its paths", origin, "GET", "/api/orders", with_key, pair=scoped, wants=lambda h: h == {})
+                for path in ("/health", "/ready", "/live"):
+                    from_page(f"{whose}: {path}", origin, "GET", path, wants=named)
+                from_page(f"{whose}: an agent", origin, "GET", "/agents/echo/a", wants=named)
+                from_page(f"{whose}: an agent that hangs up", origin, "GET", "/agents/echo/drop", wants=lambda h: h == {})
+                from_page(f"{whose}: an agent that is not registered", origin, "GET", "/agents/nobody/a", by="python")
+                from_page(f"{whose}: asking first (a preflight)", origin, "OPTIONS", "/api/users",
+                          {"Access-Control-Request-Method": "POST", "Access-Control-Request-Headers": "x-api-key"}, by="python")
+            a, b = (httpx.get(f"{base}/api/users", timeout=10, headers=[("Origin", "http://localhost:3001"), ("Origin", "http://elsewhere.example"),
+                                                                         ("X-API-Key", k)]) for base, k in ((py, keys["py"]["key"]), (rs, keys["rs"]["key"])))
+            check("from a web page: an origin given twice is Python's to answer",
+                  said_by(b) == "python" and a.status_code == b.status_code and page_headers(a) == page_headers(b), f"[{b.status_code}] {page_headers(b)}")
 
             # --- gRPC --------------------------------------------------------------------------------
             # The Python gateway does not speak HTTP/2, so there is no second plane to compare with:
