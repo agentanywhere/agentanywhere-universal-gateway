@@ -344,7 +344,7 @@ def main() -> int:
                 h = {k: (v.replace("{key}", key) if isinstance(v, str) else v) for k, v in headers.items()}
                 return httpx.request(method, base + path, headers=h, json=body, timeout=15, follow_redirects=False)
 
-            VOLATILE = {"id", "created_at", "timestamp", "request_id", "updated_at", "pid", "latency_ms", "last_checked", "checked_at"}
+            VOLATILE = {"id", "created_at", "timestamp", "request_id", "updated_at", "pid", "latency_ms", "last_checked", "checked_at", "last_used_at"}
 
             def mask(x):
                 if isinstance(x, dict):
