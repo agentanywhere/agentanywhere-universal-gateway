@@ -92,6 +92,8 @@ settings too, so `.env` applies to them; the process environment wins.)
 | `WORKERS` | `4` | Worker processes, used only by `python -m app.main` with `ENVIRONMENT=production`. The container image runs one process. |
 | `GATEWAY_URL_BASE` | unset | Public base URL of the gateway, used in generated SDKs and the A2A Agent Card. Unset: built from `HOST` and `PORT`. |
 | `CONFIG_FILE` | unset | **env only.** Path to a JSON, YAML or TOML settings file. A file that cannot be read prints a warning and is ignored. |
+| `SSL_CERT_FILE` | unset | **env only.** A file of certificates to trust when a backend is behind TLS, read by the TLS libraries and by the data plane. The data plane relays to a `wss://` WebSocket backend only when this is set for both it and the gateway. |
+| `SSL_CERT_DIR` | unset | **env only.** A directory of certificates to trust, read by the TLS libraries. With it set, the data plane speaks no TLS to backends and leaves them to the gateway. |
 
 ## Credentials
 
