@@ -655,12 +655,19 @@ def apply_report(report: DataplaneReport) -> Dict[str, int]:
     for agg in report.aggregates:
         metric_path = gw._rejected_path_label(agg.path) if agg.rejected else gw.obs_metric_path_label(agg.path)
         protocol = metric_protocol(agg.path)
+        # A request the data plane forwarded to an agent feeds the agent board, as one proxied here does.
+        agent = gw.agent_edge_config.resolve(agg.path)
         for i, pair in enumerate(agg.buckets[: len(_BOUNDS) + 1]):
             n, total = int(pair[0]), float(pair[1])
             if n <= 0:
                 continue
             mean = total / n
             counted += n
+            if agent is not None:
+                from app.agent_monitor import agent_monitor
+
+                for _ in range(n):
+                    agent_monitor.record_request(agent.slug, agg.status, round(mean * 1000, 1))
             for _ in range(n):
                 gw.obs_record_request(
                     method=agg.method, path=metric_path, status_code=agg.status,

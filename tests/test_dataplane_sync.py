@@ -840,3 +840,25 @@ async def test_the_snapshot_names_the_agents_the_data_plane_can_reach(db_session
     gw.agent_edge_config.replace({"hiring": "http://10.0.0.10:8002"})
     after = await dataplane_sync.build_snapshot(db_session)
     assert after["agents"] == {"hiring": "http://10.0.0.10:8002"} and after["revision"] != before
+
+
+def test_requests_the_data_plane_forwarded_to_an_agent_reach_the_agent_board(monkeypatch):
+    from app import main as gw
+    from app.agent_monitor import AgentMonitor
+    from app import agent_monitor as board
+    from app.agent_routes import AgentEdgeConfig
+
+    monitor = AgentMonitor()
+    monkeypatch.setattr(board, "agent_monitor", monitor)
+    monkeypatch.setattr(gw, "agent_edge_config", AgentEdgeConfig(routes={"hiring": "http://10.0.0.10:8001"}))
+    dataplane_sync.apply_report(dataplane_sync.DataplaneReport(aggregates=[
+        dataplane_sync.ReportedAggregate(method="GET", path="/agents/hiring/briefs/7", status=200, buckets=[[3, 0.006]]),
+        dataplane_sync.ReportedAggregate(method="POST", path="/agents/hiring/run", status=502, buckets=[[1, 0.5]]),
+        # Not an agent, and an agent nobody registered: neither is put on the board.
+        dataplane_sync.ReportedAggregate(method="GET", path="/api/users", status=200, buckets=[[5, 0.01]]),
+        dataplane_sync.ReportedAggregate(method="GET", path="/agents/nobody/x", status=200, buckets=[[2, 0.01]]),
+    ]))
+    stats = monitor._traffic_stats("hiring")
+    assert (stats["total_requests"], stats["error_pct"]) == (4, 25.0)
+    assert stats["avg_latency_ms"] == round((3 * 2.0 + 500.0) / 4, 1)
+    assert "nobody" not in monitor._events
