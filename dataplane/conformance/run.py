@@ -1162,6 +1162,7 @@ def main() -> int:
                           {"path": "/api/routed/tls/*", "backend_url": secure_agent},
                           {"path": "/api/routed/stranger/*", "backend_url": strange_agent},
                           {"path": "/api/routed/dead/*", "backend_url": "http://127.0.0.1:7"},  # its own address: a breaker of its own
+                          {"path": "/api/routed/down/*", "backend_url": "http://127.0.0.1:11"},
                           {"path": "/acp/routed/*", "backend_url": agent, "protocol": "acp"}):
                 post("/admin/routes", {"protocol": "http", "timeout": 30, **route})
 
@@ -1213,6 +1214,55 @@ def main() -> int:
             compare("dynamic routes: a routed path still needs a key", a, b)
             r = httpx.get(f"{rs}/api/users", headers={"X-API-Key": keys["rs"]["key"]}, timeout=10)
             check("dynamic routes: paths no route matches are served here as before", r.status_code == 200 and said_by(r) == "data plane" and "x-agent" not in r.headers)
+
+            # --- browsers on the API's own paths ------------------------------------------------------
+            # A browser is shown errors as pages. Each page from the data plane must be the Python
+            # gateway's page to the letter, bar the request id.
+            print()
+
+            def browser_same(name, path, pair=None, extra=None, status=None, by="data plane", html=True):
+                pair = pair or plain
+                send = lambda base, key: httpx.get(base + path, timeout=15, headers={
+                    **page, **{k: v.replace("{key}", key) for k, v in (extra or {}).items()}})
+                a, b = send(py, pair["py"]["key"]), send(rs, pair["rs"]["key"])
+                bad = []
+                if a.status_code != b.status_code or (status is not None and b.status_code != status):
+                    bad.append(f"status {a.status_code} vs {b.status_code}")
+                is_page = lambda r: r.headers.get("content-type") == "text/html; charset=utf-8" and "<!doctype html>" in r.text
+                if html and not (is_page(a) and is_page(b)):
+                    bad.append(f"not a page: {a.headers.get('content-type')} vs {b.headers.get('content-type')}")
+                elif html and page_of(a) != page_of(b):
+                    at = next(i for i, (x, y) in enumerate(zip(page_of(a), page_of(b))) if x != y)
+                    bad.append(f"pages differ at {at}: ...{page_of(a)[at - 30:at + 50]!r} vs ...{page_of(b)[at - 30:at + 50]!r}")
+                elif not html and status is not None and status >= 400 and shape(a) != shape(b):
+                    bad.append(f"body {shape(a)} vs {shape(b)}")
+                for h in PROMISED:
+                    if (h in a.headers) != (h in b.headers):
+                        bad.append(f"header {h}: python={h in a.headers} rust={h in b.headers}")
+                if by and said_by(b) != by:
+                    bad.append(f"answered by {said_by(b)}")
+                check(f"a browser: {name}", not bad, f"[{b.status_code}] by {said_by(b)}" + ("  " + "; ".join(bad) if bad else ""))
+                return a, b
+
+            with_key = {"X-API-Key": "{key}"}
+            browser_same("a page of the API is served like any call", "/api/users", extra=with_key, status=200, html=False)
+            browser_same("without a key", "/api/users", status=401)
+            browser_same("with a key that does not exist", "/api/users", extra={"X-API-Key": "sk-nobody-has-this"}, status=401, by=None)
+            browser_same("and again, once Python has refused it", "/api/users", extra={"X-API-Key": "sk-nobody-has-this"}, status=401)
+            a, b = browser_same("a key outside its paths", "/api/orders", pair=scoped, extra=with_key, status=403)
+            check("a browser: that page carries the hint", "Use a key whose scope covers this path." in b.text)
+            slow = {"py": make_key("conf-py-browser", 2), "rs": make_key("conf-rs-browser", 2)}
+            assert wait_until(lambda: served_natively(slow["rs"]["key"])), "key never became native"
+            for base, which in ((py, "py"), (rs, "rs")):  # each plane uses up its own key's two a minute
+                wait_until(lambda: httpx.get(f"{base}/api/users", headers={"X-API-Key": slow[which]["key"]}, timeout=10).status_code == 429)
+            a, b = browser_same("over its limit", "/api/users", pair=slow, extra=with_key, status=429)
+            check("a browser: that page counts down, and the header says the same",
+                  '<b id="cd">60</b>' in b.text and "var n=60," in b.text and b.headers.get("retry-after") == a.headers.get("retry-after") == "60")
+            browser_same("a backend that cannot be reached", "/api/routed/down/a", extra=with_key, status=502)
+            browser_same("a script in the page is answered in JSON", "/api/users", extra={"X-Requested-With": "XMLHttpRequest"}, status=401, html=False)
+            browser_same("a caller that names JSON first is answered in JSON", "/api/users", extra={"Accept": "application/json, text/html"}, status=401, html=False)
+            a, b = browser_same("its own request id is written into the page safely", "/api/users", extra={"X-Request-ID": "<b>&'\"@@message@@"}, status=401)
+            check("a browser: and only there", "&lt;b&gt;&amp;&#x27;&quot;@@message@@" in b.text and b.text.count("API key required") == a.text.count("API key required"))
 
             # --- requests from web pages in other origins --------------------------------------------
             # The gateway lists http://localhost:3001 (its default). Each request goes to both planes

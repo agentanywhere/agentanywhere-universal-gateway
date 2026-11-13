@@ -118,6 +118,9 @@ pub struct Snapshot {
     pub dynamic_routes: Vec<DynamicRoute>,
     /// `None` when the control plane did not say: requests from other origins are then its own.
     pub cross_origin: Option<CrossOrigin>,
+    /// The pages a browser is shown for the errors answered here, by `<status>:<hint><countdown>`.
+    /// `None` when the control plane sent none: browsers are then its own.
+    pub error_pages: Option<HashMap<String, String>>,
 }
 
 /// The gateway's health endpoint, as the Python gateway serves it.
@@ -229,6 +232,7 @@ struct SnapshotFile {
     #[serde(default)]
     dynamic_routes: Vec<DynamicRoute>,
     cross_origin: Option<CrossOrigin>,
+    error_pages: Option<HashMap<String, String>>,
     ready: Option<Readiness>,
     #[serde(default)]
     keys: Vec<KeyRecord>,
@@ -528,6 +532,7 @@ impl Snapshot {
             agent_failure: file.agent_failure.filter(|f| f.message_json.starts_with('"')),
             dynamic_routes: file.dynamic_routes,
             cross_origin: file.cross_origin,
+            error_pages: file.error_pages,
             inject_request_id: file.inject_request_id,
             revision: file.revision,
             api_versions,

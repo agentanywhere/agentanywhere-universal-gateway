@@ -385,12 +385,47 @@ fn names_a_version(path: &str) -> bool {
     rest.is_empty() || rest.starts_with('/')
 }
 
-fn wants_html(headers: &HeaderMap) -> bool {
-    headers
-        .get(ACCEPT)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.contains("text/html"))
-        .unwrap_or(false)
+/// The seconds of a countdown, as they stand in a page from the snapshot.
+const PAGE_RETRY_AFTER: &str = "987654321";
+
+/// The bytes of a body made here, which is whole and ready. `None` for one streamed from upstream.
+fn made_here(body: Body) -> Option<Bytes> {
+    let Either::Right(body) = body else { return None };
+    let mut body = std::pin::pin!(body);
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    match body.as_mut().poll_frame(&mut cx) {
+        std::task::Poll::Ready(Some(Ok(frame))) => frame.into_data().ok(),
+        _ => Some(Bytes::new()),
+    }
+}
+
+/// Turn an error made here into the page a browser is shown, as the Python gateway renders it:
+/// the page for this status and shape, with the error's code, message, hint, request id and
+/// retry time written in. The status and the other headers stay. If there is no such page the
+/// answer stays as it is.
+fn as_page(pages: &HashMap<String, String>, resp: Response<Body>) -> Response<Body> {
+    let (mut parts, body) = resp.into_parts();
+    let Some(bytes) = made_here(body) else { return Response::from_parts(parts, full(Bytes::new())) };
+    let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+    let said = |name: &str| error.get(name).and_then(|v| v.as_str()).unwrap_or("");
+    let details = error.get("details");
+    let hint = details.and_then(|d| d.get("hint")).and_then(|h| h.as_str()).filter(|h| !h.is_empty());
+    let wait = details.and_then(|d| d.get("retry_after")).and_then(|r| r.as_i64()).filter(|r| *r > 0 && parts.status == StatusCode::TOO_MANY_REQUESTS);
+    let shape = format!("{}:{}{}", parts.status.as_u16(), u8::from(hint.is_some()), u8::from(wait.is_some()));
+    let Some(page) = pages.get(&shape) else { return Response::from_parts(parts, full(bytes)) };
+    // The caller's own words (a request id it chose) go in last, so nothing in them is read as a marker.
+    let mut page = match wait {
+        Some(seconds) => page.replace(PAGE_RETRY_AFTER, &seconds.to_string()),
+        None => page.clone(),
+    };
+    page = page.replace("@@code@@", &html_escaped(said("error")));
+    if let Some(hint) = hint {
+        page = page.replace("@@hint@@", &html_escaped(hint));
+    }
+    page = page.replace("@@message@@", &html_escaped(said("message")));
+    page = page.replace("@@request-id@@", &html_escaped(said("request_id")));
+    parts.headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
+    Response::from_parts(parts, full(page))
 }
 
 fn full(bytes: impl Into<Bytes>) -> Body {
@@ -488,10 +523,14 @@ struct Native<'a> {
     /// The client's address, as the Python gateway would resolve it.
     ip: IpAddr,
     method: &'static str,
+    /// The caller is a browser: an error made here is shown as a page.
+    html: bool,
 }
 
 /// A request refused here with a 401: it carries no credential that works.
 struct Unauthenticated<'a> {
+    /// For a browser, the pages errors are shown as.
+    pages: Option<&'a HashMap<String, String>>,
     wording: &'a Wording,
     version: Option<&'a str>,
     ip: IpAddr,
@@ -547,9 +586,15 @@ fn decide<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, now: u6
         return agent_call(snap, peer, req, rest).map(Decision::Agent).unwrap_or(PYTHON);
     }
     let Some(protocol) = classify(path) else { return PYTHON };
-    if snap.fallthrough_prefixes.iter().any(|p| path.starts_with(p.as_str())) || wants_html(req.headers()) {
+    if snap.fallthrough_prefixes.iter().any(|p| path.starts_with(p.as_str())) {
         return PYTHON;
     }
+    // A browser is shown errors as pages, which come from the Python gateway with the snapshot.
+    let html = match prefers_html(req.headers()) {
+        Some(false) => false,
+        Some(true) if snap.error_pages.is_some() => true,
+        _ => return PYTHON,
+    };
     // A request to change protocol (a WebSocket handshake) is not an ordinary request there, and
     // one from a web page in another origin is answered with the gateway's cross-origin headers.
     if req.headers().contains_key(UPGRADE) || cross_origin(snap, req.headers()).is_err() {
@@ -578,7 +623,8 @@ fn decide<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, now: u6
         found => found.map(|(v, _)| v),
     };
     let Some(ip) = govern::client_ip(peer, req.headers(), &snap.trusted_proxies) else { return PYTHON };
-    let refuse = |wording: &'a Wording| Decision::Refuse(Unauthenticated { wording, version, ip, method });
+    let pages = snap.error_pages.as_ref().filter(|_| html);
+    let refuse = |wording: &'a Wording| Decision::Refuse(Unauthenticated { pages, wording, version, ip, method });
 
     // The key: the gateway's own header first, `Authorization` when that one is absent or empty.
     let header = |name: &HeaderName| req.headers().get(name).map(|v| v.as_bytes()).filter(|v| !v.is_empty());
@@ -636,7 +682,7 @@ fn decide<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, now: u6
     if names_a_version(asked) {
         return PYTHON;
     }
-    Decision::Native(Native { protocol, backend, entry, route, version, ip, method })
+    Decision::Native(Native { protocol, backend, entry, route, version, ip, method, html })
 }
 
 /// What the answer to a request from another origin is given, as the Python gateway's CORS
@@ -1084,7 +1130,7 @@ fn admit_grpc<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, now
     if !entry.native_ok || snap.fallthrough_prefixes.iter().any(|p| path.starts_with(p.as_str())) {
         return Err(GrpcRefusal::NOT_APPLICABLE);
     }
-    let native = Native { protocol: Protocol::Grpc, backend: Some(backend), entry, route: None, version: None, ip, method: "POST" };
+    let native = Native { protocol: Protocol::Grpc, backend: Some(backend), entry, route: None, version: None, ip, method: "POST", html: false };
     Ok(GrpcCall { native, key_in_authorization })
 }
 
@@ -1414,7 +1460,10 @@ fn finish<B>(w: &Worker, mut resp: Response<Body>, a: &Answered, req: &Request<B
 /// Answer a request that carries no credential that works.
 fn unauthenticated<B>(w: &Worker, u: &Unauthenticated, req: &Request<B>, started: Instant, at: Duration) -> Response<Body> {
     let t = trace_for(req.headers());
-    let resp = envelope(StatusCode::UNAUTHORIZED, "AUTHENTICATION_ERROR", &u.wording.message_json, &u.wording.details_json, &t, true);
+    let mut resp = envelope(StatusCode::UNAUTHORIZED, "AUTHENTICATION_ERROR", &u.wording.message_json, &u.wording.details_json, &t, true);
+    if let Some(pages) = u.pages {
+        resp = as_page(pages, resp);
+    }
     let a = Answered { method: u.method, ip: u.ip, version: u.version, rejected: true, error: Some("AUTHENTICATION_ERROR") };
     finish(w, resp, &a, req, &t, started, at)
 }
@@ -1617,6 +1666,10 @@ pub async fn handle(w: Arc<Worker>, peer: SocketAddr, mut req: Request<Incoming>
         }
     };
 
+    // To a browser, an error made here is a page.
+    if let (true, Some(_), Some(pages)) = (n.html && !grpc, error, snap.error_pages.as_ref()) {
+        resp = as_page(pages, resp);
+    }
     let status = resp.status().as_u16();
     let seconds = started.elapsed().as_secs_f64();
     let bytes_out = resp
@@ -1980,11 +2033,61 @@ mod tests {
     }
 
     #[test]
-    fn browsers_are_not_native() {
-        let mut h = HeaderMap::new();
-        h.insert(ACCEPT, HeaderValue::from_static("text/html,application/xhtml+xml"));
-        assert!(wants_html(&h));
-        assert!(!wants_html(&HeaderMap::new()));
+    fn a_browser_is_served_here_once_the_pages_for_its_errors_are_known() {
+        let browser = |snap: &Snapshot, headers: &[(&str, &str)]| {
+            let mut b = Request::builder().uri("/api/users").header("accept", "text/html,application/xhtml+xml");
+            for (k, v) in headers {
+                b = b.header(*k, *v);
+            }
+            match decide(snap, peer(), &b.body(()).unwrap(), 100, |_| false) {
+                Decision::Native(n) => format!("native, pages: {}", n.html),
+                Decision::Refuse(u) => format!("refused, pages: {}", u.pages.is_some()),
+                _ => "python".into(),
+            }
+        };
+        assert_eq!(browser(&governed("", ""), &[("x-api-key", KEY)]), "python");
+        let pages = r#","error_pages":{"401:10":"<p>@@message@@</p>"},"refusals":{"missing_key":{"message_json":"\"API key required\"","details_json":"{}"},"invalid_key":{"message_json":"\"Invalid\"","details_json":"{}"}}"#;
+        let snap = governed(pages, "");
+        assert_eq!(browser(&snap, &[("x-api-key", KEY)]), "native, pages: true");
+        assert_eq!(browser(&snap, &[]), "refused, pages: true");
+        // A script in a page is answered in JSON, as anyone else.
+        assert_eq!(browser(&snap, &[("x-api-key", KEY), ("x-requested-with", "XMLHttpRequest")]), "native, pages: false");
+    }
+
+    #[test]
+    fn an_error_becomes_the_page_for_its_status_and_shape() {
+        let pages: HashMap<String, String> = [
+            ("429:11", "<b>@@code@@</b><p>@@message@@</p><i>@@hint@@</i><u>987654321</u><script>n=987654321</script><code>@@request-id@@</code>"),
+            ("429:01", "<p>@@message@@</p><u>987654321</u><code>@@request-id@@</code>"),
+            ("403:10", "<b>@@code@@</b><p>@@message@@</p><i>@@hint@@</i><code>@@request-id@@</code>"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
+        let mut named = HeaderMap::new();
+        named.insert("x-request-id", HeaderValue::from_static("id-<1>-@@message@@"));
+        let t = trace_for(&named);
+        let page = |resp: Response<Body>| {
+            let resp = as_page(&pages, resp);
+            (resp.status().as_u16(), resp.headers()["content-type"].to_str().unwrap().to_owned(), String::from_utf8(bytes_of(resp).to_vec()).unwrap())
+        };
+        let limited = rate_limited("minute", 3, 60, Some(r#"{"tenant":"t1","hint":"Wait & retry"}"#), &t);
+        assert!(limited.headers().contains_key("retry-after"));
+        let (status, kind, body) = page(limited);
+        assert_eq!((status, kind.as_str()), (429, "text/html; charset=utf-8"));
+        assert_eq!(
+            body,
+            "<b>RATE_LIMIT_EXCEEDED</b><p>Rate limit exceeded: 3 requests per minute</p><i>Wait &amp; retry</i><u>60</u><script>n=60</script><code>id-&lt;1&gt;-@@message@@</code>"
+        );
+        // Without a hint, the page without one.
+        assert!(page(rate_limited("hour", 9, 3600, None, &t)).2.starts_with("<p>Rate limit exceeded: 9 requests per hour</p><u>3600</u>"));
+        let scoped = governed("", r#","allowed_paths":{"rules":[["under","/api/users"]],"patterns_json":"[\"/api/users\"]"}"#);
+        let scope = scoped.keys.values().next().unwrap().scope.as_ref().unwrap();
+        let body = page(forbidden(&Refusal::Scope(scope), "/api/orders", "10.0.0.1".parse().unwrap(), &t)).2;
+        assert!(body.starts_with("<b>AUTHORIZATION_ERROR</b><p>This API key is not allowed to access this path</p><i>The key was created"), "{body}");
+        // A shape there is no page for stays as it was.
+        let (status, kind, _) = page(backend_unavailable(&t));
+        assert_eq!((status, kind.as_str()), (502, "application/json"));
     }
 
     const KEY: &str = "sk-test";
