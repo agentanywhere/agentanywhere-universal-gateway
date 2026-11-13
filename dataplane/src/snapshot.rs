@@ -151,21 +151,133 @@ fn no_rules() -> Option<Vec<TransformRule>> {
 }
 
 /// Which requests a transformation rule applies to. The Python gateway applies it; this side
-/// only needs to know that a request is one of them.
+/// only needs to know that a request is one of them. The pattern arrives in one of the forms the
+/// Python gateway describes it in, each matched here as it matches there.
 #[derive(Deserialize, Debug)]
 pub struct TransformRule {
-    /// A path pattern: plain characters, `*` for any run of characters (slashes included) and
-    /// `?` for any one. It must match the whole path.
-    glob: String,
+    /// Every path.
+    #[serde(default)]
+    all: bool,
+    /// Plain characters, `*` for any run of characters (slashes included) and `?` for any one.
+    /// It must match the whole path.
+    glob: Option<String>,
+    /// The same with character classes, each given as the characters it lets through.
+    parts: Option<Vec<Part>>,
+    /// A regular expression, matched from the start of the path.
+    regex: Option<String>,
+    /// Text the path must contain (what the Python gateway falls back to for a pattern that
+    /// looks like a regular expression and is not one).
+    contains: Option<String>,
     /// Upper-case method names; none means every method.
     #[serde(default)]
     methods: Vec<String>,
+    #[serde(skip)]
+    matcher: Option<Matcher>,
+}
+
+/// One part of a glob with character classes.
+#[derive(Deserialize, Debug)]
+#[serde(untagged)]
+enum Part {
+    /// `*` or `?`.
+    Wild(String),
+    Lit { lit: String },
+    Set { set: String },
+}
+
+#[derive(Debug)]
+enum Step {
+    Byte(u8),
+    One,
+    Run,
+    /// Which of the 128 ASCII characters are let through.
+    Set(u128),
+}
+
+#[derive(Debug)]
+enum Matcher {
+    All,
+    Glob(String),
+    Steps(Vec<Step>),
+    Regex(regex::Regex),
+    Contains(String),
 }
 
 impl TransformRule {
-    fn applies(&self, method: &str, path: &str) -> bool {
-        (self.methods.is_empty() || self.methods.iter().any(|m| m == method)) && glob_matches(self.glob.as_bytes(), path.as_bytes())
+    /// Work out how the rule's pattern is matched. `None` when it is in no form this side knows,
+    /// or in more than one: then no rule can be trusted, and every request is the Python gateway's.
+    fn ready(mut self) -> Option<TransformRule> {
+        let forms = [self.all, self.glob.is_some(), self.parts.is_some(), self.regex.is_some(), self.contains.is_some()];
+        if forms.iter().filter(|f| **f).count() != 1 {
+            return None;
+        }
+        self.matcher = Some(if self.all {
+            Matcher::All
+        } else if let Some(glob) = self.glob.take() {
+            Matcher::Glob(glob)
+        } else if let Some(parts) = self.parts.take() {
+            let mut steps = Vec::new();
+            for part in parts {
+                match part {
+                    Part::Wild(w) if w == "*" => steps.push(Step::Run),
+                    Part::Wild(w) if w == "?" => steps.push(Step::One),
+                    Part::Wild(_) => return None,
+                    Part::Lit { lit } => steps.extend(lit.bytes().map(Step::Byte)),
+                    Part::Set { set } if set.is_ascii() => steps.push(Step::Set(set.bytes().fold(0, |bits, b| bits | (1u128 << b)))),
+                    Part::Set { .. } => return None,
+                }
+            }
+            Matcher::Steps(steps)
+        } else if let Some(pattern) = self.regex.take() {
+            // The Python gateway asks whether the expression matches at the start of the path.
+            Matcher::Regex(regex::Regex::new(&format!("^(?:{pattern})")).ok()?)
+        } else {
+            Matcher::Contains(self.contains.take()?)
+        });
+        Some(self)
     }
+
+    fn applies(&self, method: &str, path: &str) -> bool {
+        if !(self.methods.is_empty() || self.methods.iter().any(|m| m == method)) {
+            return false;
+        }
+        match &self.matcher {
+            Some(Matcher::All) => true,
+            Some(Matcher::Glob(glob)) => glob_matches(glob.as_bytes(), path.as_bytes()),
+            Some(Matcher::Steps(steps)) => steps_match(steps, path.as_bytes()),
+            Some(Matcher::Regex(regex)) => regex.is_match(path),
+            Some(Matcher::Contains(text)) => path.contains(text.as_str()),
+            // Never the case for a rule that was let into a snapshot.
+            None => true,
+        }
+    }
+}
+
+/// `glob_matches`, for a pattern with character classes.
+fn steps_match(steps: &[Step], text: &[u8]) -> bool {
+    let (mut s, mut t) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while t < text.len() {
+        let fits = match steps.get(s) {
+            Some(Step::Byte(b)) => *b == text[t],
+            Some(Step::One) => true,
+            Some(Step::Set(bits)) => text[t] < 128 && bits & (1u128 << text[t]) != 0,
+            Some(Step::Run) | None => false,
+        };
+        if fits {
+            s += 1;
+            t += 1;
+        } else if matches!(steps.get(s), Some(Step::Run)) {
+            star = Some((s, t));
+            s += 1;
+        } else if let Some((at, took)) = star {
+            star = Some((at, took + 1));
+            (s, t) = (at + 1, took + 1);
+        } else {
+            return false;
+        }
+    }
+    steps[s..].iter().all(|step| matches!(step, Step::Run))
 }
 
 /// Whether `text` is matched in full by `pattern`, in which `*` stands for any run of bytes and
@@ -656,7 +768,7 @@ impl Snapshot {
             dynamic_routes: file.dynamic_routes,
             cross_origin: file.cross_origin,
             error_pages: file.error_pages,
-            transform_rules: file.transform_rules,
+            transform_rules: file.transform_rules.and_then(|rules| rules.into_iter().map(TransformRule::ready).collect()),
             inject_request_id: file.inject_request_id,
             revision: file.revision,
             api_versions,

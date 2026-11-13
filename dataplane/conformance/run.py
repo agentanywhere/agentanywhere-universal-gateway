@@ -1480,6 +1480,28 @@ def main() -> int:
             assert rules_reached("/api/routed/orders/1", "data plane"), "removing the rules never reached the data plane"
             rule_same("with the rules removed, nothing is changed and all is served here", "GET", "/api/routed/orders/1", "data plane", False)
 
+            # Patterns of the other kinds: a regular expression, a character class, every path for
+            # one method, and what looks like a regular expression but is not one (which the Python
+            # gateway then looks for anywhere in the path).
+            shape_it = {"headers_set": {"X-Shaped": "yes"}}
+            made = [post("/admin/transformations", r) for r in (
+                {"name": "mark versions", "path_pattern": "^/api/routed/v[0-9]+/", "request_config": shape_it},
+                {"name": "mark two shelves", "path_pattern": "/api/routed/shelf-[ab]/*", "request_config": shape_it},
+                {"name": "mark every PUT", "path_pattern": "*", "methods": ["PUT"], "request_config": shape_it},
+                {"name": "not an expression", "path_pattern": "/routed/odd)$", "request_config": shape_it})]
+            assert rules_reached("/api/routed/v2/x", "python"), "the patterns never reached the data plane"
+            rule_same("a regular expression is matched from the start of the path", "GET", "/api/routed/v2/x", "python", True)
+            rule_same("a path the expression does not match is served here", "GET", "/api/routed/v/x", "data plane", False)
+            rule_same("a character class lets through what it names", "GET", "/api/routed/shelf-a/1", "python", True)
+            rule_same("and nothing else", "GET", "/api/routed/shelf-c/1", "data plane", False)
+            rule_same("a rule for every path with a method is that method's alone", "PUT", "/api/routed/other/1", "python", True)
+            rule_same("and the other methods are served here", "GET", "/api/routed/other/1", "data plane", False)
+            rule_same("a pattern that is no expression after all is looked for in the path", "GET", "/api/routed/odd)$/1", "python", True)
+            rule_same("and a path without it is served here", "GET", "/api/routed/odd/1", "data plane", False)
+            for rule in made:
+                httpx.delete(f"{py}/admin/transformations/{rule['id']}", headers=adm, timeout=10).raise_for_status()
+            assert rules_reached("/api/routed/v2/x", "data plane"), "removing the patterns never reached the data plane"
+
             # --- MCP tools with a schema -------------------------------------------------------------
             # A registered OpenAPI document gives each operation's tool a JSON Schema, and the Python
             # gateway checks a call's arguments against it. The data plane forwards a call that is

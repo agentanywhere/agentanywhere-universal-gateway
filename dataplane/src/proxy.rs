@@ -2795,6 +2795,40 @@ mod tests {
     }
 
     #[test]
+    fn every_form_of_pattern_is_matched_as_the_python_gateway_matches_it() {
+        let with = |rule: &str| governed(&format!(r#","transform_rules":[{rule}]"#), "");
+        let asks = |snap: &Snapshot, method: &str, uri: &str| {
+            let req = Request::builder().method(method).uri(uri).header("x-api-key", KEY).body(()).unwrap();
+            outcome(snap, &req, 100, false) == "ask"
+        };
+        // Every path, for the rule's methods only.
+        let all = with(r#"{"all":true,"methods":["POST"]}"#);
+        assert!(asks(&all, "POST", "/api/users") && !asks(&all, "GET", "/api/users"));
+        // Character classes: the characters each lets through, given by the Python gateway.
+        let classes = with(r#"{"parts":[{"lit":"/api/v"},{"set":"12"},{"lit":"/"},"*",{"lit":"/item"},"?"],"methods":[]}"#);
+        assert!(asks(&classes, "GET", "/api/v1/a/b/item7") && asks(&classes, "GET", "/api/v2//itemx"));
+        assert!(!asks(&classes, "GET", "/api/v3/a/item7") && !asks(&classes, "GET", "/api/v1/a/item") && !asks(&classes, "GET", "/api/v1/a/item77"));
+        // A regular expression matches from the start of the path, and need not reach its end.
+        let regex = with(r#"{"regex":"^/api/v[0-9]+/(?:orders|items)","methods":[]}"#);
+        assert!(asks(&regex, "GET", "/api/v12/orders/7") && asks(&regex, "GET", "/api/v1/itemsets"));
+        assert!(!asks(&regex, "GET", "/api/v/orders") && !asks(&regex, "GET", "/api/x/api/v1/orders"));
+        let ended = with(r#"{"regex":"/api/.*\\.json$","methods":[]}"#);
+        assert!(asks(&ended, "GET", "/api/a/b.json") && !asks(&ended, "GET", "/api/a/b.json5"));
+        assert!(!asks(&with(r#"{"regex":"/users/.*$","methods":[]}"#), "GET", "/api/users/1"));
+        // For the answer, the path is matched without its leading slash.
+        assert!(asks(&with(r#"{"regex":"api/users$","methods":[]}"#), "GET", "/api/users"));
+        // What is not a regular expression after all is text the path must contain.
+        let contains = with(r#"{"contains":"/(x","methods":[]}"#);
+        assert!(asks(&contains, "GET", "/api/(x/1") && !asks(&contains, "GET", "/api/x/1"));
+        // A form this side does not know, two forms at once, or an expression it cannot compile:
+        // no rule can be trusted, and every request is the Python gateway's.
+        for odd in [r#"{"methods":[]}"#, r#"{"all":true,"glob":"/x","methods":[]}"#, r#"{"regex":"^/api/(?=x)","methods":[]}"#,
+                    r#"{"parts":["**"],"methods":[]}"#, r#"{"parts":[{"set":"\u00e9"}],"methods":[]}"#] {
+            assert!(asks(&with(odd), "GET", "/api/users"), "{odd}");
+        }
+    }
+
+    #[test]
     fn globs_match_as_fnmatch_matches_them() {
         use crate::snapshot::glob_matches as m;
         for (pattern, text, want) in [

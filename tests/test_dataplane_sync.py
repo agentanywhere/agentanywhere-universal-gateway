@@ -1051,13 +1051,56 @@ async def test_the_snapshot_says_which_requests_a_transformation_rule_applies_to
     assert await listed() == [{"glob": "/api/orders/*", "methods": ["GET", "POST"]}, {"glob": "/api/item?", "methods": []}]
     # Rules the data plane can match no longer keep every path with this gateway.
     assert (await dataplane_sync.build_snapshot(db_session))["fallthrough_prefixes"] != ["/"]
-    # A pattern the data plane does not match exactly as this gateway does: every path stays here.
-    for pattern in ("*", "**", "^/api/v[0-9]+/", "/api/.*$", "/api/[ab]/x", "/api/caf\u00e9/*"):
+    # Each other kind of pattern in the form the data plane matches as this gateway does.
+    for pattern, described in (
+            ("*", {"all": True}), ("**", {"all": True}),
+            ("^/api/v[0-9]+/", {"regex": "^/api/v[0-9]+/"}), ("/api/.*$", {"regex": "/api/.*$"}),
+            ("^/api/(?:a|b)/\\d{2,}$", {"regex": "^/api/(?:a|b)/\\d{2,}$"}),
+            ("^/api/(x", {"contains": "^/api/(x"}), ("/api/[z-a]$", {"contains": "/api/[z-a]$"}),
+            ("/api/[ab]/x", {"parts": [{"lit": "/api/"}, {"set": "ab"}, {"lit": "/x"}]}),
+            ("/v[!0-9]*/?", {"parts": [{"lit": "/v"}, {"set": "".join(c for c in map(chr, range(128)) if not c.isdigit())}, "*", {"lit": "/"}, "?"]}),
+            ("/a[]]b[", {"parts": [{"lit": "/a"}, {"set": "]"}, {"lit": "b["}]}),
+            ("/a[b-d-f]", {"parts": [{"lit": "/a"}, {"set": "-bcdf"}]})):
+        odd = rule(pattern, ["put"])
+        assert (await listed())[2:] == [{**described, "methods": ["PUT"]}], pattern
+        transformation_manager.remove_rule(odd.id)
+    # A pattern with no such form: every path stays here.
+    for pattern in ("/api/caf\u00e9/*", "^/api/(?=x)", "^/api/(a)\\1$", "(?i)/api/x$", "^/api/\\s$", "^/a^b", "/a$b$", "^/api/x*+$"):
         odd = rule(pattern)
         assert await listed() is None, pattern
         assert (await dataplane_sync.build_snapshot(db_session))["fallthrough_prefixes"] == ["/"]
         transformation_manager.remove_rule(odd.id)
     assert len(await listed()) == 2
+
+
+def test_a_glob_with_classes_is_described_so_that_it_matches_as_fnmatch_does():
+    """The parts a pattern is described in, matched the obvious way, agree with Python's own fnmatch
+    on every pattern and path tried: the description is what the data plane matches by."""
+    import fnmatch
+    import random
+
+    def matches(parts, text):
+        if not parts:
+            return text == ""
+        head, rest = parts[0], parts[1:]
+        if head == "*":
+            return any(matches(rest, text[k:]) for k in range(len(text) + 1))
+        if head == "?":
+            return text != "" and matches(rest, text[1:])
+        if "lit" in head:
+            return text.startswith(head["lit"]) and matches(rest, text[len(head["lit"]):])
+        return text != "" and text[0] in head["set"] and matches(rest, text[1:])
+
+    rng = random.Random(20261113)
+    alphabet = "ab-]![^\\/*?z&~|0"
+    for _ in range(4000):
+        pattern = "".join(rng.choice(alphabet) for _ in range(rng.randrange(1, 9)))
+        if "[" not in pattern or pattern in ("*", "**") or pattern.startswith("^") or pattern.endswith("$"):
+            continue
+        parts = dataplane_sync._rule_pattern(pattern)["parts"]
+        for _ in range(30):
+            text = "".join(rng.choice(alphabet) for _ in range(rng.randrange(0, 6)))
+            assert matches(parts, text) == fnmatch.fnmatchcase(text, pattern), (pattern, text, parts)
 
 
 async def test_the_snapshot_lists_the_oauth2_tokens_accepted_as_credentials(db_session, monkeypatch):

@@ -35,6 +35,7 @@ belongs on an internal port: the data plane refuses ``/internal/`` from clients.
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import hashlib
 import ipaddress
 import json
@@ -175,25 +176,89 @@ def _transform_rules() -> Optional[list]:
     means all). A rule matches a request by the path the backend is asked for and, for the answer,
     by the request's path without its leading slash (``TransformationRule.matches``).
 
-    Only patterns the data plane matches exactly as this gateway does are listed: globs made of
-    plain characters, ``*`` and ``?``. With any other rule (a pattern that matches everything, a
-    regular expression, a character class), the answer is ``None`` and every path stays here."""
+    Each pattern is described in the form the data plane matches exactly as this gateway does
+    (see ``_rule_pattern``). With a rule whose pattern has no such form, the answer is ``None``
+    and every path stays here."""
     from app.transformers import transformation_manager
 
     out = []
     for rule in transformation_manager.list_rules():
         if not rule.enabled:
             continue
-        pattern = rule.path_pattern
-        plain = (
-            isinstance(pattern, str) and pattern not in ("*", "**") and pattern.isascii()
-            and not pattern.startswith("^") and not pattern.endswith("$") and "[" not in pattern
-        )
+        described = _rule_pattern(rule.path_pattern)
         methods = [m.upper() for m in (rule.methods or []) if isinstance(m, str)]
-        if not plain or len(methods) != len(rule.methods or []):
+        if described is None or len(methods) != len(rule.methods or []):
             return None
-        out.append({"glob": pattern, "methods": sorted(set(methods))})
+        out.append({**described, "methods": sorted(set(methods))})
     return out
+
+
+# A regular expression that means the same to Python's `re` and to the data plane's engine: plain
+# characters, `.`, a few escapes, classes of plain characters and ranges, groups, alternatives and
+# repetition, with `^` only in front and `$` only at the end. Paths are ASCII without line ends,
+# where `.`, `\d`, `\w` and `$` agree. Anything else (a look-around, a back-reference, a flag) is
+# this gateway's to match.
+_SHARED_REGEX = re.compile(r"""\^?(?:
+      [A-Za-z0-9/_~:@!,;=&'\ -] | \\[./\-_~dw] | \. | (?:[*+?]|\{\d+(?:,\d*)?\})\??(?![*+?{]) | \((?:\?:|(?!\?)) | \) | \|
+    | \[\^?(?: [A-Za-z0-9]-[A-Za-z0-9] | [A-Za-z0-9/_.~:@!,;=&'\ ] | \\[.\-/\]dw] )+\]
+    )*\$?""", re.X)
+
+
+def _rule_pattern(pattern: Any) -> Optional[Dict[str, Any]]:
+    """A transformation rule's path pattern, as ``TransformationRule.matches`` reads it:
+
+    * ``*`` and ``**`` match every path: ``{"all": True}``;
+    * one that starts with ``^`` or ends with ``$`` is a regular expression, matched from the start
+      of the path: ``{"regex": ...}`` when it means the same to both engines, and, when it does not
+      compile here, the text the path must contain instead: ``{"contains": ...}``;
+    * any other is a glob. Without character classes: ``{"glob": ...}``. With them:
+      ``{"parts": [...]}``, each part ``*``, ``?``, ``{"lit": text}`` or ``{"set": characters}``,
+      where the characters are the ASCII ones Python's own ``fnmatch`` lets the class match."""
+    if not isinstance(pattern, str) or not pattern.isascii():
+        return None
+    if pattern in ("*", "**"):
+        return {"all": True}
+    if pattern.startswith("^") or pattern.endswith("$"):
+        try:
+            re.compile(pattern)
+        except re.error:
+            return {"contains": pattern}
+        except Exception:  # noqa: BLE001 - whatever else compiling raises is raised per request here
+            return None
+        return {"regex": pattern} if _SHARED_REGEX.fullmatch(pattern) else None
+    if "[" not in pattern:
+        return {"glob": pattern}
+    parts: List[Any] = []
+    literal, i, n = "", 0, len(pattern)
+    while i < n:
+        c = pattern[i]
+        i += 1
+        if c == "[":
+            # Where the class ends, found as `fnmatch.translate` finds it.
+            j = i
+            if j < n and pattern[j] == "!":
+                j += 1
+            if j < n and pattern[j] == "]":
+                j += 1
+            while j < n and pattern[j] != "]":
+                j += 1
+            if j < n:
+                one = re.compile(fnmatch.translate(pattern[i - 1:j + 1]))
+                if literal:
+                    parts.append({"lit": literal})
+                parts.append({"set": "".join(ch for ch in map(chr, range(128)) if one.match(ch))})
+                literal, i = "", j + 1
+                continue
+        if c in "*?":
+            if literal:
+                parts.append({"lit": literal})
+            parts.append(c)
+            literal = ""
+        else:
+            literal += c
+    if literal:
+        parts.append({"lit": literal})
+    return {"parts": parts}
 
 
 _PAGE_SLOTS = {"code": "@@code@@", "message": "@@message@@", "hint": "@@hint@@", "request_id": "@@request-id@@"}

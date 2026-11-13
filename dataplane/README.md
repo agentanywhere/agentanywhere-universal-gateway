@@ -187,9 +187,15 @@ gateway's own handler and client publish the same bytes.
 **Transformation rules.** The Python gateway applies them; this side only works out which requests they apply to and
 hands those over. A rule's pattern is matched, as there, against the path the backend is asked for (after a dynamic
 route's rewrite, a protocol's prefix or an agent's slug has been dealt with) and against the request's own path
-without its leading slash, which is what the Python gateway matches when it transforms an answer. Patterns made of
-plain characters, `*` and `?` are matched here. Any other rule (a pattern for every path, a regular expression, a
-character class) keeps every path with the Python gateway.
+without its leading slash, which is what the Python gateway matches when it transforms an answer. The Python gateway
+describes each pattern in the form this side matches exactly as it does: a glob of plain characters, `*` and `?`; a
+glob with character classes, each class given as the characters Python's own `fnmatch` lets it match; `*` or `**`,
+which is every path (for the rule's methods); a regular expression (a pattern that starts with `^` or ends with `$`),
+matched from the start of the path; and, for such a pattern that is not a valid expression, the text the path must
+then contain. A regular expression is matched here only if it means the same to both engines: plain characters, `.`,
+`\d`, `\w`, classes of plain characters and ranges, groups, `|` and repetition, with `^` only in front and `$` only at
+the end. A rule with any other expression (a look-around, a back-reference, a flag) or a pattern outside ASCII keeps
+every path with the Python gateway.
 
 One difference a caller could see, though not in what the JSON says: while any rule is registered, the Python
 gateway reads and rewrites every JSON answer it passes on, matched or not, which changes its spacing and escaping.
@@ -293,7 +299,7 @@ here is the reverse of everywhere else: **whatever this side cannot be sure of i
 | A path that matches a dynamic route to an `http://` or `https://` backend | data plane, to the route's backend |
 | A path that matches a dynamic route to any other backend | Python |
 | A request a transformation rule applies to (by path pattern and method) | Python, which applies it |
-| Any transformation rule for every path, or with a regular expression or character class | Python, for every path |
+| Any transformation rule whose regular expression the two engines could read differently | Python, for every path |
 | Request-altering plugins (when any exist) | Python, for every path |
 | The health path, `/ready` and `/live`, on a plain `GET` | data plane |
 | A request with an `Origin` header | data plane, with the gateway's cross-origin headers |
