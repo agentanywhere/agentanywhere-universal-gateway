@@ -924,9 +924,26 @@ fn key_limit(snap: &Snapshot, entry: &KeyEntry, now: u64) -> Option<(&'static st
     }
 }
 
-pub async fn handle(w: Arc<Worker>, peer: SocketAddr, req: Request<Incoming>) -> Result<Response<Body>, Infallible> {
+/// An HTTP/2 request names its host in the address; put it where an HTTP/1 request has it, so
+/// that everything after this reads the two alike and the Python gateway is told the same host.
+fn as_http1_names_it<B>(req: &mut Request<B>) {
+    let Some(authority) = req.uri().authority().cloned() else { return };
+    if !req.headers().contains_key(HOST) {
+        if let Ok(host) = HeaderValue::from_str(authority.as_str()) {
+            req.headers_mut().insert(HOST, host);
+        }
+    }
+    let mut parts = std::mem::take(req.uri_mut()).into_parts();
+    (parts.scheme, parts.authority) = (None, None);
+    *req.uri_mut() = Uri::from_parts(parts).unwrap_or_else(|_| Uri::from_static("/"));
+}
+
+pub async fn handle(w: Arc<Worker>, peer: SocketAddr, mut req: Request<Incoming>) -> Result<Response<Body>, Infallible> {
     let started = Instant::now();
     let st = &*w.shared;
+    if req.version() == Version::HTTP_2 {
+        as_http1_names_it(&mut req);
+    }
     // The control plane's internal endpoints are never reachable from clients.
     if req.uri().path().starts_with("/internal/") {
         let mut resp = Response::new(full("{\"detail\":\"Not Found\"}"));
@@ -1852,6 +1869,18 @@ mod tests {
         let snap = Snapshot::from_json(r#"{"keys":[]}"#).unwrap();
         let req = Request::builder().uri("/api/users").header("origin", "https://app.example").body(()).unwrap();
         assert!(matches!(decide(&snap, "127.0.0.1:9".parse().unwrap(), &req, 0, |_| false), Decision::Ask(None)));
+    }
+
+    #[test]
+    fn an_http2_request_reads_like_an_http1_one() {
+        let mut req = Request::builder().uri("http://gw.example:8000/api/users?a=1").version(Version::HTTP_2).body(()).unwrap();
+        as_http1_names_it(&mut req);
+        assert_eq!(req.uri().to_string(), "/api/users?a=1");
+        assert_eq!(req.headers()[HOST], "gw.example:8000");
+        // A host the client also sent as a header is kept as sent.
+        let mut req = Request::builder().uri("http://gw.example/").header("host", "other").body(()).unwrap();
+        as_http1_names_it(&mut req);
+        assert_eq!((req.uri().to_string().as_str(), &req.headers()[HOST]), ("/", &HeaderValue::from_static("other")));
     }
 
     #[test]

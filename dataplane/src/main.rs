@@ -19,7 +19,8 @@ mod tenant;
 use arc_swap::ArcSwap;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicU64;
@@ -146,13 +147,24 @@ fn intakes(addr: SocketAddr, workers: usize) -> std::io::Result<Vec<Intake>> {
     Ok(receivers.into_iter().map(Intake::Dealt).collect())
 }
 
+/// What a client that speaks HTTP/2 from its first byte sends first.
+const HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
 fn connected(worker: &Arc<proxy::Worker>, stream: tokio::net::TcpStream, peer: SocketAddr) {
     let _ = stream.set_nodelay(true);
     let worker = worker.clone();
     tokio::spawn(async move {
+        // HTTP/2 without TLS starts with a fixed preface (gRPC clients connect this way). Only a
+        // connection that begins like one pays for telling the two apart.
+        let mut first = [0u8; 24];
+        let http2 = matches!(stream.peek(&mut first).await, Ok(n) if n > 0 && HTTP2_PREFACE.starts_with(&first[..n]));
         let svc = service_fn(move |req| proxy::handle(worker.clone(), peer, req));
-        // With upgrades: a WebSocket handshake that is accepted turns the connection into a tunnel.
-        let _ = http1::Builder::new().serve_connection(TokioIo::new(stream), svc).with_upgrades().await;
+        if http2 {
+            let _ = auto::Builder::new(TokioExecutor::new()).serve_connection_with_upgrades(TokioIo::new(stream), svc).await;
+        } else {
+            // With upgrades: a WebSocket handshake that is accepted turns the connection into a tunnel.
+            let _ = http1::Builder::new().serve_connection(TokioIo::new(stream), svc).with_upgrades().await;
+        }
     });
 }
 

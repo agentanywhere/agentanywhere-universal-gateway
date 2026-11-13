@@ -798,6 +798,54 @@ def main() -> int:
             r = httpx.get(f"{rs}/api/users", headers={"X-API-Key": keys["rs"]["key"]}, timeout=10)
             check("ordinary requests are unaffected afterwards", r.status_code == 200 and said_by(r) == "data plane")
 
+            # --- HTTP/2 ------------------------------------------------------------------------------
+            print()
+            import shutil
+
+            class Over2:
+                """An answer to a request made over HTTP/2 without TLS, as curl reports it."""
+
+                def __init__(self, raw):
+                    head, _, self.content = raw.partition(b"\r\n\r\n")
+                    lines = head.decode("latin-1").split("\r\n")
+                    self.version, self.status_code = lines[0].split()[0], int(lines[0].split()[1])
+                    self.headers = {k.strip().lower(): v.strip() for k, _, v in (l.partition(":") for l in lines[1:])}
+                    self.text = self.content.decode("utf-8", "replace")
+
+                def json(self):
+                    return json.loads(self.content)
+
+            def over2(path, headers=None, method="GET", body=None, key=None):
+                cmd = ["curl", "-s", "-i", "--http2-prior-knowledge", "--max-time", "15", "-X", method]
+                for k, v in (headers or {}).items():
+                    cmd += ["-H", f"{k}: {v.replace('{key}', key or keys['rs']['key'])}"]
+                if body is not None:
+                    cmd += ["-H", "Content-Type: application/json", "--data-binary", json.dumps(body)]
+                return Over2(subprocess.run(cmd + [rs + path], capture_output=True, timeout=30).stdout)
+
+            if shutil.which("curl") is None:
+                print("SKIP  HTTP/2: curl is not installed")
+            else:
+                for name, method, path, headers, body, native in (
+                        ("a valid key", "GET", "/api/users", {"X-API-Key": "{key}"}, None, True),
+                        ("a body", "POST", "/api/users", {"X-API-Key": "{key}"}, {"name": "Ada", "email": "ada@example.com"}, True),
+                        ("no key", "GET", "/api/users", {}, None, True),
+                        ("a key outside its paths", "GET", "/api/orders", {"X-API-Key": "{key}"}, None, True),
+                        ("live", "GET", "/live", {}, None, True),
+                        ("the admin API", "GET", "/admin/api-keys", adm, None, False),
+                        ("a path only Python knows", "GET", "/health/detailed", {}, None, False)):
+                    pair = scoped if "outside" in name else plain
+                    a = call(py, method, path, headers, body, pair["py"]["key"])
+                    b = over2(path, headers, method, body, pair["rs"]["key"])
+                    if path == "/live":
+                        a = b  # each process answers with its own pid; the shape is checked further down
+                    compare(f"over HTTP/2: {name}", a, b)
+                    by = "data plane" if b.headers.get("x-served-by") == "dataplane" else "python"
+                    check(f"over HTTP/2: {name}: spoken as HTTP/2, answered by {'the data plane' if native else 'Python'}",
+                          b.version == "HTTP/2" and by == ("data plane" if native else "python"), f"{b.version}, {by}")
+                r = httpx.get(f"{rs}/api/users", headers={"X-API-Key": keys["rs"]["key"]}, timeout=10)
+                check("HTTP/1.1 is still spoken to those who speak it", r.http_version == "HTTP/1.1" and r.status_code == 200, r.http_version)
+
             # --- the gateway's own endpoints ---------------------------------------------------------
             print()
             import re
