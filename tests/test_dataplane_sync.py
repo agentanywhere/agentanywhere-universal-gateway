@@ -1,3 +1,4 @@
+import json
 """The snapshot the Rust data plane reads: what it contains, when a key may be served natively, and who may read it."""
 import hashlib
 
@@ -862,3 +863,17 @@ def test_requests_the_data_plane_forwarded_to_an_agent_reach_the_agent_board(mon
     assert (stats["total_requests"], stats["error_pct"]) == (4, 25.0)
     assert stats["avg_latency_ms"] == round((3 * 2.0 + 500.0) / 4, 1)
     assert "nobody" not in monitor._events
+
+
+async def test_the_snapshot_carries_the_answer_to_an_agent_that_fails(db_session):
+    import html
+
+    from app import main as gw
+
+    failure = (await dataplane_sync.build_snapshot(db_session))["agent_failure"]
+    assert json.loads(failure["message_json"]) == gw.internal_error_data("x")["message"]
+    before, after = failure["page"]
+    # Put together with an id, it is the page this gateway renders for that id.
+    rid = 'abc-123 <&"\'>'
+    assert before + html.escape(rid) + after == gw._error_html(500, gw.internal_error_data(rid))
+    assert "INTERNAL_ERROR" not in failure["message_json"] and "<title>500" in before

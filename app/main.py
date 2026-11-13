@@ -557,6 +557,19 @@ def _error_html(status_code: int, data: Dict[str, Any]) -> str:
 </html>"""
 
 
+INTERNAL_ERROR_MESSAGE = "An unexpected error occurred. Please try again later."
+
+
+def internal_error_data(request_id: Optional[str]) -> Dict[str, Any]:
+    """The body of the 500 for an error nobody handled. It says nothing about the error itself."""
+    return {
+        "error": "INTERNAL_ERROR",
+        "message": INTERNAL_ERROR_MESSAGE,
+        "request_id": request_id,
+        "timestamp": utcnow().isoformat(),
+    }
+
+
 def render_error_response(
     request: Request,
     status_code: int,
@@ -764,12 +777,7 @@ async def general_exception_handler(request: Request, exc: Exception):
     )
     
     # Don't expose internal error details to users
-    response_data = {
-        "error": "INTERNAL_ERROR",
-        "message": "An unexpected error occurred. Please try again later.",
-        "request_id": request_id,
-        "timestamp": utcnow().isoformat(),
-    }
+    response_data = internal_error_data(request_id)
     
     if settings.metrics_enabled:
         metrics.error_count.labels(

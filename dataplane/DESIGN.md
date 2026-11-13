@@ -136,7 +136,7 @@ to be let in, and otherwise through a tunnel to the Python gateway. gRPC: the li
 from the first byte) and gRPC calls are relayed to the gRPC backend over HTTP/2 with the same key, scope, IP rule,
 policy, limit, quota and breaker checks as other native requests. There the strangler rule is turned around: the Python
 gateway cannot carry a gRPC call, so what this side cannot be sure of is refused instead of handed over. The agent
-edge (`/agents/<slug>/...`) is forwarded here for registered `http://` agents and callers that are not browsers. From phase 2, governance policies and the checks at the MCP,
+edge (`/agents/<slug>/...`) is forwarded here for registered `http://` agents, browsers included. From phase 2, governance policies and the checks at the MCP,
 A2A, AG-UI and ACP boundaries are native, with one rule that differs from the plan above: the data plane only decides
 that a body passes, and a body that does not is answered by the Python gateway, so refusals cannot drift. Those four
 protocols are forwarded natively, each to its own backend with its own breaker. Keys sent as `Authorization: Bearer`

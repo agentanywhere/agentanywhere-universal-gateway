@@ -112,6 +112,8 @@ pub struct Snapshot {
     pub agent_urls: HashMap<String, String>,
     /// The backends at those addresses, filled in when the snapshot is put to use.
     pub agents: HashMap<String, Arc<Backend>>,
+    /// How a failed agent is answered. Without it, agents are the Python gateway's.
+    pub agent_failure: Option<AgentFailure>,
 }
 
 /// The gateway's health endpoint, as the Python gateway serves it.
@@ -121,6 +123,15 @@ pub struct Ops {
     pub health_path: Option<String>,
     /// The version it reports, as a JSON string.
     pub version_json: String,
+}
+
+/// The Python gateway's answer when an agent's connection fails before it answers.
+#[derive(Deserialize, Debug, PartialEq)]
+pub struct AgentFailure {
+    /// The message of its 500, as a JSON string.
+    pub message_json: String,
+    /// The page a browser is shown, in two parts: the request id goes between them.
+    pub page: (String, String),
 }
 
 /// The Python gateway's own answer to `/ready`, as of one snapshot answer.
@@ -165,6 +176,7 @@ struct SnapshotFile {
     grpc: Option<String>,
     #[serde(default)]
     agents: HashMap<String, String>,
+    agent_failure: Option<AgentFailure>,
     ready: Option<Readiness>,
     #[serde(default)]
     keys: Vec<KeyRecord>,
@@ -461,6 +473,7 @@ impl Snapshot {
             grpc: None,
             agent_urls: file.agents.into_iter().filter(|(_, url)| url.starts_with("http://")).collect(),
             agents: HashMap::new(),
+            agent_failure: file.agent_failure.filter(|f| f.message_json.starts_with('"')),
             inject_request_id: file.inject_request_id,
             revision: file.revision,
             api_versions,

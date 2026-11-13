@@ -29,7 +29,7 @@ use crate::boundary::Verdict;
 use crate::breaker::{self, Breaker};
 use crate::govern::{self, IpRule, Policy, Scope, Subject};
 use crate::report::{Event, Reporter, Row, Served};
-use crate::snapshot::{hash_key, Digest32, KeyEntry, Readiness, Snapshot, Wording};
+use crate::snapshot::{hash_key, AgentFailure, Digest32, KeyEntry, Readiness, Snapshot, Wording};
 use crate::sync::Link;
 
 /// A body is either streamed from the other side or held here whole; neither is boxed. Responses
@@ -563,6 +563,39 @@ struct AgentCall<'a> {
     version: Option<&'a str>,
     ip: IpAddr,
     method: &'static str,
+    /// How a failure is answered, and whether as a page: the caller is a browser.
+    failure: &'a AgentFailure,
+    html: bool,
+}
+
+/// Whether the caller is shown errors as pages, as the Python gateway decides it: `text/html` is
+/// accepted, JSON is not named before it, and the request is not marked as a script's. `None`
+/// when the header cannot be read as text.
+fn prefers_html(headers: &HeaderMap) -> Option<bool> {
+    let Some(accept) = headers.get(ACCEPT) else { return Some(false) };
+    let accept = accept.to_str().ok()?.to_ascii_lowercase();
+    let Some(html) = accept.find("text/html") else { return Some(false) };
+    if accept.find("application/json").is_some_and(|json| json < html) {
+        return Some(false);
+    }
+    let script = headers.get("x-requested-with").is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"xmlhttprequest"));
+    Some(!script)
+}
+
+/// Text made safe inside a page, as Python's `html.escape` makes it.
+fn html_escaped(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#x27;"),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Headers the Python gateway forwards to an agent but this side's HTTP client would not pass on
@@ -591,9 +624,12 @@ fn agent_call<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, aft
     let (uri, headers) = (req.uri(), req.headers());
     let (slug, rest) = after.split_once('/').unwrap_or((after, ""));
     let backend = snap.agents.get(slug)?;
-    if snap.fallthrough_prefixes.iter().any(|p| uri.path().starts_with(p.as_str())) || wants_html(headers) {
+    let failure = snap.agent_failure.as_ref()?;
+    if snap.fallthrough_prefixes.iter().any(|p| uri.path().starts_with(p.as_str())) {
         return None;
     }
+    // A browser is forwarded for like anyone else; only a failure is answered differently.
+    let html = prefers_html(headers)?;
     if headers.contains_key(UPGRADE) || headers.contains_key(ORIGIN) || NOT_FORWARDED_ALIKE.iter().any(|h| headers.contains_key(*h)) {
         return None;
     }
@@ -620,7 +656,7 @@ fn agent_call<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, aft
         Some(query) if query_survives(query) => format!("{prefix}{upstream_path}?{query}"),
         Some(_) => return None,
     };
-    Some(AgentCall { backend, target, version, ip, method })
+    Some(AgentCall { backend, target, version, ip, method, failure, html })
 }
 
 /// The largest request body held here for an agent. It is held whole so that the request can
@@ -628,16 +664,23 @@ fn agent_call<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, aft
 /// body whole anyway.
 const AGENT_BODY_MAX: u64 = 1 << 20;
 
-/// The Python gateway's answer when an agent's connection fails before it answers.
-fn agent_failed(t: &Trace, at: Duration) -> Response<Body> {
-    let body = format!(
-        "{{\"error\":\"INTERNAL_ERROR\",\"message\":\"An unexpected error occurred. Please try again later.\",\"request_id\":{},\"timestamp\":{}}}",
-        json(&t.request_id),
-        json(&timestamp(at, false)),
-    );
+/// The Python gateway's answer when an agent's connection fails before it answers: its 500, as
+/// a page for a browser and as JSON for anyone else, in its words.
+fn agent_failed(failure: &AgentFailure, html: bool, t: &Trace, at: Duration) -> Response<Body> {
+    let (body, kind) = if html {
+        (format!("{}{}{}", failure.page.0, html_escaped(&t.request_id), failure.page.1), "text/html; charset=utf-8")
+    } else {
+        let body = format!(
+            "{{\"error\":\"INTERNAL_ERROR\",\"message\":{},\"request_id\":{},\"timestamp\":{}}}",
+            failure.message_json,
+            json(&t.request_id),
+            json(&timestamp(at, false)),
+        );
+        (body, "application/json")
+    };
     let mut resp = Response::new(full(body));
     *resp.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-    resp.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    resp.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static(kind));
     resp.headers_mut().insert("x-content-type-options", HeaderValue::from_static("nosniff"));
     resp
 }
@@ -698,7 +741,7 @@ async fn serve_agent(w: &Worker, a: &AgentCall<'_>, peer: SocketAddr, req: Reque
             let (parts, _) = original.into_parts();
             return to_control(w, peer, Request::from_parts(parts, full(bytes))).await;
         }
-        Err(_) => (agent_failed(&t, at), true),
+        Err(_) => (agent_failed(a.failure, a.html, &t, at), true),
     };
     let answered = Answered { method: a.method, ip: a.ip, version: a.version, rejected: false, error: failed.then_some("INTERNAL_ERROR") };
     resp = finish(w, resp, &answered, &original, &t, started, at);
@@ -1916,13 +1959,17 @@ mod tests {
         assert!(refused(&snap, &request("GET", "/api/x"), Duration::from_secs(day + 121 * 60)).is_none());
     }
 
-    fn body_of(resp: Response<Body>) -> serde_json::Value {
+    fn bytes_of(resp: Response<Body>) -> Bytes {
         let Either::Right(body) = resp.into_body() else { panic!("made here") };
         let mut body = std::pin::pin!(body);
         let waker = std::task::Waker::noop();
         let mut cx = std::task::Context::from_waker(waker);
         let std::task::Poll::Ready(Some(Ok(frame))) = body.as_mut().poll_frame(&mut cx) else { panic!("a full body is ready") };
-        serde_json::from_slice(&frame.into_data().unwrap()).unwrap()
+        frame.into_data().unwrap()
+    }
+
+    fn body_of(resp: Response<Body>) -> serde_json::Value {
+        serde_json::from_slice(&bytes_of(resp)).unwrap()
     }
 
     #[test]
@@ -2213,7 +2260,7 @@ mod tests {
         assert!(relay(&scoped, &handshake("/ws/other", &[("x-api-key", KEY)]), 100).is_none());
     }
 
-    const AGENTS: &str = r#","agents":{"hiring":"http://10.0.0.10:8001","based":"http://10.0.0.11:8001/base","secure":"https://10.0.0.12"}"#;
+    const AGENTS: &str = r#","agents":{"hiring":"http://10.0.0.10:8001","based":"http://10.0.0.11:8001/base","secure":"https://10.0.0.12"},"agent_failure":{"message_json":"\"Try again later.\"","page":["<p>Request <code>","</code></p>"]}"#;
 
     fn to_agent(snap: &Snapshot, req: &Request<()>) -> Option<String> {
         match decide(snap, peer(), req, 100, |_| false) {
@@ -2249,7 +2296,7 @@ mod tests {
             assert!(to_agent(&snap, &request("GET", uri)).is_none(), "{uri}");
         }
         assert!(to_agent(&snap, &request("OPTIONS", "/agents/hiring/a")).is_none());
-        for (name, value) in [("accept", "text/html"), ("origin", "http://localhost:3001"), ("upgrade", "websocket"), ("x-protocol", "mcp"),
+        for (name, value) in [("origin", "http://localhost:3001"), ("upgrade", "websocket"), ("x-protocol", "mcp"),
                               ("te", "trailers"), ("trailer", "x"), ("proxy-authorization", "Basic eA==")] {
             let req = Request::builder().uri("/agents/hiring/a").header(name, value).body(()).unwrap();
             assert!(to_agent(&snap, &req).is_none(), "{name}");
@@ -2272,13 +2319,45 @@ mod tests {
 
     #[test]
     fn an_agents_failure_is_answered_as_python_answers_it() {
+        let snap = governed(AGENTS, "");
+        let failure = snap.agent_failure.as_ref().unwrap();
         let t = trace_for(&HeaderMap::new());
-        let resp = agent_failed(&t, Duration::new(1_700_000_000, 123_000));
+        let resp = agent_failed(failure, false, &t, Duration::new(1_700_000_000, 123_000));
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(resp.headers()["x-content-type-options"], "nosniff");
         let body = body_of(resp);
         assert_eq!(body.as_object().unwrap().keys().collect::<Vec<_>>(), ["error", "message", "request_id", "timestamp"]);
-        assert_eq!(body["error"], "INTERNAL_ERROR");
+        assert_eq!((&body["error"], &body["message"]), (&serde_json::json!("INTERNAL_ERROR"), &serde_json::json!("Try again later.")));
+        // A browser gets the page, with the request id written in safely.
+        let mut named = HeaderMap::new();
+        named.insert("x-request-id", HeaderValue::from_static("a<b>&\"c'"));
+        let resp = agent_failed(failure, true, &trace_for(&named), Duration::ZERO);
+        assert_eq!(resp.headers()["content-type"], "text/html; charset=utf-8");
+        assert_eq!(bytes_of(resp), "<p>Request <code>a&lt;b&gt;&amp;&quot;c&#x27;</code></p>");
+    }
+
+    #[test]
+    fn a_browser_is_told_apart_as_python_tells_it() {
+        let with = |pairs: &[(&str, &str)]| {
+            let mut h = HeaderMap::new();
+            for (k, v) in pairs {
+                h.insert(HeaderName::from_bytes(k.as_bytes()).unwrap(), HeaderValue::from_str(v).unwrap());
+            }
+            prefers_html(&h)
+        };
+        assert_eq!(with(&[]), Some(false));
+        assert_eq!(with(&[("accept", "*/*")]), Some(false));
+        assert_eq!(with(&[("accept", "text/html,application/xhtml+xml,*/*;q=0.8")]), Some(true));
+        assert_eq!(with(&[("accept", "Text/HTML")]), Some(true));
+        assert_eq!(with(&[("accept", "application/json, text/html")]), Some(false));
+        assert_eq!(with(&[("accept", "text/html, application/json")]), Some(true));
+        assert_eq!(with(&[("accept", "text/html"), ("x-requested-with", "XMLHttpRequest")]), Some(false));
+        assert_eq!(html_escaped("a<b>&\"c'"), "a&lt;b&gt;&amp;&quot;c&#x27;");
+        // Without the gateway's word on how a failure is answered, agents are Python's.
+        let agents_only = r#","agents":{"hiring":"http://10.0.0.10:8001"}"#;
+        assert!(to_agent(&governed(agents_only, ""), &request("GET", "/agents/hiring/a")).is_none());
+        let browser = Request::builder().uri("/agents/hiring/a").header("accept", "text/html").body(()).unwrap();
+        assert!(to_agent(&governed(AGENTS, ""), &browser).is_some());
     }
 
     const GRPC: &str = r#","grpc":"http://127.0.0.1:50051""#;

@@ -1063,7 +1063,26 @@ def main() -> int:
             agent_same("a caller that names a protocol", "GET", "/agents/echo/a", {"X-Protocol": "mcp"}, by="python")
             agent_same("a request from a web page in another origin", "GET", "/agents/echo/a", {"Origin": "http://localhost:3001"}, by="python")
             agent_same("a body too large to hold here", "POST", "/agents/echo/upload", {"Content-Type": "application/octet-stream"}, b"z" * 2_000_000, by="python")
-            agent_same("a browser", "GET", "/agents/echo/a", {"Accept": "text/html"}, by="python")
+            page = {"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "User-Agent": "Mozilla/5.0"}
+            agent_same("a browser is forwarded for like anyone else", "GET", "/agents/echo/a", page)
+            agent_same("a browser posting a form", "POST", "/agents/echo/login", {**page, "Content-Type": "application/x-www-form-urlencoded"}, b"user=ada")
+            import re as _re
+
+            def page_of(r):
+                return _re.sub(r'(<code id="rid">)[^<]*(</code>)', r"\1<id>\2", r.text)
+
+            for name, extra, html in (("a browser is shown the gateway's page", {}, True),
+                                      ("a script in a page is answered in JSON", {"X-Requested-With": "XMLHttpRequest"}, False),
+                                      ("a caller that names JSON first is answered in JSON", {"Accept": "application/json, text/html"}, False)):
+                a, b = agent_same(f"when the agent hangs up, {name}", "GET", "/agents/echo/drop", {**page, **extra, "X-Request-ID": "page-<7>&'\""},
+                                  sees=False, want=lambda r: r.status_code == 500)
+                is_page = lambda r: r.headers["content-type"] == "text/html; charset=utf-8" and "<title>500" in r.text
+                check(f"agent edge: when the agent hangs up, {name}: the same answer, to the letter",
+                      (page_of(a) == page_of(b) and is_page(a) and is_page(b) and "page-&lt;7&gt;&amp;&#x27;&quot;" in b.text) if html
+                      else (shape(a) == shape(b) and not is_page(b) and b.json()["request_id"] == a.json()["request_id"] == "page-<7>&'\""),
+                      b.headers["content-type"])
+            agent_same("a browser asking for an agent that is not registered", "GET", "/agents/nobody/a", page, by="python", sees=False,
+                       want=lambda r: r.status_code == 404 and "<title>404" in r.text)
             agent_same("an agent that is not registered", "GET", "/agents/nobody/a", by="python", sees=False, want=lambda r: r.status_code == 404)
             agent_same("an agent that cannot be reached", "GET", "/agents/gone/a", by="python", sees=False, want=lambda r: r.status_code == 500)
             agent_same("an agent that cannot be reached, with a body", "POST", "/agents/gone/a", None, b"kept", by="python", sees=False, want=lambda r: r.status_code == 500)

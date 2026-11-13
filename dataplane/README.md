@@ -154,14 +154,15 @@ after the slug, the caller's headers (`Host`, `Authorization` and `Cookie` inclu
 its answer is streamed back as it comes. The Python gateway is handed the request when:
 
 * the slug is not registered, or its upstream is `https://` (the 404 and the TLS are Python's);
-* the caller is a browser (`Accept: text/html`), a web page in another origin, or asks for a WebSocket;
+* the caller is a web page in another origin, or asks for a WebSocket;
 * the query is anything but `key=value` pairs of unreserved characters with no key twice (Python takes a query apart
   and writes it again), a header is given twice (Python forwards the last), or the path after the slug names an API version;
 * the body has no `Content-Length` or is over 1 MiB;
 * the agent cannot be reached. Nothing was sent, so Python tries, answers in its own way and counts the failure in
   its circuit breaker. This side keeps no breaker for agents.
 
-An agent that hangs up before answering gets the Python gateway's 500 from here. A compressed answer is passed on
+An agent that hangs up before answering gets the Python gateway's 500 from here: its error page for a browser, JSON
+for anyone else, both taken from the snapshot so the words stay the Python gateway's. A compressed answer is passed on
 compressed with its `Content-Encoding`; the Python gateway decompresses it first. The caller reads the same either way.
 
 **gRPC.** A call (HTTP/2, `POST`, content type `application/grpc` or `application/grpc+...`) is relayed to
@@ -201,8 +202,8 @@ here is the reverse of everywhere else: **whatever this side cannot be sure of i
 | Any other WebSocket (`?api_key=`, `/agents/<slug>`, rules or policies in force) | Python, through a tunnel |
 | gRPC calls (HTTP/2, `application/grpc`) | data plane only; refused when it cannot be sure |
 | Any other request over HTTP/2 | as the same request over HTTP/1 |
-| `/agents/<slug>/...` to a registered `http://` agent, from a client that is not a browser | data plane |
-| `/agents/<slug>/...` otherwise (browsers, unknown slugs, `https://` agents, unusual requests) | Python |
+| `/agents/<slug>/...` to a registered `http://` agent, browsers included | data plane |
+| `/agents/<slug>/...` otherwise (unknown slugs, `https://` agents, unusual requests) | Python |
 | GraphQL, MQTT, the JSON-to-gRPC bridge under `/grpc` | Python |
 | Dynamic routes, transformation rules, request-altering plugins (when any exist) | Python, for every path |
 | The health path, `/ready` and `/live`, on a plain `GET` | data plane |
@@ -210,9 +211,6 @@ here is the reverse of everywhere else: **whatever this side cannot be sure of i
 | `/health/detailed`, `/metrics`, `/oauth2`, `/admin` and the console | Python |
 
 ## Known gaps (why this is not production-ready)
-
-* **Browsers reach agents through the Python gateway.** Any request that accepts `text/html` is handed over, because
-  the error pages are Python's. For an agent with a web interface that is most of its traffic; API callers are served here.
 
 * **A WebSocket relayed here is a tunnel, not two conversations.** The Python gateway ends the caller's WebSocket and
   opens its own to the backend, so it answers pings itself, sends the backend a keep-alive ping every 20 seconds, and

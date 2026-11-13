@@ -134,6 +134,25 @@ def _agents() -> Dict[str, str]:
             if isinstance(slug, str) and isinstance(base, str) and _AGENT_SLUG.fullmatch(slug) and _AGENT_UPSTREAM.fullmatch(base)}
 
 
+_REQUEST_ID_GOES_HERE = "@@request-id@@"
+
+
+def _agent_failure() -> Optional[Dict[str, Any]]:
+    """How this gateway answers when an agent's connection fails before it answers: the message
+    of its 500, and the page a browser is shown, cut in two where the request id goes (the data
+    plane writes the id in, escaped as HTML). ``None`` if the page cannot be cut that way."""
+    from app import main as gw
+
+    try:
+        page = gw._error_html(500, gw.internal_error_data(_REQUEST_ID_GOES_HERE))
+    except Exception:  # noqa: BLE001 - a page this code cannot render: the data plane leaves agents to us
+        return None
+    parts = page.split(_REQUEST_ID_GOES_HERE)
+    if len(parts) != 2:
+        return None
+    return {"message_json": _dumps(gw.INTERNAL_ERROR_MESSAGE), "page": parts}
+
+
 _GRPC_TARGET = re.compile(r"(?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\]):[0-9]{1,5}")
 
 
@@ -512,6 +531,7 @@ async def build_snapshot(db: AsyncSession) -> Dict[str, Any]:
         "websocket": _websocket(settings, bool(rules) or bool(policy_rows)),
         "grpc": _grpc(settings),
         "agents": _agents(),
+        "agent_failure": _agent_failure(),
     }
     snap["revision"] = hashlib.sha256(json.dumps(snap, sort_keys=True).encode()).hexdigest()
     return snap
