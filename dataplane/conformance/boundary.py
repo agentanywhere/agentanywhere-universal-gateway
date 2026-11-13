@@ -80,7 +80,7 @@ def schema(rng, depth=0):
             {"$schema": "http://json-schema.org/draft-04/schema#"}, {"$schema": "http://json-schema.org/draft-07/schema#"},
             {"patternProperties": {"^x": {"type": "string"}}}, {"propertyNames": {"maxLength": 1}}, {"dependentRequired": {"a": ["b"]}},
             {"prefixItems": [{"type": "string"}]}, {"contains": {"type": "integer"}}, {"if": {"type": "string"}, "then": {"minLength": 1}},
-            {"x-vendor": 1}, {"nullable": True}, {"type": "str"}, {"required": "a"}, {"minLength": -1}, {"minimum": "1"}, {"title": 7},
+            {"x-vendor": 1}, {"nullable": True}, {"example": "a"}, {"nullable": True, "type": "string"}, {"vendor": 1}, {"type": "str"}, {"required": "a"}, {"minLength": -1}, {"minimum": "1"}, {"title": 7},
             {"required": ["a", "a"]}, {"type": ["string", "string"]}, {"items": [{"type": "string"}]}, {"minLength": 1.0}, {"maxItems": 2.5},
         ]))
     return s

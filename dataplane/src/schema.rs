@@ -141,6 +141,11 @@ impl Schema {
                     value.as_array()?;
                 }
                 "default" => {}
+                // What an OpenAPI document adds to a schema. None of it is a JSON Schema keyword,
+                // so the Python library passes over it, `nullable` included: null is accepted
+                // only where `type` says so.
+                "example" | "nullable" | "xml" | "externalDocs" | "discriminator" => {}
+                extension if extension.starts_with("x-") => {}
                 _ => return None,
             }
         }
@@ -322,13 +327,17 @@ mod tests {
             json!({"properties": {"a": {"minimum": "1"}}}),
             json!({"properties": {"a": {"items": [{"type": "string"}]}}}),
             json!({"properties": {"a": {"title": 7}}}),
-            json!({"x-vendor": true}),
+            json!({"vendor": true}),
             json!(false),
             json!([]),
             json!("object"),
         ] {
             assert!(Schema::compile(&schema).is_none(), "{schema}");
         }
+        // What an OpenAPI document adds is passed over, as the Python library passes over it.
+        let openapi = json!({"properties": {"a": {"type": "string", "nullable": true, "example": "x", "x-order": 1}}});
+        assert!(passes(openapi.clone(), json!({"a": "x"})));
+        assert!(!passes(openapi, json!({"a": null})));
         // A schema of the wrong type for arguments passes nothing, and that is certain to no one.
         assert!(!passes(json!({"type": "array"}), json!({})));
         assert!(!passes(json!({"enum": ["a"]}), json!({})));

@@ -1386,6 +1386,51 @@ def main() -> int:
             assert rules_reached("/api/routed/orders/1", "data plane"), "removing the rules never reached the data plane"
             rule_same("with the rules removed, nothing is changed and all is served here", "GET", "/api/routed/orders/1", "data plane", False)
 
+            # --- MCP tools with a schema -------------------------------------------------------------
+            # A registered OpenAPI document gives each operation's tool a JSON Schema, and the Python
+            # gateway checks a call's arguments against it. The data plane forwards a call that is
+            # certain to fit and leaves every other one to Python, which words the refusal.
+            print()
+            order = {"type": "object", "required": ["item", "quantity"], "additionalProperties": False, "properties": {
+                "item": {"type": "string", "minLength": 1, "example": "tea"}, "quantity": {"type": "integer", "minimum": 1, "maximum": 10},
+                "gift": {"type": "boolean", "nullable": True}, "tags": {"type": "array", "items": {"type": "string"}, "maxItems": 2}}}
+            answered = {"200": {"description": "ok"}}
+            registered = post("/admin/registrations/openapi", {"name": "orders", "upstream_base_url": agents, "openapi_document": {
+                "openapi": "3.0.3", "info": {"title": "Orders", "version": "1"}, "paths": {
+                    "/orders": {"post": {"operationId": "create_order", "responses": answered,
+                                         "requestBody": {"content": {"application/json": {"schema": order}}}}},
+                    "/orders/{id}": {"get": {"operationId": "find_order", "responses": answered, "parameters": [
+                        {"name": "id", "in": "path", "required": True, "schema": {"type": "string", "pattern": "^o-"}}]}}}}})
+
+            def tool_call(base, key, tool, arguments):
+                return httpx.post(f"{base}/mcp/rpc", headers={"X-API-Key": key}, timeout=10,
+                                  json={"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": tool, "arguments": arguments}})
+
+            def tool_same(name, tool, arguments, status, by):
+                a, b = tool_call(py, keys["py"]["key"], tool, arguments), tool_call(rs, keys["rs"]["key"], tool, arguments)
+                compare(f"MCP schema: {name}", a, b)
+                alike = a.status_code == b.status_code == status and (status == 200 or a.json().get("details") == b.json().get("details"))
+                check(f"MCP schema: {name}: [{status}], decided by {by}", alike and said_by(b) == by,
+                      f"[{a.status_code} and {b.status_code}] by {said_by(b)}" + ("" if status == 200 else f"  {b.json().get('message', '')[:90]}"))
+
+            # Until the schema arrives, the data plane knows of no check and forwards the call.
+            assert wait_until(lambda: tool_call(rs, keys["rs"]["key"], "create_order", {}).status_code == 400), "the tool's schema never reached the data plane"
+            tool_same("arguments that fit are forwarded here", "create_order", {"item": "tea", "quantity": 2}, 200, "data plane")
+            tool_same("with every member given", "create_order", {"item": "t\u00e9", "quantity": 10, "gift": True, "tags": ["a", "b"]}, 200, "data plane")
+            tool_same("a member missing", "create_order", {"item": "tea"}, 400, "python")
+            tool_same("a member of the wrong type", "create_order", {"item": "tea", "quantity": "2"}, 400, "python")
+            tool_same("a number out of bounds", "create_order", {"item": "tea", "quantity": 11}, 400, "python")
+            tool_same("a member the schema does not allow", "create_order", {"item": "tea", "quantity": 2, "note": "x"}, 400, "python")
+            tool_same("null where the schema only says nullable", "create_order", {"item": "tea", "quantity": 2, "gift": None}, 400, "python")
+            tool_same("too many items", "create_order", {"item": "tea", "quantity": 2, "tags": ["a", "b", "c"]}, 400, "python")
+            tool_same("a whole number written as 2.0 is Python's to accept", "create_order", {"item": "tea", "quantity": 2.0}, 200, "python")
+            tool_same("a schema with a pattern is Python's to judge, when it fits", "find_order", {"id": "o-17"}, 200, "python")
+            tool_same("a schema with a pattern is Python's to judge, when it does not", "find_order", {"id": "17"}, 400, "python")
+            tool_same("a tool with no schema is forwarded here as before", "search", {"q": 1}, 200, "data plane")
+            httpx.delete(f"{py}/admin/registrations/openapi/{registered['id']}", headers=adm, timeout=10).raise_for_status()
+            gone = wait_until(lambda: said_by(tool_call(rs, keys["rs"]["key"], "create_order", {})) == "data plane")
+            check("MCP schema: with the registration removed, the call is forwarded unchecked again", gone is not None)
+
             # --- OAuth2 tokens -----------------------------------------------------------------------
             # A token the Python gateway issued is a credential in `Authorization: Bearer`. It lives in
             # the Python gateway's memory; the data plane is told its digest.

@@ -156,6 +156,17 @@ force no token is listed and a token's requests go to the Python gateway. A toke
 has run out, and one issued a moment ago are the Python gateway's to decide; a revoked one is refused within about one
 sync interval. Tokens are relayed neither for gRPC nor for WebSocket.
 
+**MCP tool schemas.** A tool that comes from a registered OpenAPI document has a JSON Schema, and the Python gateway
+validates a `tools/call`'s arguments against it. The snapshot carries the schemas, and this side forwards a call whose
+arguments are certain to pass. It never refuses one: a call that does not fit goes to the Python gateway, which words
+the refusal. A schema is followed here only if every keyword in it is one of `type`, `properties`, `required`,
+`additionalProperties`, `items` (one schema), `enum` (of strings), `minimum`, `maximum`, `minLength`, `maxLength`,
+`minItems`, `maxItems`, or says nothing about validity (`title`, `description`, `default`, `examples`, `format`, and
+what OpenAPI adds: `example`, `nullable`, `x-...`). With any other keyword (`pattern`, `$ref`, `oneOf`, ...) the tool's
+calls stay with the Python gateway, and so does a value the two sides could read differently, such as a whole number
+written `2.0`. `python dataplane/conformance/boundary.py` generates schemas and calls and checks that nothing the
+Python gateway refuses is forwarded here.
+
 **Transformation rules.** The Python gateway applies them; this side only works out which requests they apply to and
 hands those over. A rule's pattern is matched, as there, against the path the backend is asked for (after a dynamic
 route's rewrite, a protocol's prefix or an agent's slug has been dealt with) and against the request's own path
@@ -246,7 +257,8 @@ here is the reverse of everywhere else: **whatever this side cannot be sure of i
 | MCP (`/mcp`, `/api/mcp`), including the boundary checks | data plane; bodies that fail or cannot be judged: Python |
 | A2A (`/a2a`, `/api/a2a`), including `message:stream` | data plane; same rule |
 | AG-UI (`/agui`, `/api/agui`) and ACP (`/acp`, `/api/acp`), including event streams | data plane; same rule |
-| MCP `tools/call` for a tool with a registered JSON Schema; custom injection patterns | Python |
+| MCP `tools/call` for a tool with a registered JSON Schema, arguments certain to fit | data plane |
+| MCP `tools/call` whose arguments do not fit, or might not; a schema with a keyword this side does not follow; custom injection patterns | Python |
 | A key sent as `Authorization: Bearer <key>` | data plane |
 | No credential; a credential Python refused in the last ten seconds; a key clearly past its expiry | data plane (401) |
 | An OAuth2 token in `Authorization: Bearer`, listed in the snapshot, no IP rules or policies | data plane |
@@ -290,7 +302,7 @@ here is the reverse of everywhere else: **whatever this side cannot be sure of i
   failed in between. Key changes made through the admin API are not affected (they change the snapshot).
 * **Some MCP traffic is still judged by Python.** A string that contains one of four letters Python's
   case-insensitive matching treats as `i`, `s` or `k` (U+0130, U+0131, U+017F, U+212A), a method name that is not ASCII
-  while a method list is configured, a `tools/call` for a tool with a JSON Schema, any MCP body when custom injection
+  while a method list is configured, a `tools/call` whose arguments are not certain to fit the tool's JSON Schema, any MCP body when custom injection
   patterns are configured, and any checked body sent without a `Content-Length`: all correct, none fast.
 * **The four protocols have not been benchmarked.** Reading and parsing a body to check it costs time the plain HTTP
   path does not spend; how much has not been measured.
