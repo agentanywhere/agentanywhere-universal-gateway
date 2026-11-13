@@ -108,6 +108,10 @@ pub struct Snapshot {
     pub grpc_url: Option<String>,
     /// The backend at that address, filled in when the snapshot is put to use.
     pub grpc: Option<Arc<Backend>>,
+    /// The agent edge: slug to upstream address (`http://`), for the agents this side forwards to.
+    pub agent_urls: HashMap<String, String>,
+    /// The backends at those addresses, filled in when the snapshot is put to use.
+    pub agents: HashMap<String, Arc<Backend>>,
 }
 
 /// The gateway's health endpoint, as the Python gateway serves it.
@@ -159,6 +163,8 @@ struct SnapshotFile {
     ops: Option<Ops>,
     websocket: Option<String>,
     grpc: Option<String>,
+    #[serde(default)]
+    agents: HashMap<String, String>,
     ready: Option<Readiness>,
     #[serde(default)]
     keys: Vec<KeyRecord>,
@@ -453,6 +459,8 @@ impl Snapshot {
             websocket: None,
             grpc_url: file.grpc.filter(|u| u.starts_with("http://")),
             grpc: None,
+            agent_urls: file.agents.into_iter().filter(|(_, url)| url.starts_with("http://")).collect(),
+            agents: HashMap::new(),
             inject_request_id: file.inject_request_id,
             revision: file.revision,
             api_versions,

@@ -123,6 +123,59 @@ def websocket_backend():
     return f"ws://127.0.0.1:{server.socket.getsockname()[1]}/base"
 
 
+def agent_backend():
+    """A local agent for the agent edge. It answers with everything it was sent (method, path, query,
+    every header in order, the body), sets two cookies, and has a few paths of its own: `/teapot`
+    answers 418, `/gzip` compresses its answer, `/stream` sends three events a moment apart, and
+    `/drop` closes the connection without answering. Returns its URL."""
+    import gzip, socket
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def answer(self):
+            body = self.rfile.read(int(self.headers.get("content-length", 0) or 0))
+            path, _, query = self.path.partition("?")
+            if path.endswith("/drop"):
+                self.connection.shutdown(socket.SHUT_RDWR)
+                return
+            if path.endswith("/stream"):
+                self.send_response(200)
+                self.send_header("Content-Type", "application/x-ndjson")
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                for i in range(3):
+                    line = json.dumps({"n": i}).encode() + b"\n"
+                    self.wfile.write(f"{len(line):x}\r\n".encode() + line + b"\r\n")
+                    self.wfile.flush()
+                    time.sleep(0.4)
+                self.wfile.write(b"0\r\n\r\n")
+                return
+            out = json.dumps({"method": self.command, "path": path, "query": query, "headers": [[k, v] for k, v in self.headers.items()],
+                              "body_sha256": hashlib.sha256(body).hexdigest(), "body_bytes": len(body)}).encode()
+            self.send_response(418 if path.endswith("/teapot") else 200)
+            if path.endswith("/gzip"):
+                out = gzip.compress(out)
+                self.send_header("Content-Encoding", "gzip")
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(out)))
+            self.send_header("Set-Cookie", "session=alice; Path=/")
+            self.send_header("Set-Cookie", "csrf=1")
+            self.send_header("X-Agent", "echo")
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(out)
+
+        do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = do_HEAD = answer
+
+        def log_message(self, *_):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return f"http://127.0.0.1:{server.server_port}"
+
+
 def grpc_backend():
     """A local gRPC server that needs no generated code: messages are raw bytes. `Say` answers with
     what it was sent; `Who` with the metadata it saw; `Fail` with NOT_FOUND and a trailer; `Count`
@@ -204,6 +257,7 @@ def main() -> int:
     admin = secrets.token_urlsafe(32)
     procs = []
     agents = protocol_backend()
+    agent = agent_backend()
     grpc_server = subprocess.Popen([sys.executable, __file__, "--grpc-backend"], stdout=subprocess.PIPE, text=True)
     grpc_port = int(grpc_server.stdout.readline())
     with tempfile.TemporaryDirectory() as tmp:
@@ -211,6 +265,8 @@ def main() -> int:
                "DATABASE_URL": f"sqlite+aiosqlite:///{tmp}/g.db", "HTTP_BACKEND_URL": f"http://127.0.0.1:{bport}",
                "REDIS_ENABLED": "false", "LOG_LEVEL": "WARNING", "STARTUP_BANNER": "false", "DEBUG": "false",
                "TRUSTED_PROXIES": "127.0.0.1", "DATAPLANE_TOKEN": "conformance-token",
+               "AGENT_ROUTES_JSON": json.dumps({"echo": agent, "based": f"{agent}/base", "gone": "http://127.0.0.1:9",
+                                                "secure": "https://127.0.0.1:9"}),
                "WEBSOCKET_BACKEND_URL": websocket_backend(), "GRPC_BACKEND_URL": f"127.0.0.1:{grpc_port}",
                "MCP_BACKEND_URL": agents, "A2A_BACKEND_URL": agents, "AG_UI_BACKEND_URL": agents, "ACP_BACKEND_URL": agents,
                "CIRCUIT_BREAKER_TIMEOUT": "2", "DEFAULT_TIMEOUT": "2"}  # short, so the breaker and timeout scenarios can wait them out
@@ -920,6 +976,107 @@ def main() -> int:
                           b.version == "HTTP/2" and by == ("data plane" if native else "python"), f"{b.version}, {by}")
                 r = httpx.get(f"{rs}/api/users", headers={"X-API-Key": keys["rs"]["key"]}, timeout=10)
                 check("HTTP/1.1 is still spoken to those who speak it", r.http_version == "HTTP/1.1" and r.status_code == 200, r.http_version)
+
+            # --- the agent edge ----------------------------------------------------------------------
+            # `/agents/<slug>/...` needs no gateway key. Each request goes to both planes, and what the
+            # agent was sent and what the caller got back are compared.
+            print()
+
+            def agent_saw(r, port, through_both=False):
+                """What the agent was sent, with what rightly differs between two requests taken out."""
+                seen = r.json()
+                named = [[k.lower(), v] for k, v in seen["headers"]]
+                # A request the data plane hands to Python arrives there from a proxy, so Python
+                # passes on the address the data plane gave it.
+                if through_both and ["x-forwarded-for", "127.0.0.1"] in named:
+                    named.remove(["x-forwarded-for", "127.0.0.1"])
+                host = [v for k, v in named if k == "host"]
+                seen["host_is_the_gateways"] = host == [f"127.0.0.1:{port}"]
+                # `connection` is each HTTP client's own business with the agent.
+                seen["headers"] = sorted([k, "<trace>" if k == "traceparent" else v] for k, v in named if k not in ("host", "connection"))
+                return seen
+
+            def agent_same(name, method, path, headers=None, content=None, by="data plane", sees=True, want=None):
+                a = httpx.request(method, py + path, headers=headers, content=content, timeout=15)
+                b = httpx.request(method, rs + path, headers=headers, content=content, timeout=15)
+                bad = []
+                if a.status_code != b.status_code:
+                    bad.append(f"status {a.status_code} vs {b.status_code}")
+                if sees and a.status_code == b.status_code and method != "HEAD":
+                    x, y = agent_saw(a, gport), agent_saw(b, dport, through_both=by == "python")
+                    if x != y:
+                        diff = [f"{k}: {x[k]} vs {y[k]}" for k in x if x[k] != y.get(k)]
+                        bad.append("the agent was sent " + "; ".join(diff)[:600])
+                    elif not y["host_is_the_gateways"]:
+                        bad.append("the agent was not told the gateway's host")
+                elif not sees and shape(a) != shape(b):
+                    bad.append(f"body {shape(a)} vs {shape(b)}")
+                for h in PROMISED + ("x-agent", "set-cookie"):
+                    if a.headers.get_list(h) != b.headers.get_list(h) and h not in ("x-request-id", "traceparent", "x-response-time"):
+                        bad.append(f"header {h}: {a.headers.get_list(h)} vs {b.headers.get_list(h)}")
+                    if (h in a.headers) != (h in b.headers):
+                        bad.append(f"header {h}: python={h in a.headers} rust={h in b.headers}")
+                if said_by(b) != by:
+                    bad.append(f"answered by {said_by(b)}")
+                if want is not None and not want(b):
+                    bad.append("not the expected answer")
+                check(f"agent edge: {name}", not bad, f"[{b.status_code}] by {said_by(b)}" + ("  " + "; ".join(bad) if bad else ""))
+                return a, b
+
+            assert wait_until(lambda: said_by(httpx.get(f"{rs}/agents/echo/x", timeout=10)) == "data plane"), "agents never became native"
+            caller = {"Authorization": "Bearer theirs", "Cookie": "s=1", "X-Forwarded-For": "198.51.100.7", "X-Gateway-Internal": "1"}
+            agent_same("a request reaches the agent without a gateway key, with the caller's own credentials", "GET", "/agents/echo/a/b?x=1&y=two", caller,
+                       want=lambda r: r.json()["path"] == "/a/b" and r.json()["query"] == "x=1&y=two")
+            agent_same("a body", "POST", "/agents/echo/run", {"Content-Type": "application/json"}, b'{"a": 1}', want=lambda r: r.json()["body_bytes"] == 8)
+            agent_same("a POST without a body", "POST", "/agents/echo/run")
+            for method in ("PUT", "PATCH", "DELETE"):
+                agent_same(f"{method} with a body", method, "/agents/echo/items/7", {"Content-Type": "text/plain"}, b"x" * 5000)
+            agent_same("DELETE without a body", "DELETE", "/agents/echo/items/7")
+            agent_same("the agent's root", "GET", "/agents/echo", want=lambda r: r.json()["path"] == "/")
+            agent_same("the agent's root, with a slash", "GET", "/agents/echo/", want=lambda r: r.json()["path"] == "/")
+            agent_same("HEAD", "HEAD", "/agents/echo/a")
+            agent_same("the agent's own status comes back", "GET", "/agents/echo/teapot", want=lambda r: r.status_code == 418)
+            agent_same("a compressed answer reads the same", "GET", "/agents/echo/gzip", want=lambda r: r.json()["path"] == "/gzip")
+            agent_same("an agent registered under a path is asked under it", "GET", "/agents/based/a?n=1", want=lambda r: r.json()["path"] == "/base/a")
+            agent_same("the next caller is not sent the cookies the agent set for the last", "GET", "/agents/echo/profile",
+                       want=lambda r: not any(k.lower() == "cookie" for k, _ in r.json()["headers"]))
+            agent_same("a request id and a trace are kept", "GET", "/agents/echo/a", {"X-Request-ID": "agent-7", "traceparent": tp_in},
+                       want=lambda r: r.headers["x-request-id"] == "agent-7" and r.headers["traceparent"].split("-")[1] == tp_in.split("-")[1])
+
+            def streamed(base):
+                arrived = []
+                with httpx.stream("GET", f"{base}/agents/echo/stream", timeout=15) as r:
+                    for line in r.iter_lines():
+                        arrived.append((time.time(), line))
+                    return r, arrived
+
+            (a, lines_a), (b, lines_b) = streamed(py), streamed(rs)
+            check("agent edge: a stream arrives as it is sent, not all at the end",
+                  [l for _, l in lines_a] == [l for _, l in lines_b] and len(lines_b) == 3 and lines_b[-1][0] - lines_b[0][0] > 0.5
+                  and said_by(b) == "data plane", f"{lines_b[-1][0] - lines_b[0][0]:.2f}s between first and last, by {said_by(b)}")
+
+            # What this side cannot be sure of sending as Python sends it is Python's to send.
+            agent_same("a query key given twice", "GET", "/agents/echo/a?x=1&x=2", by="python")
+            agent_same("a query that Python rewrites", "GET", "/agents/echo/a?q=a+b&r=%7E", by="python")
+            agent_same("a header given twice", "GET", "/agents/echo/a", [("Accept", "text/plain"), ("Accept", "application/json")], by="python")
+            agent_same("a path that names an API version", "GET", "/agents/echo/v1/a", by="python")
+            agent_same("a caller that names a protocol", "GET", "/agents/echo/a", {"X-Protocol": "mcp"}, by="python")
+            agent_same("a request from a web page in another origin", "GET", "/agents/echo/a", {"Origin": "http://localhost:3001"}, by="python")
+            agent_same("a body too large to hold here", "POST", "/agents/echo/upload", {"Content-Type": "application/octet-stream"}, b"z" * 2_000_000, by="python")
+            agent_same("a browser", "GET", "/agents/echo/a", {"Accept": "text/html"}, by="python")
+            agent_same("an agent that is not registered", "GET", "/agents/nobody/a", by="python", sees=False, want=lambda r: r.status_code == 404)
+            agent_same("an agent that cannot be reached", "GET", "/agents/gone/a", by="python", sees=False, want=lambda r: r.status_code == 500)
+            agent_same("an agent that cannot be reached, with a body", "POST", "/agents/gone/a", None, b"kept", by="python", sees=False, want=lambda r: r.status_code == 500)
+            agent_same("an agent behind TLS", "GET", "/agents/secure/a", by="python", sees=False)
+            agent_same("an agent that hangs up without answering", "GET", "/agents/echo/drop", sees=False, want=lambda r: r.status_code == 500)
+            a, b = agent_same("and with a body", "POST", "/agents/echo/drop", None, b"once", sees=False, want=lambda r: r.status_code == 500)
+            check("agent edge: that answer has Python's fields in Python's order", list(a.json()) == list(b.json()), str(list(b.json())))
+
+            time.sleep(2.0)
+            counted = metric("gateway_requests_total", method="PUT", path="/agents/echo/items/:id", status_code="200")
+            check("agent edge: requests are counted once per plane", counted == 2, f"{counted:.0f} (one through each plane)")
+            logs = httpx.get(f"{py}/admin/logs", params={"limit": 1000, "path": "/agents/echo/items/7"}, headers=adm, timeout=10).json()["logs"]
+            check("agent edge: requests are logged, without a key", len(logs) == 8 and all(not l.get("api_key_id") for l in logs), f"{len(logs)} rows")
 
             # --- gRPC --------------------------------------------------------------------------------
             # The Python gateway does not speak HTTP/2, so there is no second plane to compare with:

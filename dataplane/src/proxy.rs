@@ -142,6 +142,7 @@ impl Backends {
         // A WebSocket is opened with an HTTP request to the same address.
         snap.websocket = snap.websocket_url.as_deref().and_then(|u| self.at(&u.replacen("ws://", "http://", 1)));
         snap.grpc = snap.grpc_url.as_deref().and_then(|u| self.at(u));
+        snap.agents = snap.agent_urls.iter().filter_map(|(slug, url)| Some((slug.clone(), self.at(url)?))).collect();
     }
 }
 
@@ -427,6 +428,8 @@ struct Unauthenticated<'a> {
 /// What to do with a request.
 enum Decision<'a> {
     Native(Native<'a>),
+    /// A request for an agent behind the agent edge, forwarded here without a gateway key.
+    Agent(AgentCall<'a>),
     Refuse(Unauthenticated<'a>),
     /// The Python gateway answers, which is always right: it is the answer whenever this side
     /// cannot be sure of deciding the same. With a digest: the request carries one credential this
@@ -466,6 +469,9 @@ fn decide<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, now: u6
     // and what a policy matches are decided on the decoded one.
     if uri.authority().is_some() || !path.is_ascii() || path.contains('%') {
         return PYTHON;
+    }
+    if let Some(rest) = path.strip_prefix("/agents/") {
+        return agent_call(snap, peer, req, rest).map(Decision::Agent).unwrap_or(PYTHON);
     }
     let Some(protocol) = classify(path) else { return PYTHON };
     if snap.fallthrough_prefixes.iter().any(|p| path.starts_with(p.as_str())) || wants_html(req.headers()) {
@@ -547,6 +553,162 @@ fn decide<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, now: u6
         return PYTHON;
     }
     Decision::Native(Native { protocol, backend, entry, version, ip, method })
+}
+
+/// A request for `/agents/<slug>/...` this side forwards itself.
+struct AgentCall<'a> {
+    backend: &'a Backend,
+    /// What the agent is asked for: the path after `/agents/<slug>`, and the query.
+    target: String,
+    version: Option<&'a str>,
+    ip: IpAddr,
+    method: &'static str,
+}
+
+/// Headers the Python gateway forwards to an agent but this side's HTTP client would not pass on
+/// the same way, and `x-protocol`, which the Python gateway sends twice when the caller sent one.
+const NOT_FORWARDED_ALIKE: [&str; 5] = ["te", "trailer", "proxy-authorization", "proxy-authenticate", "x-protocol"];
+
+/// Whether a query reaches the agent unchanged through the Python gateway, which takes it apart
+/// and writes it again: `key=value` pairs of unreserved characters, no key twice.
+fn query_survives(query: &str) -> bool {
+    let plain = |s: &str| s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~'));
+    let mut seen: Vec<&str> = Vec::new();
+    query.split('&').all(|pair| match pair.split_once('=') {
+        Some((key, value)) if !key.is_empty() && plain(key) && plain(value) && !seen.contains(&key) => {
+            seen.push(key);
+            true
+        }
+        _ => false,
+    })
+}
+
+/// Decide a request under `/agents/`: forwarded here when the agent is one this side can reach
+/// and the request would arrive there exactly as the Python gateway sends it. The agent edge asks
+/// for no gateway key, applies no limit and no rule; the agent authenticates its own callers. An
+/// unknown slug, a browser, and anything unusual about the request are the Python gateway's.
+fn agent_call<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, after: &str) -> Option<AgentCall<'a>> {
+    let (uri, headers) = (req.uri(), req.headers());
+    let (slug, rest) = after.split_once('/').unwrap_or((after, ""));
+    let backend = snap.agents.get(slug)?;
+    if snap.fallthrough_prefixes.iter().any(|p| uri.path().starts_with(p.as_str())) || wants_html(headers) {
+        return None;
+    }
+    if headers.contains_key(UPGRADE) || headers.contains_key(ORIGIN) || NOT_FORWARDED_ALIKE.iter().any(|h| headers.contains_key(*h)) {
+        return None;
+    }
+    // Of a header sent twice, the Python gateway forwards the last one only.
+    if headers.len() != headers.keys_len() {
+        return None;
+    }
+    let method = [("GET", Method::GET), ("POST", Method::POST), ("PUT", Method::PUT), ("DELETE", Method::DELETE), ("PATCH", Method::PATCH), ("HEAD", Method::HEAD)]
+        .into_iter()
+        .find(|(_, m)| m == req.method())?
+        .0;
+    let version = match resolve_version(snap, headers) {
+        Some((_, false)) => return None,
+        found => found.map(|(v, _)| v),
+    };
+    let upstream_path = format!("/{rest}");
+    if names_a_version(&upstream_path) {
+        return None;
+    }
+    let ip = govern::client_ip(peer, headers, &snap.trusted_proxies)?;
+    let prefix = &backend.upstream.prefix;
+    let target = match uri.query() {
+        None | Some("") => format!("{prefix}{upstream_path}"),
+        Some(query) if query_survives(query) => format!("{prefix}{upstream_path}?{query}"),
+        Some(_) => return None,
+    };
+    Some(AgentCall { backend, target, version, ip, method })
+}
+
+/// The largest request body held here for an agent. It is held whole so that the request can
+/// still be handed to the Python gateway if the agent cannot be reached; that gateway holds every
+/// body whole anyway.
+const AGENT_BODY_MAX: u64 = 1 << 20;
+
+/// The Python gateway's answer when an agent's connection fails before it answers.
+fn agent_failed(t: &Trace, at: Duration) -> Response<Body> {
+    let body = format!(
+        "{{\"error\":\"INTERNAL_ERROR\",\"message\":\"An unexpected error occurred. Please try again later.\",\"request_id\":{},\"timestamp\":{}}}",
+        json(&t.request_id),
+        json(&timestamp(at, false)),
+    );
+    let mut resp = Response::new(full(body));
+    *resp.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+    resp.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    resp.headers_mut().insert("x-content-type-options", HeaderValue::from_static("nosniff"));
+    resp
+}
+
+/// Forward a request to an agent as the Python gateway forwards it: the path after the slug, the
+/// caller's headers (its `Host`, `Authorization` and `Cookie` included) and the gateway's own
+/// additions. The agent's answer is streamed back as it comes. An agent that cannot be reached
+/// was sent nothing, so the request goes to the Python gateway, which answers (and counts the
+/// failure) in its own way.
+async fn serve_agent(w: &Worker, a: &AgentCall<'_>, peer: SocketAddr, req: Request<Incoming>, started: Instant, at: Duration) -> Response<Body> {
+    let has_body = matches!(a.method, "POST" | "PUT" | "PATCH" | "DELETE");
+    let fits = match req.body().size_hint().exact() {
+        Some(0) => true,
+        Some(len) => has_body && len <= AGENT_BODY_MAX,
+        None => false,
+    };
+    let to = &a.backend.upstream;
+    let uri = Uri::builder().scheme(to.scheme.clone()).authority(to.authority.clone()).path_and_query(a.target.as_str()).build();
+    let (true, Ok(uri)) = (fits, uri) else { return to_control(w, peer, req.map(Either::Left)).await };
+    let (parts, body) = req.into_parts();
+    let Ok(read) = body.collect().await else { return body_unreadable() };
+    let bytes = read.to_bytes();
+    let t = trace_for(&parts.headers);
+
+    let mut out = Request::new(full(bytes.clone()));
+    *out.method_mut() = parts.method.clone();
+    *out.uri_mut() = uri;
+    let mut headers = parts.headers.clone();
+    for h in ["connection", "keep-alive", "transfer-encoding", "upgrade"] {
+        headers.remove(h);
+    }
+    let internal: Vec<HeaderName> = headers.keys().filter(|k| k.as_str().starts_with("x-gateway-")).cloned().collect();
+    for name in internal {
+        headers.remove(name);
+    }
+    // Added beside whatever the caller sent under the same names, as the Python gateway adds them.
+    if let Some(v) = a.version.and_then(|v| HeaderValue::from_str(v).ok()) {
+        headers.append("x-api-version", v);
+    }
+    headers.append("x-forwarded-for", HeaderValue::from_static(""));
+    headers.insert("x-protocol", HeaderValue::from_static("http"));
+    if let Ok(v) = HeaderValue::from_str(&t.traceparent) {
+        headers.insert("traceparent", v);
+    }
+    *out.headers_mut() = headers;
+
+    let original = Request::from_parts(parts, ());
+    let (mut resp, failed) = match w.client.request(out).await {
+        Ok(resp) => {
+            let (mut rp, rb) = resp.into_parts();
+            for h in HOP_BY_HOP {
+                rp.headers.remove(h);
+            }
+            rp.headers.remove("x-dataplane-auth");
+            (Response::from_parts(rp, Either::Left(rb)), false)
+        }
+        Err(e) if e.is_connect() => {
+            let (parts, _) = original.into_parts();
+            return to_control(w, peer, Request::from_parts(parts, full(bytes))).await;
+        }
+        Err(_) => (agent_failed(&t, at), true),
+    };
+    let answered = Answered { method: a.method, ip: a.ip, version: a.version, rejected: false, error: failed.then_some("INTERNAL_ERROR") };
+    resp = finish(w, resp, &answered, &original, &t, started, at);
+    if failed {
+        // The Python gateway's answer to this failure carries none of its usual headers.
+        for h in ["x-request-id", "x-response-time", "traceparent", "x-api-version"] {
+            resp.headers_mut().remove(h);
+        }
+    }
+    resp
 }
 
 /// A WebSocket handshake this side relays itself.
@@ -1152,6 +1314,7 @@ pub async fn handle(w: Arc<Worker>, peer: SocketAddr, mut req: Request<Incoming>
     };
     let n = match decision {
         Decision::Native(n) => n,
+        Decision::Agent(a) => return Ok(serve_agent(&w, &a, peer, req, started, at).await),
         Decision::Refuse(u) => return Ok(unauthenticated(&w, &u, &req, started, at)),
         Decision::Ask(credential) => {
             let (resp, refused) = ask_control(&w, peer, req.map(Either::Left)).await;
@@ -1799,6 +1962,7 @@ mod tests {
     fn outcome(snap: &Snapshot, req: &Request<()>, now: u64, denied: bool) -> String {
         match decide(snap, peer(), req, now, |_| denied) {
             Decision::Native(_) => "native".into(),
+            Decision::Agent(_) => "agent".into(),
             Decision::Ask(None) => "ask".into(),
             Decision::Ask(Some(_)) => "learn".into(),
             Decision::Refuse(u) => u.wording.message_json.clone(),
@@ -2047,6 +2211,74 @@ mod tests {
         let scoped = governed(WS, r#","allowed_paths":{"rules":[["under","/ws/chat"]],"patterns_json":"[\"/ws/chat\"]"}"#);
         assert!(relay(&scoped, &req, 100).is_some());
         assert!(relay(&scoped, &handshake("/ws/other", &[("x-api-key", KEY)]), 100).is_none());
+    }
+
+    const AGENTS: &str = r#","agents":{"hiring":"http://10.0.0.10:8001","based":"http://10.0.0.11:8001/base","secure":"https://10.0.0.12"}"#;
+
+    fn to_agent(snap: &Snapshot, req: &Request<()>) -> Option<String> {
+        match decide(snap, peer(), req, 100, |_| false) {
+            Decision::Agent(a) => Some(format!("{}{}", a.backend.upstream.authority, a.target)),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_request_for_a_known_agent_is_forwarded_here_without_a_key() {
+        let snap = governed(AGENTS, "");
+        let sent = |uri: &str| to_agent(&snap, &request("GET", uri));
+        assert_eq!(sent("/agents/hiring/a/b?x=1&y=two").as_deref(), Some("10.0.0.10:8001/a/b?x=1&y=two"));
+        assert_eq!(sent("/agents/hiring").as_deref(), Some("10.0.0.10:8001/"));
+        assert_eq!(sent("/agents/hiring/").as_deref(), Some("10.0.0.10:8001/"));
+        assert_eq!(sent("/agents/hiring/a?").as_deref(), Some("10.0.0.10:8001/a"));
+        assert_eq!(sent("/agents/based/a").as_deref(), Some("10.0.0.11:8001/base/a"));
+        for method in ["POST", "PUT", "PATCH", "DELETE", "HEAD"] {
+            assert!(to_agent(&snap, &request(method, "/agents/hiring/a")).is_some(), "{method}");
+        }
+        // An agent this side does not know or cannot reach, and no agent at all.
+        for uri in ["/agents/nobody/a", "/agents/secure/a", "/agents/", "/agents", "/agents/hiring%2Fa", "/api/agents/hiring/a"] {
+            assert!(sent(uri).is_none(), "{uri}");
+        }
+        assert!(to_agent(&governed("", ""), &request("GET", "/agents/hiring/a")).is_none());
+    }
+
+    #[test]
+    fn an_agent_request_python_would_send_differently_is_left_to_python() {
+        let snap = governed(AGENTS, "");
+        for uri in ["/agents/hiring/a?x=1&x=2", "/agents/hiring/a?q=a+b", "/agents/hiring/a?q=%7E", "/agents/hiring/a?flag", "/agents/hiring/a?=1",
+                    "/agents/hiring/a?a=1&&b=2", "/agents/hiring/v1/a", "/agents/hiring/v2"] {
+            assert!(to_agent(&snap, &request("GET", uri)).is_none(), "{uri}");
+        }
+        assert!(to_agent(&snap, &request("OPTIONS", "/agents/hiring/a")).is_none());
+        for (name, value) in [("accept", "text/html"), ("origin", "http://localhost:3001"), ("upgrade", "websocket"), ("x-protocol", "mcp"),
+                              ("te", "trailers"), ("trailer", "x"), ("proxy-authorization", "Basic eA==")] {
+            let req = Request::builder().uri("/agents/hiring/a").header(name, value).body(()).unwrap();
+            assert!(to_agent(&snap, &req).is_none(), "{name}");
+        }
+        let twice = Request::builder().uri("/agents/hiring/a").header("accept", "text/plain").header("accept", "application/json").body(()).unwrap();
+        assert!(to_agent(&snap, &twice).is_none());
+        // With every path left to Python (a transformation rule exists, say), so is this one.
+        assert!(to_agent(&governed(&format!(r#"{AGENTS},"fallthrough_prefixes":["/"]"#), ""), &request("GET", "/agents/hiring/a")).is_none());
+    }
+
+    #[test]
+    fn a_query_python_writes_back_unchanged_is_told_apart() {
+        for q in ["a=1", "a=1&b=two", "a=&b=x-y_z.~", "A1=B2"] {
+            assert!(query_survives(q), "{q}");
+        }
+        for q in ["", "a", "a=1&a=2", "a=b=c", "a=1&", "a=%20", "a=b+c", "a=caf\u{e9}", "a[]=1"] {
+            assert!(!query_survives(q), "{q}");
+        }
+    }
+
+    #[test]
+    fn an_agents_failure_is_answered_as_python_answers_it() {
+        let t = trace_for(&HeaderMap::new());
+        let resp = agent_failed(&t, Duration::new(1_700_000_000, 123_000));
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(resp.headers()["x-content-type-options"], "nosniff");
+        let body = body_of(resp);
+        assert_eq!(body.as_object().unwrap().keys().collect::<Vec<_>>(), ["error", "message", "request_id", "timestamp"]);
+        assert_eq!(body["error"], "INTERNAL_ERROR");
     }
 
     const GRPC: &str = r#","grpc":"http://127.0.0.1:50051""#;
