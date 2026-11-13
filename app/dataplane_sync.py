@@ -118,12 +118,12 @@ def _websocket(settings, governed: bool) -> Optional[str]:
 
 
 _AGENT_SLUG = re.compile(r"[A-Za-z0-9._~-]+")
-_AGENT_UPSTREAM = re.compile(r"http://(?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])(?::[0-9]{1,5})?(?:/[A-Za-z0-9._~/-]*)?")
+_AGENT_UPSTREAM = re.compile(r"https?://(?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])(?::[0-9]{1,5})?(?:/[A-Za-z0-9._~/-]*)?")
 
 
 def _agents() -> Dict[str, str]:
     """The agents of the agent edge the data plane may forward to itself: slug to upstream, for
-    those with a plain ``http://`` upstream. ``/agents/<slug>/...`` needs no gateway key (the agent
+    those with a plain ``http://`` or ``https://`` upstream. ``/agents/<slug>/...`` needs no gateway key (the agent
     authenticates its own callers), so the route is all there is to know. A slug that is not here
     is this gateway's to answer, registered or not."""
     from app import main as gw

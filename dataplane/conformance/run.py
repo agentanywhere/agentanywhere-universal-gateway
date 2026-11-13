@@ -123,8 +123,40 @@ def websocket_backend():
     return f"ws://127.0.0.1:{server.socket.getsockname()[1]}/base"
 
 
-def agent_backend():
-    """A local agent for the agent edge. It answers with everything it was sent (method, path, query,
+def certificates(folder):
+    """A certificate authority and a server certificate for 127.0.0.1 signed by it, and a second
+    server certificate nobody vouches for. Returns (authority file, trusted (cert, key), untrusted (cert, key))."""
+    import datetime, ipaddress
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    def issue(name, signer=None, authority=False):
+        key = ec.generate_private_key(ec.SECP256R1())
+        subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, name)])
+        issuer_name, signing_key = (signer[0].subject, signer[1]) if signer else (subject, key)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        cert = (x509.CertificateBuilder().subject_name(subject).issuer_name(issuer_name).public_key(key.public_key())
+                .serial_number(x509.random_serial_number()).not_valid_before(now - datetime.timedelta(minutes=5))
+                .not_valid_after(now + datetime.timedelta(days=2))
+                .add_extension(x509.BasicConstraints(ca=authority, path_length=None), critical=True)
+                .add_extension(x509.SubjectAlternativeName([x509.IPAddress(ipaddress.ip_address("127.0.0.1")), x509.DNSName("localhost")]), critical=False)
+                .sign(signing_key, hashes.SHA256()))
+        return cert, key
+
+    def write(stem, cert, key):
+        cert_file, key_file = Path(folder) / f"{stem}.pem", Path(folder) / f"{stem}.key"
+        cert_file.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+        key_file.write_bytes(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
+        return str(cert_file), str(key_file)
+
+    authority = issue("conformance authority", authority=True)
+    return write("authority", *authority)[0], write("trusted", *issue("trusted backend", authority)), write("untrusted", *issue("stranger"))
+
+
+def agent_backend(tls=None):
+    """A local agent for the agent edge (behind TLS when given a certificate and its key). It answers with everything it was sent (method, path, query,
     every header in order, the body), sets two cookies, and has a few paths of its own: `/teapot`
     answers 418, `/gzip` compresses its answer, `/stream` sends three events a moment apart, and
     `/drop` closes the connection without answering. Returns its URL."""
@@ -174,8 +206,13 @@ def agent_backend():
             pass
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    if tls:
+        import ssl
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(*tls)
+        server.socket = context.wrap_socket(server.socket, server_side=True)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    return f"http://127.0.0.1:{server.server_port}"
+    return f"{'https' if tls else 'http'}://127.0.0.1:{server.server_port}"
 
 
 def grpc_backend():
@@ -255,7 +292,6 @@ def main() -> int:
     if not BIN.exists():
         print(f"build first: cargo build --release  (in {BIN.parent.parent.parent})")
         return 2
-    bport, gport, dport = free_port(), free_port(), free_port()
     admin = secrets.token_urlsafe(32)
     procs = []
     agents = protocol_backend()
@@ -263,13 +299,19 @@ def main() -> int:
     grpc_server = subprocess.Popen([sys.executable, __file__, "--grpc-backend"], stdout=subprocess.PIPE, text=True)
     grpc_port = int(grpc_server.stdout.readline())
     with tempfile.TemporaryDirectory() as tmp:
-        env = {**os.environ, "SECRET_KEY": secrets.token_urlsafe(48), "ADMIN_TOKEN": admin,
+        authority, trusted, untrusted = certificates(tmp)
+        secure_agent, strange_agent = agent_backend(trusted), agent_backend(untrusted)
+        sockets = websocket_backend()
+        # Chosen last: a port found free is free only until the next server here is given one.
+        bport, gport, dport = free_port(), free_port(), free_port()
+        # Both planes are told to trust the same authority, the way an operator tells them.
+        env = {**os.environ, "SSL_CERT_FILE": authority, "SECRET_KEY": secrets.token_urlsafe(48), "ADMIN_TOKEN": admin,
                "DATABASE_URL": f"sqlite+aiosqlite:///{tmp}/g.db", "HTTP_BACKEND_URL": f"http://127.0.0.1:{bport}",
                "REDIS_ENABLED": "false", "LOG_LEVEL": "WARNING", "STARTUP_BANNER": "false", "DEBUG": "false",
                "TRUSTED_PROXIES": "127.0.0.1", "DATAPLANE_TOKEN": "conformance-token",
                "AGENT_ROUTES_JSON": json.dumps({"echo": agent, "based": f"{agent}/base", "gone": "http://127.0.0.1:9",
-                                                "secure": "https://127.0.0.1:9"}),
-               "WEBSOCKET_BACKEND_URL": websocket_backend(), "GRPC_BACKEND_URL": f"127.0.0.1:{grpc_port}",
+                                                "secure": secure_agent, "stranger": strange_agent}),
+               "WEBSOCKET_BACKEND_URL": sockets, "GRPC_BACKEND_URL": f"127.0.0.1:{grpc_port}",
                "MCP_BACKEND_URL": agents, "A2A_BACKEND_URL": agents, "AG_UI_BACKEND_URL": agents, "ACP_BACKEND_URL": agents,
                "CIRCUIT_BREAKER_TIMEOUT": "2", "DEFAULT_TIMEOUT": "2"}  # short, so the breaker and timeout scenarios can wait them out
 
@@ -299,7 +341,7 @@ def main() -> int:
             # staleness limit keep the live scenarios quick.
             procs.append(subprocess.Popen([str(BIN), "--listen", f"127.0.0.1:{dport}", "--control-token", "conformance-token",
                                            "--sync-interval-ms", "200", "--max-staleness-ms", "2000", "--report-interval-ms", "300",
-                                           "--backend", f"http://127.0.0.1:{bport}", "--control", f"http://127.0.0.1:{gport}"]))
+                                           "--backend", f"http://127.0.0.1:{bport}", "--control", f"http://127.0.0.1:{gport}"], env=env))
             time.sleep(1.5)
 
             py, rs = f"http://127.0.0.1:{gport}", f"http://127.0.0.1:{dport}"
@@ -1088,7 +1130,12 @@ def main() -> int:
             agent_same("an agent that is not registered", "GET", "/agents/nobody/a", by="python", sees=False, want=lambda r: r.status_code == 404)
             agent_same("an agent that cannot be reached", "GET", "/agents/gone/a", by="python", sees=False, want=lambda r: r.status_code == 500)
             agent_same("an agent that cannot be reached, with a body", "POST", "/agents/gone/a", None, b"kept", by="python", sees=False, want=lambda r: r.status_code == 500)
-            agent_same("an agent behind TLS", "GET", "/agents/secure/a", by="python", sees=False)
+            agent_same("an agent behind TLS, with a certificate the gateway trusts", "GET", "/agents/secure/a/b?x=1", caller,
+                       want=lambda r: r.json()["path"] == "/a/b")
+            agent_same("an agent behind TLS, with a body", "POST", "/agents/secure/run", {"Content-Type": "application/json"}, b'{"a": 1}',
+                       want=lambda r: r.json()["body_bytes"] == 8)
+            agent_same("an agent behind TLS whose certificate nobody vouches for is not spoken to", "GET", "/agents/stranger/a", by="python",
+                       sees=False, want=lambda r: r.status_code == 500)
             agent_same("an agent that hangs up without answering", "GET", "/agents/echo/drop", sees=False, want=lambda r: r.status_code == 500)
             a, b = agent_same("and with a body", "POST", "/agents/echo/drop", None, b"once", sees=False, want=lambda r: r.status_code == 500)
             check("agent edge: that answer has Python's fields in Python's order", list(a.json()) == list(b.json()), str(list(b.json())))
@@ -1106,7 +1153,8 @@ def main() -> int:
                           {"path": "/api/routed/exact", "backend_url": f"{agent}/exactly"},
                           {"path": "/api/routed/renamed/*", "backend_url": agent, "protocol": "mcp", "rewrite_path": "/elsewhere"},
                           {"path": "/api/routed/quick/*", "backend_url": agent, "timeout": 1},
-                          {"path": "/api/routed/tls/*", "backend_url": "https://127.0.0.1:9"},
+                          {"path": "/api/routed/tls/*", "backend_url": secure_agent},
+                          {"path": "/api/routed/stranger/*", "backend_url": strange_agent},
                           {"path": "/acp/routed/*", "backend_url": agent, "protocol": "acp"}):
                 post("/admin/routes", {"protocol": "http", "timeout": 30, **route})
 
@@ -1133,7 +1181,8 @@ def main() -> int:
                 check(f"dynamic routes: {name}", not bad, f"[{b.status_code}] by {said_by(b)}" + ("  " + "; ".join(bad) if bad else ""))
                 return a, b
 
-            assert wait_until(lambda: httpx.get(f"{rs}/api/routed/a", headers={"X-API-Key": keys["rs"]["key"]}, timeout=10).headers.get("x-agent") == "echo"), \
+            # The route registered last: once the data plane follows it, it has them all.
+            assert wait_until(lambda: httpx.get(f"{rs}/acp/routed/a", headers={"X-API-Key": keys["rs"]["key"]}, timeout=10).headers.get("x-agent") == "echo"), \
                 "routes never reached the data plane"
             route_same("a routed path goes to the route's backend, as asked", "GET", "/api/routed/a/b?x=1", want=lambda r: r.json()["path"] == "/api/routed/a/b")
             route_same("a body", "POST", "/api/routed/items", content=b'{"a": 1}', want=lambda r: r.json()["body_bytes"] == 8)
@@ -1144,7 +1193,13 @@ def main() -> int:
             route_same("a protocol's path that is routed keeps its prefix", "GET", "/acp/routed/runs", want=lambda r: r.json()["path"] == "/acp/routed/runs")
             route_same("a route's timeout is the one that applies", "GET", "/api/routed/quick/slow", sees=False, want=lambda r: r.status_code >= 500)
             route_same("without it the same backend has time to answer", "GET", "/api/routed/slow", want=lambda r: r.status_code == 200)
-            route_same("a route to a backend behind TLS is Python's", "GET", "/api/routed/tls/a", by="python", sees=False)
+            route_same("a route to a backend behind TLS", "GET", "/api/routed/tls/a?n=1", want=lambda r: r.json()["path"] == "/api/routed/tls/a")
+            route_same("a route to a backend behind TLS, with a body", "POST", "/api/routed/tls/items", content=b"x" * 70_000,
+                       want=lambda r: r.json()["body_bytes"] == 70_000)
+            a, b = route_same("a backend whose certificate nobody vouches for is not spoken to", "GET", "/api/routed/stranger/a", sees=False,
+                              want=lambda r: r.status_code == 502)
+            check("dynamic routes: and the refusal is the same on both planes, to the details",
+                  a.json().get("details") == b.json().get("details") and list(a.json()) == list(b.json()), str(b.json().get("details"))[:120])
             route_same("a key's allowed paths still apply to a routed path", "GET", "/api/routed/a", pair=scoped, sees=False, want=lambda r: r.status_code == 403)
             a = httpx.get(f"{py}/api/routed/a", timeout=10)
             b = httpx.get(f"{rs}/api/routed/a", timeout=10)

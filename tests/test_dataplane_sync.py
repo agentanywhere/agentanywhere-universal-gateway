@@ -835,7 +835,8 @@ async def test_the_snapshot_names_the_agents_the_data_plane_can_reach(db_session
         "secure": "https://agents.example.com", "odd slug": "http://10.0.0.11:8001", "query": "http://10.0.0.12:8001/?a=1",
         "caf\u00e9": "http://10.0.0.13:8001", "blank": "",
     }))
-    assert await named() == {"hiring": "http://10.0.0.10:8001", "docs.v2": "http://agents.internal/base", "six": "http://[::1]:9000"}
+    assert await named() == {"hiring": "http://10.0.0.10:8001", "docs.v2": "http://agents.internal/base", "six": "http://[::1]:9000",
+                             "secure": "https://agents.example.com"}
     # An agent registered or retired later changes the snapshot.
     before = (await dataplane_sync.build_snapshot(db_session))["revision"]
     gw.agent_edge_config.replace({"hiring": "http://10.0.0.10:8002"})
@@ -908,8 +909,8 @@ async def test_the_snapshot_lists_the_dynamic_routes_in_force_in_matching_order(
                                 "timeout_seconds": 30, "rewrite": None}
     assert by_path["/api/orders/"] == {"path": "/api/orders/", "wildcard": True, "backend": "http://b2:9000", "protocol": "mcp",
                                        "timeout_seconds": 5, "rewrite": "/v/orders"}
-    # Routes the data plane cannot follow are listed, so that it leaves what they match alone.
-    assert by_path["/api/secure/"]["backend"] is None and by_path["/api/odd/"]["backend"] is None
+    # A route the data plane cannot follow is listed, so that it leaves what it matches alone.
+    assert by_path["/api/secure/"]["backend"] == "https://b4:9000" and by_path["/api/odd/"]["backend"] is None
     # Routes no longer keep every path with this gateway: the data plane follows them.
     assert (await dataplane_sync.build_snapshot(db_session))["fallthrough_prefixes"] != ["/"]
     monkeypatch.setattr(get_settings(), "dynamic_routes_enabled", False)
