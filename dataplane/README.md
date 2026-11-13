@@ -120,7 +120,7 @@ with no backend of its own; the key is in the snapshot, active, unexpired and `n
 gateway checks the body, the body has a `Content-Length`, fits in memory (4 MiB, or the MCP limit if lower) and is
 certain to pass. On those same paths, a request with no credential, or with one the Python gateway has just refused,
 is answered here with the gateway's 401. Anything else, including OAuth2 tokens, credentials seen for the first time,
-a request from a web page in another origin (one with an `Origin` header), `/metrics`, `/admin`, `/oauth2`, GraphQL
+a preflight from a web page, `/metrics`, `/admin`, `/oauth2`, GraphQL
 and MQTT, goes to the Python gateway untouched, so its answer is the answer.
 
 **HTTP/2.** A client that opens its connection with the HTTP/2 preface (no TLS; `curl --http2-prior-knowledge`, a
@@ -147,6 +147,13 @@ tunnel: bytes go both ways until either side closes. If it refuses or cannot be 
 other handshake (a key in `?api_key=`, an unknown key, `/agents/<slug>/...`, any IP rule or policy in force) is tunnelled
 to the Python gateway, which relays or refuses as it always does.
 
+**Requests from web pages.** A request with an `Origin` header is answered here with the cross-origin headers the
+Python gateway's CORS middleware writes, from `CORS_ORIGINS` and `CORS_ALLOW_CREDENTIALS` in the snapshot: a listed
+origin is named back with `Vary: Origin`, `*` is answered with `*` (or with the origin itself when the request has a
+cookie), and the credentials header is added when allowed, all over whatever the backend sent under those names. As
+in the Python gateway, these go on answers from a backend (and the 502 or 503 standing in for one), the health
+endpoints and agents; the gateway's own 401, 403 and 429 carry none. A preflight is the Python gateway's to answer.
+
 **Backends behind TLS.** An `https://` backend (a protocol's, a dynamic route's, an agent's, or `--backend`) is spoken
 to over TLS, HTTP/1.1, and its certificate is verified as the Python gateway's HTTP client verifies it: against the
 certificates in `SSL_CERT_FILE` when that is set, otherwise against the Mozilla root certificates. A backend whose
@@ -169,7 +176,7 @@ after the slug, the caller's headers (`Host`, `Authorization` and `Cookie` inclu
 its answer is streamed back as it comes. The Python gateway is handed the request when:
 
 * the slug is not registered (the 404 is Python's);
-* the caller is a web page in another origin, or asks for a WebSocket;
+* the caller asks for a WebSocket;
 * the query is anything but `key=value` pairs of unreserved characters with no key twice (Python takes a query apart
   and writes it again), a header is given twice (Python forwards the last), or the path after the slug names an API version;
 * the body has no `Content-Length` or is over 1 MiB;
@@ -224,7 +231,8 @@ here is the reverse of everywhere else: **whatever this side cannot be sure of i
 | A path that matches a dynamic route to any other backend | Python |
 | Transformation rules, request-altering plugins (when any exist) | Python, for every path |
 | The health path, `/ready` and `/live`, on a plain `GET` | data plane |
-| A request with an `Origin` header (the cross-origin headers are Python's) | Python |
+| A request with an `Origin` header | data plane, with the gateway's cross-origin headers |
+| A preflight (`OPTIONS`), an `Origin` given twice | Python |
 | `/health/detailed`, `/metrics`, `/oauth2`, `/admin` and the console | Python |
 
 ## Known gaps (why this is not production-ready)
@@ -242,8 +250,6 @@ here is the reverse of everywhere else: **whatever this side cannot be sure of i
 * **`/metrics` is still the Python gateway's.** It is the registry for the whole gateway, including everything this
   side reports to it, so there is one place to scrape. The data plane has no metrics endpoint of its own yet: with the
   Python gateway down, nothing can be scraped.
-* **Calls from web pages in another origin are not fast.** Any request with an `Origin` header is handed to the Python
-  gateway, which writes the cross-origin headers.
 
 * **A refused credential stays refused for up to ten seconds after the Python gateway would accept it** in one case
   this side cannot see: the gateway was restarted with a new `SECRET_KEY` or OAuth2 state so quickly that no sync
