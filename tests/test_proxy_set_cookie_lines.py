@@ -46,7 +46,7 @@ def buffered(monkeypatch, extra=()):
     ("GET", "/api/things"),            # plain REST
     ("POST", "/api/things"),
     ("POST", "/mcp/tools/call"),       # MCP over HTTP, not streamed
-    ("POST", "/a2a/message:send"),     # A2A, not streamed
+    ("POST", "/a2a/tasks/get"),        # A2A, not streamed
     ("GET", "/agui/events"),           # AG-UI without an SSE Accept: buffered
 ])
 def test_buffered_response_keeps_each_set_cookie_line(gwdb, monkeypatch, H, method, path):

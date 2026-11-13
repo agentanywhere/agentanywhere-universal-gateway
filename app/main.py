@@ -2109,6 +2109,33 @@ _STRIP_RESPONSE_HEADERS = {
 }
 
 
+def _restore_repeated_header_lines(response: Response, upstream_headers, sent_headers) -> None:
+    """Give the caller each line of a header the backend sent more than once.
+
+    Response headers travel through the proxy as a dict, and reading httpx headers
+    as a dict joins lines of the same name with ", ". For ``Set-Cookie`` that loses
+    cookies: a browser reads the joined line as a single cookie, and it cannot be
+    split apart again because a cookie may hold a comma of its own (``Expires``).
+
+    ``sent_headers`` is the dict the response was built from. A header is put back
+    as separate lines only when its value there is still the joined value httpx
+    produced, so a header that a transformation or plugin rewrote or removed stays
+    as that step left it.
+    """
+    lines: dict[str, list[str]] = {}
+    for name, value in upstream_headers.multi_items():
+        lines.setdefault(name.lower(), []).append(value)
+    for name, values in lines.items():
+        if len(values) < 2 or name in _STRIP_RESPONSE_HEADERS:
+            continue
+        sent = [v for k, v in sent_headers.items() if k.lower() == name]
+        if sent != [upstream_headers.get(name)]:
+            continue
+        del response.headers[name]
+        for value in values:
+            response.headers.append(name, value)
+
+
 async def _proxy_agent_route(request: Request, agent_route, request_id: str) -> Response:
     """Proxy an ``/agents/<slug>/...`` request to the per-slug upstream.
 
@@ -2434,12 +2461,14 @@ async def gateway_proxy(request: Request, path: str):
                 finally:
                     await upstream.aclose()
 
-            return StreamingResponse(
+            streaming_response = StreamingResponse(
                 _stream_body(),
                 status_code=upstream.status_code,
                 headers=resp_headers,
                 media_type=ct.split(";")[0].strip() if ct else None,
             )
+            _restore_repeated_header_lines(streaming_response, upstream.headers, resp_headers)
+            return streaming_response
 
         # Route request
         response = await router.route_request(
@@ -2595,12 +2624,14 @@ async def gateway_proxy(request: Request, path: str):
             except Exception as exc:
                 logger.warning("plugin_response_transform_failed", error=str(exc))
 
-        return Response(
+        proxied_response = Response(
             content=content,
             status_code=final_status_code,
             headers=response_headers,
             media_type=response.headers.get("content-type", "application/json")
         )
+        _restore_repeated_header_lines(proxied_response, response.headers, response_headers)
+        return proxied_response
     
     except HTTPException:
         raise
