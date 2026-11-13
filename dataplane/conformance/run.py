@@ -135,10 +135,15 @@ def websocket_backend(tls=None):
 
 class MqttBroker:
     """An MQTT 5 broker that acknowledges what it is sent, keeps a note of it and delivers nothing.
-    It can be stopped and started again on the same port, as a broker that goes away and comes back."""
+    It can be stopped and started again on the same port, as a broker that goes away and comes back.
+    Given a certificate and its key, it is behind TLS."""
 
-    def __init__(self):
-        self.port, self.server, self.open = 0, None, []
+    def __init__(self, tls=None):
+        self.port, self.server, self.open, self.secure = 0, None, [], None
+        if tls:
+            import ssl
+            self.secure = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            self.secure.load_cert_chain(*tls)
         self.clients, self.published, self.released, self.subscribed = [], [], [], []
         self.start()
 
@@ -149,7 +154,7 @@ class MqttBroker:
             def handle(self):
                 broker.open.append(self.request)
                 try:
-                    broker.serve(self.request)
+                    broker.serve(broker.secure.wrap_socket(self.request, server_side=True) if broker.secure else self.request)
                 except (EOFError, OSError):
                     pass
 
@@ -476,8 +481,11 @@ def main() -> int:
             def wait_until(check, seconds=4.0):
                 end = time.time() + seconds
                 while time.time() < end:
-                    if check():
-                        return time.time()
+                    try:
+                        if check():
+                            return time.time()
+                    except httpx.TransportError:
+                        pass  # a process just started is not listening yet
                     time.sleep(0.05)
                 return None
 
@@ -1976,6 +1984,53 @@ def main() -> int:
             check("MQTT: when the broker is back, the data plane publishes again", back is not None)
             pub_same("after the broker came back, messages are the same again", "data plane", {"topic": "back", "payload": {"n": 1}}, want=one("back", 1, b'{"n": 1}'))
             check("MQTT: nothing sent while the broker was away turns up later", not any(m["topic"] == "while/away" for m in broker.published[seen:]))
+
+            # --- MQTT behind TLS ----------------------------------------------------------------------
+            # As with the other backends behind TLS: a broker both planes trust, and one nobody vouches for.
+            def secure_broker(name, certificate):
+                """A broker behind TLS with a gateway and a data plane in front. Returns (broker, python, data plane, a key for each)."""
+                its = MqttBroker(certificate)
+                g, d = free_port(), free_port()
+                own = {**env, "DATABASE_URL": f"sqlite+aiosqlite:///{tmp}/{name}.db", "MQTT_BROKER_URL": f"mqtts://127.0.0.1:{its.port}"}
+                procs.append(subprocess.Popen([sys.executable, "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", str(g),
+                                               "--log-level", "warning"], cwd=ROOT, env=own, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+                wait_healthy(f"http://127.0.0.1:{g}/health", procs[-1])
+                made = {}
+                for side in ("py", "rs"):
+                    r = httpx.post(f"http://127.0.0.1:{g}/admin/api-keys", headers=adm, timeout=10,
+                                   params={"name": f"{name}-{side}", "rate_limit_per_minute": 1000, "rate_limit_per_hour": 1000})
+                    r.raise_for_status()
+                    made[side] = r.json()["key"]
+                procs.append(subprocess.Popen([str(BIN), "--listen", f"127.0.0.1:{d}", "--control-token", "conformance-token",
+                                               "--sync-interval-ms", "200", "--max-staleness-ms", "2000", "--report-interval-ms", "300",
+                                               "--backend", f"http://127.0.0.1:{bport}", "--control", f"http://127.0.0.1:{g}"], env=own))
+                native = lambda: httpx.get(f"http://127.0.0.1:{d}/api/users", headers={"X-API-Key": made["rs"]}, timeout=10).headers.get("x-served-by") == "dataplane"
+                assert wait_until(native, 8), f"the {name} data plane never started serving natively"
+                return its, f"http://127.0.0.1:{g}", f"http://127.0.0.1:{d}", made
+
+            def send(base, key, its, body):
+                before = len(its.published)
+                r = httpx.post(f"{base}/mqtt/publish", headers={"X-API-Key": key}, json=body, timeout=15)
+                if r.status_code == 200:
+                    wait_until(lambda: len(its.published) > before, 3)
+                return r, [{k: v for k, v in m.items() if k != "client"} for m in its.published[before:]], [from_data_plane(m) for m in its.published[before:]]
+
+            its, spy, srs, made = secure_broker("mqtt-vouched", trusted)
+            warm = wait_until(lambda: send(srs, made["rs"], its, {"topic": "warm-up"})[2] == [True], 10)
+            check("MQTT behind TLS: the data plane connects to a broker both planes trust and publishes itself", warm is not None)
+            for name, body in (("a message is the same from both planes", {"topic": "secure/7", "payload": {"t": 21.5, "unit": "\u00b0C"}, "qos": 1}),
+                               ("quality of service 2", {"topic": "secure/2", "payload": [1, "x"], "qos": 2})):
+                (a, sent_a, by_a), (b, sent_b, by_b) = send(spy, made["py"], its, body), send(srs, made["rs"], its, body)
+                check(f"MQTT behind TLS: {name}", a.status_code == b.status_code == 200 and a.json() == b.json() and sent_a == sent_b and len(sent_b) == 1
+                      and (by_a, by_b) == ([False], [True]) and said_by(b) == "data plane", f"[{b.status_code}] by the {said_by(b)} {sent_b}")
+            (a, sent_a, _), (b, sent_b, _) = send(spy, made["py"], its, {"topic": "a/#"}), send(srs, made["rs"], its, {"topic": "a/#"})
+            check("MQTT behind TLS: what Python refuses is still Python's to refuse", a.status_code == b.status_code == 500 and said_by(b) == "python" and not sent_a + sent_b)
+
+            its, spy, srs, made = secure_broker("mqtt-strangers", untrusted)
+            (a, sent_a, _), (b, sent_b, _) = send(spy, made["py"], its, {"topic": "t"}), send(srs, made["rs"], its, {"topic": "t"})
+            check("MQTT behind TLS: a broker nobody vouches for is published to by neither plane",
+                  a.status_code == b.status_code == 503 and shape(a) == shape(b) and said_by(b) == "python" and not its.published and not its.clients,
+                  f"[{a.status_code}/{b.status_code}] {b.text[:80]} clients {its.clients}")
 
             # Last: the control plane goes away. The data plane must stop serving natively.
             procs[1].send_signal(signal.SIGTERM)

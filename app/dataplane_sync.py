@@ -330,21 +330,24 @@ _MQTT_HOST = re.compile(r"[A-Za-z0-9.-]+")
 def _mqtt() -> Optional[Dict[str, Any]]:
     """The MQTT broker ``POST /mqtt/publish`` publishes to, while this gateway's own client is
     connected to it: the data plane then keeps a connection of its own and publishes there too.
-    A broker behind TLS (``mqtts://``) is left to this gateway, whose client verifies it against
-    certificates the data plane does not read."""
+    Behind TLS (``mqtts://``), this gateway's client verifies the broker against the system's
+    certificates and SSL_CERT_FILE; the data plane only against that file. Without one, the two
+    would not trust alike, and the broker is left to this gateway."""
     from app import main as gw
 
     handler = gw.mqtt_handler
     url = getattr(handler, "broker_url", None)
-    if handler is None or not handler.connected or not isinstance(url, str) or not url.startswith("mqtt://"):
+    if handler is None or not handler.connected or not isinstance(url, str) or not url.startswith(("mqtt://", "mqtts://")):
+        return None
+    if url.startswith("mqtts://") and (not os.environ.get("SSL_CERT_FILE") or os.environ.get("SSL_CERT_DIR")):
         return None
     try:
         host, port, tls = handler._parse_broker_url()
     except Exception:
         return None
-    if tls or not _MQTT_HOST.fullmatch(host) or not 0 < port < 65536:
+    if not _MQTT_HOST.fullmatch(host) or not 0 < port < 65536:
         return None
-    return {"host": host, "port": port}
+    return {"host": host, "port": port, "tls": bool(tls)}
 
 
 def _boundary(settings) -> Dict[str, Any]:

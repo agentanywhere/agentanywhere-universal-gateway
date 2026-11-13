@@ -246,11 +246,13 @@ pub struct AgentFailure {
     pub page: (String, String),
 }
 
-/// An MQTT broker reached without TLS.
+/// An MQTT broker, reached with or without TLS.
 #[derive(Deserialize, Clone, Debug, PartialEq)]
 pub struct Broker {
     pub host: String,
     pub port: u16,
+    #[serde(default)]
+    pub tls: bool,
 }
 
 /// The Python gateway's own answer to `/ready`, as of one snapshot answer.

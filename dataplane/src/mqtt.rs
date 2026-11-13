@@ -12,8 +12,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::time::timeout;
@@ -181,7 +180,7 @@ fn release_packet(id: u16) -> [u8; 4] {
     [0x62, 2, id[0], id[1]]
 }
 
-async fn read_packet(from: &mut OwnedReadHalf) -> std::io::Result<(u8, Vec<u8>)> {
+async fn read_packet(from: &mut (impl AsyncRead + Unpin)) -> std::io::Result<(u8, Vec<u8>)> {
     let first = from.read_u8().await?;
     let (mut len, mut shift) = (0usize, 0);
     loop {
@@ -202,6 +201,10 @@ async fn read_packet(from: &mut OwnedReadHalf) -> std::io::Result<(u8, Vec<u8>)>
     from.read_exact(&mut body).await?;
     Ok((first, body))
 }
+
+/// The connection, with or without TLS under it.
+trait Wire: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> Wire for T {}
 
 /// Ends the task that reads from the broker when the connection it belongs to is done with.
 struct Reading(tokio::task::JoinHandle<()>);
@@ -228,7 +231,19 @@ async fn serve(
         .map_err(|_| "no connection in time".to_owned())?
         .map_err(said)?;
     let _ = stream.set_nodelay(true);
-    let (mut read, mut write): (OwnedReadHalf, OwnedWriteHalf) = stream.into_split();
+    let wire: Box<dyn Wire> = if broker.tls {
+        // Verified as the Python gateway's client verifies it: the certificate, and that it is the host's.
+        let config = crate::proxy::tls_for_brokers().ok_or("is behind TLS, and this side has no certificates to verify it against")?;
+        let name = rustls::pki_types::ServerName::try_from(broker.host.clone()).map_err(|e| e.to_string())?;
+        let secured = timeout(CONNECT_TIMEOUT, tokio_rustls::TlsConnector::from(config).connect(name, stream))
+            .await
+            .map_err(|_| "no TLS session in time".to_owned())?
+            .map_err(said)?;
+        Box::new(secured)
+    } else {
+        Box::new(stream)
+    };
+    let (mut read, mut write) = tokio::io::split(wire);
     write.write_all(&connect_packet(client_id, number == 1)).await.map_err(said)?;
     let (first, body) = timeout(CONNECT_TIMEOUT, read_packet(&mut read)).await.map_err(|_| "no answer to CONNECT in time".to_owned())?.map_err(said)?;
     match (first >> 4, body.get(1)) {
@@ -395,10 +410,10 @@ mod tests {
     #[test]
     fn a_message_is_handed_over_only_while_the_connection_to_its_broker_stands() {
         let (link, _events) = Link::new();
-        let here = Broker { host: "broker".into(), port: 1883 };
+        let here = Broker { host: "broker".into(), port: 1883, tls: false };
         assert!(!link.serves(&here));
         link.set(Some(&here));
-        assert!(link.serves(&here) && !link.serves(&Broker { host: "broker".into(), port: 1884 }));
+        assert!(link.serves(&here) && !link.serves(&Broker { host: "broker".into(), port: 1884, tls: false }) && !link.serves(&Broker { tls: true, ..here.clone() }));
         link.set(None);
         assert!(!link.serves(&here));
     }

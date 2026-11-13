@@ -143,6 +143,13 @@ fn tls_for_websockets() -> bool {
     TLS_FROM_FILE.get().copied().unwrap_or(false)
 }
 
+/// How an `mqtts://` broker is verified, when it is this side's to connect to: as with a
+/// `wss://` backend, only against the certificates in `SSL_CERT_FILE`, which the Python gateway's
+/// MQTT client reads as well.
+pub fn tls_for_brokers() -> Option<Arc<rustls::ClientConfig>> {
+    tls().filter(|_| tls_for_websockets()).cloned()
+}
+
 impl Upstream {
     pub fn parse(text: &str) -> Result<Upstream, String> {
         let text = text.trim_end_matches('/');

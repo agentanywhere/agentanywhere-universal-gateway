@@ -858,13 +858,21 @@ async def test_the_snapshot_names_the_mqtt_broker_while_this_gateway_is_connecte
     monkeypatch.setattr(gw, "mqtt_handler", handler)
     assert await named() is None  # not connected: this gateway answers 503, and so must the data plane's answer be
     handler.connected = True
-    assert await named() == {"host": "broker.internal", "port": 1884}
-    for url, want in (("mqtt://broker.internal", {"host": "broker.internal", "port": get_settings().protocol_mqtt_default_port}),
+    assert await named() == {"host": "broker.internal", "port": 1884, "tls": False}
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+    for url, want in (("mqtt://broker.internal", {"host": "broker.internal", "port": get_settings().protocol_mqtt_default_port, "tls": False}),
                       ("mqtts://broker.internal:8883", None), ("broker.internal:1883", None), ("mqtt://broker.internal:1883/path", None),
                       ("mqtt://user@broker.internal:1883", None), ("mqtt://[::1]:1883", None), ("mqtt://b\u00e9:1883", None),
                       ("mqtt://broker.internal:0", None), ("mqtt://broker.internal:70000", None)):
         handler.broker_url = url
         assert await named() == want, url
+    # Behind TLS, only with a certificate file both sides read and no directory beside it.
+    handler.broker_url = "mqtts://broker.internal:8883"
+    monkeypatch.setenv("SSL_CERT_FILE", "/etc/ssl/own.pem")
+    assert await named() == {"host": "broker.internal", "port": 8883, "tls": True}
+    monkeypatch.setenv("SSL_CERT_DIR", "/etc/ssl/certs")
+    assert await named() is None
 
 
 async def test_the_snapshot_names_the_agents_the_data_plane_can_reach(db_session, monkeypatch):

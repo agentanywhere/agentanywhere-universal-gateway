@@ -175,8 +175,9 @@ connection stands and it is certain which message the Python gateway would publi
 with a non-empty string `topic` without wildcards, a `qos` written `0`, `1` or `2` (or none), and a payload this side
 can spell exactly as Python does. Everything else goes to the Python gateway, which publishes or refuses it: a member
 named twice, `NaN`, a number exactly halfway between two shortest spellings (the two languages round those
-differently), a body over 1 MiB or in another encoding, a broker behind TLS (`mqtts://`), and any request while this
-side's connection is down. As with the Python gateway's client, the answer is given once the message is handed to the
+differently), a body over 1 MiB or in another encoding, and any request while this side's connection is down. A broker
+behind TLS (`mqtts://`) is this side's only with `SSL_CERT_FILE` set and `SSL_CERT_DIR` not, for the reason given for
+`wss://` backends: only then do both sides verify it against the same certificates. As with the Python gateway's client, the answer is given once the message is handed to the
 connection, not once the broker acknowledges it; messages above quality of service 0 are kept until it does and sent
 again after a reconnect. `/mqtt/subscribe` stays with the Python gateway.
 `python dataplane/conformance/publish.py` generates bodies and checks that whatever this side would publish, the Python
@@ -282,8 +283,8 @@ here is the reverse of everywhere else: **whatever this side cannot be sure of i
 | WebSocket under `/ws/`, key in `X-API-Key`, no IP rules or policies | data plane |
 | Any other WebSocket (`?api_key=`, `/agents/<slug>`, rules or policies in force) | Python, through a tunnel |
 | gRPC calls (HTTP/2, `application/grpc`) | data plane only; refused when it cannot be sure |
-| `POST /mqtt/publish` to an `mqtt://` broker, body certain to publish the same message | data plane, over its own connection to the broker |
-| Any other publish (a body this side is not sure of, `mqtts://`, the connection down), `/mqtt/subscribe` | Python |
+| `POST /mqtt/publish` (broker at `mqtt://`, or `mqtts://` with `SSL_CERT_FILE`), body certain to publish the same message | data plane, over its own connection to the broker |
+| Any other publish (a body this side is not sure of, `mqtts://` without `SSL_CERT_FILE`, the connection down), `/mqtt/subscribe` | Python |
 | Any other request over HTTP/2 | as the same request over HTTP/1 |
 | `/agents/<slug>/...` to a registered agent, browsers included | data plane |
 | `/agents/<slug>/...` otherwise (unknown slugs, unusual requests) | Python |
