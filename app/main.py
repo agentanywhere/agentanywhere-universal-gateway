@@ -1887,6 +1887,24 @@ async def oauth2_authorize(
         )
 
 
+def _client_credentials(request: Request, body: Dict[str, Any]):
+    """The client id and secret a token request carries: HTTP Basic first, else the body."""
+    scheme, _, encoded = request.headers.get("authorization", "").partition(" ")
+    if scheme.lower() == "basic" and encoded.strip():
+        try:
+            import base64
+            from urllib.parse import unquote_plus
+
+            client_id, sep, secret = base64.b64decode(encoded.strip(), validate=True).decode("utf-8").partition(":")
+            if sep:
+                return unquote_plus(client_id), unquote_plus(secret)
+        except Exception:  # noqa: BLE001 - not a Basic credential: nothing presented
+            pass
+        return None, None
+    client_id, secret = body.get("client_id"), body.get("client_secret")
+    return (client_id if isinstance(client_id, str) else None, secret if isinstance(secret, str) else None)
+
+
 @app.post("/oauth2/token")
 async def oauth2_token(request: Request):
     """OAuth2 token endpoint (RFC 6749, Sections 4.1.3, 4.4, 6).
@@ -1940,6 +1958,9 @@ async def oauth2_token(request: Request):
             return JSONResponse(content=token_data)
 
         if grant_type == "client_credentials":
+            # The caller proves who it is with the provider's client credentials (RFC 6749, 2.3.1):
+            # HTTP Basic, or client_id and client_secret in the body.
+            oauth2_manager.authenticate_client(provider, *_client_credentials(request, body))
             scope = body.get("scope")
             scopes = scope.split() if isinstance(scope, str) and scope else None
             token_data = await oauth2_manager.client_credentials(provider, scopes)
