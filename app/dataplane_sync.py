@@ -133,6 +133,24 @@ def _agents() -> Dict[str, str]:
             if isinstance(slug, str) and isinstance(base, str) and _AGENT_SLUG.fullmatch(slug) and _AGENT_UPSTREAM.fullmatch(base)}
 
 
+def _cross_origin() -> Optional[Dict[str, Any]]:
+    """How this gateway answers a request from a web page in another origin (one with an
+    ``Origin`` header): the origins it names back, and whether it says credentials are allowed.
+    These are the options its CORS middleware was started with. ``None`` when they include
+    something the data plane does not reproduce, and such requests then stay here."""
+    from app import main as gw
+
+    options = dict(gw._cors_options)
+    origins = options.pop("allow_origins", None)
+    credentials = options.pop("allow_credentials", None)
+    options.pop("allow_methods", None)  # these two only matter to a preflight, which is answered here
+    options.pop("allow_headers", None)
+    plain = isinstance(origins, list) and all(isinstance(o, str) and o.isascii() for o in origins) and isinstance(credentials, bool)
+    if options or not plain:
+        return None
+    return {"any_origin": "*" in origins, "origins": sorted(set(origins) - {"*"}), "credentials": credentials}
+
+
 _ROUTE_REWRITE = re.compile(r"/[A-Za-z0-9._~/-]*")
 
 
@@ -567,6 +585,7 @@ async def build_snapshot(db: AsyncSession) -> Dict[str, Any]:
         "agents": _agents(),
         "agent_failure": _agent_failure(),
         "dynamic_routes": dynamic_routes,
+        "cross_origin": _cross_origin(),
     }
     snap["revision"] = hashlib.sha256(json.dumps(snap, sort_keys=True).encode()).hexdigest()
     return snap

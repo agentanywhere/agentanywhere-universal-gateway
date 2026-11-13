@@ -916,3 +916,22 @@ async def test_the_snapshot_lists_the_dynamic_routes_in_force_in_matching_order(
     monkeypatch.setattr(get_settings(), "dynamic_routes_enabled", False)
     assert await listed() == []
     assert (await dataplane_sync.build_snapshot(db_session))["fallthrough_prefixes"] != ["/"]
+
+
+async def test_the_snapshot_says_how_a_request_from_another_origin_is_answered(db_session, monkeypatch):
+    from app import main as gw
+
+    async def said():
+        return (await dataplane_sync.build_snapshot(db_session))["cross_origin"]
+
+    monkeypatch.setattr(gw, "_cors_options", {"allow_origins": ["http://b.example", "http://a.example"], "allow_credentials": True,
+                                              "allow_methods": ["*"], "allow_headers": ["*"]})
+    assert await said() == {"any_origin": False, "origins": ["http://a.example", "http://b.example"], "credentials": True}
+    monkeypatch.setattr(gw, "_cors_options", {"allow_origins": ["*", "http://a.example"], "allow_credentials": False,
+                                              "allow_methods": ["GET"], "allow_headers": []})
+    assert await said() == {"any_origin": True, "origins": ["http://a.example"], "credentials": False}
+    # An option the data plane does not reproduce: such requests stay with this gateway.
+    monkeypatch.setattr(gw, "_cors_options", {"allow_origins": [], "allow_credentials": False, "allow_origin_regex": "https://.*"})
+    assert await said() is None
+    monkeypatch.setattr(gw, "_cors_options", {"allow_origins": [], "allow_credentials": False, "expose_headers": ["X-A"]})
+    assert await said() is None
