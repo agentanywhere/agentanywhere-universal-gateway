@@ -29,7 +29,7 @@ use crate::boundary::Verdict;
 use crate::breaker::{self, Breaker};
 use crate::govern::{self, IpRule, Policy, Scope, Subject};
 use crate::report::{Event, Reporter, Row, Served};
-use crate::snapshot::{hash_key, AgentFailure, Digest32, KeyEntry, Readiness, Snapshot, Wording};
+use crate::snapshot::{hash_key, AgentFailure, Digest32, DynamicRoute, KeyEntry, Readiness, Snapshot, Wording};
 use crate::sync::Link;
 
 /// A body is either streamed from the other side or held here whole; neither is boxed. Responses
@@ -142,6 +142,10 @@ impl Backends {
         // A WebSocket is opened with an HTTP request to the same address.
         snap.websocket = snap.websocket_url.as_deref().and_then(|u| self.at(&u.replacen("ws://", "http://", 1)));
         snap.grpc = snap.grpc_url.as_deref().and_then(|u| self.at(u));
+        for route in snap.dynamic_routes.iter_mut() {
+            // A route with a backend this side cannot reach is kept, without one: what it matches is Python's.
+            route.backend = route.backend_url.as_deref().filter(|_| route.timeout().is_some()).and_then(|u| self.at(u));
+        }
         snap.agents = snap.agent_urls.iter().filter_map(|(slug, url)| Some((slug.clone(), self.at(url)?))).collect();
     }
 }
@@ -411,6 +415,8 @@ struct Native<'a> {
     /// The protocol's backend, when it is not the plain HTTP one.
     backend: Option<&'a Backend>,
     entry: &'a KeyEntry,
+    /// The dynamic route the path matches, which then decides where the request goes and how.
+    route: Option<&'a DynamicRoute>,
     version: Option<&'a str>,
     /// The client's address, as the Python gateway would resolve it.
     ip: IpAddr,
@@ -541,18 +547,29 @@ fn decide<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, now: u6
         Some(e) if e <= now as i64 => return PYTHON,
         _ => {}
     }
-    // A protocol without a backend this side can reach is the Python gateway's to answer.
-    let backend = match protocol.route_index() {
-        Some(i) => match snap.routes[i].as_deref() {
+    // A dynamic route comes before the protocol's own backend: the first that matches decides.
+    let route = snap.dynamic_routes.iter().find(|r| r.matches(path));
+    let backend = match (route, protocol.route_index()) {
+        (Some(route), _) => match route.backend.as_deref() {
             Some(backend) => Some(backend),
             None => return PYTHON,
         },
-        None => None,
+        // A protocol without a backend this side can reach is the Python gateway's to answer.
+        (None, Some(i)) => match snap.routes[i].as_deref() {
+            Some(backend) => Some(backend),
+            None => return PYTHON,
+        },
+        (None, None) => None,
     };
-    if names_a_version(upstream_path(path, protocol)) {
+    // A routed request keeps its path, or takes the route's; the protocol's prefix is not taken off.
+    let asked = match route {
+        Some(route) => route.rewrite.as_deref().unwrap_or(path),
+        None => upstream_path(path, protocol),
+    };
+    if names_a_version(asked) {
         return PYTHON;
     }
-    Decision::Native(Native { protocol, backend, entry, version, ip, method })
+    Decision::Native(Native { protocol, backend, entry, route, version, ip, method })
 }
 
 /// A request for `/agents/<slug>/...` this side forwards itself.
@@ -934,7 +951,7 @@ fn admit_grpc<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, now
     if !entry.native_ok {
         return Err(GrpcRefusal::NOT_APPLICABLE);
     }
-    let native = Native { protocol: Protocol::Grpc, backend: Some(backend), entry, version: None, ip, method: "POST" };
+    let native = Native { protocol: Protocol::Grpc, backend: Some(backend), entry, route: None, version: None, ip, method: "POST" };
     Ok(GrpcCall { native, key_in_authorization })
 }
 
@@ -1430,12 +1447,16 @@ pub async fn handle(w: Arc<Worker>, peer: SocketAddr, mut req: Request<Incoming>
                         trace: &t,
                         version: n.version,
                         inject_request_id: snap.inject_request_id,
-                        protocol: n.protocol,
-                        path: Some(upstream_path(path, n.protocol)).filter(|p| *p != path),
+                        protocol: n.route.map(|r| r.protocol.as_str()).unwrap_or(n.protocol.name()),
+                        path: match n.route {
+                            Some(route) => route.rewrite.as_deref(),
+                            None => Some(upstream_path(path, n.protocol)).filter(|p| *p != path),
+                        },
                     };
+                    let limit = n.route.and_then(DynamicRoute::timeout).unwrap_or(snap.upstream_timeout);
                     let answer = match grpc {
                         true => forward_grpc(&w, &backend.upstream, peer, req, &t, &snap.key_header, key_in_authorization).await,
-                        false => forward(&w, &backend.upstream, peer, req, Some(native), Some(snap.upstream_timeout)).await,
+                        false => forward(&w, &backend.upstream, peer, req, Some(native), Some(limit)).await,
                     };
                     match answer {
                         Ok(resp) => {
@@ -1553,7 +1574,8 @@ struct Sent<'a> {
     trace: &'a Trace,
     version: Option<&'a str>,
     inject_request_id: bool,
-    protocol: Protocol,
+    /// The protocol name the backend is told.
+    protocol: &'a str,
     /// The path to ask the backend for, when it is not the one the client asked for.
     path: Option<&'a str>,
 }
@@ -1623,7 +1645,9 @@ async fn forward(
             for name in internal {
                 headers.remove(name);
             }
-            headers.insert("x-protocol", HeaderValue::from_static(sent.protocol.name()));
+            if let Ok(v) = HeaderValue::from_str(sent.protocol) {
+                headers.insert("x-protocol", v);
+            }
             if let Some(v) = sent.version.and_then(|v| HeaderValue::from_str(v).ok()) {
                 headers.insert("x-api-version", v);
             }
@@ -2258,6 +2282,39 @@ mod tests {
         let scoped = governed(WS, r#","allowed_paths":{"rules":[["under","/ws/chat"]],"patterns_json":"[\"/ws/chat\"]"}"#);
         assert!(relay(&scoped, &req, 100).is_some());
         assert!(relay(&scoped, &handshake("/ws/other", &[("x-api-key", KEY)]), 100).is_none());
+    }
+
+    const ROUTES: &str = r#","dynamic_routes":[
+        {"path":"/api/exact","wildcard":false,"backend":"http://10.0.1.1:9000","protocol":"http","timeout_seconds":30,"rewrite":null},
+        {"path":"/api/orders/new/","wildcard":true,"backend":"http://10.0.1.2:9000","protocol":"mcp","timeout_seconds":5,"rewrite":"/intake"},
+        {"path":"/api/orders/","wildcard":true,"backend":"http://10.0.1.3:9000/base","protocol":"http","timeout_seconds":30,"rewrite":null},
+        {"path":"/api/secure/","wildcard":true,"backend":null,"protocol":"http","timeout_seconds":null,"rewrite":null},
+        {"path":"/api/versioned/","wildcard":true,"backend":"http://10.0.1.4:9000","protocol":"http","timeout_seconds":30,"rewrite":"/v2/x"},
+        {"path":"/acp/routed/","wildcard":true,"backend":"http://10.0.1.5:9000","protocol":"acp","timeout_seconds":30,"rewrite":null}]"#;
+
+    #[test]
+    fn the_first_dynamic_route_that_matches_decides_where_a_request_goes() {
+        let snap = governed(ROUTES, "");
+        let routed = |uri: &str| {
+            let req = Request::builder().uri(uri).header("x-api-key", KEY).body(()).unwrap();
+            route(&snap, peer(), &req, 100).map(|n| (n.backend.map(|b| b.upstream.text.clone()), n.route.map(|r| (r.protocol.clone(), r.rewrite.clone(), r.timeout()))))
+        };
+        let to = |url: &str, protocol: &str, rewrite: Option<&str>, secs: u64| {
+            Some((Some(url.to_owned()), Some((protocol.to_owned(), rewrite.map(str::to_owned), Some(Duration::from_secs(secs))))))
+        };
+        assert_eq!(routed("/api/exact"), to("http://10.0.1.1:9000", "http", None, 30));
+        // An exact path is that path only; a wildcard is everything under its prefix, the longest first.
+        assert_eq!(routed("/api/exact/more"), Some((None, None)));
+        assert_eq!(routed("/api/orders/new/7"), to("http://10.0.1.2:9000", "mcp", Some("/intake"), 5));
+        assert_eq!(routed("/api/orders/7?x=1"), to("http://10.0.1.3:9000/base", "http", None, 30));
+        assert_eq!(routed("/api/orders"), Some((None, None)));
+        assert_eq!(routed("/api/users"), Some((None, None)));
+        // A route this side cannot follow, and one that leads to a path naming an API version.
+        assert_eq!(routed("/api/secure/x"), None);
+        assert_eq!(routed("/api/versioned/x"), None);
+        // A protocol's path that is routed needs no backend of the protocol's own.
+        assert_eq!(routed("/acp/routed/runs"), to("http://10.0.1.5:9000", "acp", None, 30));
+        assert_eq!(routed("/acp/runs"), None);
     }
 
     const AGENTS: &str = r#","agents":{"hiring":"http://10.0.0.10:8001","based":"http://10.0.0.11:8001/base","secure":"https://10.0.0.12"},"agent_failure":{"message_json":"\"Try again later.\"","page":["<p>Request <code>","</code></p>"]}"#;

@@ -484,8 +484,7 @@ async def build_snapshot(db: AsyncSession) -> Dict[str, Any]:
         p.plugin_type != PluginType.AUTH_PROVIDER and p.name != "request-id" for p in active
     )
     dynamic_routes = _dynamic_routes(settings)
-    # Until the data plane follows the routes itself, one route in force keeps every path here.
-    all_paths_via_python = bool(dynamic_routes or transformation_manager.list_rules() or request_plugins)
+    all_paths_via_python = bool(transformation_manager.list_rules() or request_plugins)
     auth_plugins = any(p.plugin_type == PluginType.AUTH_PROVIDER for p in active)
     # The health and metrics endpoints are this gateway's own and need no key, wherever they are
     # configured to live: if that is under a prefix the data plane serves, it must leave them alone.

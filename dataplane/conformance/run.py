@@ -136,6 +136,8 @@ def agent_backend():
         def answer(self):
             body = self.rfile.read(int(self.headers.get("content-length", 0) or 0))
             path, _, query = self.path.partition("?")
+            if path.endswith("/slow"):
+                time.sleep(1.5)
             if path.endswith("/drop"):
                 self.connection.shutdown(socket.SHUT_RDWR)
                 return
@@ -1096,6 +1098,59 @@ def main() -> int:
             check("agent edge: requests are counted once per plane", counted == 2, f"{counted:.0f} (one through each plane)")
             logs = httpx.get(f"{py}/admin/logs", params={"limit": 1000, "path": "/agents/echo/items/7"}, headers=adm, timeout=10).json()["logs"]
             check("agent edge: requests are logged, without a key", len(logs) == 8 and all(not l.get("api_key_id") for l in logs), f"{len(logs)} rows")
+
+            # --- dynamic routes ----------------------------------------------------------------------
+            # Routes registered through the admin API. The same echoing backend says what it was sent.
+            print()
+            for route in ({"path": "/api/routed/*", "backend_url": agent},
+                          {"path": "/api/routed/exact", "backend_url": f"{agent}/exactly"},
+                          {"path": "/api/routed/renamed/*", "backend_url": agent, "protocol": "mcp", "rewrite_path": "/elsewhere"},
+                          {"path": "/api/routed/quick/*", "backend_url": agent, "timeout": 1},
+                          {"path": "/api/routed/tls/*", "backend_url": "https://127.0.0.1:9"},
+                          {"path": "/acp/routed/*", "backend_url": agent, "protocol": "acp"}):
+                post("/admin/routes", {"protocol": "http", "timeout": 30, **route})
+
+            def route_same(name, method, path, by="data plane", sees=True, want=None, pair=None, content=None):
+                pair = pair or plain
+                a = httpx.request(method, py + path, headers={"X-API-Key": pair["py"]["key"]}, content=content, timeout=15)
+                b = httpx.request(method, rs + path, headers={"X-API-Key": pair["rs"]["key"]}, content=content, timeout=15)
+                bad = []
+                if a.status_code != b.status_code:
+                    bad.append(f"status {a.status_code} vs {b.status_code}")
+                elif sees:
+                    x, y = agent_saw(a, gport, by == "python"), agent_saw(b, dport, by == "python")
+                    for seen in (x, y):  # each request has its own key and its own id
+                        seen["headers"] = [[k, "<own>" if k in ("x-api-key", "x-request-id") else v] for k, v in seen["headers"]]
+                        del seen["host_is_the_gateways"]
+                    if x != y:
+                        bad.append("the backend was sent " + "; ".join(f"{k}: {x[k]} vs {y[k]}" for k in x if x[k] != y.get(k))[:600])
+                elif shape(a) != shape(b):
+                    bad.append(f"body {shape(a)} vs {shape(b)}")
+                if said_by(b) != by:
+                    bad.append(f"answered by {said_by(b)}")
+                if want is not None and not want(b):
+                    bad.append("not the expected answer")
+                check(f"dynamic routes: {name}", not bad, f"[{b.status_code}] by {said_by(b)}" + ("  " + "; ".join(bad) if bad else ""))
+                return a, b
+
+            assert wait_until(lambda: httpx.get(f"{rs}/api/routed/a", headers={"X-API-Key": keys["rs"]["key"]}, timeout=10).headers.get("x-agent") == "echo"), \
+                "routes never reached the data plane"
+            route_same("a routed path goes to the route's backend, as asked", "GET", "/api/routed/a/b?x=1", want=lambda r: r.json()["path"] == "/api/routed/a/b")
+            route_same("a body", "POST", "/api/routed/items", content=b'{"a": 1}', want=lambda r: r.json()["body_bytes"] == 8)
+            route_same("an exact route wins over a wildcard", "GET", "/api/routed/exact", want=lambda r: r.json()["path"] == "/exactly/api/routed/exact")
+            route_same("and matches that path only", "GET", "/api/routed/exact/more", want=lambda r: r.json()["path"] == "/api/routed/exact/more")
+            route_same("the longest prefix wins, and its path and protocol name are the route's", "GET", "/api/routed/renamed/x?y=2",
+                       want=lambda r: r.json()["path"] == "/elsewhere" and r.json()["query"] == "y=2" and ["x-protocol", "mcp"] in [[k.lower(), v] for k, v in r.json()["headers"]])
+            route_same("a protocol's path that is routed keeps its prefix", "GET", "/acp/routed/runs", want=lambda r: r.json()["path"] == "/acp/routed/runs")
+            route_same("a route's timeout is the one that applies", "GET", "/api/routed/quick/slow", sees=False, want=lambda r: r.status_code >= 500)
+            route_same("without it the same backend has time to answer", "GET", "/api/routed/slow", want=lambda r: r.status_code == 200)
+            route_same("a route to a backend behind TLS is Python's", "GET", "/api/routed/tls/a", by="python", sees=False)
+            route_same("a key's allowed paths still apply to a routed path", "GET", "/api/routed/a", pair=scoped, sees=False, want=lambda r: r.status_code == 403)
+            a = httpx.get(f"{py}/api/routed/a", timeout=10)
+            b = httpx.get(f"{rs}/api/routed/a", timeout=10)
+            compare("dynamic routes: a routed path still needs a key", a, b)
+            r = httpx.get(f"{rs}/api/users", headers={"X-API-Key": keys["rs"]["key"]}, timeout=10)
+            check("dynamic routes: paths no route matches are served here as before", r.status_code == 200 and said_by(r) == "data plane" and "x-agent" not in r.headers)
 
             # --- gRPC --------------------------------------------------------------------------------
             # The Python gateway does not speak HTTP/2, so there is no second plane to compare with:

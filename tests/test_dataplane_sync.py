@@ -910,9 +910,8 @@ async def test_the_snapshot_lists_the_dynamic_routes_in_force_in_matching_order(
                                        "timeout_seconds": 5, "rewrite": "/v/orders"}
     # Routes the data plane cannot follow are listed, so that it leaves what they match alone.
     assert by_path["/api/secure/"]["backend"] is None and by_path["/api/odd/"]["backend"] is None
-    # A route in force still keeps every path with this gateway; a route that is off, or routes
-    # switched off altogether, no longer do.
-    assert (await dataplane_sync.build_snapshot(db_session))["fallthrough_prefixes"] == ["/"]
+    # Routes no longer keep every path with this gateway: the data plane follows them.
+    assert (await dataplane_sync.build_snapshot(db_session))["fallthrough_prefixes"] != ["/"]
     monkeypatch.setattr(get_settings(), "dynamic_routes_enabled", False)
     assert await listed() == []
     assert (await dataplane_sync.build_snapshot(db_session))["fallthrough_prefixes"] != ["/"]

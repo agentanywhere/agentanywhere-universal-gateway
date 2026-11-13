@@ -114,6 +114,8 @@ pub struct Snapshot {
     pub agents: HashMap<String, Arc<Backend>>,
     /// How a failed agent is answered. Without it, agents are the Python gateway's.
     pub agent_failure: Option<AgentFailure>,
+    /// The dynamic routes in force, in the order the Python gateway tries them.
+    pub dynamic_routes: Vec<DynamicRoute>,
 }
 
 /// The gateway's health endpoint, as the Python gateway serves it.
@@ -123,6 +125,40 @@ pub struct Ops {
     pub health_path: Option<String>,
     /// The version it reports, as a JSON string.
     pub version_json: String,
+}
+
+/// A route registered through the admin API: where a matching request goes instead.
+#[derive(Deserialize)]
+pub struct DynamicRoute {
+    /// The path it matches: all of it, or with `wildcard` its beginning.
+    pub path: String,
+    pub wildcard: bool,
+    /// Where requests go (`http://`). `None` for a route only the Python gateway can follow.
+    #[serde(rename = "backend")]
+    pub backend_url: Option<String>,
+    /// That backend, filled in when the snapshot is put to use.
+    #[serde(skip)]
+    pub backend: Option<Arc<Backend>>,
+    /// The protocol name the backend is told.
+    pub protocol: String,
+    timeout_seconds: Option<u64>,
+    /// The path the backend is asked for, in place of the caller's.
+    pub rewrite: Option<String>,
+}
+
+impl DynamicRoute {
+    pub fn matches(&self, path: &str) -> bool {
+        if self.wildcard {
+            path.starts_with(self.path.as_str())
+        } else {
+            path == self.path
+        }
+    }
+
+    /// How long the backend may take to start answering.
+    pub fn timeout(&self) -> Option<Duration> {
+        self.timeout_seconds.map(Duration::from_secs)
+    }
 }
 
 /// The Python gateway's answer when an agent's connection fails before it answers.
@@ -177,6 +213,8 @@ struct SnapshotFile {
     #[serde(default)]
     agents: HashMap<String, String>,
     agent_failure: Option<AgentFailure>,
+    #[serde(default)]
+    dynamic_routes: Vec<DynamicRoute>,
     ready: Option<Readiness>,
     #[serde(default)]
     keys: Vec<KeyRecord>,
@@ -474,6 +512,7 @@ impl Snapshot {
             agent_urls: file.agents.into_iter().filter(|(_, url)| url.starts_with("http://")).collect(),
             agents: HashMap::new(),
             agent_failure: file.agent_failure.filter(|f| f.message_json.starts_with('"')),
+            dynamic_routes: file.dynamic_routes,
             inject_request_id: file.inject_request_id,
             revision: file.revision,
             api_versions,
