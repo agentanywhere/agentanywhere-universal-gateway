@@ -114,7 +114,7 @@ Its format is the same as what the control plane serves; see `src/snapshot.rs`.
 ## What it handles itself
 
 A request is served natively only when **all** of these hold: the link is fresh; the path is `/api/...`, or belongs to
-MCP, A2A, AG-UI or ACP and that protocol has an `http://` backend configured; no `fallthrough_prefixes` entry matches;
+MCP, A2A, AG-UI or ACP and that protocol has an `http://` or `https://` backend configured; no `fallthrough_prefixes` entry matches;
 the client is not a browser (`Accept: text/html`); `X-API-Version` or `Accept-Version` resolves to an active version
 with no backend of its own; the key is in the snapshot, active, unexpired and `native_ok`; and, where the
 gateway checks the body, the body has a `Content-Length`, fits in memory (4 MiB, or the MCP limit if lower) and is
@@ -147,20 +147,28 @@ tunnel: bytes go both ways until either side closes. If it refuses or cannot be 
 other handshake (a key in `?api_key=`, an unknown key, `/agents/<slug>/...`, any IP rule or policy in force) is tunnelled
 to the Python gateway, which relays or refuses as it always does.
 
+**Backends behind TLS.** An `https://` backend (a protocol's, a dynamic route's, an agent's, or `--backend`) is spoken
+to over TLS, HTTP/1.1, and its certificate is verified as the Python gateway's HTTP client verifies it: against the
+certificates in `SSL_CERT_FILE` when that is set, otherwise against the Mozilla root certificates. A backend whose
+certificate does not verify is not spoken to and counts as unreachable (`502 BACKEND_ERROR`, or for an agent the
+Python gateway's answer). With `SSL_CERT_DIR` set, or a certificate file that cannot be read, this side speaks no TLS
+and says so when it starts; `https://` backends are then the Python gateway's. Not over TLS here: gRPC backends and
+`wss://` WebSocket backends.
+
 **Dynamic routes.** The routes registered through `/admin/routes` that are in force come with the snapshot, in the
 order the Python gateway tries them: exact paths, then wildcards from the longest prefix down. A request whose path
 matches one goes to that route's backend with the route's protocol name and timeout, and to its rewritten path if it
 has one; otherwise the caller's path, unchanged (a protocol's prefix such as `/acp` is not taken off a routed path).
-Keys, limits, rules and policies apply as for any other path. A route whose backend is not a plain `http://` address
-leaves what it matches to the Python gateway. A route takes effect here one sync interval after it does there.
+Keys, limits, rules and policies apply as for any other path. A route whose backend is not a plain `http://` or `https://`
+address leaves what it matches to the Python gateway. A route takes effect here one sync interval after it does there.
 
 **The agent edge.** A request for `/agents/<slug>/...` is forwarded here when the agent is registered with a plain
-`http://` upstream and the request would reach it exactly as the Python gateway sends it. As there, no gateway key is
+`http://` or `https://` upstream and the request would reach it exactly as the Python gateway sends it. As there, no gateway key is
 asked for and no limit, IP rule or policy applies: the agent authenticates its own callers. The agent is sent the path
 after the slug, the caller's headers (`Host`, `Authorization` and `Cookie` included) and the gateway's additions, and
 its answer is streamed back as it comes. The Python gateway is handed the request when:
 
-* the slug is not registered, or its upstream is `https://` (the 404 and the TLS are Python's);
+* the slug is not registered (the 404 is Python's);
 * the caller is a web page in another origin, or asks for a WebSocket;
 * the query is anything but `key=value` pairs of unreserved characters with no key twice (Python takes a query apart
   and writes it again), a header is given twice (Python forwards the last), or the path after the slug names an API version;
@@ -209,10 +217,10 @@ here is the reverse of everywhere else: **whatever this side cannot be sure of i
 | Any other WebSocket (`?api_key=`, `/agents/<slug>`, rules or policies in force) | Python, through a tunnel |
 | gRPC calls (HTTP/2, `application/grpc`) | data plane only; refused when it cannot be sure |
 | Any other request over HTTP/2 | as the same request over HTTP/1 |
-| `/agents/<slug>/...` to a registered `http://` agent, browsers included | data plane |
-| `/agents/<slug>/...` otherwise (unknown slugs, `https://` agents, unusual requests) | Python |
+| `/agents/<slug>/...` to a registered agent, browsers included | data plane |
+| `/agents/<slug>/...` otherwise (unknown slugs, unusual requests) | Python |
 | GraphQL, MQTT, the JSON-to-gRPC bridge under `/grpc` | Python |
-| A path that matches a dynamic route to an `http://` backend | data plane, to the route's backend |
+| A path that matches a dynamic route to an `http://` or `https://` backend | data plane, to the route's backend |
 | A path that matches a dynamic route to any other backend | Python |
 | Transformation rules, request-altering plugins (when any exist) | Python, for every path |
 | The health path, `/ready` and `/live`, on a plain `GET` | data plane |
