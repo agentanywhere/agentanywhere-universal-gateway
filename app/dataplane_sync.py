@@ -15,7 +15,8 @@ plugins turn native serving off for every path. When in doubt the answer is "ask
 which is always correct and only slower.
 
 A key may arrive in the configured header or as ``Authorization: Bearer``; the data plane reads both as
-this gateway does. It also answers the 401 for a request with no credential, and for a credential this
+this gateway does. An OAuth2 access token is listed by its digest and accepted there too, unless an IP rule
+or policy is in force (see ``_tokens``). It also answers the 401 for a request with no credential, and for a credential this
 gateway has just refused (it learns that from the ``X-Dataplane-Auth`` response header, never from the
 snapshot, so a key created a moment ago is never refused by mistake). The wording comes from here.
 

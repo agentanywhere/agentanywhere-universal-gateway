@@ -120,7 +120,7 @@ MCP, A2A, AG-UI or ACP and that protocol has an `http://` or `https://` backend 
 with no backend of its own; the key is in the snapshot, active, unexpired and `native_ok`; and, where the
 gateway checks the body, the body has a `Content-Length`, fits in memory (4 MiB, or the MCP limit if lower) and is
 certain to pass. On those same paths, a request with no credential, or with one the Python gateway has just refused,
-is answered here with the gateway's 401. Anything else, including OAuth2 tokens, credentials seen for the first time,
+is answered here with the gateway's 401. Anything else, including credentials seen for the first time,
 a preflight from a web page, `/metrics`, `/admin`, `/oauth2`, GraphQL
 and MQTT, goes to the Python gateway untouched, so its answer is the answer.
 
@@ -147,6 +147,14 @@ offered and the caller's `Authorization` and `Cookie`; never the gateway's key. 
 tunnel: bytes go both ways until either side closes. If it refuses or cannot be reached, the caller gets 403. Every
 other handshake (a key in `?api_key=`, an unknown key, `/agents/<slug>/...`, any IP rule or policy in force) is tunnelled
 to the Python gateway, which relays or refuses as it always does.
+
+**OAuth2 tokens.** An access token the Python gateway issued is a credential in `Authorization: Bearer <token>`, and
+the snapshot lists each by its SHA-256 digest, never the token. One that is listed and has not run out is served here
+under the gateway's default limits, as the Python gateway serves it: no tenant, no allowed paths. The Python gateway
+also lets a token past its IP rules and policies. This side passes over no rule, so while any IP rule or policy is in
+force no token is listed and a token's requests go to the Python gateway. A token sent beside a key header, one that
+has run out, and one issued a moment ago are the Python gateway's to decide; a revoked one is refused within about one
+sync interval. Tokens are relayed neither for gRPC nor for WebSocket.
 
 **Transformation rules.** The Python gateway applies them; this side only works out which requests they apply to and
 hands those over. A rule's pattern is matched, as there, against the path the backend is asked for (after a dynamic
@@ -236,7 +244,8 @@ here is the reverse of everywhere else: **whatever this side cannot be sure of i
 | MCP `tools/call` for a tool with a registered JSON Schema; custom injection patterns | Python |
 | A key sent as `Authorization: Bearer <key>` | data plane |
 | No credential; a credential Python refused in the last ten seconds; a key clearly past its expiry | data plane (401) |
-| A credential seen for the first time; OAuth2 tokens; two credentials of which the key does not work | Python |
+| An OAuth2 token in `Authorization: Bearer`, listed in the snapshot, no IP rules or policies | data plane |
+| A credential seen for the first time; an OAuth2 token while an IP rule or policy is in force; two credentials of which the key does not work | Python |
 | Browsers | data plane, with the gateway's error pages |
 | WebSocket under `/ws/`, key in `X-API-Key`, no IP rules or policies | data plane |
 | Any other WebSocket (`?api_key=`, `/agents/<slug>`, rules or policies in force) | Python, through a tunnel |
@@ -281,7 +290,7 @@ here is the reverse of everywhere else: **whatever this side cannot be sure of i
 * **The four protocols have not been benchmarked.** Reading and parsing a body to check it costs time the plain HTTP
   path does not spend; how much has not been measured.
 * **Runtime changes held only in a Python worker's memory are not visible to the snapshot:** transformation rules,
-  API version changes, plugins and the MCP tool registry are per process in the Python gateway. The snapshot reflects the worker that answers
+  API version changes, plugins, OAuth2 tokens and the MCP tool registry are per process in the Python gateway. The snapshot reflects the worker that answers
   it, so with several workers, change them through configuration and restart, or run one worker, until these are stored.
 * **Reporting is by aggregate and sample, not per request.** Counts, latency and SLOs are exact; the request-log view
   shows every error but only a capped number of successes at high rates. Each key's `last_used_at` is kept current.
