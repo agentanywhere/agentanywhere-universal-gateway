@@ -38,6 +38,7 @@ import asyncio
 import hashlib
 import ipaddress
 import json
+import os
 import re
 import time
 from datetime import datetime, time as dtime, timezone
@@ -111,7 +112,11 @@ def _websocket(settings, governed: bool) -> Optional[str]:
     from app import main as gw
 
     url = getattr(gw.websocket_handler, "backend_url", None)
-    if not isinstance(url, str) or not url.startswith("ws://") or not url.isascii() or "?" in url or "#" in url:
+    if not isinstance(url, str) or not url.startswith(("ws://", "wss://")) or not url.isascii() or "?" in url or "#" in url:
+        return None
+    # Behind TLS, this gateway's WebSocket client verifies against the system's certificates and
+    # SSL_CERT_FILE; the data plane only against that file. Without one, the two would not trust alike.
+    if url.startswith("wss://") and (not os.environ.get("SSL_CERT_FILE") or os.environ.get("SSL_CERT_DIR")):
         return None
     if governed or settings.api_key_header != "X-API-Key":
         return None
@@ -312,9 +317,11 @@ def _grpc(settings) -> Optional[str]:
     ``host:port`` (how a gRPC address is usually written), as an ``http://`` address. gRPC calls reach
     only the data plane, which speaks HTTP/2; this gateway cannot carry them."""
     target = (settings.grpc_backend_url or "").strip()
-    if target.startswith("http://"):
-        target = target[len("http://"):].rstrip("/")
-    return f"http://{target}" if _GRPC_TARGET.fullmatch(target) else None
+    scheme = "http://"
+    for named in ("http://", "https://"):
+        if target.startswith(named):
+            scheme, target = named, target[len(named):].rstrip("/")
+    return f"{scheme}{target}" if _GRPC_TARGET.fullmatch(target) else None
 
 
 def _boundary(settings) -> Dict[str, Any]:

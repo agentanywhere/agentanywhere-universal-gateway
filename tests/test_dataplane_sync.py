@@ -794,6 +794,8 @@ async def test_the_snapshot_names_the_websocket_backend_only_when_the_data_plane
     async def named():
         return (await dataplane_sync.build_snapshot(db_session))["websocket"]
 
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
     monkeypatch.setattr(gw, "websocket_handler", None)
     assert await named() is None
     for url in ("http://b:7000", "wss://b:7000", "ws://b:7000/x?token=1", "ws://b\u00e9:7000"):
@@ -801,6 +803,13 @@ async def test_the_snapshot_names_the_websocket_backend_only_when_the_data_plane
         assert await named() is None, url
     monkeypatch.setattr(gw, "websocket_handler", SimpleNamespace(backend_url="ws://b:7000/base"))
     assert await named() == "ws://b:7000/base"
+    # Behind TLS only when both sides are told which certificates to trust, in a file.
+    monkeypatch.setattr(gw, "websocket_handler", SimpleNamespace(backend_url="wss://b:7443/base"))
+    monkeypatch.setenv("SSL_CERT_FILE", "/etc/gateway/ca.pem")
+    assert await named() == "wss://b:7443/base"
+    monkeypatch.setenv("SSL_CERT_DIR", "/etc/ssl/certs")
+    assert await named() is None
+    monkeypatch.setattr(gw, "websocket_handler", SimpleNamespace(backend_url="ws://b:7000/base"))
     # A key read from another header, or any rule or policy to evaluate: this gateway relays.
     monkeypatch.setattr(get_settings(), "api_key_header", "X-Gateway-Key")
     assert await named() is None
@@ -815,7 +824,8 @@ async def test_the_snapshot_names_the_grpc_backend_when_it_is_a_plain_address(db
 
     for target, want in ((None, None), ("", None), ("localhost:50051", "http://localhost:50051"),
                          ("http://grpc.internal:9000/", "http://grpc.internal:9000"), ("[::1]:50051", "http://[::1]:50051"),
-                         ("dns:///grpc.internal:9000", None), ("unix:/tmp/grpc.sock", None), ("https://grpc.internal:443", None),
+                         ("dns:///grpc.internal:9000", None), ("unix:/tmp/grpc.sock", None), ("https://grpc.internal:443", "https://grpc.internal:443"),
+                         ("https://grpc.internal:443/", "https://grpc.internal:443"), ("https://grpc.internal", None),
                          ("grpc.internal", None), ("b\u00e9:1", None), ("host:50051/path", None)):
         monkeypatch.setattr(get_settings(), "grpc_backend_url", target)
         assert await named() == want, target

@@ -90,6 +90,9 @@ pub struct Upstream {
 /// side does not speak TLS to backends, and an `https://` backend is the Python gateway's.
 static TLS: OnceLock<Option<Arc<rustls::ClientConfig>>> = OnceLock::new();
 
+/// Whether the certificates backends are verified against come from `SSL_CERT_FILE`.
+static TLS_FROM_FILE: OnceLock<bool> = OnceLock::new();
+
 /// Decide how backends behind TLS are verified, as the Python gateway's HTTP client decides it:
 /// against the certificates in `SSL_CERT_FILE` when that is set, and otherwise against the
 /// Mozilla root certificates (the set that client ships with). With `SSL_CERT_DIR` set, or a
@@ -108,6 +111,7 @@ pub fn start_tls() -> Result<(), String> {
         Ok(config) => (Some(Arc::new(config)), Ok(())),
         Err(why) => (None, Err(why)),
     };
+    let _ = TLS_FROM_FILE.set(config.is_some() && set("SSL_CERT_FILE").is_some());
     let _ = TLS.set(config);
     said
 }
@@ -126,6 +130,13 @@ fn roots_from(file: &std::path::Path) -> Result<rustls::RootCertStore, String> {
 
 fn tls() -> Option<&'static Arc<rustls::ClientConfig>> {
     TLS.get().and_then(Option::as_ref)
+}
+
+/// Whether a `wss://` backend is this side's to connect to. The Python gateway's WebSocket client
+/// verifies against the system's certificates plus `SSL_CERT_FILE`, not the Mozilla set: only
+/// with that file given do both sides trust what this side trusts.
+fn tls_for_websockets() -> bool {
+    TLS_FROM_FILE.get().copied().unwrap_or(false)
 }
 
 impl Upstream {
@@ -188,9 +199,13 @@ impl Backends {
             *route = url.as_deref().and_then(|u| self.at(u));
         }
         // A WebSocket is opened with an HTTP request to the same address.
-        snap.websocket = snap.websocket_url.as_deref().and_then(|u| self.at(&u.replacen("ws://", "http://", 1)));
-        // gRPC is relayed without TLS only: over TLS it would need HTTP/2 negotiated in the handshake.
-        snap.grpc = snap.grpc_url.as_deref().filter(|u| u.starts_with("http://")).and_then(|u| self.at(u));
+        snap.websocket = snap.websocket_url.as_deref().and_then(|u| match u.strip_prefix("wss://") {
+            Some(rest) if tls_for_websockets() => self.at(&format!("https://{rest}")),
+            Some(_) => None,
+            None => self.at(&u.replacen("ws://", "http://", 1)),
+        });
+        // Behind TLS (`https://`), HTTP/2 is agreed in the handshake; `at` knows whether this side speaks TLS.
+        snap.grpc = snap.grpc_url.as_deref().and_then(|u| self.at(u));
         for route in snap.dynamic_routes.iter_mut() {
             // A route with a backend this side cannot reach is kept, without one: what it matches is Python's.
             route.backend = route.backend_url.as_deref().filter(|_| route.timeout().is_some()).and_then(|u| self.at(u));
@@ -235,6 +250,8 @@ pub struct Worker {
     secure: Option<Client<hyper_rustls::HttpsConnector<HttpConnector>, Body>>,
     /// Connections to gRPC backends, which are spoken to in HTTP/2 from the first byte.
     grpc: Client<HttpConnector, Body>,
+    /// The same for gRPC backends behind TLS, when this side speaks TLS to backends.
+    grpc_secure: Option<Client<hyper_rustls::HttpsConnector<HttpConnector>, Body>>,
     /// The snapshot as of `generation`, behind a reference count only this worker touches.
     held: Mutex<(u64, Arc<Arc<Snapshot>>)>,
     index: usize,
@@ -290,7 +307,16 @@ impl Worker {
                 hyper_rustls::HttpsConnectorBuilder::new().with_tls_config((**config).clone()).https_only().enable_http1().wrap_connector(connector);
             Client::builder(TokioExecutor::new()).pool_idle_timeout(Duration::from_secs(30)).pool_max_idle_per_host(512).build(connector)
         });
-        Worker { shared, client, secure, grpc, held, index }
+        let grpc_secure = tls().map(|config| {
+            let mut connector = HttpConnector::new();
+            connector.set_nodelay(true);
+            connector.set_connect_timeout(Some(GRPC_CONNECT_TIMEOUT));
+            connector.enforce_http(false);
+            let connector =
+                hyper_rustls::HttpsConnectorBuilder::new().with_tls_config((**config).clone()).https_only().enable_http2().wrap_connector(connector);
+            Client::builder(TokioExecutor::new()).http2_only(true).pool_idle_timeout(Duration::from_secs(90)).build(connector)
+        });
+        Worker { shared, client, secure, grpc, grpc_secure, held, index }
     }
 
     /// Send a request to an upstream, over TLS if that is how it is reached.
@@ -1025,8 +1051,10 @@ const RELAYED: [&str; 6] =
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Open the connection to the backend and, if it accepts, join the two. If it cannot be reached
-/// or refuses, the caller's handshake is refused, as the Python gateway refuses it.
-async fn relay_websocket(w: &Worker, r: &Relay<'_>, mut req: Request<Incoming>) -> Response<Body> {
+/// or refuses, the caller's handshake is refused, as the Python gateway refuses it. A backend
+/// behind TLS that cannot be connected to is not refused here: the handshake comes back (`Err`)
+/// for the Python gateway, which may trust a certificate this side does not.
+async fn relay_websocket(w: &Worker, r: &Relay<'_>, mut req: Request<Incoming>) -> Result<Response<Body>, Request<Incoming>> {
     let refused = || {
         let mut resp = Response::new(full(Bytes::new()));
         *resp.status_mut() = StatusCode::FORBIDDEN;
@@ -1034,9 +1062,8 @@ async fn relay_websocket(w: &Worker, r: &Relay<'_>, mut req: Request<Incoming>) 
     };
     let to = &r.backend.upstream;
     let Ok(uri) = Uri::builder().scheme(to.scheme.clone()).authority(to.authority.clone()).path_and_query(r.target.as_str()).build() else {
-        return refused();
+        return Ok(refused());
     };
-    let client_end = hyper::upgrade::on(&mut req);
     let mut out = Request::new(full(Bytes::new()));
     *out.uri_mut() = uri;
     for name in RELAYED {
@@ -1046,13 +1073,14 @@ async fn relay_websocket(w: &Worker, r: &Relay<'_>, mut req: Request<Incoming>) 
     }
     out.headers_mut().insert(CONNECTION, HeaderValue::from_static("upgrade"));
     out.headers_mut().insert(UPGRADE, HeaderValue::from_static("websocket"));
-    match tokio::time::timeout(HANDSHAKE_TIMEOUT, w.client.request(out)).await {
+    match tokio::time::timeout(HANDSHAKE_TIMEOUT, w.send(to, out)).await {
         Ok(Ok(resp)) if resp.status() == StatusCode::SWITCHING_PROTOCOLS => {
-            let mut resp = tunnel(client_end, resp);
+            let mut resp = tunnel(hyper::upgrade::on(&mut req), resp);
             resp.headers_mut().insert("x-served-by", HeaderValue::from_static("dataplane"));
-            resp
+            Ok(resp)
         }
-        _ => refused(),
+        Ok(Err(_)) if to.tls => Err(req),
+        _ => Ok(refused()),
     }
 }
 
@@ -1206,7 +1234,11 @@ async fn forward_grpc(
     if let Ok(v) = HeaderValue::from_str(&trace.traceparent) {
         headers.insert("traceparent", v);
     }
-    match w.grpc.request(req).await {
+    let sent = match &w.grpc_secure {
+        Some(secure) if to.tls => secure.request(req),
+        _ => w.grpc.request(req),
+    };
+    match sent.await {
         Ok(resp) => Ok(resp.map(Either::Left)),
         Err(e) if e.is_connect() => Err(Unanswered::Refused),
         Err(_) => Err(Unanswered::Broken),
@@ -1569,7 +1601,10 @@ pub async fn handle(w: Arc<Worker>, peer: SocketAddr, mut req: Request<Incoming>
             if r.entry.last_used.load(Ordering::Relaxed) != now {
                 r.entry.last_used.store(now, Ordering::Relaxed);
             }
-            return Ok(relay_websocket(&w, &r, req).await);
+            match relay_websocket(&w, &r, req).await {
+                Ok(resp) => return Ok(resp),
+                Err(back) => req = back,
+            }
         }
     }
     let mut key_in_authorization = false;
@@ -2629,6 +2664,7 @@ mod tests {
         let req = handshake("/ws/chat", &[("x-api-key", KEY)]);
         // No WebSocket backend this side can reach.
         assert!(relay(&governed("", ""), &req, 100).is_none());
+        // Behind TLS only where this side verifies against a file of certificates it was given.
         assert!(relay(&governed(r#","websocket":"wss://secure.example/base""#, ""), &req, 100).is_none());
         assert!(relay(&governed(r#","websocket":"http://127.0.0.1:7000""#, ""), &req, 100).is_none());
         // A key that is off, not reproducible here, expired, or not allowed this path.
