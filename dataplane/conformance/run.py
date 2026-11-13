@@ -84,8 +84,8 @@ def protocol_backend():
     return f"http://127.0.0.1:{server.server_port}"
 
 
-def websocket_backend():
-    """A local WebSocket server. It sends back what it is sent, text as text and bytes as bytes, and
+def websocket_backend(tls=None):
+    """A local WebSocket server (behind TLS when given a certificate and its key). It sends back what it is sent, text as text and bytes as bytes, and
     answers a few words: `where` with the path and query it was asked for, `who` with the
     Authorization, Cookie and X-API-Key headers it saw, and `close:<code>` by closing with that
     code. It picks the subprotocol `chat.v2` when offered, and refuses a handshake on `/base/refuse`.
@@ -118,9 +118,19 @@ def websocket_backend():
             else:
                 ws.send(message)
 
-    server = serve(handler, "127.0.0.1", 0, process_request=refuse, select_subprotocol=pick, max_size=None)
+    options = dict(process_request=refuse, select_subprotocol=pick, max_size=None)
+    if tls:
+        import ssl
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(*tls)
+        try:
+            server = serve(handler, "127.0.0.1", 0, ssl=context, **options)
+        except TypeError:  # by library version
+            server = serve(handler, "127.0.0.1", 0, ssl_context=context, **options)
+    else:
+        server = serve(handler, "127.0.0.1", 0, **options)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    return f"ws://127.0.0.1:{server.socket.getsockname()[1]}/base"
+    return f"{'wss' if tls else 'ws'}://127.0.0.1:{server.socket.getsockname()[1]}/base"
 
 
 def certificates(folder):
@@ -231,7 +241,7 @@ def agent_backend(tls=None):
     return f"{'https' if tls else 'http'}://127.0.0.1:{server.server_port}"
 
 
-def grpc_backend():
+def grpc_backend(tls=None):
     """A local gRPC server that needs no generated code: messages are raw bytes. `Say` answers with
     what it was sent; `Who` with the metadata it saw; `Fail` with NOT_FOUND and a trailer; `Count`
     streams that many messages; `Slow` streams one every 0.1 s for 5 s; `Total` takes a stream and
@@ -273,7 +283,11 @@ def grpc_backend():
     }
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=16), options=GRPC_SIZES)
     server.add_generic_rpc_handlers((grpc.method_handlers_generic_handler("conf.Echo", handlers),))
-    port = server.add_insecure_port("127.0.0.1:0")
+    if tls:
+        pair = (Path(tls[1]).read_bytes(), Path(tls[0]).read_bytes())
+        port = server.add_secure_port("127.0.0.1:0", grpc.ssl_server_credentials([pair]))
+    else:
+        port = server.add_insecure_port("127.0.0.1:0")
     server.start()
     return server, port
 
@@ -281,12 +295,15 @@ def grpc_backend():
 GRPC_SIZES = [("grpc.max_receive_message_length", 16 << 20), ("grpc.max_send_message_length", 16 << 20)]
 
 
-def grpc_call(target, kind, method, request, metadata=(), timeout=10):
-    """One gRPC call. Returns its status name, what was answered (a list for a stream), the
-    status message, and the metadata received before and after."""
+def grpc_call(target, kind, method, request, metadata=(), timeout=10, authority=None):
+    """One gRPC call (over TLS when given the authority that vouches for the server). Returns its
+    status name, what was answered (a list for a stream), the status message, and the metadata
+    received before and after."""
     import grpc
 
-    with grpc.insecure_channel(target, options=GRPC_SIZES) as channel:
+    opened = (grpc.secure_channel(target, grpc.ssl_channel_credentials(Path(authority).read_bytes()), options=GRPC_SIZES)
+              if authority else grpc.insecure_channel(target, options=GRPC_SIZES))
+    with opened as channel:
         path, md = f"/conf.Echo/{method}", tuple(metadata)
         try:
             if kind == "unary":
@@ -1609,6 +1626,78 @@ def main() -> int:
             check("native probes are logged without a key or an error",
                   len(logs) >= 1 and all(not l.get("error") and not l.get("api_key_id") for l in logs), f"{len(logs)} rows")
 
+            # --- WebSocket and gRPC backends behind TLS --------------------------------------------
+            # A gateway has one WebSocket backend and one gRPC backend, so these run on gateways of
+            # their own: one whose backends present a certificate both planes trust, one whose
+            # backends present a certificate nobody vouches for.
+            print()
+
+            def secure_pair(name, certificate):
+                """A Python gateway and a data plane in front of it, with a WebSocket backend and a
+                gRPC backend behind TLS. Returns (python, data plane, a key for each, the gRPC port)."""
+                rpc = subprocess.Popen([sys.executable, __file__, "--grpc-backend", *certificate], stdout=subprocess.PIPE, text=True)
+                procs.append(rpc)
+                rpc_port = int(rpc.stdout.readline())
+                sockets = websocket_backend(certificate)
+                g, d = free_port(), free_port()
+                own = {**env, "DATABASE_URL": f"sqlite+aiosqlite:///{tmp}/{name}.db", "WEBSOCKET_BACKEND_URL": sockets,
+                       "GRPC_BACKEND_URL": f"https://127.0.0.1:{rpc_port}"}
+                procs.append(subprocess.Popen([sys.executable, "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", str(g),
+                                               "--log-level", "warning"], cwd=ROOT, env=own, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+                wait_healthy(f"http://127.0.0.1:{g}/health", procs[-1])
+                made = {}
+                for side in ("py", "rs"):
+                    r = httpx.post(f"http://127.0.0.1:{g}/admin/api-keys", headers=adm, timeout=10,
+                                   params={"name": f"{name}-{side}", "rate_limit_per_minute": 1000, "rate_limit_per_hour": 1000})
+                    r.raise_for_status()
+                    made[side] = r.json()
+                procs.append(subprocess.Popen([str(BIN), "--listen", f"127.0.0.1:{d}", "--control-token", "conformance-token",
+                                               "--sync-interval-ms", "200", "--max-staleness-ms", "2000", "--report-interval-ms", "300",
+                                               "--backend", f"http://127.0.0.1:{bport}", "--control", f"http://127.0.0.1:{g}"], env=own))
+                native = lambda: httpx.get(f"http://127.0.0.1:{d}/api/users", headers={"X-API-Key": made["rs"]["key"]}, timeout=10).headers.get("x-served-by") == "dataplane"
+                assert wait_until(native, 8), f"the {name} data plane never started serving natively"
+                return f"http://127.0.0.1:{g}", f"http://127.0.0.1:{d}", made, rpc_port
+
+            def tls_ws(name, pair, path, messages=(), headers=None, want=None, by=None, **kw):
+                spy, srs, made, _ = pair
+                a = ws_talk(spy, path, made["py"]["key"], messages, headers, **kw)
+                del relayed_by[:]
+                b = ws_talk(srs, path, made["rs"]["key"], messages, headers, **kw)
+                ok = a == b and (want is None or want(b)) and (by is None or relayed_by == [by])
+                shown = str(b) if a == b else f"python {a} vs data plane {b}"
+                check(f"behind TLS, websocket: {name}", ok, (f"relayed by {relayed_by[0]}  " if relayed_by else "") + shown[:140])
+
+            vouched = secure_pair("vouched", trusted)
+            tls_ws("text and bytes are relayed here", vouched, "/ws/chat", ["hello", b"\x00\xff"], with_key, by="data plane",
+                   want=lambda r: r.get("answers") == ["hello", b"\x00\xff"])
+            tls_ws("the backend sees the path, the query and the caller's own credentials", vouched, "/ws/rooms/7?room=blue", ["where", "who"],
+                   {**with_key, "Authorization": "Bearer t", "Cookie": "s=1"}, by="data plane",
+                   want=lambda r: r.get("answers") == ["/base/rooms/7?room=blue", '["Bearer t", "s=1", null]'])
+            tls_ws("the subprotocol and the close code pass through", vouched, "/ws/chat", ["close:4001"], with_key, subprotocols=["chat.v1", "chat.v2"],
+                   by="data plane", want=lambda r: (r.get("subprotocol"), r.get("closed")) == ("chat.v2", [4001, "bye"]))
+            tls_ws("a handshake the backend refuses is refused", vouched, "/ws/refuse", headers=with_key, want=lambda r: "refused" in r)
+            tls_ws("without a key the handshake is refused", vouched, "/ws/chat", want=lambda r: "refused" in r)
+
+            def tls_grpc(name, kind, method, request, want=None):
+                a = grpc_call(f"127.0.0.1:{vouched[3]}", kind, method, request, authority=authority)
+                b = grpc_call(vouched[1][7:], kind, method, request, (("x-api-key", vouched[2]["rs"]["key"]),))
+                alike = all(a[k] == b[k] for k in ("code", "answer", "details"))
+                ok = alike and (want is None or want(b)) and b["before"].get("x-served-by", b["after"].get("x-served-by")) == "dataplane"
+                check(f"behind TLS, gRPC: {name}", ok, f"{b['code']} {str(b['answer'])[:60]}" if alike else f"backend {a['code']} {a['details']} vs gateway {b['code']} {b['details']}")
+
+            tls_grpc("a call is answered as the backend answers it", "unary", "Say", b"hello", want=lambda r: (r["code"], r["answer"]) == ("OK", b"hello"))
+            tls_grpc("a stream from the backend arrives whole", "server-stream", "Count", b"25", want=lambda r: len(r["answer"]) == 25)
+            tls_grpc("a stream both ways is relayed", "bidi", "Chat", [b"a", b"b", b"c"], want=lambda r: r["answer"] == [b"A", b"B", b"C"])
+            tls_grpc("the backend's own error and trailer pass through", "unary", "Fail", b"", want=lambda r: (r["code"], r["after"].get("reason-code")) == ("NOT_FOUND", "r-17"))
+            b = grpc_call(vouched[1][7:], "unary", "Say", b"hello")
+            check("behind TLS, gRPC: a call without a key is refused here", b["code"] == "UNAUTHENTICATED", f"{b['code']}: {b['details']}")
+
+            strangers = secure_pair("strangers", untrusted)
+            tls_ws("a backend nobody vouches for: the handshake is Python's, and refused by both", strangers, "/ws/chat", ["hello"], with_key,
+                   want=lambda r: "refused" in r or r.get("closed") is not None)
+            b = grpc_call(strangers[1][7:], "unary", "Say", b"hello", (("x-api-key", strangers[2]["rs"]["key"]),))
+            check("behind TLS, gRPC: a backend nobody vouches for is not spoken to", b["code"] == "UNAVAILABLE", f"{b['code']}: {b['details']}")
+
             # Last: the control plane goes away. The data plane must stop serving natively.
             procs[1].send_signal(signal.SIGTERM)
             procs[1].wait(timeout=15)
@@ -1639,8 +1728,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    if sys.argv[1:] == ["--grpc-backend"]:
-        _server, _port = grpc_backend()
+    if sys.argv[1:2] == ["--grpc-backend"]:
+        _server, _port = grpc_backend(tuple(sys.argv[2:4]) or None)
         print(_port, flush=True)
         _server.wait_for_termination()
         sys.exit(0)
