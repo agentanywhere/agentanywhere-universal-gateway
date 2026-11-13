@@ -118,6 +118,22 @@ def _websocket(settings, governed: bool) -> Optional[str]:
     return url
 
 
+_AGENT_SLUG = re.compile(r"[A-Za-z0-9._~-]+")
+_AGENT_UPSTREAM = re.compile(r"http://(?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])(?::[0-9]{1,5})?(?:/[A-Za-z0-9._~/-]*)?")
+
+
+def _agents() -> Dict[str, str]:
+    """The agents of the agent edge the data plane may forward to itself: slug to upstream, for
+    those with a plain ``http://`` upstream. ``/agents/<slug>/...`` needs no gateway key (the agent
+    authenticates its own callers), so the route is all there is to know. A slug that is not here
+    is this gateway's to answer, registered or not."""
+    from app import main as gw
+
+    routes = gw.agent_edge_config.snapshot()["routes"]
+    return {slug: base for slug, base in sorted(routes.items())
+            if isinstance(slug, str) and isinstance(base, str) and _AGENT_SLUG.fullmatch(slug) and _AGENT_UPSTREAM.fullmatch(base)}
+
+
 _GRPC_TARGET = re.compile(r"(?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\]):[0-9]{1,5}")
 
 
@@ -495,6 +511,7 @@ async def build_snapshot(db: AsyncSession) -> Dict[str, Any]:
         "ops": _ops(settings),
         "websocket": _websocket(settings, bool(rules) or bool(policy_rows)),
         "grpc": _grpc(settings),
+        "agents": _agents(),
     }
     snap["revision"] = hashlib.sha256(json.dumps(snap, sort_keys=True).encode()).hexdigest()
     return snap

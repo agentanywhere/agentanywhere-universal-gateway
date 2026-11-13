@@ -818,3 +818,25 @@ async def test_the_snapshot_names_the_grpc_backend_when_it_is_a_plain_address(db
                          ("grpc.internal", None), ("b\u00e9:1", None), ("host:50051/path", None)):
         monkeypatch.setattr(get_settings(), "grpc_backend_url", target)
         assert await named() == want, target
+
+
+async def test_the_snapshot_names_the_agents_the_data_plane_can_reach(db_session, monkeypatch):
+    from app import main as gw
+    from app.agent_routes import AgentEdgeConfig
+
+    async def named():
+        return (await dataplane_sync.build_snapshot(db_session))["agents"]
+
+    monkeypatch.setattr(gw, "agent_edge_config", AgentEdgeConfig(routes={}))
+    assert await named() == {}
+    monkeypatch.setattr(gw, "agent_edge_config", AgentEdgeConfig(routes={
+        "hiring": "http://10.0.0.10:8001/", "docs.v2": "http://agents.internal/base", "six": "http://[::1]:9000",
+        "secure": "https://agents.example.com", "odd slug": "http://10.0.0.11:8001", "query": "http://10.0.0.12:8001/?a=1",
+        "caf\u00e9": "http://10.0.0.13:8001", "blank": "",
+    }))
+    assert await named() == {"hiring": "http://10.0.0.10:8001", "docs.v2": "http://agents.internal/base", "six": "http://[::1]:9000"}
+    # An agent registered or retired later changes the snapshot.
+    before = (await dataplane_sync.build_snapshot(db_session))["revision"]
+    gw.agent_edge_config.replace({"hiring": "http://10.0.0.10:8002"})
+    after = await dataplane_sync.build_snapshot(db_session)
+    assert after["agents"] == {"hiring": "http://10.0.0.10:8002"} and after["revision"] != before
