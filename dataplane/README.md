@@ -115,7 +115,7 @@ Its format is the same as what the control plane serves; see `src/snapshot.rs`.
 
 A request is served natively only when **all** of these hold: the link is fresh; the path is `/api/...`, or belongs to
 MCP, A2A, AG-UI or ACP and that protocol has an `http://` or `https://` backend configured; no `fallthrough_prefixes` entry matches;
-the client is not a browser (`Accept: text/html`); `X-API-Version` or `Accept-Version` resolves to an active version
+`X-API-Version` or `Accept-Version` resolves to an active version
 with no backend of its own; the key is in the snapshot, active, unexpired and `native_ok`; and, where the
 gateway checks the body, the body has a `Content-Length`, fits in memory (4 MiB, or the MCP limit if lower) and is
 certain to pass. On those same paths, a request with no credential, or with one the Python gateway has just refused,
@@ -146,6 +146,12 @@ offered and the caller's `Authorization` and `Cookie`; never the gateway's key. 
 tunnel: bytes go both ways until either side closes. If it refuses or cannot be reached, the caller gets 403. Every
 other handshake (a key in `?api_key=`, an unknown key, `/agents/<slug>/...`, any IP rule or policy in force) is tunnelled
 to the Python gateway, which relays or refuses as it always does.
+
+**Browsers.** A caller that prefers `text/html` (decided as the Python gateway decides it: `text/html` accepted, JSON
+not named before it, no `X-Requested-With: XMLHttpRequest`) is shown errors as pages. A successful request is
+forwarded like any other. An error answered here (401, 403, 429, 502, 503) becomes the Python gateway's page for that
+status, which comes with the snapshot, with the error's code, message, hint, request id and retry time written in.
+The status and headers are those of the JSON answer.
 
 **Requests from web pages.** A request with an `Origin` header is answered here with the cross-origin headers the
 Python gateway's CORS middleware writes, from `CORS_ORIGINS` and `CORS_ALLOW_CREDENTIALS` in the snapshot: a listed
@@ -219,7 +225,7 @@ here is the reverse of everywhere else: **whatever this side cannot be sure of i
 | A key sent as `Authorization: Bearer <key>` | data plane |
 | No credential; a credential Python refused in the last ten seconds; a key clearly past its expiry | data plane (401) |
 | A credential seen for the first time; OAuth2 tokens; two credentials of which the key does not work | Python |
-| Browsers (HTML error pages) | Python |
+| Browsers | data plane, with the gateway's error pages |
 | WebSocket under `/ws/`, key in `X-API-Key`, no IP rules or policies | data plane |
 | Any other WebSocket (`?api_key=`, `/agents/<slug>`, rules or policies in force) | Python, through a tunnel |
 | gRPC calls (HTTP/2, `application/grpc`) | data plane only; refused when it cannot be sure |
