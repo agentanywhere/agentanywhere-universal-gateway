@@ -37,6 +37,7 @@ import asyncio
 import hashlib
 import ipaddress
 import json
+import re
 import time
 from datetime import datetime, time as dtime, timezone
 from typing import Any, Dict, List, Optional
@@ -115,6 +116,19 @@ def _websocket(settings, governed: bool) -> Optional[str]:
     if governed or settings.api_key_header != "X-API-Key":
         return None
     return url
+
+
+_GRPC_TARGET = re.compile(r"(?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\]):[0-9]{1,5}")
+
+
+def _grpc(settings) -> Optional[str]:
+    """The gRPC server the data plane relays calls to: ``GRPC_BACKEND_URL`` when it is a plain
+    ``host:port`` (how a gRPC address is usually written), as an ``http://`` address. gRPC calls reach
+    only the data plane, which speaks HTTP/2; this gateway cannot carry them."""
+    target = (settings.grpc_backend_url or "").strip()
+    if target.startswith("http://"):
+        target = target[len("http://"):].rstrip("/")
+    return f"http://{target}" if _GRPC_TARGET.fullmatch(target) else None
 
 
 def _boundary(settings) -> Dict[str, Any]:
@@ -480,6 +494,7 @@ async def build_snapshot(db: AsyncSession) -> Dict[str, Any]:
         "refusals": _refusals(auth_plugins),
         "ops": _ops(settings),
         "websocket": _websocket(settings, bool(rules) or bool(policy_rows)),
+        "grpc": _grpc(settings),
     }
     snap["revision"] = hashlib.sha256(json.dumps(snap, sort_keys=True).encode()).hexdigest()
     return snap

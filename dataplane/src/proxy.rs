@@ -46,6 +46,8 @@ pub enum Protocol {
     A2a,
     AgUi,
     Acp,
+    /// gRPC calls, which arrive over HTTP/2 and are told apart by their content type, not by path.
+    Grpc,
 }
 
 /// The protocols whose backends come from the snapshot, in the order `Snapshot::routes` holds them.
@@ -61,6 +63,7 @@ impl Protocol {
             Protocol::A2a => "a2a",
             Protocol::AgUi => "ag_ui",
             Protocol::Acp => "acp",
+            Protocol::Grpc => "grpc",
         }
     }
 
@@ -138,6 +141,7 @@ impl Backends {
         }
         // A WebSocket is opened with an HTTP request to the same address.
         snap.websocket = snap.websocket_url.as_deref().and_then(|u| self.at(&u.replacen("ws://", "http://", 1)));
+        snap.grpc = snap.grpc_url.as_deref().and_then(|u| self.at(u));
     }
 }
 
@@ -173,6 +177,8 @@ impl State {
 pub struct Worker {
     pub shared: Arc<State>,
     client: Client<HttpConnector, Body>,
+    /// Connections to gRPC backends, which are spoken to in HTTP/2 from the first byte.
+    grpc: Client<HttpConnector, Body>,
     /// The snapshot as of `generation`, behind a reference count only this worker touches.
     held: Mutex<(u64, Arc<Arc<Snapshot>>)>,
     index: usize,
@@ -215,8 +221,12 @@ impl Worker {
             .pool_idle_timeout(Duration::from_secs(30))
             .pool_max_idle_per_host(512)
             .build(connector);
+        let mut connector = HttpConnector::new();
+        connector.set_nodelay(true);
+        connector.set_connect_timeout(Some(GRPC_CONNECT_TIMEOUT));
+        let grpc = Client::builder(TokioExecutor::new()).http2_only(true).pool_idle_timeout(Duration::from_secs(90)).build(connector);
         let held = Mutex::new((shared.generation.load(Ordering::Acquire), Arc::new(shared.snapshot.load_full())));
-        Worker { shared, client, held, index }
+        Worker { shared, client, grpc, held, index }
     }
 
     /// The current snapshot and the generation it belongs to.
@@ -621,6 +631,161 @@ async fn relay_websocket(w: &Worker, r: &Relay<'_>, mut req: Request<Incoming>) 
     }
 }
 
+/// How long a gRPC backend may take to accept a connection. Nothing bounds a call after that
+/// but the caller's own deadline: a stream may rightly stay open for hours.
+const GRPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Whether a request is a gRPC call: HTTP/2, POST, and a gRPC content type (`application/grpc`,
+/// or that with `+proto`, `+json`, ...). gRPC-Web is another protocol and is not one.
+fn is_grpc<B>(req: &Request<B>) -> bool {
+    req.version() == Version::HTTP_2
+        && req.method() == Method::POST
+        && req.headers().get(CONTENT_TYPE).is_some_and(|v| {
+            v.as_bytes().strip_prefix(b"application/grpc").is_some_and(|rest| matches!(rest.first(), None | Some(b'+') | Some(b';')))
+        })
+}
+
+/// A gRPC call answered here instead of by the backend: the status a gRPC client is told, its
+/// message, and the HTTP status the same refusal would have had, which is what is counted and logged.
+#[derive(Debug, PartialEq, Clone, Copy)]
+struct GrpcRefusal {
+    code: u8,
+    message: &'static str,
+    http: u16,
+    /// The gateway's name for the error, in the request log.
+    error: &'static str,
+}
+
+impl GrpcRefusal {
+    const NOT_READY: Self = Self { code: 14, message: "the gateway is not ready", http: 503, error: "SERVICE_UNAVAILABLE" };
+    const NOT_CONFIGURED: Self = Self { code: 12, message: "gRPC is not configured on this gateway", http: 501, error: "NOT_IMPLEMENTED" };
+    const NO_KEY: Self = Self { code: 16, message: "API key required", http: 401, error: "AUTHENTICATION_ERROR" };
+    const BAD_KEY: Self = Self { code: 16, message: "invalid API key", http: 401, error: "AUTHENTICATION_ERROR" };
+    const NOT_APPLICABLE: Self =
+        Self { code: 7, message: "the gateway's rules for this key cannot be applied to gRPC", http: 403, error: "AUTHORIZATION_ERROR" };
+    const DENIED: Self = Self { code: 7, message: "access denied", http: 403, error: "AUTHORIZATION_ERROR" };
+    const LIMITED: Self = Self { code: 8, message: "rate limit exceeded", http: 429, error: "RATE_LIMIT_EXCEEDED" };
+    const CIRCUIT_OPEN: Self = Self { code: 14, message: "the backend is unavailable (circuit open)", http: 503, error: "SERVICE_UNAVAILABLE" };
+    const NO_ANSWER: Self = Self { code: 14, message: "the backend is unavailable", http: 502, error: "BACKEND_ERROR" };
+
+    /// The refusal for an answer the HTTP path made, by its error code.
+    fn for_error(error: &str) -> Self {
+        match error {
+            "AUTHORIZATION_ERROR" => Self::DENIED,
+            "RATE_LIMIT_EXCEEDED" => Self::LIMITED,
+            "SERVICE_UNAVAILABLE" => Self::CIRCUIT_OPEN,
+            _ => Self::NO_ANSWER,
+        }
+    }
+
+    /// Turn an answer into the form a gRPC client reads: HTTP 200, no body, the status in the
+    /// headers. What the answer was stamped with (request id, trace, `Retry-After`) stays.
+    fn onto(&self, mut resp: Response<Body>) -> Response<Body> {
+        *resp.status_mut() = StatusCode::OK;
+        *resp.body_mut() = full(Bytes::new());
+        let h = resp.headers_mut();
+        h.remove(CONTENT_LENGTH);
+        h.insert(CONTENT_TYPE, HeaderValue::from_static("application/grpc"));
+        h.insert("grpc-status", HeaderValue::from(u16::from(self.code)));
+        h.insert("grpc-message", HeaderValue::from_static(self.message));
+        resp
+    }
+}
+
+/// A gRPC call that goes on to the backend, and which of its headers carried the gateway's key.
+struct GrpcCall<'a> {
+    native: Native<'a>,
+    key_in_authorization: bool,
+}
+
+/// Decide a gRPC call. There is no Python gateway to hand one to (it does not speak HTTP/2), so
+/// whatever this side cannot be sure of is refused: a stale snapshot, a key it does not know (one
+/// made a moment ago included), a key whose rules it cannot apply. The key's allowed paths, the IP
+/// rules, the policies, the limits and the quotas are applied afterwards, as for any native request.
+fn admit_grpc<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, now: u64, trusted: bool) -> Result<GrpcCall<'a>, GrpcRefusal> {
+    if !trusted {
+        return Err(GrpcRefusal::NOT_READY);
+    }
+    let backend = snap.grpc.as_deref().ok_or(GrpcRefusal::NOT_CONFIGURED)?;
+    let path = req.uri().path();
+    // A method is `/package.Service/Method`; nothing a client library sends is escaped.
+    if !path.is_ascii() || path.contains('%') {
+        return Err(GrpcRefusal::DENIED);
+    }
+    let ip = govern::client_ip(peer, req.headers(), &snap.trusted_proxies).ok_or(GrpcRefusal::DENIED)?;
+    let header = |name: &HeaderName| req.headers().get(name).map(|v| v.as_bytes()).filter(|v| !v.is_empty());
+    let (credential, key_in_authorization) = match (header(&snap.key_header), header(&AUTHORIZATION)) {
+        (None, None) => return Err(GrpcRefusal::NO_KEY),
+        (Some(key), _) => (Cow::Borrowed(key), false),
+        (None, Some(value)) => (without_bearer(value), true),
+    };
+    if credential.is_empty() || !credential.is_ascii() {
+        return Err(GrpcRefusal::BAD_KEY);
+    }
+    let entry = snap.keys.get(&hash_key(&credential)).ok_or(GrpcRefusal::BAD_KEY)?;
+    if !entry.is_active || entry.expires_at.is_some_and(|e| e <= now as i64) {
+        return Err(GrpcRefusal::BAD_KEY);
+    }
+    if !entry.native_ok {
+        return Err(GrpcRefusal::NOT_APPLICABLE);
+    }
+    let native = Native { protocol: Protocol::Grpc, backend: Some(backend), entry, version: None, ip, method: "POST" };
+    Ok(GrpcCall { native, key_in_authorization })
+}
+
+/// Answer a gRPC call that never got as far as a key: counted and logged like any refusal made
+/// here, under the HTTP status it stands for.
+fn grpc_refused<B>(w: &Worker, refusal: &GrpcRefusal, peer: SocketAddr, req: &Request<B>, started: Instant, at: Duration) -> Response<Body> {
+    let t = trace_for(req.headers());
+    let mut resp = Response::new(full(Bytes::new()));
+    *resp.status_mut() = StatusCode::from_u16(refusal.http).unwrap_or(StatusCode::FORBIDDEN);
+    let a = Answered { method: "POST", ip: peer.ip(), version: None, rejected: true, error: Some(refusal.error) };
+    refusal.onto(finish(w, resp, &a, req, &t, started, at))
+}
+
+/// Send a gRPC call to its backend over HTTP/2, body and trailers streamed both ways. The backend
+/// is not sent the gateway's key; an `Authorization` that did not carry it is the caller's own
+/// and goes through.
+async fn forward_grpc(
+    w: &Worker,
+    to: &Upstream,
+    peer: SocketAddr,
+    mut req: Request<Body>,
+    trace: &Trace,
+    key_header: &HeaderName,
+    key_in_authorization: bool,
+) -> Result<Response<Body>, Unanswered> {
+    let asked = req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/");
+    let uri = Uri::builder().scheme(to.scheme.clone()).authority(to.authority.clone()).path_and_query(format!("{}{asked}", to.prefix));
+    *req.uri_mut() = uri.build().map_err(|_| Unanswered::Broken)?;
+    let headers = req.headers_mut();
+    for h in HOP_BY_HOP {
+        headers.remove(h);
+    }
+    headers.remove(HOST);
+    headers.remove(key_header);
+    if key_in_authorization {
+        headers.remove(AUTHORIZATION);
+    }
+    // Every gRPC call says it accepts trailers: the status of the call arrives in them.
+    headers.insert("te", HeaderValue::from_static("trailers"));
+    let xff = match headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+        Some(prior) => format!("{prior}, {}", peer.ip()),
+        None => peer.ip().to_string(),
+    };
+    if let Ok(v) = HeaderValue::from_str(&xff) {
+        headers.insert("x-forwarded-for", v);
+    }
+    if let Ok(v) = HeaderValue::from_str(&trace.traceparent) {
+        headers.insert("traceparent", v);
+    }
+    match w.grpc.request(req).await {
+        Ok(resp) => Ok(resp.map(Either::Left)),
+        Err(e) if e.is_connect() => Err(Unanswered::Refused),
+        Err(_) => Err(Unanswered::Broken),
+    }
+}
+
 /// One of the gateway's own endpoints, answered here.
 #[derive(Debug, PartialEq)]
 enum Own<'a> {
@@ -971,9 +1136,19 @@ pub async fn handle(w: Arc<Worker>, peer: SocketAddr, mut req: Request<Incoming>
             return Ok(relay_websocket(&w, &r, req).await);
         }
     }
-    let decision = match trusted {
-        true => decide(&snap, peer, &req, now, |digest| st.denied.lock().unwrap().holds(digest, generation, started)),
-        false => Decision::Ask(None),
+    let mut key_in_authorization = false;
+    let decision = if is_grpc(&req) {
+        match admit_grpc(&snap, peer, &req, now, trusted) {
+            Ok(call) => {
+                key_in_authorization = call.key_in_authorization;
+                Decision::Native(call.native)
+            }
+            Err(refusal) => return Ok(grpc_refused(&w, &refusal, peer, &req, started, at)),
+        }
+    } else if trusted {
+        decide(&snap, peer, &req, now, |digest| st.denied.lock().unwrap().holds(digest, generation, started))
+    } else {
+        Decision::Ask(None)
     };
     let n = match decision {
         Decision::Native(n) => n,
@@ -1004,7 +1179,8 @@ pub async fn handle(w: Arc<Worker>, peer: SocketAddr, mut req: Request<Incoming>
     // Where the Python gateway looks inside the body, so does this side, before anything is
     // counted. A body that is certain to pass goes on; anything else is the Python gateway's to
     // answer, in its own words, so the request is handed over whole.
-    if refused.is_none() && snap.boundary.reads_body(n.method, path) {
+    let grpc = n.protocol == Protocol::Grpc;
+    if refused.is_none() && !grpc && snap.boundary.reads_body(n.method, path) {
         match req.body().size_hint().exact() {
             Some(0) => {}
             Some(len) if len <= snap.boundary.max_body(n.method, path) => {
@@ -1051,7 +1227,11 @@ pub async fn handle(w: Arc<Worker>, peer: SocketAddr, mut req: Request<Incoming>
                         protocol: n.protocol,
                         path: Some(upstream_path(path, n.protocol)).filter(|p| *p != path),
                     };
-                    match forward(&w, &backend.upstream, peer, req, Some(native), Some(snap.upstream_timeout)).await {
+                    let answer = match grpc {
+                        true => forward_grpc(&w, &backend.upstream, peer, req, &t, &snap.key_header, key_in_authorization).await,
+                        false => forward(&w, &backend.upstream, peer, req, Some(native), Some(snap.upstream_timeout)).await,
+                    };
+                    match answer {
                         Ok(resp) => {
                             if let Some(tr) = backend.breaker.success(&cb) {
                                 announce(st, backend, &cb, tr);
@@ -1131,6 +1311,11 @@ pub async fn handle(w: Arc<Worker>, peer: SocketAddr, mut req: Request<Incoming>
             user_agent,
             referrer: referrer.as_ref().and_then(|v| v.to_str().ok()),
         }));
+    }
+    // A gRPC client reads a refusal in gRPC's own form; it was counted and logged above as the
+    // HTTP answer it stands for.
+    if let Some(error) = error.filter(|_| grpc) {
+        resp = GrpcRefusal::for_error(error).onto(resp);
     }
     Ok(resp)
 }
@@ -1862,6 +2047,97 @@ mod tests {
         let scoped = governed(WS, r#","allowed_paths":{"rules":[["under","/ws/chat"]],"patterns_json":"[\"/ws/chat\"]"}"#);
         assert!(relay(&scoped, &req, 100).is_some());
         assert!(relay(&scoped, &handshake("/ws/other", &[("x-api-key", KEY)]), 100).is_none());
+    }
+
+    const GRPC: &str = r#","grpc":"http://127.0.0.1:50051""#;
+
+    fn rpc(path: &str, headers: &[(&str, &str)]) -> Request<()> {
+        let mut b = Request::builder().method("POST").uri(path).version(Version::HTTP_2).header("content-type", "application/grpc");
+        for (k, v) in headers {
+            b = b.header(*k, *v);
+        }
+        b.body(()).unwrap()
+    }
+
+    #[test]
+    fn a_grpc_call_is_told_by_its_content_type_over_http2() {
+        assert!(is_grpc(&rpc("/pkg.Service/Method", &[])));
+        for kind in ["application/grpc+proto", "application/grpc+json", "application/grpc;charset=utf-8"] {
+            let req = Request::builder().method("POST").uri("/a/b").version(Version::HTTP_2).header("content-type", kind).body(()).unwrap();
+            assert!(is_grpc(&req), "{kind}");
+        }
+        for kind in ["application/grpc-web", "application/grpc-web+proto", "application/grpcx", "application/json"] {
+            let req = Request::builder().method("POST").uri("/a/b").version(Version::HTTP_2).header("content-type", kind).body(()).unwrap();
+            assert!(!is_grpc(&req), "{kind}");
+        }
+        // Not over HTTP/1, and not with another method.
+        assert!(!is_grpc(&Request::builder().method("POST").uri("/a/b").header("content-type", "application/grpc").body(()).unwrap()));
+        assert!(!is_grpc(&Request::builder().uri("/a/b").version(Version::HTTP_2).header("content-type", "application/grpc").body(()).unwrap()));
+    }
+
+    fn admitted(snap: &Snapshot, req: &Request<()>, now: u64, trusted: bool) -> Result<bool, GrpcRefusal> {
+        admit_grpc(snap, peer(), req, now, trusted).map(|call| call.key_in_authorization)
+    }
+
+    #[test]
+    fn a_grpc_call_with_a_working_key_goes_to_the_grpc_backend() {
+        let snap = governed(GRPC, "");
+        let call = admit_grpc(&snap, peer(), &rpc("/pkg.Service/Method", &[("x-api-key", KEY)]), 100, true).ok().unwrap();
+        assert_eq!(call.native.protocol, Protocol::Grpc);
+        assert_eq!(call.native.backend.unwrap().upstream.text, "http://127.0.0.1:50051");
+        assert!(!call.key_in_authorization);
+        let bearer = format!("Bearer {KEY}");
+        assert_eq!(admitted(&snap, &rpc("/pkg.Service/Method", &[("authorization", &bearer)]), 100, true), Ok(true));
+        // With both, the key is the one in its own header and the other is the caller's own.
+        assert_eq!(admitted(&snap, &rpc("/a/b", &[("x-api-key", KEY), ("authorization", "Bearer theirs")]), 100, true), Ok(false));
+    }
+
+    #[test]
+    fn a_grpc_call_this_side_cannot_be_sure_of_is_refused() {
+        let with_key = rpc("/pkg.Service/Method", &[("x-api-key", KEY)]);
+        let snap = governed(GRPC, "");
+        assert_eq!(admitted(&snap, &with_key, 100, false), Err(GrpcRefusal::NOT_READY));
+        assert_eq!(admitted(&governed("", ""), &with_key, 100, true), Err(GrpcRefusal::NOT_CONFIGURED));
+        assert_eq!(admitted(&governed(r#","grpc":"https://secure.example:443""#, ""), &with_key, 100, true), Err(GrpcRefusal::NOT_CONFIGURED));
+        assert_eq!(admitted(&snap, &rpc("/pkg.Service/Method", &[]), 100, true), Err(GrpcRefusal::NO_KEY));
+        assert_eq!(admitted(&snap, &rpc("/pkg.Service/Method", &[("x-api-key", "sk-nope")]), 100, true), Err(GrpcRefusal::BAD_KEY));
+        assert_eq!(admitted(&snap, &rpc("/pkg.Service/Method", &[("authorization", "Bearer sk-nope")]), 100, true), Err(GrpcRefusal::BAD_KEY));
+        assert_eq!(admitted(&snap, &rpc("/pkg.Service/M%65thod", &[("x-api-key", KEY)]), 100, true), Err(GrpcRefusal::DENIED));
+        // A key that is off or expired (there is no second opinion to ask, so none on the margin).
+        for key_extra in [r#","is_active":false"#, r#","expires_at":100"#, r#","expires_at":99"#] {
+            assert_eq!(admitted(&governed(GRPC, key_extra), &with_key, 100, true), Err(GrpcRefusal::BAD_KEY), "{key_extra}");
+        }
+        assert_eq!(admitted(&governed(GRPC, r#","expires_at":101"#), &with_key, 100, true), Ok(false));
+        assert_eq!(admitted(&governed(GRPC, r#","native_ok":false"#), &with_key, 100, true), Err(GrpcRefusal::NOT_APPLICABLE));
+    }
+
+    #[test]
+    fn a_grpc_key_only_reaches_its_allowed_methods() {
+        let snap = governed(GRPC, r#","allowed_paths":{"rules":[["under","/pkg.Service"]],"patterns_json":"[\"/pkg.Service\"]"}"#);
+        let at = Duration::from_secs(100);
+        let allowed = rpc("/pkg.Service/Method", &[("x-api-key", KEY)]);
+        let call = admit_grpc(&snap, peer(), &allowed, 100, true).ok().unwrap();
+        assert!(refusal(&snap, &call.native, allowed.uri().path(), at).is_none());
+        let other = rpc("/pkg.Other/Method", &[("x-api-key", KEY)]);
+        let call = admit_grpc(&snap, peer(), &other, 100, true).ok().unwrap();
+        assert!(matches!(refusal(&snap, &call.native, other.uri().path(), at), Some(Refusal::Scope(_))));
+    }
+
+    #[test]
+    fn a_grpc_refusal_is_one_a_grpc_client_reads() {
+        let t = trace_for(&HeaderMap::new());
+        let mut made = rate_limited("minute", 3, 60, None, &t);
+        stamp(&mut made, &t, 0.001, None);
+        let resp = GrpcRefusal::for_error("RATE_LIMIT_EXCEEDED").onto(made);
+        assert_eq!(resp.status(), StatusCode::OK);
+        let h = resp.headers();
+        assert_eq!((h["content-type"].as_bytes(), h["grpc-status"].as_bytes()), (&b"application/grpc"[..], &b"8"[..]));
+        assert_eq!(h["grpc-message"], "rate limit exceeded");
+        assert!(h.contains_key("retry-after") && h.contains_key("x-request-id") && !h.contains_key("content-length"));
+        assert_eq!(resp.body().size_hint().exact(), Some(0));
+        assert_eq!(GrpcRefusal::for_error("AUTHORIZATION_ERROR").code, 7);
+        assert_eq!(GrpcRefusal::for_error("SERVICE_UNAVAILABLE").code, 14);
+        assert_eq!(GrpcRefusal::for_error("BACKEND_ERROR").code, 14);
     }
 
     #[test]

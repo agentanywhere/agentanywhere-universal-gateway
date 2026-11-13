@@ -123,6 +123,79 @@ def websocket_backend():
     return f"ws://127.0.0.1:{server.socket.getsockname()[1]}/base"
 
 
+def grpc_backend():
+    """A local gRPC server that needs no generated code: messages are raw bytes. `Say` answers with
+    what it was sent; `Who` with the metadata it saw; `Fail` with NOT_FOUND and a trailer; `Count`
+    streams that many messages; `Slow` streams one every 0.1 s for 5 s; `Total` takes a stream and
+    answers with its size; `Chat` answers each message of a stream as it arrives. Returns (server, port).
+    It runs in a process of its own (`run.py --grpc-backend`), which says its port and serves until ended."""
+    import grpc
+    from concurrent import futures
+
+    def who(request, context):
+        seen = dict(context.invocation_metadata())
+        return json.dumps({**{k: seen.get(k) for k in ("authorization", "x-api-key", "x-forwarded-for", "tenant")},
+                           "traced": "traceparent" in seen}).encode()
+
+    def fail(request, context):
+        context.set_trailing_metadata((("reason-code", "r-17"),))
+        context.abort(grpc.StatusCode.NOT_FOUND, "no such thing")
+
+    def count(request, context):
+        for i in range(int(request)):
+            yield str(i).encode()
+
+    def slow(request, context):
+        for _ in range(50):
+            time.sleep(0.1)
+            yield b"."
+
+    def chat(requests, context):
+        for message in requests:
+            yield message.upper()
+
+    handlers = {
+        "Say": grpc.unary_unary_rpc_method_handler(lambda request, context: request),
+        "Who": grpc.unary_unary_rpc_method_handler(who),
+        "Fail": grpc.unary_unary_rpc_method_handler(fail),
+        "Count": grpc.unary_stream_rpc_method_handler(count),
+        "Slow": grpc.unary_stream_rpc_method_handler(slow),
+        "Total": grpc.stream_unary_rpc_method_handler(lambda requests, context: str(sum(len(m) for m in requests)).encode()),
+        "Chat": grpc.stream_stream_rpc_method_handler(chat),
+    }
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=16), options=GRPC_SIZES)
+    server.add_generic_rpc_handlers((grpc.method_handlers_generic_handler("conf.Echo", handlers),))
+    port = server.add_insecure_port("127.0.0.1:0")
+    server.start()
+    return server, port
+
+
+GRPC_SIZES = [("grpc.max_receive_message_length", 16 << 20), ("grpc.max_send_message_length", 16 << 20)]
+
+
+def grpc_call(target, kind, method, request, metadata=(), timeout=10):
+    """One gRPC call. Returns its status name, what was answered (a list for a stream), the
+    status message, and the metadata received before and after."""
+    import grpc
+
+    with grpc.insecure_channel(target, options=GRPC_SIZES) as channel:
+        path, md = f"/conf.Echo/{method}", tuple(metadata)
+        try:
+            if kind == "unary":
+                answer, call = channel.unary_unary(path).with_call(request, metadata=md, timeout=timeout)
+            elif kind == "client-stream":
+                answer, call = channel.stream_unary(path).with_call(iter(request), metadata=md, timeout=timeout)
+            else:
+                multi = channel.unary_stream(path) if kind == "server-stream" else channel.stream_stream(path)
+                call = multi(request if kind == "server-stream" else iter(request), metadata=md, timeout=timeout)
+                answer = list(call)
+            return {"code": call.code().name, "answer": answer, "details": call.details(),
+                    "before": dict(call.initial_metadata()), "after": dict(call.trailing_metadata())}
+        except grpc.RpcError as e:
+            return {"code": e.code().name, "answer": None, "details": e.details(),
+                    "before": dict(e.initial_metadata() or ()), "after": dict(e.trailing_metadata() or ())}
+
+
 def main() -> int:
     if not BIN.exists():
         print(f"build first: cargo build --release  (in {BIN.parent.parent.parent})")
@@ -131,12 +204,14 @@ def main() -> int:
     admin = secrets.token_urlsafe(32)
     procs = []
     agents = protocol_backend()
+    grpc_server = subprocess.Popen([sys.executable, __file__, "--grpc-backend"], stdout=subprocess.PIPE, text=True)
+    grpc_port = int(grpc_server.stdout.readline())
     with tempfile.TemporaryDirectory() as tmp:
         env = {**os.environ, "SECRET_KEY": secrets.token_urlsafe(48), "ADMIN_TOKEN": admin,
                "DATABASE_URL": f"sqlite+aiosqlite:///{tmp}/g.db", "HTTP_BACKEND_URL": f"http://127.0.0.1:{bport}",
                "REDIS_ENABLED": "false", "LOG_LEVEL": "WARNING", "STARTUP_BANNER": "false", "DEBUG": "false",
                "TRUSTED_PROXIES": "127.0.0.1", "DATAPLANE_TOKEN": "conformance-token",
-               "WEBSOCKET_BACKEND_URL": websocket_backend(),
+               "WEBSOCKET_BACKEND_URL": websocket_backend(), "GRPC_BACKEND_URL": f"127.0.0.1:{grpc_port}",
                "MCP_BACKEND_URL": agents, "A2A_BACKEND_URL": agents, "AG_UI_BACKEND_URL": agents, "ACP_BACKEND_URL": agents,
                "CIRCUIT_BREAKER_TIMEOUT": "2", "DEFAULT_TIMEOUT": "2"}  # short, so the breaker and timeout scenarios can wait them out
 
@@ -846,6 +921,83 @@ def main() -> int:
                 r = httpx.get(f"{rs}/api/users", headers={"X-API-Key": keys["rs"]["key"]}, timeout=10)
                 check("HTTP/1.1 is still spoken to those who speak it", r.http_version == "HTTP/1.1" and r.status_code == 200, r.http_version)
 
+            # --- gRPC --------------------------------------------------------------------------------
+            # The Python gateway does not speak HTTP/2, so there is no second plane to compare with:
+            # each call through the data plane is compared with the same call made to the backend itself.
+            print()
+            direct, through = f"127.0.0.1:{grpc_port}", f"127.0.0.1:{dport}"
+            rs_key = (("x-api-key", keys["rs"]["key"]),)
+
+            def grpc_same(name, kind, method, request, want=None, metadata=rs_key, **kw):
+                a = grpc_call(direct, kind, method, request, **kw)
+                b = grpc_call(through, kind, method, request, metadata, **kw)
+                same_answer = all(a[k] == b[k] for k in ("code", "answer", "details"))
+                ok = same_answer and (want is None or want(b)) and b["before"].get("x-served-by", b["after"].get("x-served-by")) == "dataplane"
+                shown = f"{b['code']} {str(b['answer'])[:70]}" if same_answer else f"backend {a['code']} {str(a['answer'])[:50]} vs gateway {b['code']} {b['details']} {str(b['answer'])[:50]}"
+                check(f"gRPC: {name}", ok, shown)
+                return b
+
+            def grpc_refused(name, code, message, metadata=(), method="Say"):
+                b = grpc_call(through, "unary", method, b"hello", metadata)
+                check(f"gRPC: {name}", (b["code"], b["details"]) == (code, message) and "x-request-id" in {**b["before"], **b["after"]},
+                      f"{b['code']}: {b['details']}")
+                return b
+
+            grpc_same("a call is answered as the backend answers it", "unary", "Say", b"hello", want=lambda r: r["answer"] == b"hello")
+            grpc_same("a 3 MB message goes both ways whole", "unary", "Say", b"x" * 3_000_000, want=lambda r: len(r["answer"]) == 3_000_000)
+            grpc_same("a stream from the server", "server-stream", "Count", b"25", want=lambda r: len(r["answer"]) == 25)
+            grpc_same("a stream from the client", "client-stream", "Total", [b"ab", b"cde", b"f" * 1000], want=lambda r: r["answer"] == b"1005")
+            grpc_same("a stream both ways", "bidi", "Chat", [b"one", b"two", b"three"], want=lambda r: r["answer"] == [b"ONE", b"TWO", b"THREE"])
+            b = grpc_same("the backend's own error, its message and its trailer arrive", "unary", "Fail", b"",
+                          want=lambda r: (r["code"], r["details"], r["after"].get("reason-code")) == ("NOT_FOUND", "no such thing", "r-17"))
+            grpc_same("a method the backend does not have is the backend's to refuse", "unary", "Nope", b"", want=lambda r: r["code"] == "UNIMPLEMENTED")
+            b = grpc_call(through, "unary", "Who", b"", rs_key + (("authorization", "Bearer theirs"), ("tenant", "blue")))
+            seen = json.loads(b["answer"] or b"{}")
+            check("gRPC: the backend sees the caller's metadata and address, never the gateway's key",
+                  seen.get("authorization") == "Bearer theirs" and seen.get("x-api-key") is None and seen.get("tenant") == "blue"
+                  and seen.get("x-forwarded-for") == "127.0.0.1" and seen.get("traced") is True, str(seen))
+            b = grpc_call(through, "unary", "Who", b"", (("authorization", f"Bearer {keys['rs']['key']}"),))
+            seen = json.loads(b["answer"] or b"{}")
+            check("gRPC: a key sent as a Bearer token works, and stays here too",
+                  b["code"] == "OK" and seen.get("authorization") is None and seen.get("x-api-key") is None, f"{b['code']} {seen}")
+            b = grpc_call(through, "server-stream", "Slow", b"", rs_key, timeout=0.6)
+            check("gRPC: the caller's deadline ends a call that is still streaming", b["code"] == "DEADLINE_EXCEEDED", b["code"])
+            grpc_same("and the next call is served", "unary", "Say", b"after", want=lambda r: r["answer"] == b"after")
+
+            grpc_refused("without a key the call is refused", "UNAUTHENTICATED", "API key required")
+            grpc_refused("with a wrong key the call is refused", "UNAUTHENTICATED", "invalid API key", (("x-api-key", "sk-nope"),))
+            grpc_refused("a key not allowed this method is refused", "PERMISSION_DENIED", "access denied", (("x-api-key", scoped["rs"]["key"]),))
+            only_say = httpx.post(f"{py}/admin/api-keys", headers=adm, timeout=10, params={
+                "name": "conf-grpc-say", "rate_limit_per_minute": 3, "rate_limit_per_hour": 1000, "allowed_paths": "/conf.Echo/Say"}).json()
+            say_key = (("x-api-key", only_say["key"]),)
+            got = wait_until(lambda: grpc_call(through, "unary", "Who", b"", say_key)["code"] == "PERMISSION_DENIED")
+            check("gRPC: a key made for one method becomes known, and is refused the others", got is not None)
+            codes = [grpc_call(through, "unary", "Say", b"hi", say_key)["code"] for _ in range(4)]
+            check("gRPC: the key's rate limit applies (refusals do not count against it)", codes == ["OK", "OK", "OK", "RESOURCE_EXHAUSTED"], str(codes))
+            b = grpc_refused("a rate-limited call says so", "RESOURCE_EXHAUSTED", "rate limit exceeded", say_key)
+            check("gRPC: and says when to come back", {**b["before"], **b["after"]}.get("retry-after") == "60")
+            b = over2("/conf.Echo/Say", {"X-API-Key": "{key}", "Content-Type": "application/grpc-web"}, "POST")
+            check("gRPC: gRPC-Web is not gRPC and is left to Python", b.headers.get("x-served-by") != "dataplane" and "grpc-status" not in b.headers,
+                  f"[{b.status_code}]") if shutil.which("curl") else None
+
+            # Counted and logged like any request served here, under the method called.
+            time.sleep(2.0)
+            counted = metric("gateway_requests_total", method="POST", path="/conf.Echo/Count", status_code="200")
+            check("gRPC: calls are counted in gateway_requests_total", counted == 1, f"{counted:.0f}")
+            logs = httpx.get(f"{py}/admin/logs", params={"limit": 1000, "path": "/conf.Echo/Say"}, headers=adm, timeout=10).json()["logs"]
+            limited = [l for l in logs if l.get("status_code", l.get("status")) == 429]
+            check("gRPC: calls are logged with their key, refusals under the status they stand for",
+                  any(l.get("api_key_id") == keys["rs"]["id"] for l in logs) and len(limited) >= 1, f"{len(logs)} rows, {len(limited)} limited")
+
+            # The backend goes away: the caller is told so, in gRPC's terms.
+            grpc_server.terminate()
+            grpc_server.wait(timeout=10)
+            b = grpc_call(through, "unary", "Say", b"hello", rs_key)
+            check("gRPC: with the backend down the call is UNAVAILABLE", (b["code"], b["details"]) == ("UNAVAILABLE", "the backend is unavailable"),
+                  f"{b['code']}: {b['details']}")
+            r = httpx.get(f"{rs}/api/users", headers={"X-API-Key": keys["rs"]["key"]}, timeout=10)
+            check("ordinary requests are unaffected", r.status_code == 200 and said_by(r) == "data plane")
+
             # --- the gateway's own endpoints ---------------------------------------------------------
             print()
             import re
@@ -911,6 +1063,9 @@ def main() -> int:
             h, r, l = (httpx.get(f"{rs}{path}", timeout=10) for path in ("/health", "/ready", "/live"))
             check("with the control plane down, health and ready stop saying yes",
                   h.status_code >= 500 and r.status_code >= 500, f"[{h.status_code}, {r.status_code}]")
+            b = grpc_call(f"127.0.0.1:{dport}", "unary", "Say", b"hello", (("x-api-key", keys["rs"]["key"]),))
+            check("with the control plane down, gRPC calls are refused (there is no one to ask)",
+                  (b["code"], b["details"]) == ("UNAVAILABLE", "the gateway is not ready"), f"{b['code']}: {b['details']}")
             check("with the control plane down, the data plane still says it is alive",
                   l.status_code == 200 and said_by(l) == "data plane" and l.json() == {"status": "alive", "pid": procs[2].pid}, f"[{l.status_code}]")
 
@@ -919,6 +1074,7 @@ def main() -> int:
             print(f"\n{'ALL PASS' if not failures else str(failures) + ' FAILED'}")
             return 1 if failures else 0
         finally:
+            grpc_server.kill()
             for p in reversed(procs):
                 p.send_signal(signal.SIGTERM)
             for p in procs:
@@ -929,4 +1085,9 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    if sys.argv[1:] == ["--grpc-backend"]:
+        _server, _port = grpc_backend()
+        print(_port, flush=True)
+        _server.wait_for_termination()
+        sys.exit(0)
     sys.exit(main())

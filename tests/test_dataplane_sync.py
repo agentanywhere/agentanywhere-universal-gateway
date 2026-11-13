@@ -806,3 +806,15 @@ async def test_the_snapshot_names_the_websocket_backend_only_when_the_data_plane
     monkeypatch.setattr(get_settings(), "api_key_header", "X-API-Key")
     assert dataplane_sync._websocket(get_settings(), governed=True) is None
     assert dataplane_sync._websocket(get_settings(), governed=False) == "ws://b:7000/base"
+
+
+async def test_the_snapshot_names_the_grpc_backend_when_it_is_a_plain_address(db_session, monkeypatch):
+    async def named():
+        return (await dataplane_sync.build_snapshot(db_session))["grpc"]
+
+    for target, want in ((None, None), ("", None), ("localhost:50051", "http://localhost:50051"),
+                         ("http://grpc.internal:9000/", "http://grpc.internal:9000"), ("[::1]:50051", "http://[::1]:50051"),
+                         ("dns:///grpc.internal:9000", None), ("unix:/tmp/grpc.sock", None), ("https://grpc.internal:443", None),
+                         ("grpc.internal", None), ("b\u00e9:1", None), ("host:50051/path", None)):
+        monkeypatch.setattr(get_settings(), "grpc_backend_url", target)
+        assert await named() == want, target

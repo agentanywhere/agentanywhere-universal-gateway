@@ -104,6 +104,10 @@ pub struct Snapshot {
     pub websocket_url: Option<String>,
     /// The backend at that address, filled in when the snapshot is put to use.
     pub websocket: Option<Arc<Backend>>,
+    /// The gRPC server calls are relayed to (an `http://` address spoken to in HTTP/2).
+    pub grpc_url: Option<String>,
+    /// The backend at that address, filled in when the snapshot is put to use.
+    pub grpc: Option<Arc<Backend>>,
 }
 
 /// The gateway's health endpoint, as the Python gateway serves it.
@@ -154,6 +158,7 @@ struct SnapshotFile {
     refusals: Option<Refusals>,
     ops: Option<Ops>,
     websocket: Option<String>,
+    grpc: Option<String>,
     ready: Option<Readiness>,
     #[serde(default)]
     keys: Vec<KeyRecord>,
@@ -446,6 +451,8 @@ impl Snapshot {
             ops: file.ops,
             websocket_url: file.websocket.filter(|u| u.starts_with("ws://")),
             websocket: None,
+            grpc_url: file.grpc.filter(|u| u.starts_with("http://")),
+            grpc: None,
             inject_request_id: file.inject_request_id,
             revision: file.revision,
             api_versions,
