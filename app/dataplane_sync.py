@@ -15,8 +15,8 @@ plugins turn native serving off for every path. When in doubt the answer is "ask
 which is always correct and only slower.
 
 A key may arrive in the configured header or as ``Authorization: Bearer``; the data plane reads both as
-this gateway does. An OAuth2 access token is listed by its digest and accepted there too, unless an IP rule
-or policy is in force (see ``_tokens``). It also answers the 401 for a request with no credential, and for a credential this
+this gateway does. An OAuth2 access token is listed by its digest and accepted there too, under the IP rules
+and policies as here (see ``_tokens``). It also answers the 401 for a request with no credential, and for a credential this
 gateway has just refused (it learns that from the ``X-Dataplane-Auth`` response header, never from the
 snapshot, so a key created a moment ago is never refused by mistake). The wording comes from here.
 
@@ -139,15 +139,13 @@ def _agents() -> Dict[str, str]:
             if isinstance(slug, str) and isinstance(base, str) and _AGENT_SLUG.fullmatch(slug) and _AGENT_UPSTREAM.fullmatch(base)}
 
 
-def _tokens(settings, governed: bool) -> list:
+def _tokens(settings) -> list:
     """The OAuth2 access tokens this gateway accepts as credentials (``Authorization: Bearer <token>``),
-    each by its SHA-256 digest, never the token itself. A token is let in without the checks a key
-    goes through (allowed paths, IP rules, policies) and has no tenant; its limits are the
-    gateway's defaults. So that the data plane never has to pass over a rule, none is listed while
-    any IP rule or policy is in force: those requests stay here. Tokens live in this process's
-    memory, so only the ones this worker issued are known here."""
-    if governed:
-        return []
+    each by its SHA-256 digest, never the token itself. A token's caller goes through the IP
+    rules and the policies as a key's does, with no key id and no tenant: the global rules apply,
+    the ones scoped to a key or a tenant do not. It has no allowed paths, and its limits are the
+    gateway's defaults. Tokens live in this process's memory, so only the ones this worker issued
+    are known here."""
     from app.api_key_cache import hash_key
     from app.oauth2 import oauth2_manager
 
@@ -733,7 +731,7 @@ async def build_snapshot(db: AsyncSession) -> Dict[str, Any]:
         "cross_origin": _cross_origin(),
         "error_pages": _error_pages(),
         "transform_rules": transform_rules,
-        "tokens": _tokens(settings, bool(rules) or bool(policy_rows)),
+        "tokens": _tokens(settings),
     }
     snap["revision"] = hashlib.sha256(json.dumps(snap, sort_keys=True).encode()).hexdigest()
     return snap

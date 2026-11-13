@@ -1075,9 +1075,9 @@ async def test_the_snapshot_lists_the_oauth2_tokens_accepted_as_credentials(db_s
         "rate_limit_per_minute": settings.rate_limit_per_minute, "rate_limit_per_hour": settings.rate_limit_per_hour,
     }]
     assert "tok-live" not in json.dumps(await dataplane_sync.build_snapshot(db_session))
-    # A token passes over IP rules and policies here; the data plane is never asked to do that.
+    # A token's caller goes through the IP rules and policies on both planes, so it stays listed.
     await create_ip_rule(db_session, cidr="203.0.113.0/24", action="deny")
-    assert await listed() == []
+    assert len(await listed()) == 1
 
 
 async def test_a_native_rate_limit_refusal_of_a_token_is_announced_as_our_own_is(db_session, announced):

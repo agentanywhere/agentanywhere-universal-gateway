@@ -815,8 +815,8 @@ mod tests {
         assert_eq!((&*tenant.id, tenant.minute, tenant.hour), ("acme", Some(2), None));
         let scope = e.scope.as_ref().unwrap();
         assert!(scope.allows("/api/users/7") && scope.allows("/api/public") && !scope.allows("/api/orders"));
-        assert!(snap.ip_rules.blocking("10.1.2.3".parse().unwrap(), Some("acme"), "k1").is_some());
-        assert!(snap.ip_rules.blocking("10.1.2.3".parse().unwrap(), None, "k1").is_none());
+        assert!(snap.ip_rules.blocking("10.1.2.3".parse().unwrap(), Some("acme"), Some("k1")).is_some());
+        assert!(snap.ip_rules.blocking("10.1.2.3".parse().unwrap(), None, Some("k1")).is_none());
         assert_eq!(snap.policies.len(), 1);
         assert_eq!(snap.trusted_proxies.len(), 1);
         // The database already holds the tenant's two requests for the minute starting at 600.

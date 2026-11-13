@@ -150,11 +150,12 @@ to the Python gateway, which relays or refuses as it always does.
 
 **OAuth2 tokens.** An access token the Python gateway issued is a credential in `Authorization: Bearer <token>`, and
 the snapshot lists each by its SHA-256 digest, never the token. One that is listed and has not run out is served here
-under the gateway's default limits, as the Python gateway serves it: no tenant, no allowed paths. The Python gateway
-also lets a token past its IP rules and policies. This side passes over no rule, so while any IP rule or policy is in
-force no token is listed and a token's requests go to the Python gateway. A token sent beside a key header, one that
-has run out, and one issued a moment ago are the Python gateway's to decide; a revoked one is refused within about one
-sync interval. Tokens are relayed neither for gRPC nor for WebSocket.
+under the gateway's default limits, as the Python gateway serves it: no tenant, no allowed paths. Its caller goes
+through the IP rules and the policies as a key's does, on both planes: the global rules apply, and those scoped to a
+key or a tenant do not, since a token has neither. A token sent beside a key header, one that has run out, and one
+issued a moment ago are the Python gateway's to decide; a revoked one is refused within about one sync interval. On a
+gRPC call a token in `authorization` is a credential too, and reaches the backend as the caller's own. A WebSocket
+handshake is not let in on a token alone by the Python gateway, so none is relayed here on one.
 
 **MCP tool schemas.** A tool that comes from a registered OpenAPI document has a JSON Schema, and the Python gateway
 validates a `tools/call`'s arguments against it. The snapshot carries the schemas, and this side forwards a call whose
@@ -277,8 +278,8 @@ here is the reverse of everywhere else: **whatever this side cannot be sure of i
 | MCP `tools/call` whose arguments do not fit, or might not; a schema with a keyword this side does not follow; custom injection patterns | Python |
 | A key sent as `Authorization: Bearer <key>` | data plane |
 | No credential; a credential Python refused in the last ten seconds; a key clearly past its expiry | data plane (401) |
-| An OAuth2 token in `Authorization: Bearer`, listed in the snapshot, no IP rules or policies | data plane |
-| A credential seen for the first time; an OAuth2 token while an IP rule or policy is in force; two credentials of which the key does not work | Python |
+| An OAuth2 token in `Authorization: Bearer`, listed in the snapshot, under the IP rules and policies | data plane |
+| A credential seen for the first time; two credentials of which the key does not work | Python |
 | Browsers | data plane, with the gateway's error pages |
 | WebSocket under `/ws/`, key in `X-API-Key`, no IP rules or policies | data plane |
 | Any other WebSocket (`?api_key=`, `/agents/<slug>`, rules or policies in force) | Python, through a tunnel |

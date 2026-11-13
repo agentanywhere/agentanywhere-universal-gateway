@@ -713,11 +713,11 @@ fn decide<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, now: u6
     let invalid = snap.refusals.as_ref().filter(|_| only_credential).map(|r| &r.invalid_key);
     // What is not a key may be an OAuth2 token, which the Python gateway looks for in
     // `Authorization` once the key has failed. With a key header as well, which of the two lets
-    // the request in is its to say. A token passes over IP rules and policies there; this side
-    // passes over none, so with any in force the request is handed over. One that has run out
-    // is treated as unknown: the Python gateway refuses it first.
+    // the request in is its to say. A token's caller goes through the IP rules and policies
+    // like a key's, further down. One that has run out is treated as unknown: the Python
+    // gateway refuses it first.
     let token = || match (own, authorization) {
-        (None, Some(value)) if snap.ip_rules.is_empty() && snap.policies.is_empty() => bearer_token(value)
+        (None, Some(value)) => bearer_token(value)
             .and_then(|token| snap.tokens.get(&hash_key(token)))
             .filter(|t| t.expires_at.is_some_and(|e| (now as i64) < e)),
         _ => None,
@@ -1204,10 +1204,19 @@ fn admit_grpc<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, now
     if credential.is_empty() || !credential.is_ascii() {
         return Err(GrpcRefusal::BAD_KEY);
     }
-    let entry = snap.keys.get(&hash_key(&credential)).ok_or(GrpcRefusal::BAD_KEY)?;
+    // A key, or failing that an OAuth2 token, which arrives in `authorization` alone, as over HTTP.
+    let token = || match (header(&snap.key_header), header(&AUTHORIZATION)) {
+        (None, Some(value)) => bearer_token(value).and_then(|token| snap.tokens.get(&hash_key(token))),
+        _ => None,
+    };
+    let key = snap.keys.get(&hash_key(&credential));
+    let entry = key.or_else(token).ok_or(GrpcRefusal::BAD_KEY)?;
     if !entry.is_active || entry.expires_at.is_some_and(|e| e <= now as i64) {
         return Err(GrpcRefusal::BAD_KEY);
     }
+    // The gateway's key is not the backend's to see; a token is the caller's own with whoever
+    // issued it, and goes through as it does over HTTP.
+    let key_in_authorization = key_in_authorization && key.is_some();
     // Rules this side cannot apply: to this key, or (a transformation rule, a plugin that alters
     // requests) to every request.
     if !entry.native_ok || snap.fallthrough_prefixes.iter().any(|p| path.starts_with(p.as_str())) || snap.transformed("POST", path, path) {
@@ -1348,7 +1357,9 @@ fn refusal<'a>(snap: &'a Snapshot, n: &Native<'a>, path: &str, at: Duration) -> 
         return Some(Refusal::Scope(scope));
     }
     let tenant = n.entry.tenant.as_ref().map(|t| &*t.id);
-    if let Some(rule) = snap.ip_rules.blocking(n.ip, tenant, &n.entry.id) {
+    // A token is no key: the id its requests are counted under names no key's rules.
+    let key_id = n.entry.token.is_none().then_some(&*n.entry.id);
+    if let Some(rule) = snap.ip_rules.blocking(n.ip, tenant, key_id) {
         return Some(Refusal::Ip(rule));
     }
     if snap.policies.is_empty() {
@@ -2458,17 +2469,31 @@ mod tests {
     }
 
     #[test]
-    fn with_a_rule_or_a_policy_in_force_a_token_is_handed_over() {
+    fn a_token_is_served_here_under_the_rules_but_no_keys_rules() {
         let req = with_headers(&[("authorization", "Bearer tok-abc")]);
         let rule = r#","ip_rules":[{"scope":"global","allow":false,"net":"198.51.100.0/24","details_json":"{}"}]"#;
         let keyed = r#","ip_rules":[{"scope":"api_key","scope_id":"k9","allow":true,"net":"198.51.100.0/24","details_json":"{}"}]"#;
         let policy = r#","policies":[{"path":null,"methods":[],"tenants":[],"cidrs":null,"time":[60,120],"deny":true,"message_json":"\"closed\"","details_json":"{}"}]"#;
         for extra in [rule, keyed, policy] {
             let snap = with_token(extra);
-            assert_eq!(outcome(&snap, &req, 0, false), "learn", "{extra}");
-            // A key is decided here all the same.
+            assert_eq!(outcome(&snap, &req, 0, false), "native", "{extra}");
             assert_eq!(outcome(&snap, &with_headers(&[("x-api-key", KEY)]), 0, false), "native", "{extra}");
         }
+        let from = |addr: &str, headers: &[(&str, &str)], extra: &str| {
+            let snap = with_token(extra);
+            let peer: SocketAddr = format!("{addr}:4000").parse().unwrap();
+            let Decision::Native(n) = decide(&snap, peer, &with_headers(headers), 0, |_| false) else { panic!("not served here") };
+            refusal(&snap, &n, "/api/users", Duration::from_secs(90 * 60)).is_some()
+        };
+        let token: &[(&str, &str)] = &[("authorization", "Bearer tok-abc")];
+        // A global rule blocks a token's caller as it blocks a key's.
+        assert!(from("198.51.100.7", token, rule) && !from("203.0.113.9", token, rule));
+        // A rule scoped to the id tokens are counted under is some key's, not theirs.
+        let named = keyed.replace("k9", "non-database-key");
+        assert!(!from("203.0.113.9", token, &named));
+        // A policy applies whoever calls.
+        let always = policy.replace("[60,120]", "[0,1440]");
+        assert!(from("203.0.113.9", token, &always) && from("203.0.113.9", &[("x-api-key", KEY)], &always));
     }
 
     #[test]

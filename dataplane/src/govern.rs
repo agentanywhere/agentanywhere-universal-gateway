@@ -148,9 +148,6 @@ pub struct IpRules {
 }
 
 impl IpRules {
-    pub fn is_empty(&self) -> bool {
-        self.global.rules.is_empty() && self.tenant.is_empty() && self.key.is_empty()
-    }
 
     pub fn add(&mut self, scope: &str, scope_id: Option<String>, rule: IpRule) -> Result<(), String> {
         let bucket = match (scope, scope_id) {
@@ -163,15 +160,16 @@ impl IpRules {
         Ok(())
     }
 
-    /// Global rules, then the tenant's, then the key's; the first scope that blocks decides.
-    pub fn blocking(&self, ip: IpAddr, tenant: Option<&str>, key_id: &str) -> Option<&IpRule> {
+    /// Global rules, then the tenant's, then the key's; the first scope that blocks decides. A
+    /// caller without a key id (an OAuth2 token's) is under no key's rules.
+    pub fn blocking(&self, ip: IpAddr, tenant: Option<&str>, key_id: Option<&str>) -> Option<&IpRule> {
         if let Some(r) = self.global.blocking(ip) {
             return Some(r);
         }
         if let Some(r) = tenant.and_then(|t| self.tenant.get(t)).and_then(|b| b.blocking(ip)) {
             return Some(r);
         }
-        self.key.get(key_id).and_then(|b| b.blocking(ip))
+        key_id.and_then(|k| self.key.get(k)).and_then(|b| b.blocking(ip))
     }
 }
 
@@ -383,7 +381,7 @@ mod tests {
         rules.add("global", None, rule(true, "10.0.0.0/8", "a1")).unwrap();
         rules.add("global", None, rule(true, "192.168.0.0/16", "a2")).unwrap();
         rules.add("global", None, rule(false, "10.6.6.0/24", "d1")).unwrap();
-        let hit = |addr: &str| rules.blocking(ip(addr), None, "k").map(|r| r.details_json.clone());
+        let hit = |addr: &str| rules.blocking(ip(addr), None, Some("k")).map(|r| r.details_json.clone());
         assert_eq!(hit("10.1.1.1"), None);
         assert_eq!(hit("192.168.4.4"), None);
         assert_eq!(hit("10.6.6.6").as_deref(), Some("{\"rule_id\":\"d1\"}"));
@@ -395,7 +393,7 @@ mod tests {
         let mut rules = IpRules::default();
         rules.add("tenant", Some("t1".into()), rule(false, "10.0.0.0/8", "t")).unwrap();
         rules.add("api_key", Some("k1".into()), rule(false, "0.0.0.0/0", "k")).unwrap();
-        let hit = |tenant: Option<&str>, key: &str| rules.blocking(ip("10.1.1.1"), tenant, key).map(|r| r.details_json.clone());
+        let hit = |tenant: Option<&str>, key: &str| rules.blocking(ip("10.1.1.1"), tenant, Some(key)).map(|r| r.details_json.clone());
         assert_eq!(hit(None, "k2"), None);
         assert_eq!(hit(Some("t1"), "k1").as_deref(), Some("{\"rule_id\":\"t\"}"));
         assert_eq!(hit(Some("t2"), "k1").as_deref(), Some("{\"rule_id\":\"k\"}"));
@@ -406,7 +404,7 @@ mod tests {
     fn an_unreadable_allow_rule_still_makes_an_allow_list() {
         let mut rules = IpRules::default();
         rules.add("global", None, rule(true, "nonsense", "a")).unwrap();
-        assert!(rules.blocking(ip("10.1.1.1"), None, "k").is_some());
+        assert!(rules.blocking(ip("10.1.1.1"), None, Some("k")).is_some());
     }
 
     #[test]

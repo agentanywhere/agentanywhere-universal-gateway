@@ -1604,17 +1604,34 @@ def main() -> int:
             t = wait_until(lambda: bearing(rs, f"Bearer {gone}").status_code == 401)
             check("OAuth2: a revoked token is refused within seconds", t is not None and t - t0 < 2.5, f"after {t - t0:.2f}s" if t else "still served")
 
-            # The Python gateway lets a token past its IP rules and policies. The data plane passes
-            # over no rule: while one is in force, a token's requests are Python's.
+            # A token's caller goes through the IP rules and policies like a key's, on both planes.
+            def token_pair(extra=None, method="GET"):
+                return tuple(httpx.request(method, f"{base}/api/routed/who", headers={"Authorization": f"Bearer {tokens[k]}", **(extra or {})}, timeout=10)
+                             for base, k in ((py, "py"), (rs, "rs")))
+
+            def served(name, pair):
+                a, b = pair
+                check(name, a.status_code == b.status_code == 200 and said_by(b) == "data plane", f"[{a.status_code} and {b.status_code}] by the {said_by(b)}")
+
+            blocked = {"X-Forwarded-For": "198.51.100.7"}
             rule = post("/admin/governance/ip-rules", {"cidr": "198.51.100.0/24", "action": "deny", "scope": "global"})
-            handed = wait_until(lambda: said_by(bearing(rs, f"Bearer {tokens['rs']}")) == "python")
-            a, b = (bearing(base, f"Bearer {tokens[k]}", {"X-Forwarded-For": "198.51.100.7"}) for base, k in ((py, "py"), (rs, "rs")))
-            check("OAuth2: with an IP rule in force, a token's requests are Python's, and both planes answer alike",
-                  handed is not None and a.status_code == b.status_code and said_by(b) == "python", f"[{a.status_code} and {b.status_code}] by {said_by(b)}")
-            r = httpx.get(f"{rs}/api/users", headers={"X-API-Key": keys["rs"]["key"]}, timeout=10)
-            check("OAuth2: and a key's are still decided here", r.status_code == 200 and said_by(r) == "data plane", f"[{r.status_code}] by {said_by(r)}")
+            assert wait_until(lambda: token_pair(blocked)[1].status_code == 403), "the rule never reached the data plane"
+            same("OAuth2: a token from an address a rule blocks (403)", *token_pair(blocked))
+            served("OAuth2: a token from another address is served, with the rule in force", token_pair({"X-Forwarded-For": "203.0.113.9"}))
             httpx.delete(f"{py}/admin/governance/ip-rules/{rule['id']}", headers=adm, timeout=10).raise_for_status()
-            check("OAuth2: with the rule removed, the token is served here again", native_token(tokens["rs"]) is not None)
+            assert wait_until(lambda: token_pair(blocked)[1].status_code == 200), "the rule never left the data plane"
+            # A rule scoped to a key is that key's; the id a token's requests are counted under names none.
+            rule = post("/admin/governance/ip-rules", {"cidr": "198.51.100.0/24", "action": "allow", "scope": "api_key", "scope_id": "non-database-key"})
+            time.sleep(1.0)
+            served("OAuth2: a rule scoped to a key does not bind a token", token_pair({"X-Forwarded-For": "203.0.113.9"}))
+            httpx.delete(f"{py}/admin/governance/ip-rules/{rule['id']}", headers=adm, timeout=10).raise_for_status()
+            policy = post("/admin/governance/policies", {"name": "conf-token-no-deletes", "priority": 10, "action": {"type": "deny", "reason": "No deletes"},
+                                                         "conditions": {"path": "/api/routed/*", "methods": ["DELETE"]}})
+            assert wait_until(lambda: token_pair(method="DELETE")[1].status_code == 403), "the policy never reached the data plane"
+            same("OAuth2: a token's request a policy denies (403)", *token_pair(method="DELETE"))
+            served("OAuth2: a token's request the policy lets through is served", token_pair())
+            httpx.delete(f"{py}/admin/governance/policies/{policy['id']}", headers=adm, timeout=10).raise_for_status()
+            assert wait_until(lambda: token_pair(method="DELETE")[1].status_code != 403), "the policy never left the data plane"
 
             # --- gRPC --------------------------------------------------------------------------------
             # The Python gateway does not speak HTTP/2, so there is no second plane to compare with:
@@ -1655,6 +1672,12 @@ def main() -> int:
             seen = json.loads(b["answer"] or b"{}")
             check("gRPC: a key sent as a Bearer token works, and stays here too",
                   b["code"] == "OK" and seen.get("authorization") is None and seen.get("x-api-key") is None, f"{b['code']} {seen}")
+            b = grpc_call(through, "unary", "Who", b"", (("authorization", f"Bearer {tokens['rs']}"),))
+            seen = json.loads(b["answer"] or b"{}")
+            check("gRPC: an OAuth2 token is a credential, and reaches the backend as the caller's own",
+                  b["code"] == "OK" and seen.get("authorization") == f"Bearer {tokens['rs']}", f"{b['code']} {str(seen)[:80]}")
+            b = grpc_call(through, "unary", "Who", b"", (("authorization", f"Bearer {tokens['rs']}x"),))
+            check("gRPC: a token nobody issued is refused", b["code"] == "UNAUTHENTICATED", f"{b['code']}: {b['details']}")
             b = grpc_call(through, "server-stream", "Slow", b"", rs_key, timeout=0.6)
             check("gRPC: the caller's deadline ends a call that is still streaming", b["code"] == "DEADLINE_EXCEEDED", b["code"])
             grpc_same("and the next call is served", "unary", "Say", b"after", want=lambda r: r["answer"] == b"after")
