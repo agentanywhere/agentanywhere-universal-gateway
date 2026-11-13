@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::accesslog::{self, AccessLog};
@@ -79,6 +79,50 @@ pub struct Upstream {
     authority: Authority,
     /// A path the upstream's own URL carries, put before every request's path.
     prefix: String,
+    /// An `https://` address: spoken to over TLS.
+    tls: bool,
+}
+
+/// How backends behind TLS are verified, decided once when the process starts. `None`: this
+/// side does not speak TLS to backends, and an `https://` backend is the Python gateway's.
+static TLS: OnceLock<Option<Arc<rustls::ClientConfig>>> = OnceLock::new();
+
+/// Decide how backends behind TLS are verified, as the Python gateway's HTTP client decides it:
+/// against the certificates in `SSL_CERT_FILE` when that is set, and otherwise against the
+/// Mozilla root certificates (the set that client ships with). With `SSL_CERT_DIR` set, or a
+/// file that cannot be read, `https://` backends are left to the Python gateway.
+pub fn start_tls() -> Result<(), String> {
+    let set = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty());
+    let decided = match (set("SSL_CERT_FILE"), set("SSL_CERT_DIR")) {
+        (_, Some(_)) => Err("SSL_CERT_DIR is set".to_owned()),
+        (Some(file), None) => roots_from(std::path::Path::new(&file)).map(|roots| rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth()),
+        (None, None) => {
+            let roots = rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            Ok(rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth())
+        }
+    };
+    let (config, said) = match decided {
+        Ok(config) => (Some(Arc::new(config)), Ok(())),
+        Err(why) => (None, Err(why)),
+    };
+    let _ = TLS.set(config);
+    said
+}
+
+fn roots_from(file: &std::path::Path) -> Result<rustls::RootCertStore, String> {
+    use rustls::pki_types::{pem::PemObject, CertificateDer};
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in CertificateDer::pem_file_iter(file).map_err(|e| format!("{}: {e}", file.display()))? {
+        roots.add(cert.map_err(|e| format!("{}: {e}", file.display()))?).map_err(|e| format!("{}: {e}", file.display()))?;
+    }
+    if roots.is_empty() {
+        return Err(format!("{}: no certificates", file.display()));
+    }
+    Ok(roots)
+}
+
+fn tls() -> Option<&'static Arc<rustls::ClientConfig>> {
+    TLS.get().and_then(Option::as_ref)
 }
 
 impl Upstream {
@@ -86,13 +130,14 @@ impl Upstream {
         let text = text.trim_end_matches('/');
         let uri: Uri = text.parse().map_err(|e| format!("{text}: {e}"))?;
         match (uri.scheme(), uri.authority()) {
-            (Some(scheme), Some(authority)) if *scheme == Scheme::HTTP => Ok(Upstream {
+            (Some(scheme), Some(authority)) if *scheme == Scheme::HTTP || (*scheme == Scheme::HTTPS && tls().is_some()) => Ok(Upstream {
                 text: text.to_owned(),
                 scheme: scheme.clone(),
                 authority: authority.clone(),
                 prefix: uri.path().trim_end_matches('/').to_owned(),
+                tls: *scheme == Scheme::HTTPS,
             }),
-            _ => Err(format!("{text}: must be an http:// address")),
+            _ => Err(format!("{text}: must be an http:// address (or https://, where this side speaks TLS to backends)")),
         }
     }
 }
@@ -141,7 +186,8 @@ impl Backends {
         }
         // A WebSocket is opened with an HTTP request to the same address.
         snap.websocket = snap.websocket_url.as_deref().and_then(|u| self.at(&u.replacen("ws://", "http://", 1)));
-        snap.grpc = snap.grpc_url.as_deref().and_then(|u| self.at(u));
+        // gRPC is relayed without TLS only: over TLS it would need HTTP/2 negotiated in the handshake.
+        snap.grpc = snap.grpc_url.as_deref().filter(|u| u.starts_with("http://")).and_then(|u| self.at(u));
         for route in snap.dynamic_routes.iter_mut() {
             // A route with a backend this side cannot reach is kept, without one: what it matches is Python's.
             route.backend = route.backend_url.as_deref().filter(|_| route.timeout().is_some()).and_then(|u| self.at(u));
@@ -182,6 +228,8 @@ impl State {
 pub struct Worker {
     pub shared: Arc<State>,
     client: Client<HttpConnector, Body>,
+    /// Connections to backends behind TLS, when this side speaks it.
+    secure: Option<Client<hyper_rustls::HttpsConnector<HttpConnector>, Body>>,
     /// Connections to gRPC backends, which are spoken to in HTTP/2 from the first byte.
     grpc: Client<HttpConnector, Body>,
     /// The snapshot as of `generation`, behind a reference count only this worker touches.
@@ -231,7 +279,23 @@ impl Worker {
         connector.set_connect_timeout(Some(GRPC_CONNECT_TIMEOUT));
         let grpc = Client::builder(TokioExecutor::new()).http2_only(true).pool_idle_timeout(Duration::from_secs(90)).build(connector);
         let held = Mutex::new((shared.generation.load(Ordering::Acquire), Arc::new(shared.snapshot.load_full())));
-        Worker { shared, client, grpc, held, index }
+        let secure = tls().map(|config| {
+            let mut connector = HttpConnector::new();
+            connector.set_nodelay(true);
+            connector.enforce_http(false);
+            let connector =
+                hyper_rustls::HttpsConnectorBuilder::new().with_tls_config((**config).clone()).https_only().enable_http1().wrap_connector(connector);
+            Client::builder(TokioExecutor::new()).pool_idle_timeout(Duration::from_secs(30)).pool_max_idle_per_host(512).build(connector)
+        });
+        Worker { shared, client, secure, grpc, held, index }
+    }
+
+    /// Send a request to an upstream, over TLS if that is how it is reached.
+    fn send(&self, to: &Upstream, req: Request<Body>) -> hyper_util::client::legacy::ResponseFuture {
+        match &self.secure {
+            Some(secure) if to.tls => secure.request(req),
+            _ => self.client.request(req),
+        }
     }
 
     /// The current snapshot and the generation it belongs to.
@@ -745,7 +809,7 @@ async fn serve_agent(w: &Worker, a: &AgentCall<'_>, peer: SocketAddr, req: Reque
     *out.headers_mut() = headers;
 
     let original = Request::from_parts(parts, ());
-    let (mut resp, failed) = match w.client.request(out).await {
+    let (mut resp, failed) = match w.send(to, out).await {
         Ok(resp) => {
             let (mut rp, rb) = resp.into_parts();
             for h in HOP_BY_HOP {
@@ -1675,7 +1739,7 @@ async fn forward(
             }
         }
     }
-    let sent = w.client.request(req);
+    let sent = w.send(to, req);
     let answer = match timeout {
         Some(limit) => tokio::time::timeout(limit, sent).await.map_err(|_| Unanswered::TimedOut)?,
         None => sent.await,

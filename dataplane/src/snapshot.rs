@@ -509,7 +509,7 @@ impl Snapshot {
             websocket: None,
             grpc_url: file.grpc.filter(|u| u.starts_with("http://")),
             grpc: None,
-            agent_urls: file.agents.into_iter().filter(|(_, url)| url.starts_with("http://")).collect(),
+            agent_urls: file.agents,
             agents: HashMap::new(),
             agent_failure: file.agent_failure.filter(|f| f.message_json.starts_with('"')),
             dynamic_routes: file.dynamic_routes,

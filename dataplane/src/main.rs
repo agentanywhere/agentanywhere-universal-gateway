@@ -220,6 +220,9 @@ fn main() {
     };
     let link = args.token.as_ref().map(|_| Arc::new(sync::Link::new(args.max_staleness)));
     let reporter = args.token.as_ref().map(|_| Arc::new(report::Reporter::new(args.rows_per_second, 5000, args.workers)));
+    if let Err(why) = proxy::start_tls() {
+        eprintln!("dataplane: backends behind TLS are left to the control plane ({why})");
+    }
     let backend = proxy::Backend::parse(&args.backend).unwrap_or_else(|e| fail(format!("--backend {e}")));
     let state = Arc::new(proxy::State {
         snapshot: ArcSwap::from_pointee(snapshot::Snapshot::empty()),

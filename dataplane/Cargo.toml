@@ -13,6 +13,9 @@ path = "src/main.rs"
 tokio = { version = "1", features = ["rt", "net", "time", "sync", "io-util"] }
 hyper = { version = "1", features = ["http1", "http2", "server", "client"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "server-auto", "tokio"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "ring", "tls12", "webpki-tokio"] }
+webpki-roots = "1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 http-body-util = "0.1"
 bytes = "1"
 sha2 = "0.10"
