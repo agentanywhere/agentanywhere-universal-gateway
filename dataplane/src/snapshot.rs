@@ -121,6 +121,9 @@ pub struct Snapshot {
     /// The pages a browser is shown for the errors answered here, by `<status>:<hint><countdown>`.
     /// `None` when the control plane sent none: browsers are then its own.
     pub error_pages: Option<HashMap<String, String>>,
+    /// The transformation rules in force. A request one applies to is the Python gateway's.
+    /// `None`: there are rules this side was not told the reach of, and every request is.
+    pub transform_rules: Option<Vec<TransformRule>>,
 }
 
 /// The gateway's health endpoint, as the Python gateway serves it.
@@ -130,6 +133,52 @@ pub struct Ops {
     pub health_path: Option<String>,
     /// The version it reports, as a JSON string.
     pub version_json: String,
+}
+
+fn no_rules() -> Option<Vec<TransformRule>> {
+    Some(Vec::new())
+}
+
+/// Which requests a transformation rule applies to. The Python gateway applies it; this side
+/// only needs to know that a request is one of them.
+#[derive(Deserialize, Debug)]
+pub struct TransformRule {
+    /// A path pattern: plain characters, `*` for any run of characters (slashes included) and
+    /// `?` for any one. It must match the whole path.
+    glob: String,
+    /// Upper-case method names; none means every method.
+    #[serde(default)]
+    methods: Vec<String>,
+}
+
+impl TransformRule {
+    fn applies(&self, method: &str, path: &str) -> bool {
+        (self.methods.is_empty() || self.methods.iter().any(|m| m == method)) && glob_matches(self.glob.as_bytes(), path.as_bytes())
+    }
+}
+
+/// Whether `text` is matched in full by `pattern`, in which `*` stands for any run of bytes and
+/// `?` for any one: Python's `fnmatch`, without its character classes.
+pub fn glob_matches(pattern: &[u8], text: &[u8]) -> bool {
+    let (mut p, mut t) = (0, 0);
+    // Where to come back to when what follows a `*` does not fit: the `*`, and how much it took.
+    let mut star: Option<(usize, usize)> = None;
+    while t < text.len() {
+        if p < pattern.len() && (pattern[p] == b'?' || (pattern[p] != b'*' && pattern[p] == text[t])) {
+            p += 1;
+            t += 1;
+        } else if p < pattern.len() && pattern[p] == b'*' {
+            star = Some((p, t));
+            p += 1;
+        } else if let Some((at, took)) = star {
+            star = Some((at, took + 1));
+            p = at + 1;
+            t = took + 1;
+        } else {
+            return false;
+        }
+    }
+    pattern[p..].iter().all(|c| *c == b'*')
 }
 
 /// How the Python gateway answers a request from a web page in another origin.
@@ -233,6 +282,9 @@ struct SnapshotFile {
     dynamic_routes: Vec<DynamicRoute>,
     cross_origin: Option<CrossOrigin>,
     error_pages: Option<HashMap<String, String>>,
+    /// Absent: a control plane that knows of no rules. `null`: rules it could not describe.
+    #[serde(default = "no_rules")]
+    transform_rules: Option<Vec<TransformRule>>,
     ready: Option<Readiness>,
     #[serde(default)]
     keys: Vec<KeyRecord>,
@@ -403,6 +455,20 @@ fn scope(record: ScopeRecord) -> Result<Scope, String> {
 }
 
 impl Snapshot {
+    /// Whether a transformation rule applies to a request: to what the backend is asked for
+    /// (`asked`), or to its answer, which the Python gateway matches by the request's own path
+    /// without the leading slash.
+    pub fn transformed(&self, method: &str, asked: &str, path: &str) -> bool {
+        let Some(rules) = &self.transform_rules else { return true };
+        if rules.is_empty() {
+            return false;
+        }
+        let answered = path.strip_prefix('/').unwrap_or(path);
+        rules.iter().any(|r| r.applies(method, asked) || r.applies(method, answered))
+    }
+}
+
+impl Snapshot {
     pub fn empty() -> Snapshot {
         Snapshot::from_json(r#"{"keys":[]}"#).expect("an empty snapshot is valid")
     }
@@ -533,6 +599,7 @@ impl Snapshot {
             dynamic_routes: file.dynamic_routes,
             cross_origin: file.cross_origin,
             error_pages: file.error_pages,
+            transform_rules: file.transform_rules,
             inject_request_id: file.inject_request_id,
             revision: file.revision,
             api_versions,

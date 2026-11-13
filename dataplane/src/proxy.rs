@@ -679,7 +679,7 @@ fn decide<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, now: u6
         Some(route) => route.rewrite.as_deref().unwrap_or(path),
         None => upstream_path(path, protocol),
     };
-    if names_a_version(asked) {
+    if names_a_version(asked) || snap.transformed(method, asked, path) {
         return PYTHON;
     }
     Decision::Native(Native { protocol, backend, entry, route, version, ip, method, html })
@@ -828,7 +828,7 @@ fn agent_call<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, aft
         found => found.map(|(v, _)| v),
     };
     let upstream_path = format!("/{rest}");
-    if names_a_version(&upstream_path) {
+    if names_a_version(&upstream_path) || snap.transformed(method, &upstream_path, uri.path()) {
         return None;
     }
     let ip = govern::client_ip(peer, headers, &snap.trusted_proxies)?;
@@ -1127,7 +1127,7 @@ fn admit_grpc<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, now
     }
     // Rules this side cannot apply: to this key, or (a transformation rule, a plugin that alters
     // requests) to every request.
-    if !entry.native_ok || snap.fallthrough_prefixes.iter().any(|p| path.starts_with(p.as_str())) {
+    if !entry.native_ok || snap.fallthrough_prefixes.iter().any(|p| path.starts_with(p.as_str())) || snap.transformed("POST", path, path) {
         return Err(GrpcRefusal::NOT_APPLICABLE);
     }
     let native = Native { protocol: Protocol::Grpc, backend: Some(backend), entry, route: None, version: None, ip, method: "POST", html: false };
@@ -2529,6 +2529,55 @@ mod tests {
         let scoped = governed(WS, r#","allowed_paths":{"rules":[["under","/ws/chat"]],"patterns_json":"[\"/ws/chat\"]"}"#);
         assert!(relay(&scoped, &req, 100).is_some());
         assert!(relay(&scoped, &handshake("/ws/other", &[("x-api-key", KEY)]), 100).is_none());
+    }
+
+    #[test]
+    fn a_request_a_transformation_rule_applies_to_is_left_to_python() {
+        let rules = r#","transform_rules":[{"glob":"/api/orders/*","methods":["GET","POST"]},{"glob":"/api/item?","methods":[]},
+            {"glob":"api/answers/*","methods":[]},{"glob":"/shaped/*","methods":[]},{"glob":"/pkg.Service/*","methods":[]}]"#;
+        let snap = governed(&format!("{AGENTS}{GRPC}{rules}"), "");
+        let native = |method: &str, uri: &str| {
+            let req = Request::builder().method(method).uri(uri).header("x-api-key", KEY).body(()).unwrap();
+            outcome(&snap, &req, 100, false)
+        };
+        assert_eq!(native("GET", "/api/users"), "native");
+        assert_eq!(native("GET", "/api/orders/7"), "ask");
+        assert_eq!(native("POST", "/api/orders/7/lines"), "ask");
+        // Another method, and a path the pattern does not cover in full.
+        assert_eq!(native("DELETE", "/api/orders/7"), "native");
+        assert_eq!(native("GET", "/api/orders"), "native");
+        assert_eq!(native("PUT", "/api/item7"), "ask");
+        assert_eq!(native("PUT", "/api/item77"), "native");
+        // A rule for the answer is matched by the path without its leading slash.
+        assert_eq!(native("GET", "/api/answers/1"), "ask");
+        // An agent is asked for the path after its slug, and that is what a rule sees.
+        assert_eq!(native("GET", "/agents/hiring/shaped/a"), "ask");
+        assert_eq!(native("GET", "/agents/hiring/other/a"), "agent");
+        // A gRPC call has nobody to be left to.
+        let call = rpc("/pkg.Service/Method", &[("x-api-key", KEY)]);
+        assert_eq!(admit_grpc(&snap, peer(), &call, 100, true).err(), Some(GrpcRefusal::NOT_APPLICABLE));
+        assert!(admit_grpc(&snap, peer(), &rpc("/pkg.Other/Method", &[("x-api-key", KEY)]), 100, true).is_ok());
+        // Rules the control plane could not describe: every request is taken to be one of theirs.
+        let unknown = governed(&format!(r#"{AGENTS}{GRPC},"transform_rules":null"#), "");
+        let req = Request::builder().uri("/api/users").header("x-api-key", KEY).body(()).unwrap();
+        assert_eq!(outcome(&unknown, &req, 100, false), "ask");
+        assert_eq!(admit_grpc(&unknown, peer(), &call, 100, true).err(), Some(GrpcRefusal::NOT_APPLICABLE));
+        // A control plane that says nothing about rules has none.
+        assert_eq!(outcome(&governed("", ""), &req, 100, false), "native");
+    }
+
+    #[test]
+    fn globs_match_as_fnmatch_matches_them() {
+        use crate::snapshot::glob_matches as m;
+        for (pattern, text, want) in [
+            ("/api/users/*", "/api/users/7", true), ("/api/users/*", "/api/users/", true), ("/api/users/*", "/api/users", false),
+            ("/api/*/lines", "/api/orders/7/lines", true), ("/api/*/lines", "/api/orders/7/line", false),
+            ("*.json", "/a/b.json", true), ("*.json", "/a/b.jsonl", false), ("/a?c", "/abc", true), ("/a?c", "/ac", false),
+            ("/a?c", "/a/c", true), ("", "", true), ("", "/", false), ("***", "", true), ("/a*b*c", "/aXbXbYc", true),
+            ("/a*b*c", "/aXbXbY", false), ("/A", "/a", false), ("/a.b", "/aXb", false),
+        ] {
+            assert_eq!(m(pattern.as_bytes(), text.as_bytes()), want, "{pattern} against {text}");
+        }
     }
 
     const ROUTES: &str = r#","dynamic_routes":[

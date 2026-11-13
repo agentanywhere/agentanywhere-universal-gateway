@@ -1316,6 +1316,48 @@ def main() -> int:
             check("from a web page: an origin given twice is Python's to answer",
                   said_by(b) == "python" and a.status_code == b.status_code and page_headers(a) == page_headers(b), f"[{b.status_code}] {page_headers(b)}")
 
+            # --- transformation rules ----------------------------------------------------------------
+            # A rule is applied by the Python gateway. The data plane must hand it exactly the
+            # requests the rule applies to, and keep serving the rest.
+            print()
+
+            def shaped(base, key, method, path):
+                return httpx.request(method, base + path, headers={"X-API-Key": key}, timeout=15)
+
+            def rule_same(name, method, path, by, marked):
+                a, b = shaped(py, keys["py"]["key"], method, path), shaped(rs, keys["rs"]["key"], method, path)
+                mark = lambda r: dict((k.lower(), v) for k, v in r.json()["headers"]).get("x-shaped")
+                ok = a.status_code == b.status_code == 200 and mark(a) == mark(b) == ("yes" if marked else None) and said_by(b) == by
+                check(f"transformation rules: {name}", ok, f"[{b.status_code}] by {said_by(b)}, the backend saw X-Shaped: {mark(a)} and {mark(b)}")
+
+            def rules_reached(path, by):
+                return wait_until(lambda: said_by(shaped(rs, keys["rs"]["key"], "GET", path)) == by)
+
+            made = [post("/admin/transformations", r) for r in (
+                {"name": "mark orders", "path_pattern": "/api/routed/orders/*", "methods": ["GET"], "request_config": {"headers_set": {"X-Shaped": "yes"}}},
+                {"name": "mark an agent's intake", "path_pattern": "/intake/*", "request_config": {"headers_set": {"X-Shaped": "yes"}}})]
+            assert rules_reached("/api/routed/orders/1", "python"), "the rules never reached the data plane"
+            rule_same("a request a rule applies to is Python's, and is changed", "GET", "/api/routed/orders/1", "python", True)
+            rule_same("another method on the same path is served here, unchanged", "POST", "/api/routed/orders/1", "data plane", False)
+            rule_same("a path the rule does not cover is served here", "GET", "/api/routed/other/1", "data plane", False)
+            rule_same("an agent's path is matched as the agent is asked for it", "GET", "/agents/echo/intake/7", "python", True)
+            rule_same("and the agent's other paths are served here", "GET", "/agents/echo/outtake/7", "data plane", False)
+            r = shaped(rs, keys["rs"]["key"], "GET", "/api/users")
+            check("transformation rules: every other path is served here as before", r.status_code == 200 and said_by(r) == "data plane")
+            b = grpc_call(f"127.0.0.1:{dport}", "unary", "Say", b"hello", (("x-api-key", keys["rs"]["key"]),))
+            check("transformation rules: gRPC calls no rule applies to are still relayed", b["code"] == "OK", b["code"])
+
+            everything = post("/admin/transformations", {"name": "mark everything", "path_pattern": "*", "request_config": {"headers_set": {"X-Shaped": "yes"}}})
+            assert rules_reached("/api/routed/other/1", "python"), "the catch-all rule never reached the data plane"
+            rule_same("a rule for every path makes every path Python's", "GET", "/api/routed/other/1", "python", True)
+            b = grpc_call(f"127.0.0.1:{dport}", "unary", "Say", b"hello", (("x-api-key", keys["rs"]["key"]),))
+            check("transformation rules: and gRPC calls, which Python cannot carry, are refused",
+                  (b["code"], b["details"]) == ("PERMISSION_DENIED", "the gateway's rules for this key cannot be applied to gRPC"), f"{b['code']}: {b['details']}")
+            for rule in made + [everything]:
+                httpx.delete(f"{py}/admin/transformations/{rule['id']}", headers=adm, timeout=10).raise_for_status()
+            assert rules_reached("/api/routed/orders/1", "data plane"), "removing the rules never reached the data plane"
+            rule_same("with the rules removed, nothing is changed and all is served here", "GET", "/api/routed/orders/1", "data plane", False)
+
             # --- gRPC --------------------------------------------------------------------------------
             # The Python gateway does not speak HTTP/2, so there is no second plane to compare with:
             # each call through the data plane is compared with the same call made to the backend itself.

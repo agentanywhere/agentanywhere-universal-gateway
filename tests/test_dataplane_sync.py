@@ -983,9 +983,12 @@ async def test_the_snapshot_says_which_requests_a_transformation_rule_applies_to
     rule("/api/item?")
     rule("/api/off/*", enabled=False)
     assert await listed() == [{"glob": "/api/orders/*", "methods": ["GET", "POST"]}, {"glob": "/api/item?", "methods": []}]
+    # Rules the data plane can match no longer keep every path with this gateway.
+    assert (await dataplane_sync.build_snapshot(db_session))["fallthrough_prefixes"] != ["/"]
     # A pattern the data plane does not match exactly as this gateway does: every path stays here.
     for pattern in ("*", "**", "^/api/v[0-9]+/", "/api/.*$", "/api/[ab]/x", "/api/caf\u00e9/*"):
         odd = rule(pattern)
         assert await listed() is None, pattern
+        assert (await dataplane_sync.build_snapshot(db_session))["fallthrough_prefixes"] == ["/"]
         transformation_manager.remove_rule(odd.id)
     assert len(await listed()) == 2
