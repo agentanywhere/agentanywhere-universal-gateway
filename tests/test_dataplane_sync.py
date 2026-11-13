@@ -19,6 +19,18 @@ def _fresh_cache():
     dataplane_sync.reset_cache()
 
 
+@pytest.fixture(autouse=True)
+def _rules_as_found():
+    """The IP rules and policies these tests load live in engines the whole process shares; they
+    are put back, so that a test file run after this one does not meet them."""
+    from app.governance import ip_rule_engine, policy_engine
+
+    rules, policies, loaded = list(ip_rule_engine._rules), list(policy_engine._cache), policy_engine._loaded
+    yield
+    ip_rule_engine._rules = rules
+    policy_engine._cache, policy_engine._loaded = policies, loaded
+
+
 async def _key(db, name="k", **kw):
     plaintext, model = await APIKeyRepository.create(db=db, name=name, **kw)
     return plaintext, model
