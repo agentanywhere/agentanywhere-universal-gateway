@@ -158,8 +158,9 @@ def certificates(folder):
 def agent_backend(tls=None):
     """A local agent for the agent edge (behind TLS when given a certificate and its key). It answers with everything it was sent (method, path, query,
     every header in order, the body), sets two cookies, and has a few paths of its own: `/teapot`
-    answers 418, `/gzip` compresses its answer, `/stream` sends three events a moment apart, and
-    `/drop` closes the connection without answering. Returns its URL."""
+    answers 418, `/gzip` compresses its answer, `/stream` sends three events a moment apart,
+    `/drop` closes the connection without answering, and `/token` issues an OAuth2 access token
+    as an identity provider would. Returns its URL."""
     import gzip, socket
 
     class Handler(BaseHTTPRequestHandler):
@@ -172,6 +173,16 @@ def agent_backend(tls=None):
                 time.sleep(1.5)
             if path.endswith("/drop"):
                 self.connection.shutdown(socket.SHUT_RDWR)
+                return
+            if path.endswith("/token"):
+                # An identity provider's token endpoint: a new token, good for as long as asked.
+                out = json.dumps({"access_token": "tok-" + secrets.token_urlsafe(18), "token_type": "Bearer",
+                                  "expires_in": int(query.partition("ttl=")[2] or 3600)}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(out)))
+                self.end_headers()
+                self.wfile.write(out)
                 return
             if path.endswith("/stream"):
                 self.send_response(200)
@@ -1357,6 +1368,95 @@ def main() -> int:
                 httpx.delete(f"{py}/admin/transformations/{rule['id']}", headers=adm, timeout=10).raise_for_status()
             assert rules_reached("/api/routed/orders/1", "data plane"), "removing the rules never reached the data plane"
             rule_same("with the rules removed, nothing is changed and all is served here", "GET", "/api/routed/orders/1", "data plane", False)
+
+            # --- OAuth2 tokens -----------------------------------------------------------------------
+            # A token the Python gateway issued is a credential in `Authorization: Bearer`. It lives in
+            # the Python gateway's memory; the data plane is told its digest.
+            print()
+            for provider, ttl in (("idp", 3600), ("brief", 4)):
+                post("/admin/oauth2/providers", {"name": provider, "client_id": "conformance", "client_secret": "s3cret",
+                                                 "authorization_endpoint": f"{agent}/authorize", "token_endpoint": f"{agent}/token?ttl={ttl}"})
+
+            def issue(provider="idp"):
+                r = httpx.post(f"{py}/oauth2/token", json={"grant_type": "client_credentials", "provider": provider}, timeout=10)
+                r.raise_for_status()
+                return r.json()["access_token"]
+
+            def bearing(base, value, extra=None, path="/api/routed/who"):
+                return httpx.get(base + path, headers={"Authorization": value, **(extra or {})}, timeout=10)
+
+            def native_token(token):
+                return wait_until(lambda: said_by(bearing(rs, f"Bearer {token}")) == "data plane")
+
+            def sent(r):
+                return dict((k.lower(), v) for k, v in r.json()["headers"]).get("authorization") if r.status_code == 200 else None
+
+            tokens = {"py": issue(), "rs": issue()}
+            t0 = time.time()
+            t = native_token(tokens["rs"])
+            check("OAuth2: a token issued by the gateway becomes native", t is not None, f"after {t - t0:.2f}s" if t else "never")
+            snap = httpx.get(f"{py}/internal/dataplane/snapshot", headers={"X-Dataplane-Token": "conformance-token"}, timeout=10).json()
+            check("OAuth2: the snapshot holds the tokens' digests, never the tokens",
+                  len(snap["tokens"]) == 2 and all(t not in json.dumps(snap) for t in tokens.values()), f"{len(snap['tokens'])} listed")
+            for name, form in (("Bearer", "Bearer {}"), ("bearer in lower case", "bearer {}"), ("BEARER and more spaces", "BEARER   {}")):
+                a, b = bearing(py, form.format(tokens["py"])), bearing(rs, form.format(tokens["rs"]))
+                ok = a.status_code == b.status_code == 200 and said_by(b) == "data plane" and (sent(a), sent(b)) == (form.format(tokens["py"]), form.format(tokens["rs"]))
+                check(f"OAuth2: a token after {name} is served here, and reaches the backend as sent", ok, f"[{a.status_code} and {b.status_code}] by {said_by(b)}")
+            for name, headers in (("without the word Bearer", lambda t: {"Authorization": t}), ("in the key's header", lambda t: {"X-API-Key": t}),
+                                  ("after another scheme", lambda t: {"Authorization": f"Basic {t}"})):
+                a, b = (httpx.get(f"{base}/api/routed/who", headers=headers(tokens[k]), timeout=10) for base, k in ((py, "py"), (rs, "rs")))
+                compare(f"OAuth2: a token {name} is refused", a, b)
+                check(f"OAuth2: a token {name} is refused with a 401", a.status_code == b.status_code == 401, f"[{a.status_code} and {b.status_code}]")
+            a, b = (bearing(base, f"Bearer {tokens[k]}", {"X-API-Key": "sk-nope"}) for base, k in ((py, "py"), (rs, "rs")))
+            check("OAuth2: beside a key that does not work, the token is Python's to accept",
+                  a.status_code == b.status_code == 200 and said_by(b) == "python", f"[{a.status_code} and {b.status_code}] by {said_by(b)}")
+            row = wait_until(lambda: any(l.get("path") == "/api/routed/who" and l.get("status_code") == 200 and l.get("api_key_id") is None
+                                         for l in httpx.get(f"{py}/admin/logs", params={"limit": 1000}, headers=adm, timeout=10).json()["logs"]), 6)
+            check("OAuth2: a request served here for a token is logged, with no key named", row is not None)
+
+            # A token gets the gateway's default limit (60 a minute). Each plane exhausts its own.
+            limited = {"py": issue(), "rs": issue()}
+            assert native_token(limited["rs"]), "the token never became native"
+            refused = {}
+            for base, k in ((py, "py"), (rs, "rs")):
+                for n in range(80):
+                    refused[k] = bearing(base, f"Bearer {limited[k]}")
+                    if refused[k].status_code != 200:
+                        break
+            same("OAuth2: a token over the default limit", refused["py"], refused["rs"])
+            check("OAuth2: a token over the default limit gets a 429", refused["py"].status_code == refused["rs"].status_code == 429)
+            got = wait_until(lambda: len(hooked("rate_limit_exceeded", api_key_name="oauth2:idp")) >= 2, 6)
+            named = hooked("rate_limit_exceeded", api_key_name="oauth2:idp")
+            check("OAuth2: both planes announce the refusal under the token's name, with no key id",
+                  got is not None and all(h["data"]["api_key_id"] is None for h in named), f"{len(named)} webhooks")
+            check("OAuth2: a native 429 for a token feeds the rate-limit metric as Python's does", metric("gateway_rate_limit_hits_total", client_id="non-database-key") >= 2)
+
+            brief = {"py": issue("brief"), "rs": issue("brief")}
+            issued = time.time()
+            check("OAuth2: a short-lived token is served here while it lasts", native_token(brief["rs"]) is not None)
+            time.sleep(max(0, issued + 4.3 - time.time()))
+            a, b = bearing(py, f"Bearer {brief['py']}"), bearing(rs, f"Bearer {brief['rs']}")
+            compare("OAuth2: a token that has run out", a, b)
+            check("OAuth2: a token that has run out is refused with a 401", a.status_code == b.status_code == 401, f"[{a.status_code} and {b.status_code}]")
+
+            gone = issue()
+            assert native_token(gone), "the token never became native"
+            t0 = time.time()
+            httpx.post(f"{py}/oauth2/revoke", json={"provider": "idp", "token": gone}, timeout=10).raise_for_status()
+            t = wait_until(lambda: bearing(rs, f"Bearer {gone}").status_code == 401)
+            check("OAuth2: a revoked token is refused within seconds", t is not None and t - t0 < 2.5, f"after {t - t0:.2f}s" if t else "still served")
+
+            # The Python gateway lets a token past its IP rules and policies. The data plane passes
+            # over no rule: while one is in force, a token's requests are Python's.
+            rule = post("/admin/governance/ip-rules", {"cidr": "198.51.100.0/24", "action": "deny", "scope": "global"})
+            handed = wait_until(lambda: said_by(bearing(rs, f"Bearer {tokens['rs']}")) == "python")
+            a, b = (bearing(base, f"Bearer {tokens[k]}", {"X-Forwarded-For": "198.51.100.7"}) for base, k in ((py, "py"), (rs, "rs")))
+            check("OAuth2: with an IP rule in force, a token's requests are Python's, and both planes answer alike",
+                  handed is not None and a.status_code == b.status_code and said_by(b) == "python", f"[{a.status_code} and {b.status_code}] by {said_by(b)}")
+            r = httpx.get(f"{rs}/api/users", headers={"X-API-Key": keys["rs"]["key"]}, timeout=10)
+            check("OAuth2: and a key's are still decided here", r.status_code == 200 and said_by(r) == "data plane", f"[{r.status_code}] by {said_by(r)}")
+            httpx.delete(f"{py}/admin/governance/ip-rules/{rule['id']}", headers=adm, timeout=10).raise_for_status()
+            check("OAuth2: with the rule removed, the token is served here again", native_token(tokens["rs"]) is not None)
 
             # --- gRPC --------------------------------------------------------------------------------
             # The Python gateway does not speak HTTP/2, so there is no second plane to compare with:
