@@ -120,8 +120,8 @@ with no backend of its own; the key is in the snapshot, active, unexpired and `n
 gateway checks the body, the body has a `Content-Length`, fits in memory (4 MiB, or the MCP limit if lower) and is
 certain to pass. On those same paths, a request with no credential, or with one the Python gateway has just refused,
 is answered here with the gateway's 401. Anything else, including OAuth2 tokens, credentials seen for the first time,
-a request from a web page in another origin (one with an `Origin` header), `/metrics`, `/admin`, `/oauth2`, GraphQL,
-MQTT and `/agents/...`, goes to the Python gateway untouched, so its answer is the answer.
+a request from a web page in another origin (one with an `Origin` header), `/metrics`, `/admin`, `/oauth2`, GraphQL
+and MQTT, goes to the Python gateway untouched, so its answer is the answer.
 
 **HTTP/2.** A client that opens its connection with the HTTP/2 preface (no TLS; `curl --http2-prior-knowledge`, a
 gRPC client, a proxy configured for it) is spoken to in HTTP/2. Its requests are decided exactly as HTTP/1 requests
@@ -146,6 +146,23 @@ offered and the caller's `Authorization` and `Cookie`; never the gateway's key. 
 tunnel: bytes go both ways until either side closes. If it refuses or cannot be reached, the caller gets 403. Every
 other handshake (a key in `?api_key=`, an unknown key, `/agents/<slug>/...`, any IP rule or policy in force) is tunnelled
 to the Python gateway, which relays or refuses as it always does.
+
+**The agent edge.** A request for `/agents/<slug>/...` is forwarded here when the agent is registered with a plain
+`http://` upstream and the request would reach it exactly as the Python gateway sends it. As there, no gateway key is
+asked for and no limit, IP rule or policy applies: the agent authenticates its own callers. The agent is sent the path
+after the slug, the caller's headers (`Host`, `Authorization` and `Cookie` included) and the gateway's additions, and
+its answer is streamed back as it comes. The Python gateway is handed the request when:
+
+* the slug is not registered, or its upstream is `https://` (the 404 and the TLS are Python's);
+* the caller is a browser (`Accept: text/html`), a web page in another origin, or asks for a WebSocket;
+* the query is anything but `key=value` pairs of unreserved characters with no key twice (Python takes a query apart
+  and writes it again), a header is given twice (Python forwards the last), or the path after the slug names an API version;
+* the body has no `Content-Length` or is over 1 MiB;
+* the agent cannot be reached. Nothing was sent, so Python tries, answers in its own way and counts the failure in
+  its circuit breaker. This side keeps no breaker for agents.
+
+An agent that hangs up before answering gets the Python gateway's 500 from here. A compressed answer is passed on
+compressed with its `Content-Encoding`; the Python gateway decompresses it first. The caller reads the same either way.
 
 **gRPC.** A call (HTTP/2, `POST`, content type `application/grpc` or `application/grpc+...`) is relayed to
 `GRPC_BACKEND_URL` when that is a plain `host:port`, over HTTP/2 without TLS, with the path unchanged and the body and
@@ -184,13 +201,18 @@ here is the reverse of everywhere else: **whatever this side cannot be sure of i
 | Any other WebSocket (`?api_key=`, `/agents/<slug>`, rules or policies in force) | Python, through a tunnel |
 | gRPC calls (HTTP/2, `application/grpc`) | data plane only; refused when it cannot be sure |
 | Any other request over HTTP/2 | as the same request over HTTP/1 |
-| GraphQL, MQTT, the JSON-to-gRPC bridge under `/grpc`, `/agents/<slug>` | Python |
+| `/agents/<slug>/...` to a registered `http://` agent, from a client that is not a browser | data plane |
+| `/agents/<slug>/...` otherwise (browsers, unknown slugs, `https://` agents, unusual requests) | Python |
+| GraphQL, MQTT, the JSON-to-gRPC bridge under `/grpc` | Python |
 | Dynamic routes, transformation rules, request-altering plugins (when any exist) | Python, for every path |
 | The health path, `/ready` and `/live`, on a plain `GET` | data plane |
 | A request with an `Origin` header (the cross-origin headers are Python's) | Python |
 | `/health/detailed`, `/metrics`, `/oauth2`, `/admin` and the console | Python |
 
 ## Known gaps (why this is not production-ready)
+
+* **Browsers reach agents through the Python gateway.** Any request that accepts `text/html` is handed over, because
+  the error pages are Python's. For an agent with a web interface that is most of its traffic; API callers are served here.
 
 * **A WebSocket relayed here is a tunnel, not two conversations.** The Python gateway ends the caller's WebSocket and
   opens its own to the backend, so it answers pings itself, sends the backend a keep-alive ping every 20 seconds, and
