@@ -935,3 +935,29 @@ async def test_the_snapshot_says_how_a_request_from_another_origin_is_answered(d
     assert await said() is None
     monkeypatch.setattr(gw, "_cors_options", {"allow_origins": [], "allow_credentials": False, "expose_headers": ["X-A"]})
     assert await said() is None
+
+
+async def test_the_snapshot_carries_the_pages_a_browser_is_shown(db_session):
+    import html
+
+    from app import main as gw
+
+    pages = (await dataplane_sync.build_snapshot(db_session))["error_pages"]
+    assert sorted(pages) == ["401:00", "401:10", "403:00", "403:10", "429:00", "429:01", "429:10", "429:11", "502:00", "502:10", "503:00", "503:10"]
+
+    def filled(key, code, message, rid, hint=None, retry=None):
+        page = pages[key].replace("@@code@@", html.escape(code)).replace("@@message@@", html.escape(message))
+        page = page.replace("@@request-id@@", html.escape(rid))
+        if hint is not None:
+            page = page.replace("@@hint@@", html.escape(hint))
+        return page if retry is None else page.replace("987654321", str(retry))
+
+    # Filled in, each is the page this gateway renders for the same error.
+    data = {"error": "RATE_LIMIT_EXCEEDED", "message": "Rate limit exceeded: 3 requests per <minute>", "request_id": "r-1&2",
+            "details": {"limit": 3, "retry_after": 60, "hint": "Wait & retry"}}
+    assert filled("429:11", data["error"], data["message"], "r-1&2", "Wait & retry", 60) == gw._error_html(429, data)
+    data = {"error": "AUTHORIZATION_ERROR", "message": "This API key is not allowed to access this path", "request_id": "r-2",
+            "details": {"path": "/api/x"}}
+    assert filled("403:00", data["error"], data["message"], "r-2") == gw._error_html(403, data)
+    data = {"error": "BACKEND_ERROR", "message": "Backend: Backend service unavailable", "request_id": "r-3", "details": {"hint": "Check it"}}
+    assert filled("502:10", data["error"], data["message"], "r-3", "Check it") == gw._error_html(502, data)

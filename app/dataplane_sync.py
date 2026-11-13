@@ -133,6 +133,45 @@ def _agents() -> Dict[str, str]:
             if isinstance(slug, str) and isinstance(base, str) and _AGENT_SLUG.fullmatch(slug) and _AGENT_UPSTREAM.fullmatch(base)}
 
 
+_PAGE_SLOTS = {"code": "@@code@@", "message": "@@message@@", "hint": "@@hint@@", "request_id": "@@request-id@@"}
+_PAGE_RETRY_AFTER = 987654321
+_PAGE_STATUSES = (401, 403, 429, 502, 503)
+
+
+def _error_pages() -> Optional[Dict[str, str]]:
+    """The pages a browser is shown for the errors the data plane answers itself, one for each
+    status and for each shape the page takes (with or without a hint; for a 429, with or without
+    a countdown). Where the error's own words go there is a marker, which the data plane replaces
+    with the words, escaped as HTML; the seconds of a countdown stand as ``987654321``. Keys are
+    ``<status>:<hint><countdown>``, as in ``429:11``. ``None`` if a page does not come out with
+    its markers where they are expected, and browsers then stay with this gateway."""
+    from app import main as gw
+
+    pages: Dict[str, str] = {}
+    try:
+        for status in _PAGE_STATUSES:
+            for hint in (False, True):
+                for countdown in ((False, True) if status == 429 else (False,)):
+                    details: Dict[str, Any] = {}
+                    if hint:
+                        details["hint"] = _PAGE_SLOTS["hint"]
+                    if countdown:
+                        details["retry_after"] = _PAGE_RETRY_AFTER
+                    page = gw._error_html(status, {
+                        "error": _PAGE_SLOTS["code"], "message": _PAGE_SLOTS["message"],
+                        "request_id": _PAGE_SLOTS["request_id"], "details": details,
+                    })
+                    expected = {"code": 1, "message": 1, "request_id": 1, "hint": int(hint)}
+                    if any(page.count(_PAGE_SLOTS[slot]) != n for slot, n in expected.items()):
+                        return None
+                    if page.count(str(_PAGE_RETRY_AFTER)) != (2 if countdown else 0):
+                        return None
+                    pages[f"{status}:{int(hint)}{int(countdown)}"] = page
+    except Exception:  # noqa: BLE001 - pages this code cannot render: browsers stay with this gateway
+        return None
+    return pages
+
+
 def _cross_origin() -> Optional[Dict[str, Any]]:
     """How this gateway answers a request from a web page in another origin (one with an
     ``Origin`` header): the origins it names back, and whether it says credentials are allowed.
@@ -586,6 +625,7 @@ async def build_snapshot(db: AsyncSession) -> Dict[str, Any]:
         "agent_failure": _agent_failure(),
         "dynamic_routes": dynamic_routes,
         "cross_origin": _cross_origin(),
+        "error_pages": _error_pages(),
     }
     snap["revision"] = hashlib.sha256(json.dumps(snap, sort_keys=True).encode()).hexdigest()
     return snap
