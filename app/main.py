@@ -2278,11 +2278,12 @@ async def _proxy_agent_route(request: Request, agent_route, request_id: str) -> 
         body=body,
         route_config=route_config,
     )
-    resp_headers = {
-        k: v for k, v in upstream.headers.items()
+    # Every header line as the agent sent it: an agent that sets two cookies sends two
+    # ``Set-Cookie`` lines, and joined into one they are no longer two cookies.
+    resp_headers = [
+        (k, v) for k, v in upstream.headers.multi_items()
         if k.lower() not in _STRIP_RESPONSE_HEADERS
-    }
-    ct = upstream.headers.get("content-type")
+    ]
     # Feed the live Mission Control board (time-to-first-byte from the upstream).
     try:
         from app.agent_monitor import agent_monitor
@@ -2308,12 +2309,10 @@ async def _proxy_agent_route(request: Request, agent_route, request_id: str) -> 
         finally:
             await upstream.aclose()
 
-    return StreamingResponse(
-        _agent_stream_body(),
-        status_code=upstream.status_code,
-        headers=resp_headers,
-        media_type=ct.split(";")[0].strip() if ct else None,
-    )
+    response = StreamingResponse(_agent_stream_body(), status_code=upstream.status_code)
+    for name, value in resp_headers:
+        response.headers.append(name, value)
+    return response
 
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
