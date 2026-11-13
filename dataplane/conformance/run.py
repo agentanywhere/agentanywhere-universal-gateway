@@ -964,6 +964,21 @@ def main() -> int:
             check("gRPC: the caller's deadline ends a call that is still streaming", b["code"] == "DEADLINE_EXCEEDED", b["code"])
             grpc_same("and the next call is served", "unary", "Say", b"after", want=lambda r: r["answer"] == b"after")
 
+            # Many calls at once: on one connection (as a client library sends them), and on many.
+            import grpc
+            from concurrent.futures import ThreadPoolExecutor
+            with grpc.insecure_channel(through, options=GRPC_SIZES) as channel:
+                say = channel.unary_unary("/conf.Echo/Say")
+                waiting = [say.future(f"call {i}".encode(), metadata=rs_key, timeout=20) for i in range(300)]
+                answers = [f.result() for f in waiting]
+            check("gRPC: 300 calls at once on one connection each get their own answer",
+                  answers == [f"call {i}".encode() for i in range(300)], f"{len(answers)} answers")
+            with ThreadPoolExecutor(max_workers=40) as pool:
+                apart = list(pool.map(lambda i: grpc_call(through, "bidi", "Chat", [f"c{i}".encode(), b"x"], rs_key, timeout=20), range(40)))
+            check("gRPC: 40 streams at once on 40 connections each get their own answers",
+                  [r["answer"] for r in apart] == [[f"C{i}".encode(), b"X"] for i in range(40)],
+                  str(sorted({r["code"] for r in apart})))
+
             grpc_refused("without a key the call is refused", "UNAUTHENTICATED", "API key required")
             grpc_refused("with a wrong key the call is refused", "UNAUTHENTICATED", "invalid API key", (("x-api-key", "sk-nope"),))
             grpc_refused("a key not allowed this method is refused", "PERMISSION_DENIED", "access denied", (("x-api-key", scoped["rs"]["key"]),))
