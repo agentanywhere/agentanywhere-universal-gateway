@@ -53,6 +53,12 @@ See [docs/known-limitations.md](docs/known-limitations.md) for the full list.
 
 ### Fixed
 
+- MQTT: the gateway's client now survives the broker dropping the connection.
+  Before, the first disconnect ended the client's network thread, so it never
+  reconnected: `/mqtt/publish` answered 500 `Failed to publish message` until
+  the gateway was restarted, while still reporting itself connected. Now it
+  answers 503 `MQTT broker not connected` while the broker is away and
+  publishes again once it is back.
 - Database migrations: the Alembic migrations `001` and `002` were replaced by
   one baseline, `0001`, that creates the full current schema. It is safe to
   run on a database the gateway already created at startup, works on SQLite
