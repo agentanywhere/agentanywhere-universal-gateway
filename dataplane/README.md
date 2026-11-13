@@ -81,8 +81,8 @@ as it has workers, or set `--workers` below the core count on a shared machine, 
   breaker, as they do in Python.
 * **Anything it cannot reproduce goes to Python.** The snapshot marks a key `native_ok: false` when something about it
   cannot be reproduced exactly (a policy that matches on headers or uses a character class in its path, a scoped IPv6
-  network, a key linked to more than one tenant), and turns native serving off for every path when dynamic routes,
-  transformation rules or a request-altering plugin exist. A single request also goes to Python when its path is
+  network, a key linked to more than one tenant), and turns native serving off for every path when
+  transformation rules or a request-altering plugin exist. Dynamic routes are followed here (see below). A single request also goes to Python when its path is
   percent-escaped or not ASCII, its method is not one of the plain ones, or the client's address cannot be resolved
   the way Python resolves it. The stock `request-id` plugin is reproduced natively.
 * **Native answers are labelled** with `X-Served-By: dataplane`, so you can see which plane answered.
@@ -147,6 +147,13 @@ tunnel: bytes go both ways until either side closes. If it refuses or cannot be 
 other handshake (a key in `?api_key=`, an unknown key, `/agents/<slug>/...`, any IP rule or policy in force) is tunnelled
 to the Python gateway, which relays or refuses as it always does.
 
+**Dynamic routes.** The routes registered through `/admin/routes` that are in force come with the snapshot, in the
+order the Python gateway tries them: exact paths, then wildcards from the longest prefix down. A request whose path
+matches one goes to that route's backend with the route's protocol name and timeout, and to its rewritten path if it
+has one; otherwise the caller's path, unchanged (a protocol's prefix such as `/acp` is not taken off a routed path).
+Keys, limits, rules and policies apply as for any other path. A route whose backend is not a plain `http://` address
+leaves what it matches to the Python gateway. A route takes effect here one sync interval after it does there.
+
 **The agent edge.** A request for `/agents/<slug>/...` is forwarded here when the agent is registered with a plain
 `http://` upstream and the request would reach it exactly as the Python gateway sends it. As there, no gateway key is
 asked for and no limit, IP rule or policy applies: the agent authenticates its own callers. The agent is sent the path
@@ -174,8 +181,8 @@ here is the reverse of everywhere else: **whatever this side cannot be sure of i
   unexpired. A key created less than a sync interval ago is refused until the next sync.
 * The key's allowed paths (matched against `/package.Service/Method`), the IP rules, the policies, the key's rate
   limit, its tenant's quota and the backend's circuit breaker apply as for any native request.
-* A key marked `native_ok: false`, which includes every key while dynamic routes, transformation rules or
-  request-altering plugins exist, is refused: those are rules this side cannot apply.
+* A key marked `native_ok: false` is refused, and so is every call while a transformation rule or a
+  request-altering plugin exists: those are rules this side cannot apply. Dynamic routes do not apply to gRPC calls.
 * Refusals are gRPC statuses with the request id attached: `UNAUTHENTICATED` (no key, or one that does not work),
   `PERMISSION_DENIED` (scope, IP rule, policy, or rules that cannot be applied), `RESOURCE_EXHAUSTED` (rate limit or
   quota, with `retry-after`), `UNAVAILABLE` (snapshot not fresh, circuit open, backend unreachable), `UNIMPLEMENTED`
@@ -205,7 +212,9 @@ here is the reverse of everywhere else: **whatever this side cannot be sure of i
 | `/agents/<slug>/...` to a registered `http://` agent, browsers included | data plane |
 | `/agents/<slug>/...` otherwise (unknown slugs, `https://` agents, unusual requests) | Python |
 | GraphQL, MQTT, the JSON-to-gRPC bridge under `/grpc` | Python |
-| Dynamic routes, transformation rules, request-altering plugins (when any exist) | Python, for every path |
+| A path that matches a dynamic route to an `http://` backend | data plane, to the route's backend |
+| A path that matches a dynamic route to any other backend | Python |
+| Transformation rules, request-altering plugins (when any exist) | Python, for every path |
 | The health path, `/ready` and `/live`, on a plain `GET` | data plane |
 | A request with an `Origin` header (the cross-origin headers are Python's) | Python |
 | `/health/detailed`, `/metrics`, `/oauth2`, `/admin` and the console | Python |

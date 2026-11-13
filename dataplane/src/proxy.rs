@@ -948,7 +948,9 @@ fn admit_grpc<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, now
     if !entry.is_active || entry.expires_at.is_some_and(|e| e <= now as i64) {
         return Err(GrpcRefusal::BAD_KEY);
     }
-    if !entry.native_ok {
+    // Rules this side cannot apply: to this key, or (a transformation rule, a plugin that alters
+    // requests) to every request.
+    if !entry.native_ok || snap.fallthrough_prefixes.iter().any(|p| path.starts_with(p.as_str())) {
         return Err(GrpcRefusal::NOT_APPLICABLE);
     }
     let native = Native { protocol: Protocol::Grpc, backend: Some(backend), entry, route: None, version: None, ip, method: "POST" };
@@ -2477,6 +2479,9 @@ mod tests {
         }
         assert_eq!(admitted(&governed(GRPC, r#","expires_at":101"#), &with_key, 100, true), Ok(false));
         assert_eq!(admitted(&governed(GRPC, r#","native_ok":false"#), &with_key, 100, true), Err(GrpcRefusal::NOT_APPLICABLE));
+        // With every path left to Python (a transformation rule exists, say), there is nobody to leave a call to.
+        let all_python = format!(r#"{GRPC},"fallthrough_prefixes":["/"]"#);
+        assert_eq!(admitted(&governed(&all_python, ""), &with_key, 100, true), Err(GrpcRefusal::NOT_APPLICABLE));
     }
 
     #[test]
