@@ -53,7 +53,6 @@ from app.db_models import (
     APIKeyModel,
     IPRuleModel,
     PolicyModel,
-    RouteModel,
     TenantAPIKeyModel,
     TenantModel,
     TenantUsageModel,
@@ -132,6 +131,41 @@ def _agents() -> Dict[str, str]:
     routes = gw.agent_edge_config.snapshot()["routes"]
     return {slug: base for slug, base in sorted(routes.items())
             if isinstance(slug, str) and isinstance(base, str) and _AGENT_SLUG.fullmatch(slug) and _AGENT_UPSTREAM.fullmatch(base)}
+
+
+_ROUTE_REWRITE = re.compile(r"/[A-Za-z0-9._~/-]*")
+
+
+def _dynamic_routes(settings) -> list:
+    """The routes registered through ``/admin/routes`` that are in force, in the order this gateway
+    tries them (``route_registry.match``): exact paths, then wildcards from the longest prefix down.
+    A matching route decides where a request goes, under which protocol name, to which path and
+    with which timeout. One the data plane cannot follow exactly has no ``backend`` here, and
+    requests it matches are this gateway's. With dynamic routes switched off there are none."""
+    if not getattr(settings, "dynamic_routes_enabled", False):
+        return []
+    from app import route_registry
+
+    out = []
+    for match_path, is_wildcard, _length, cfg in route_registry._ROUTES:
+        backend = (cfg.backend_url or "").rstrip("/")
+        rewrite = cfg.rewrite_path or None
+        timeout = cfg.timeout
+        follows = (
+            _AGENT_UPSTREAM.fullmatch(backend) is not None
+            and (rewrite is None or _ROUTE_REWRITE.fullmatch(rewrite) is not None)
+            and isinstance(timeout, int) and not isinstance(timeout, bool) and 0 < timeout <= 86_400
+            and cfg.protocol.value.isascii()
+        )
+        out.append({
+            "path": match_path,
+            "wildcard": bool(is_wildcard),
+            "backend": backend if follows else None,
+            "protocol": cfg.protocol.value,
+            "timeout_seconds": timeout if follows else None,
+            "rewrite": rewrite if follows else None,
+        })
+    return out
 
 
 _REQUEST_ID_GOES_HERE = "@@request-id@@"
@@ -425,7 +459,6 @@ async def build_snapshot(db: AsyncSession) -> Dict[str, Any]:
         select(PolicyModel).where(PolicyModel.enabled.is_(True))
         .order_by(PolicyModel.priority.asc(), PolicyModel.created_at.asc())
     )).scalars().all()
-    routes = (await db.execute(select(func.count()).select_from(RouteModel))).scalar_one()
 
     from app.plugins import PluginType, plugin_registry
     from app.transformers import transformation_manager
@@ -450,7 +483,9 @@ async def build_snapshot(db: AsyncSession) -> Dict[str, Any]:
     request_plugins = any(
         p.plugin_type != PluginType.AUTH_PROVIDER and p.name != "request-id" for p in active
     )
-    all_paths_via_python = bool(routes or transformation_manager.list_rules() or request_plugins)
+    dynamic_routes = _dynamic_routes(settings)
+    # Until the data plane follows the routes itself, one route in force keeps every path here.
+    all_paths_via_python = bool(dynamic_routes or transformation_manager.list_rules() or request_plugins)
     auth_plugins = any(p.plugin_type == PluginType.AUTH_PROVIDER for p in active)
     # The health and metrics endpoints are this gateway's own and need no key, wherever they are
     # configured to live: if that is under a prefix the data plane serves, it must leave them alone.
@@ -532,6 +567,7 @@ async def build_snapshot(db: AsyncSession) -> Dict[str, Any]:
         "grpc": _grpc(settings),
         "agents": _agents(),
         "agent_failure": _agent_failure(),
+        "dynamic_routes": dynamic_routes,
     }
     snap["revision"] = hashlib.sha256(json.dumps(snap, sort_keys=True).encode()).hexdigest()
     return snap

@@ -877,3 +877,42 @@ async def test_the_snapshot_carries_the_answer_to_an_agent_that_fails(db_session
     rid = 'abc-123 <&"\'>'
     assert before + html.escape(rid) + after == gw._error_html(500, gw.internal_error_data(rid))
     assert "INTERNAL_ERROR" not in failure["message_json"] and "<title>500" in before
+
+
+async def test_the_snapshot_lists_the_dynamic_routes_in_force_in_matching_order(db_session, monkeypatch):
+    from types import SimpleNamespace
+
+    from app import route_registry
+
+    def row(path, backend, **kw):
+        return SimpleNamespace(path=path, backend_url=backend, is_active=kw.pop("is_active", True), protocol=kw.pop("protocol", "http"),
+                               timeout=kw.pop("timeout", 30), rate_limit=None, requires_auth=True, headers=None, rewrite_path=kw.pop("rewrite", None))
+
+    async def listed():
+        return (await dataplane_sync.build_snapshot(db_session))["dynamic_routes"]
+
+    monkeypatch.setattr(route_registry, "_ROUTES", route_registry._snapshot_from_rows([
+        row("/api/*", "http://b1:9000/"),
+        row("/api/orders/*", "http://b2:9000", protocol="mcp", timeout=5, rewrite="/v/orders"),
+        row("/api/exact", "http://b3:9000"),
+        row("/api/secure/*", "https://b4:9000"),
+        row("/api/odd/*", "http://b5:9000", rewrite="/a?b=1"),
+        row("/api/off/*", "http://b6:9000", is_active=False),
+    ]))
+    routes = await listed()
+    # Exact first, then the longest prefix; an inactive route is not there at all.
+    assert [(r["path"], r["wildcard"]) for r in routes] == [
+        ("/api/exact", False), ("/api/orders/", True), ("/api/secure/", True), ("/api/odd/", True), ("/api/", True)]
+    by_path = {r["path"]: r for r in routes}
+    assert by_path["/api/"] == {"path": "/api/", "wildcard": True, "backend": "http://b1:9000", "protocol": "http",
+                                "timeout_seconds": 30, "rewrite": None}
+    assert by_path["/api/orders/"] == {"path": "/api/orders/", "wildcard": True, "backend": "http://b2:9000", "protocol": "mcp",
+                                       "timeout_seconds": 5, "rewrite": "/v/orders"}
+    # Routes the data plane cannot follow are listed, so that it leaves what they match alone.
+    assert by_path["/api/secure/"]["backend"] is None and by_path["/api/odd/"]["backend"] is None
+    # A route in force still keeps every path with this gateway; a route that is off, or routes
+    # switched off altogether, no longer do.
+    assert (await dataplane_sync.build_snapshot(db_session))["fallthrough_prefixes"] == ["/"]
+    monkeypatch.setattr(get_settings(), "dynamic_routes_enabled", False)
+    assert await listed() == []
+    assert (await dataplane_sync.build_snapshot(db_session))["fallthrough_prefixes"] != ["/"]
