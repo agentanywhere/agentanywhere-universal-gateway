@@ -43,7 +43,7 @@ Python 3.11; they were not repeated for this page.
 | GraphQL | `POST /graphql` | `GRAPHQL_BACKEND_URL` | Working (queries over HTTP; no subscriptions) | `tests/test_gateway.py::test_graphql_routing`, `tests/test_protocols.py`; earlier manual check |
 | MQTT | `POST /mqtt/publish`, `POST /mqtt/subscribe` | `MQTT_BROKER_URL` | Partial: publish works; subscribe registers a subscription but messages are not delivered to the HTTP caller | `tests/test_protocols.py`; earlier manual check of publish |
 | WebSocket | `/ws/*` | `WEBSOCKET_BACKEND_URL` (a `ws://` or `wss://` address) | Working, with an API key; governance by key scope, IP rules and policies, no rate limit or quota | `tests/test_cov_main_proxy.py`, `dataplane/conformance/run.py` |
-| gRPC | `/grpc*`, `/api/grpc*` | `GRPC_BACKEND_URL` | Not working | `tests/test_protocols.py::test_call_unary_does_not_fabricate_success`; earlier manual check |
+| gRPC | Any gRPC method (`/package.Service/Method`), through the Rust data plane only | `GRPC_BACKEND_URL` (`host:port`) | Working through the experimental data plane (`dataplane/`), with an API key; not working in the Python gateway on its own | `dataplane/conformance/run.py`; `tests/test_protocols.py::test_call_unary_does_not_fabricate_success` |
 | Agent edge | `/agents/<slug>/*` (HTTP and WebSocket) | `AGENT_EDGE_ENABLED`, `AGENT_ROUTES_JSON`, or `/admin/agents` | Working, without gateway credentials (off by default) | `tests/test_agent_edge_proxy.py`, `tests/test_agent_routes.py` |
 | Plugin protocols | Any prefix a `ProtocolPlugin` claims | Plugin | Working (request and response, no streaming) | `tests/test_plugins.py` |
 
@@ -145,7 +145,21 @@ bridge (`app/protocols/grpc_handler.py`) that takes
 (`grpc_reflection`, which is not in `requirements.txt`) or the sample
 `greeter_pb2` modules. With the stock requirements it answers HTTP 200 with
 `"status": "unsupported"`. It is not a gRPC proxy: gRPC clients cannot connect
-to the gateway.
+to the Python gateway, which does not speak HTTP/2.
+
+With the Rust data plane in front (`dataplane/`, experimental), gRPC clients
+connect to the data plane and their calls are relayed to `GRPC_BACKEND_URL`
+when that is a plain `host:port`. Connections are HTTP/2 without TLS on both
+sides. Unary calls and all three kinds of stream are carried, with the
+backend's status, message and trailers. Every call needs an API key, sent as
+`x-api-key` metadata (or whatever `API_KEY_HEADER` names) or as
+`authorization: Bearer <key>`; the backend is not sent it. A key's allowed
+paths are matched against the method path, so `/package.Service` limits a key
+to one service. IP rules, policies, rate limits, tenant quotas and the circuit
+breaker apply as they do to HTTP. A refusal is a gRPC status: `UNAUTHENTICATED`
+without a working key, `PERMISSION_DENIED` when a rule refuses,
+`RESOURCE_EXHAUSTED` over a limit, `UNAVAILABLE` when the backend cannot be
+reached. See `dataplane/README.md` for the limits.
 
 ## Agent edge
 

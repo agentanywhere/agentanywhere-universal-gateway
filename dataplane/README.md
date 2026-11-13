@@ -121,7 +121,12 @@ gateway checks the body, the body has a `Content-Length`, fits in memory (4 MiB,
 certain to pass. On those same paths, a request with no credential, or with one the Python gateway has just refused,
 is answered here with the gateway's 401. Anything else, including OAuth2 tokens, credentials seen for the first time,
 a request from a web page in another origin (one with an `Origin` header), `/metrics`, `/admin`, `/oauth2`, GraphQL,
-MQTT, gRPC and `/agents/...`, goes to the Python gateway untouched, so its answer is the answer.
+MQTT and `/agents/...`, goes to the Python gateway untouched, so its answer is the answer.
+
+**HTTP/2.** A client that opens its connection with the HTTP/2 preface (no TLS; `curl --http2-prior-knowledge`, a
+gRPC client, a proxy configured for it) is spoken to in HTTP/2. Its requests are decided exactly as HTTP/1 requests
+are, and those that go to the Python gateway or to an HTTP backend go there as HTTP/1.1. Upgrading an HTTP/1
+connection with `Upgrade: h2c` is not supported, and neither is WebSocket over HTTP/2.
 
 The gateway's own health endpoints are answered here on a plain `GET`, each for what this side can vouch for:
 
@@ -142,6 +147,28 @@ tunnel: bytes go both ways until either side closes. If it refuses or cannot be 
 other handshake (a key in `?api_key=`, an unknown key, `/agents/<slug>/...`, any IP rule or policy in force) is tunnelled
 to the Python gateway, which relays or refuses as it always does.
 
+**gRPC.** A call (HTTP/2, `POST`, content type `application/grpc` or `application/grpc+...`) is relayed to
+`GRPC_BACKEND_URL` when that is a plain `host:port`, over HTTP/2 without TLS, with the path unchanged and the body and
+trailers streamed both ways. The Python gateway cannot carry gRPC, so there is nobody to hand a call to, and the rule
+here is the reverse of everywhere else: **whatever this side cannot be sure of is refused.**
+
+* The key comes from the key header or from `authorization: Bearer`, and must be in the snapshot, active and
+  unexpired. A key created less than a sync interval ago is refused until the next sync.
+* The key's allowed paths (matched against `/package.Service/Method`), the IP rules, the policies, the key's rate
+  limit, its tenant's quota and the backend's circuit breaker apply as for any native request.
+* A key marked `native_ok: false`, which includes every key while dynamic routes, transformation rules or
+  request-altering plugins exist, is refused: those are rules this side cannot apply.
+* Refusals are gRPC statuses with the request id attached: `UNAUTHENTICATED` (no key, or one that does not work),
+  `PERMISSION_DENIED` (scope, IP rule, policy, or rules that cannot be applied), `RESOURCE_EXHAUSTED` (rate limit or
+  quota, with `retry-after`), `UNAVAILABLE` (snapshot not fresh, circuit open, backend unreachable), `UNIMPLEMENTED`
+  (no gRPC backend configured). They are counted and logged under the HTTP status they stand for (401, 403, 429, 503, 502, 501).
+* The backend is sent the caller's metadata, `x-forwarded-for` and `traceparent`, and never the gateway's key. An
+  `authorization` that did not carry the key is the caller's own and goes through.
+* Nothing bounds a call but the caller's deadline; `DEFAULT_TIMEOUT` does not apply, so a stream may stay open. Only
+  connecting to the backend is bounded (10 s). A call the caller cancels is cancelled at the backend.
+* A call that reaches the backend is counted with status 200 whatever gRPC status the backend ends it with, and
+  under the protocol label `http`. gRPC-Web is not handled.
+
 | Traffic | Served by |
 |---|---|
 | Plain HTTP under `/api/` | data plane |
@@ -155,7 +182,9 @@ to the Python gateway, which relays or refuses as it always does.
 | Browsers (HTML error pages) | Python |
 | WebSocket under `/ws/`, key in `X-API-Key`, no IP rules or policies | data plane |
 | Any other WebSocket (`?api_key=`, `/agents/<slug>`, rules or policies in force) | Python, through a tunnel |
-| GraphQL, MQTT, gRPC, `/agents/<slug>` | Python |
+| gRPC calls (HTTP/2, `application/grpc`) | data plane only; refused when it cannot be sure |
+| Any other request over HTTP/2 | as the same request over HTTP/1 |
+| GraphQL, MQTT, the JSON-to-gRPC bridge under `/grpc`, `/agents/<slug>` | Python |
 | Dynamic routes, transformation rules, request-altering plugins (when any exist) | Python, for every path |
 | The health path, `/ready` and `/live`, on a plain `GET` | data plane |
 | A request with an `Origin` header (the cross-origin headers are Python's) | Python |

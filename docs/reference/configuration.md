@@ -145,7 +145,7 @@ settings too, so `.env` applies to them; the process environment wins.)
 | `GRAPHQL_BACKEND_URL` | unset | Endpoint that `POST /graphql` forwards queries to. `env.example` sets `http://localhost:4000/graphql`; the sample backend is on port 8006. |
 | `MQTT_BROKER_URL` | unset | Broker for `/mqtt/publish` and `/mqtt/subscribe`, for example `mqtt://localhost:1883` (`mqtts://` for TLS). The gateway connects when it starts. |
 | `WEBSOCKET_BACKEND_URL` | unset | The WebSocket server `/ws/*` connections are relayed to. Give a `ws://` or `wss://` address; see the [protocol support matrix](../explanation/protocol-support.md). |
-| `GRPC_BACKEND_URL` | unset | Target for the JSON-to-gRPC bridge, for example `localhost:50051`. The bridge does not work. |
+| `GRPC_BACKEND_URL` | unset | The gRPC server, as `host:port`, for example `localhost:50051`. The Rust data plane relays gRPC calls to it; the Python gateway's own JSON-to-gRPC bridge does not work. See the [protocol support matrix](../explanation/protocol-support.md). |
 | `DEFAULT_TIMEOUT` | `30` | Seconds the gateway waits for a buffered backend response. Also the timeout of agent-edge requests. |
 
 These values are for a gateway running directly on a machine. Under the
