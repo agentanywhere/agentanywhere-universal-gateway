@@ -1378,7 +1378,9 @@ def main() -> int:
                                                  "authorization_endpoint": f"{agent}/authorize", "token_endpoint": f"{agent}/token?ttl={ttl}"})
 
             def issue(provider="idp"):
-                r = httpx.post(f"{py}/oauth2/token", json={"grant_type": "client_credentials", "provider": provider}, timeout=10)
+                # With the client's own credentials, which a gateway that asks for them needs.
+                r = httpx.post(f"{py}/oauth2/token", timeout=10, json={"grant_type": "client_credentials", "provider": provider,
+                                                                       "client_id": "conformance", "client_secret": "s3cret"})
                 r.raise_for_status()
                 return r.json()["access_token"]
 
