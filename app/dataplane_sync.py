@@ -331,10 +331,19 @@ def _boundary(settings) -> Dict[str, Any]:
 
     try:
         # Only a tool with a non-empty schema has its arguments validated.
-        schema_tools = sorted(name for name, schema in tier1_registry.tool_input_schema_index().items() if schema)
+        index = tier1_registry.tool_input_schema_index()
+        schema_tools = sorted(name for name, schema in index.items() if schema)
         schemas_known = True
     except Exception:  # noqa: BLE001 - a registry this code cannot read: let Python judge MCP bodies
-        schema_tools, schemas_known = [], False
+        index, schema_tools, schemas_known = {}, [], False
+    # The schemas themselves, so the data plane can forward a call whose arguments are certain to
+    # pass. One it does not fully understand, or that is not sent, keeps the tool's calls here.
+    tool_schemas = {}
+    for name in schema_tools:
+        try:
+            tool_schemas[name] = json.loads(json.dumps(index[name], allow_nan=False))
+        except Exception:  # noqa: BLE001 - not plain JSON: this gateway judges that tool's calls
+            continue
     return {
         "mcp": {
             "enabled": bool(settings.mcp_boundary_enabled),
@@ -345,6 +354,7 @@ def _boundary(settings) -> Dict[str, Any]:
             # The data plane carries the default patterns only; with others, MCP bodies are judged here.
             "default_patterns": schemas_known and not list(settings.mcp_boundary_injection_patterns or []),
             "schema_tools": schema_tools,
+            "tool_schemas": tool_schemas,
         },
         "a2a": {
             "enabled": bool(settings.a2a_boundary_enabled),

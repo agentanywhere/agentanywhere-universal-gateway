@@ -11,7 +11,8 @@
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::{Map, Value};
-use std::collections::HashSet;
+use crate::schema::Schema;
+use std::collections::{HashMap, HashSet};
 
 /// The largest body read into memory to be checked. A longer one is handed to the Python gateway.
 pub const MAX_CHECKED_BODY: u64 = 4 * 1024 * 1024;
@@ -64,6 +65,9 @@ struct McpRecord {
     /// Tools whose arguments the Python gateway validates against a JSON Schema.
     #[serde(default)]
     schema_tools: Vec<String>,
+    /// Those schemas, by tool. A tool named above and missing here is the Python gateway's to judge.
+    #[serde(default)]
+    tool_schemas: HashMap<String, Value>,
 }
 
 #[derive(Deserialize)]
@@ -84,7 +88,9 @@ struct Mcp {
     allowed: HashSet<String>,
     block_injection: bool,
     default_patterns: bool,
-    schema_tools: HashSet<String>,
+    /// Tools whose arguments are validated against a schema: the schema when this side
+    /// understands all of it, `None` when only the Python gateway can judge.
+    schemas: HashMap<String, Option<Schema>>,
 }
 
 pub struct Boundary {
@@ -141,7 +147,10 @@ impl Boundary {
                 allowed: m.allowed_methods.into_iter().collect(),
                 block_injection: m.block_injection,
                 default_patterns: m.default_patterns,
-                schema_tools: m.schema_tools.into_iter().collect(),
+                schemas: m.schema_tools.into_iter().map(|name| {
+                    let schema = m.tool_schemas.get(&name).and_then(Schema::compile);
+                    (name, schema)
+                }).collect(),
             }),
             None => Some(Mcp {
                 max_body: 2_097_152,
@@ -149,7 +158,7 @@ impl Boundary {
                 allowed: HashSet::new(),
                 block_injection: true,
                 default_patterns: true,
-                schema_tools: HashSet::new(),
+                schemas: HashMap::new(),
             }),
         };
         let injection = DEFAULT_INJECTION_PATTERNS
@@ -274,12 +283,19 @@ impl Boundary {
                 Some(Value::String(s)) => s.as_str(),
                 Some(_) => return false,
             };
-            if !matches!(present(params, "arguments"), None | Some(Value::Object(_))) {
-                return false;
-            }
-            // Arguments checked against a JSON Schema are for the Python gateway to judge.
-            if !name.is_empty() && mcp.schema_tools.contains(name) {
-                return false;
+            let nothing = Map::new();
+            let arguments = match present(params, "arguments") {
+                None => &nothing,
+                Some(Value::Object(given)) => given,
+                Some(_) => return false,
+            };
+            // Arguments are checked against the tool's JSON Schema. Where they are certain to
+            // pass, the call goes on; a refusal, or a schema this side does not fully
+            // understand, is the Python gateway's.
+            if let Some(schema) = mcp.schemas.get(name).filter(|_| !name.is_empty()) {
+                if !schema.as_ref().is_some_and(|s| s.accepts_object(arguments)) {
+                    return false;
+                }
             }
         }
         true
@@ -525,6 +541,19 @@ mod tests {
         assert_eq!(mcp(&schemas, r#"{"method":"tools/call","params":{"name":"add","arguments":{}}}"#), Verdict::AskPython);
         assert_eq!(mcp(&schemas, r#"{"method":"tools/call","params":{"name":"echo","arguments":{}}}"#), Verdict::Pass);
         assert_eq!(mcp(&schemas, r#"{"method":"tools/list","params":{"name":"add"}}"#), Verdict::Pass);
+        // With the schema itself, a call certain to pass it goes on; the rest are still Python's.
+        let known = with(r#"{"enabled":true,"max_body_bytes":0,"block_injection":true,"default_patterns":true,"schema_tools":["add","odd"],
+            "tool_schemas":{"add":{"type":"object","properties":{"a":{"type":"integer"},"b":{"type":"integer"}},"required":["a","b"]},
+                            "odd":{"type":"object","properties":{"a":{"pattern":"^x"}}}}}"#);
+        assert_eq!(mcp(&known, r#"{"method":"tools/call","params":{"name":"add","arguments":{"a":1,"b":2}}}"#), Verdict::Pass);
+        assert_eq!(mcp(&known, r#"{"method":"tools/call","params":{"name":"add","arguments":{"a":1,"b":2,"note":"x"}}}"#), Verdict::Pass);
+        assert_eq!(mcp(&known, r#"{"method":"tools/call","params":{"name":"add","arguments":{"a":1}}}"#), Verdict::AskPython);
+        assert_eq!(mcp(&known, r#"{"method":"tools/call","params":{"name":"add","arguments":{"a":1,"b":"2"}}}"#), Verdict::AskPython);
+        assert_eq!(mcp(&known, r#"{"method":"tools/call","params":{"name":"add"}}"#), Verdict::AskPython);
+        assert_eq!(mcp(&known, r#"{"method":"tools/call","params":{"name":"add","arguments":null}}"#), Verdict::AskPython);
+        assert_eq!(mcp(&known, r#"{"method":"tools/call","params":{"name":"odd","arguments":{"a":"x"}}}"#), Verdict::AskPython);
+        assert_eq!(mcp(&known, r#"{"method":"tools/call","params":{"name":"echo","arguments":{"a":"x"}}}"#), Verdict::Pass);
+        assert_eq!(mcp(&known, r#"[{"method":"tools/call","params":{"name":"add","arguments":{"a":1,"b":2}}},{"method":"tools/call","params":{"name":"add","arguments":{}}}]"#), Verdict::AskPython);
     }
 
     #[test]

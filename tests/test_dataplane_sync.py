@@ -568,7 +568,7 @@ async def test_the_snapshot_carries_the_body_checks_as_they_are_shipped(db_sessi
     assert snap["boundary"] == {
         "mcp": {
             "enabled": True, "max_body_bytes": 2_097_152, "blocked_methods": [], "allowed_methods": [],
-            "block_injection": True, "default_patterns": True, "schema_tools": [],
+            "block_injection": True, "default_patterns": True, "schema_tools": [], "tool_schemas": {},
         },
         "a2a": {"enabled": True, "enforce_send_message_shape": True},
         "acp": {"enabled": True},
@@ -607,7 +607,21 @@ def test_only_tools_with_a_schema_are_named(monkeypatch):
         tier1_registry, "tool_input_schema_index",
         classmethod(lambda cls: {"add": {"type": "object"}, "noop": {}, "zeta": {"required": ["a"]}}),
     )
-    assert dataplane_sync._boundary(get_settings())["mcp"]["schema_tools"] == ["add", "zeta"]
+    mcp = dataplane_sync._boundary(get_settings())["mcp"]
+    assert mcp["schema_tools"] == ["add", "zeta"]
+    # With the schemas themselves, so the data plane can pass a call that is certain to fit.
+    assert mcp["tool_schemas"] == {"add": {"type": "object"}, "zeta": {"required": ["a"]}}
+
+
+def test_a_schema_that_is_not_plain_json_is_named_but_not_sent(monkeypatch):
+    from app.tier1_registry import tier1_registry
+
+    monkeypatch.setattr(
+        tier1_registry, "tool_input_schema_index",
+        classmethod(lambda cls: {"odd": {"minimum": float("inf")}, "set": {"enum": {1, 2}}, "fine": {"type": "object"}}),
+    )
+    mcp = dataplane_sync._boundary(get_settings())["mcp"]
+    assert mcp["schema_tools"] == ["fine", "odd", "set"] and mcp["tool_schemas"] == {"fine": {"type": "object"}}
 
 
 def test_a_registry_that_cannot_be_read_keeps_mcp_bodies_with_python(monkeypatch):

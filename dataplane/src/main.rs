@@ -12,6 +12,7 @@ mod govern;
 mod limits;
 mod proxy;
 mod report;
+mod schema;
 mod snapshot;
 mod sync;
 mod tenant;
