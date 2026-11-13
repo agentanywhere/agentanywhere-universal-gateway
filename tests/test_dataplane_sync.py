@@ -961,3 +961,31 @@ async def test_the_snapshot_carries_the_pages_a_browser_is_shown(db_session):
     assert filled("403:00", data["error"], data["message"], "r-2") == gw._error_html(403, data)
     data = {"error": "BACKEND_ERROR", "message": "Backend: Backend service unavailable", "request_id": "r-3", "details": {"hint": "Check it"}}
     assert filled("502:10", data["error"], data["message"], "r-3", "Check it") == gw._error_html(502, data)
+
+
+async def test_the_snapshot_says_which_requests_a_transformation_rule_applies_to(db_session, monkeypatch):
+    from app.transformers import TransformationManager, TransformationRule, TransformConfig, transformation_manager
+
+    fresh = TransformationManager()
+    monkeypatch.setattr(transformation_manager, "rules_by_id", fresh.rules_by_id)
+    monkeypatch.setattr(transformation_manager, "rules_by_path", fresh.rules_by_path)
+
+    async def listed():
+        return (await dataplane_sync.build_snapshot(db_session))["transform_rules"]
+
+    def rule(pattern, methods=(), enabled=True):
+        return transformation_manager.register_rule(TransformationRule(
+            name=pattern, path_pattern=pattern, methods=list(methods), enabled=enabled,
+            request_config=TransformConfig(headers_set={"X-A": "1"})))
+
+    assert await listed() == []
+    rule("/api/orders/*", ["get", "POST"])
+    rule("/api/item?")
+    rule("/api/off/*", enabled=False)
+    assert await listed() == [{"glob": "/api/orders/*", "methods": ["GET", "POST"]}, {"glob": "/api/item?", "methods": []}]
+    # A pattern the data plane does not match exactly as this gateway does: every path stays here.
+    for pattern in ("*", "**", "^/api/v[0-9]+/", "/api/.*$", "/api/[ab]/x", "/api/caf\u00e9/*"):
+        odd = rule(pattern)
+        assert await listed() is None, pattern
+        transformation_manager.remove_rule(odd.id)
+    assert len(await listed()) == 2

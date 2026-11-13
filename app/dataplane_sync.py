@@ -133,6 +133,33 @@ def _agents() -> Dict[str, str]:
             if isinstance(slug, str) and isinstance(base, str) and _AGENT_SLUG.fullmatch(slug) and _AGENT_UPSTREAM.fullmatch(base)}
 
 
+def _transform_rules() -> Optional[list]:
+    """Which requests a transformation rule applies to, so that the data plane can leave exactly
+    those to this gateway: for each rule that is switched on, its path pattern and its methods (none
+    means all). A rule matches a request by the path the backend is asked for and, for the answer,
+    by the request's path without its leading slash (``TransformationRule.matches``).
+
+    Only patterns the data plane matches exactly as this gateway does are listed: globs made of
+    plain characters, ``*`` and ``?``. With any other rule (a pattern that matches everything, a
+    regular expression, a character class), the answer is ``None`` and every path stays here."""
+    from app.transformers import transformation_manager
+
+    out = []
+    for rule in transformation_manager.list_rules():
+        if not rule.enabled:
+            continue
+        pattern = rule.path_pattern
+        plain = (
+            isinstance(pattern, str) and pattern not in ("*", "**") and pattern.isascii()
+            and not pattern.startswith("^") and not pattern.endswith("$") and "[" not in pattern
+        )
+        methods = [m.upper() for m in (rule.methods or []) if isinstance(m, str)]
+        if not plain or len(methods) != len(rule.methods or []):
+            return None
+        out.append({"glob": pattern, "methods": sorted(set(methods))})
+    return out
+
+
 _PAGE_SLOTS = {"code": "@@code@@", "message": "@@message@@", "hint": "@@hint@@", "request_id": "@@request-id@@"}
 _PAGE_RETRY_AFTER = 987654321
 _PAGE_STATUSES = (401, 403, 429, 502, 503)
@@ -541,6 +568,8 @@ async def build_snapshot(db: AsyncSession) -> Dict[str, Any]:
         p.plugin_type != PluginType.AUTH_PROVIDER and p.name != "request-id" for p in active
     )
     dynamic_routes = _dynamic_routes(settings)
+    transform_rules = _transform_rules()
+    # Until the data plane tells for itself which requests a rule applies to, one rule keeps every path here.
     all_paths_via_python = bool(transformation_manager.list_rules() or request_plugins)
     auth_plugins = any(p.plugin_type == PluginType.AUTH_PROVIDER for p in active)
     # The health and metrics endpoints are this gateway's own and need no key, wherever they are
@@ -626,6 +655,7 @@ async def build_snapshot(db: AsyncSession) -> Dict[str, Any]:
         "dynamic_routes": dynamic_routes,
         "cross_origin": _cross_origin(),
         "error_pages": _error_pages(),
+        "transform_rules": transform_rules,
     }
     snap["revision"] = hashlib.sha256(json.dumps(snap, sort_keys=True).encode()).hexdigest()
     return snap
