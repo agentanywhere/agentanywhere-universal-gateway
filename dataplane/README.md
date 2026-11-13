@@ -140,7 +140,7 @@ The gateway's own health endpoints are answered here on a plain `GET`, each for 
 
 With the Python gateway down, the health path and `/ready` therefore answer 502 and `/live` still answers 200.
 
-**WebSocket.** A handshake for `/ws/...` is relayed here when `WEBSOCKET_BACKEND_URL` is a `ws://` address and the
+**WebSocket.** A handshake for `/ws/...` is relayed here when `WEBSOCKET_BACKEND_URL` is a `ws://` address (or `wss://`, see TLS below) and the
 key is certain to be let in: sent in `X-API-Key`, known, working and allowed that path, with no IP rule or policy
 configured. The backend is asked for the rest of the path and the query, and sent only the handshake, the subprotocols
 offered and the caller's `Authorization` and `Cookie`; never the gateway's key. Once it accepts, the connection is a
@@ -185,8 +185,13 @@ to over TLS, HTTP/1.1, and its certificate is verified as the Python gateway's H
 certificates in `SSL_CERT_FILE` when that is set, otherwise against the Mozilla root certificates. A backend whose
 certificate does not verify is not spoken to and counts as unreachable (`502 BACKEND_ERROR`, or for an agent the
 Python gateway's answer). With `SSL_CERT_DIR` set, or a certificate file that cannot be read, this side speaks no TLS
-and says so when it starts; `https://` backends are then the Python gateway's. Not over TLS here: gRPC backends and
-`wss://` WebSocket backends.
+and says so when it starts; `https://` backends are then the Python gateway's.
+
+A gRPC backend named as `https://host:port` is spoken to over TLS, with HTTP/2 agreed in the handshake and the same
+verification. A `wss://` WebSocket backend is relayed to here only when `SSL_CERT_FILE` is set for both this side and
+the Python gateway: the Python gateway's WebSocket client verifies against the system's certificates and that file,
+not the Mozilla set, so only with the file do both sides trust what this side trusts. If the TLS connection to a
+`wss://` backend fails here, the handshake is handed to the Python gateway instead of being refused.
 
 **Dynamic routes.** The routes registered through `/admin/routes` that are in force come with the snapshot, in the
 order the Python gateway tries them: exact paths, then wildcards from the longest prefix down. A request whose path
@@ -214,7 +219,7 @@ for anyone else, both taken from the snapshot so the words stay the Python gatew
 compressed with its `Content-Encoding`; the Python gateway decompresses it first. The caller reads the same either way.
 
 **gRPC.** A call (HTTP/2, `POST`, content type `application/grpc` or `application/grpc+...`) is relayed to
-`GRPC_BACKEND_URL` when that is a plain `host:port`, over HTTP/2 without TLS, with the path unchanged and the body and
+`GRPC_BACKEND_URL` when that is a plain `host:port` (HTTP/2 without TLS) or `https://host:port` (over TLS), with the path unchanged and the body and
 trailers streamed both ways. The Python gateway cannot carry gRPC, so there is nobody to hand a call to, and the rule
 here is the reverse of everywhere else: **whatever this side cannot be sure of is refused.**
 
@@ -272,7 +277,7 @@ here is the reverse of everywhere else: **whatever this side cannot be sure of i
   and the backend. Messages, subprotocol and close codes are the same either way.
 * **A WebSocket is checked when it opens, not while it is open.** A key revoked afterwards keeps its open connections,
   here and in the Python gateway alike. Connections are not counted, limited or written to the request log by either.
-* **`wss://` backends and WebSockets with IP rules or policies are relayed by the Python gateway**, not here.
+* **WebSockets with IP rules or policies, and `wss://` backends without `SSL_CERT_FILE`, are relayed by the Python gateway**, not here.
 
 * **`/ready` can be one sync interval behind** (500 ms by default), or as long as a sync that hangs takes to fail
   (five seconds), because it repeats the Python gateway's last answer instead of asking the database itself.
