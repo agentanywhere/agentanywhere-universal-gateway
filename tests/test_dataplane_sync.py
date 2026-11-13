@@ -992,3 +992,49 @@ async def test_the_snapshot_says_which_requests_a_transformation_rule_applies_to
         assert (await dataplane_sync.build_snapshot(db_session))["fallthrough_prefixes"] == ["/"]
         transformation_manager.remove_rule(odd.id)
     assert len(await listed()) == 2
+
+
+async def test_the_snapshot_lists_the_oauth2_tokens_accepted_as_credentials(db_session, monkeypatch):
+    import hashlib
+    from datetime import timedelta, timezone
+
+    from app.governance import create_ip_rule
+    from app.oauth2 import oauth2_manager
+
+    monkeypatch.setattr(oauth2_manager, "tokens", {})
+    monkeypatch.setattr(oauth2_manager, "_access_index", {})
+
+    async def listed():
+        return (await dataplane_sync.build_snapshot(db_session))["tokens"]
+
+    assert await listed() == []
+    stored = oauth2_manager._store_token("idp", {"access_token": "tok-live", "expires_in": 600})
+    spent = oauth2_manager._store_token("idp", {"access_token": "tok-spent", "expires_in": 600})
+    spent.expires_at -= timedelta(seconds=601)
+    oauth2_manager._store_token("idp", {"access_token": " padded", "expires_in": 600})
+    oauth2_manager._store_token("idp", {"access_token": "tok-é", "expires_in": 600})
+    settings = dataplane_sync.get_settings()
+    # By digest, never the token; with the gateway's default limits, which is what a token gets.
+    assert await listed() == [{
+        "hash": hashlib.sha256(b"tok-live").hexdigest(), "id": "non-database-key", "name": "oauth2:idp",
+        "expires_at": int(stored.expires_at.replace(tzinfo=timezone.utc).timestamp()),
+        "rate_limit_per_minute": settings.rate_limit_per_minute, "rate_limit_per_hour": settings.rate_limit_per_hour,
+    }]
+    assert "tok-live" not in json.dumps(await dataplane_sync.build_snapshot(db_session))
+    # A token passes over IP rules and policies here; the data plane is never asked to do that.
+    await create_ip_rule(db_session, cidr="203.0.113.0/24", action="deny")
+    assert await listed() == []
+
+
+async def test_a_native_rate_limit_refusal_of_a_token_is_announced_as_our_own_is(db_session, announced):
+    event = dataplane_sync.ReportedEvent(
+        type="rate_limit_exceeded", api_key_id="non-database-key", api_key_name="oauth2:idp",
+        client_ip="198.51.100.7", limit=3, window="minute", path="/api/users", count=2,
+    )
+    assert await dataplane_sync.apply_events(db_session, [event]) == 1
+    await _settle()
+    assert announced["webhooks"] == [("rate_limit_exceeded", {
+        "api_key_id": None, "api_key_name": "oauth2:idp", "client_ip": "198.51.100.7", "limit": 3,
+        "window": "minute", "path": "/api/users", "count": 2,
+    })]
+    assert announced["limit_alerts"][0]["api_key_id"] is None

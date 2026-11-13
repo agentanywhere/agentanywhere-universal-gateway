@@ -133,6 +133,38 @@ def _agents() -> Dict[str, str]:
             if isinstance(slug, str) and isinstance(base, str) and _AGENT_SLUG.fullmatch(slug) and _AGENT_UPSTREAM.fullmatch(base)}
 
 
+def _tokens(settings, governed: bool) -> list:
+    """The OAuth2 access tokens this gateway accepts as credentials (``Authorization: Bearer <token>``),
+    each by its SHA-256 digest, never the token itself. A token is let in without the checks a key
+    goes through (allowed paths, IP rules, policies) and has no tenant; its limits are the
+    gateway's defaults. So that the data plane never has to pass over a rule, none is listed while
+    any IP rule or policy is in force: those requests stay here. Tokens live in this process's
+    memory, so only the ones this worker issued are known here."""
+    if governed:
+        return []
+    from app.api_key_cache import hash_key
+    from app.oauth2 import oauth2_manager
+
+    listed = []
+    for token, token_id in list(oauth2_manager._access_index.items()):
+        stored = oauth2_manager.tokens.get(token_id)
+        # One that could never arrive in a header as it is stored is never matched here either.
+        if stored is None or not isinstance(token, str) or not token.isascii() or token != token.strip() or not token:
+            continue
+        if stored.is_expired():
+            continue
+        listed.append({
+            "hash": hash_key(token),
+            # What this gateway counts a refused request under when the credential is not a database key.
+            "id": "non-database-key",
+            "name": f"oauth2:{stored.provider}",
+            "expires_at": _epoch(stored.expires_at),
+            "rate_limit_per_minute": int(settings.rate_limit_per_minute or 0),
+            "rate_limit_per_hour": int(settings.rate_limit_per_hour or 0),
+        })
+    return sorted(listed, key=lambda t: t["hash"])
+
+
 def _transform_rules() -> Optional[list]:
     """Which requests a transformation rule applies to, so that the data plane can leave exactly
     those to this gateway: for each rule that is switched on, its path pattern and its methods (none
@@ -656,6 +688,7 @@ async def build_snapshot(db: AsyncSession) -> Dict[str, Any]:
         "cross_origin": _cross_origin(),
         "error_pages": _error_pages(),
         "transform_rules": transform_rules,
+        "tokens": _tokens(settings, bool(rules) or bool(policy_rows)),
     }
     snap["revision"] = hashlib.sha256(json.dumps(snap, sort_keys=True).encode()).hexdigest()
     return snap
@@ -761,6 +794,7 @@ class ReportedEvent(BaseModel):
     timeout_seconds: int = 0
     # rate_limit_exceeded
     api_key_id: Optional[str] = None
+    api_key_name: Optional[str] = None  # sent for a credential that is not a database key (an OAuth2 token)
     client_ip: Optional[str] = None
     limit: int = 0
     window: Optional[str] = None
@@ -900,8 +934,10 @@ async def apply_events(db: AsyncSession, events: list) -> int:
                 "failure_count": e.failure_count, "message": message,
             }))
         elif e.type == "rate_limit_exceeded":
+            if e.api_key_name:  # not a database key: it has a name and no id, as when refused here
+                e.api_key_id = None
             _in_background(webhook_manager.trigger_webhook(WebhookEventType.RATE_LIMIT_EXCEEDED, {
-                "api_key_id": e.api_key_id, "api_key_name": names.get(e.api_key_id or ""),
+                "api_key_id": e.api_key_id, "api_key_name": e.api_key_name or names.get(e.api_key_id or ""),
                 "client_ip": e.client_ip, "limit": e.limit, "window": e.window, "path": e.path,
                 "count": max(1, e.count),
             }))
