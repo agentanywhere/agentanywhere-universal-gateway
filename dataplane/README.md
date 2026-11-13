@@ -122,7 +122,7 @@ gateway checks the body, the body has a `Content-Length`, fits in memory (4 MiB,
 certain to pass. On those same paths, a request with no credential, or with one the Python gateway has just refused,
 is answered here with the gateway's 401. Anything else, including credentials seen for the first time,
 a preflight from a web page, `/metrics`, `/admin`, `/oauth2`, GraphQL
-and MQTT, goes to the Python gateway untouched, so its answer is the answer.
+and MQTT other than publishing, goes to the Python gateway untouched, so its answer is the answer.
 
 **HTTP/2.** A client that opens its connection with the HTTP/2 preface (no TLS; `curl --http2-prior-knowledge`, a
 gRPC client, a proxy configured for it) is spoken to in HTTP/2. Its requests are decided exactly as HTTP/1 requests
@@ -166,6 +166,21 @@ what OpenAPI adds: `example`, `nullable`, `x-...`). With any other keyword (`pat
 calls stay with the Python gateway, and so does a value the two sides could read differently, such as a whole number
 written `2.0`. `python dataplane/conformance/boundary.py` generates schemas and calls and checks that nothing the
 Python gateway refuses is forwarded here.
+
+**MQTT publishing.** The Python gateway holds one MQTT 5 connection to the broker in `MQTT_BROKER_URL` and publishes on
+it what `POST /mqtt/publish` is sent: `json.dumps` of the `payload`, never retained, at the `qos` asked for (1 if none).
+While that connection stands, the snapshot names the broker and this side keeps a connection of its own to it (one for
+the process, on its own thread, under the client name `gateway_dataplane_<random>`). A publish is answered here when the
+connection stands and it is certain which message the Python gateway would publish: the body is a JSON object in UTF-8
+with a non-empty string `topic` without wildcards, a `qos` written `0`, `1` or `2` (or none), and a payload this side
+can spell exactly as Python does. Everything else goes to the Python gateway, which publishes or refuses it: a member
+named twice, `NaN`, a number exactly halfway between two shortest spellings (the two languages round those
+differently), a body over 1 MiB or in another encoding, a broker behind TLS (`mqtts://`), and any request while this
+side's connection is down. As with the Python gateway's client, the answer is given once the message is handed to the
+connection, not once the broker acknowledges it; messages above quality of service 0 are kept until it does and sent
+again after a reconnect. `/mqtt/subscribe` stays with the Python gateway.
+`python dataplane/conformance/publish.py` generates bodies and checks that whatever this side would publish, the Python
+gateway's own handler and client publish the same bytes.
 
 **Transformation rules.** The Python gateway applies them; this side only works out which requests they apply to and
 hands those over. A rule's pattern is matched, as there, against the path the backend is asked for (after a dynamic
@@ -267,10 +282,12 @@ here is the reverse of everywhere else: **whatever this side cannot be sure of i
 | WebSocket under `/ws/`, key in `X-API-Key`, no IP rules or policies | data plane |
 | Any other WebSocket (`?api_key=`, `/agents/<slug>`, rules or policies in force) | Python, through a tunnel |
 | gRPC calls (HTTP/2, `application/grpc`) | data plane only; refused when it cannot be sure |
+| `POST /mqtt/publish` to an `mqtt://` broker, body certain to publish the same message | data plane, over its own connection to the broker |
+| Any other publish (a body this side is not sure of, `mqtts://`, the connection down), `/mqtt/subscribe` | Python |
 | Any other request over HTTP/2 | as the same request over HTTP/1 |
 | `/agents/<slug>/...` to a registered agent, browsers included | data plane |
 | `/agents/<slug>/...` otherwise (unknown slugs, unusual requests) | Python |
-| GraphQL, MQTT, the JSON-to-gRPC bridge under `/grpc` | Python |
+| GraphQL, the JSON-to-gRPC bridge under `/grpc` | Python |
 | A path that matches a dynamic route to an `http://` or `https://` backend | data plane, to the route's backend |
 | A path that matches a dynamic route to any other backend | Python |
 | A request a transformation rule applies to (by path pattern and method) | Python, which applies it |
@@ -334,6 +351,7 @@ cargo test                              # unit tests
 python dataplane/conformance/run.py     # same scenarios against Python and the data plane, plus the live-link
                                         # scenarios (needs the build above)
 python dataplane/conformance/boundary.py  # the body checks against the Python functions, on generated bodies
+python dataplane/conformance/publish.py   # what would be published to MQTT, against the Python handler and client
 ```
 
 The conformance suite is the definition of "same behaviour": a scenario must pass on both before the data plane may

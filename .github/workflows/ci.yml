@@ -94,3 +94,5 @@ jobs:
         run: python dataplane/conformance/run.py
       - name: Body checks against the Python functions
         run: python dataplane/conformance/boundary.py
+      - name: MQTT publishing against the Python handler
+        run: python dataplane/conformance/publish.py

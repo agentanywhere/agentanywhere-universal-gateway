@@ -1976,8 +1976,6 @@ def main() -> int:
             check("MQTT: when the broker is back, the data plane publishes again", back is not None)
             pub_same("after the broker came back, messages are the same again", "data plane", {"topic": "back", "payload": {"n": 1}}, want=one("back", 1, b'{"n": 1}'))
             check("MQTT: nothing sent while the broker was away turns up later", not any(m["topic"] == "while/away" for m in broker.published[seen:]))
-            # The gateway is slow to stop with a broker connection it has used; it is not waited for.
-            mqtt_gateway.kill()
 
             # Last: the control plane goes away. The data plane must stop serving natively.
             procs[1].send_signal(signal.SIGTERM)

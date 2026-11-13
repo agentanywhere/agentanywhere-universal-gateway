@@ -845,6 +845,28 @@ async def test_the_snapshot_names_the_grpc_backend_when_it_is_a_plain_address(db
         assert await named() == want, target
 
 
+async def test_the_snapshot_names_the_mqtt_broker_while_this_gateway_is_connected_to_it(db_session, monkeypatch):
+    from app import main as gw
+    from app.protocols import MQTTHandler
+
+    async def named():
+        return (await dataplane_sync.build_snapshot(db_session))["mqtt"]
+
+    monkeypatch.setattr(gw, "mqtt_handler", None)
+    assert await named() is None
+    handler = MQTTHandler("mqtt://broker.internal:1884")
+    monkeypatch.setattr(gw, "mqtt_handler", handler)
+    assert await named() is None  # not connected: this gateway answers 503, and so must the data plane's answer be
+    handler.connected = True
+    assert await named() == {"host": "broker.internal", "port": 1884}
+    for url, want in (("mqtt://broker.internal", {"host": "broker.internal", "port": get_settings().protocol_mqtt_default_port}),
+                      ("mqtts://broker.internal:8883", None), ("broker.internal:1883", None), ("mqtt://broker.internal:1883/path", None),
+                      ("mqtt://user@broker.internal:1883", None), ("mqtt://[::1]:1883", None), ("mqtt://b\u00e9:1883", None),
+                      ("mqtt://broker.internal:0", None), ("mqtt://broker.internal:70000", None)):
+        handler.broker_url = url
+        assert await named() == want, url
+
+
 async def test_the_snapshot_names_the_agents_the_data_plane_can_reach(db_session, monkeypatch):
     from app import main as gw
     from app.agent_routes import AgentEdgeConfig
