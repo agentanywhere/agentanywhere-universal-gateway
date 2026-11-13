@@ -31,6 +31,7 @@ use crate::accesslog::{self, AccessLog};
 use crate::boundary::Verdict;
 use crate::breaker::{self, Breaker};
 use crate::govern::{self, IpRule, Policy, Scope, Subject};
+use crate::pyjson;
 use crate::report::{Event, Reporter, Row, Served};
 use crate::snapshot::{hash_key, AgentFailure, Digest32, DynamicRoute, KeyEntry, Readiness, Snapshot, Wording};
 use crate::sync::Link;
@@ -51,6 +52,8 @@ pub enum Protocol {
     Acp,
     /// gRPC calls, which arrive over HTTP/2 and are told apart by their content type, not by path.
     Grpc,
+    /// `POST /mqtt/publish`, which goes to no backend: the message is published to the broker.
+    Mqtt,
 }
 
 /// The protocols whose backends come from the snapshot, in the order `Snapshot::routes` holds them.
@@ -67,6 +70,7 @@ impl Protocol {
             Protocol::AgUi => "ag_ui",
             Protocol::Acp => "acp",
             Protocol::Grpc => "grpc",
+            Protocol::Mqtt => "mqtt",
         }
     }
 
@@ -230,6 +234,8 @@ pub struct State {
     pub reporter: Option<Arc<Reporter>>,
     /// Present when a line per native request was asked for.
     pub access_log: Option<AccessLog>,
+    /// This side's connection to the MQTT broker.
+    pub mqtt: Arc<crate::mqtt::Link>,
 }
 
 impl State {
@@ -349,16 +355,25 @@ const HOP_BY_HOP: [&str; 8] = [
     "upgrade",
 ];
 
+/// The one MQTT path with a handler of its own in the Python gateway that this side answers too.
+/// Every other path under `/mqtt` is the Python gateway's.
+const PUBLISH: &str = "/mqtt/publish";
+/// The longest body to publish from that is read here; a longer one is the Python gateway's.
+const PUBLISH_BODY_MAX: u64 = 1 << 20;
+
 /// First path segments after `/api/` that the control plane keeps although its router would call
 /// them plain HTTP.
 const KEPT_BY_CONTROL: [&str; 2] = ["ws", "agents"];
 
 /// The protocol a path belongs to, decided in the order the Python gateway's router decides it
 /// (prefixes are compared as text, so `/mcpx` is MCP there and here). `None` for what the control
-/// plane keeps: MQTT, WebSocket, gRPC, GraphQL, its own endpoints and anything without a prefix.
+/// plane keeps: MQTT but for publishing, WebSocket, gRPC, GraphQL, its own endpoints and anything
+/// without a prefix.
 fn classify(path: &str) -> Option<Protocol> {
     let under = |name: &str| path.starts_with(name) || path.strip_prefix("/api").map(|rest| rest.starts_with(name)).unwrap_or(false);
-    if under("/mcp") {
+    if path == PUBLISH {
+        Some(Protocol::Mqtt)
+    } else if under("/mcp") {
         Some(Protocol::Mcp)
     } else if under("/a2a") {
         Some(Protocol::A2a)
@@ -664,6 +679,12 @@ fn decide<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, now: u6
         found => found.map(|(v, _)| v),
     };
     let Some(ip) = govern::client_ip(peer, req.headers(), &snap.trusted_proxies) else { return PYTHON };
+    // Publishing is a POST to a broker the Python gateway is connected to; anything else on that
+    // path is its to answer.
+    let publishing = protocol == Protocol::Mqtt;
+    if publishing && (method != "POST" || snap.mqtt.is_none()) {
+        return PYTHON;
+    }
     let pages = snap.error_pages.as_ref().filter(|_| html);
     let refuse = |wording: &'a Wording| Decision::Refuse(Unauthenticated { pages, wording, version, ip, method });
 
@@ -713,7 +734,8 @@ fn decide<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, now: u6
         _ => {}
     }
     // A dynamic route comes before the protocol's own backend: the first that matches decides.
-    let route = snap.dynamic_routes.iter().find(|r| r.matches(path));
+    // Publishing has a handler of its own in the Python gateway, which no route comes before.
+    let route = snap.dynamic_routes.iter().find(|r| !publishing && r.matches(path));
     let backend = match (route, protocol.route_index()) {
         (Some(route), _) => match route.backend.as_deref() {
             Some(backend) => Some(backend),
@@ -1670,6 +1692,27 @@ pub async fn handle(w: Arc<Worker>, peer: SocketAddr, mut req: Request<Incoming>
         }
     }
 
+    // A message to publish is read here whole, before anything is counted. Unless what the
+    // Python gateway would publish for it is certain, and this side's connection to the broker
+    // stands, the request is handed over as it came.
+    let mut publish = None;
+    if refused.is_none() && n.protocol == Protocol::Mqtt {
+        let ready = snap.mqtt.as_ref().is_some_and(|broker| st.mqtt.serves(broker));
+        match req.body().size_hint().exact() {
+            Some(len) if ready && len <= PUBLISH_BODY_MAX => {
+                let (parts, body) = req.into_parts();
+                let Ok(read) = body.collect().await else { return Ok(body_unreadable()) };
+                let bytes = read.to_bytes();
+                publish = pyjson::publish(&bytes);
+                req = Request::from_parts(parts, full(bytes));
+            }
+            _ => {}
+        }
+        if publish.is_none() {
+            return Ok(to_control(&w, peer, req).await);
+        }
+    }
+
     let (mut ticket, mut rejected, mut error_type) = (None, false, None);
     let (mut resp, error) = if let Some(r) = refused {
         rejected = true;
@@ -1689,7 +1732,13 @@ pub async fn handle(w: Arc<Worker>, peer: SocketAddr, mut req: Request<Incoming>
             }
             Ok(admitted) => {
                 ticket = admitted;
-                if !backend.breaker.allow(&cb, Instant::now()) {
+                if let Some(message) = publish.take() {
+                    // Answered as the Python gateway answers: once the message is on its way.
+                    let mut resp = Response::new(full(format!("{{\"status\":\"published\",\"topic\":{}}}", pyjson::quoted(&message.topic))));
+                    resp.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                    st.mqtt.publish(message);
+                    (resp, None)
+                } else if !backend.breaker.allow(&cb, Instant::now()) {
                     (circuit_open(&t), Some("SERVICE_UNAVAILABLE"))
                 } else {
                     let native = Sent {
@@ -1988,6 +2037,7 @@ mod tests {
     fn a_path_belongs_to_the_protocol_the_python_router_gives_it() {
         for (path, protocol) in [
             ("/api/users", Some(Protocol::Http)),
+            ("/mqtt/publish", Some(Protocol::Mqtt)),
             ("/api/v1/orders/7", Some(Protocol::Http)),
             ("/mcp", Some(Protocol::Mcp)),
             ("/mcp/tools", Some(Protocol::Mcp)),
@@ -2004,7 +2054,7 @@ mod tests {
         }
         for path in [
             "/admin/keys", "/oauth2/token", "/health", "/docs", "/", "/api", "/apix/y", "/rest/x", "/users",
-            "/mqtt/publish", "/api/mqtt/x", "/ws/x", "/websocket", "/wss", "/grpc/x", "/api/grpc", "/graphql", "/api/graphql",
+            "/mqtt/publish/", "/mqtt/subscribe", "/mqtt", "/api/mqtt/publish", "/api/mqtt/x", "/ws/x", "/websocket", "/wss", "/grpc/x", "/api/grpc", "/graphql", "/api/graphql",
             "/api/ws/x", "/api/agents/a", "/agents/a/mcp",
         ] {
             assert_eq!(classify(path), None, "{path}");

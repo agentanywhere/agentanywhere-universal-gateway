@@ -116,6 +116,9 @@ pub struct Snapshot {
     pub grpc_url: Option<String>,
     /// The backend at that address, filled in when the snapshot is put to use.
     pub grpc: Option<Arc<Backend>>,
+    /// The MQTT broker `POST /mqtt/publish` publishes to, while the Python gateway is connected
+    /// to it and this side may publish there as well.
+    pub mqtt: Option<Broker>,
     /// The agent edge: slug to upstream address (`http://`), for the agents this side forwards to.
     pub agent_urls: HashMap<String, String>,
     /// The backends at those addresses, filled in when the snapshot is put to use.
@@ -243,6 +246,13 @@ pub struct AgentFailure {
     pub page: (String, String),
 }
 
+/// An MQTT broker reached without TLS.
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+pub struct Broker {
+    pub host: String,
+    pub port: u16,
+}
+
 /// The Python gateway's own answer to `/ready`, as of one snapshot answer.
 #[derive(Deserialize, Debug, PartialEq)]
 pub struct Readiness {
@@ -283,6 +293,7 @@ struct SnapshotFile {
     ops: Option<Ops>,
     websocket: Option<String>,
     grpc: Option<String>,
+    mqtt: Option<Broker>,
     #[serde(default)]
     agents: HashMap<String, String>,
     agent_failure: Option<AgentFailure>,
@@ -636,6 +647,7 @@ impl Snapshot {
             websocket: None,
             grpc_url: file.grpc.filter(|u| u.starts_with("http://") || u.starts_with("https://")),
             grpc: None,
+            mqtt: file.mqtt.filter(|b| !b.host.is_empty() && b.port != 0),
             agent_urls: file.agents,
             agents: HashMap::new(),
             agent_failure: file.agent_failure.filter(|f| f.message_json.starts_with('"')),

@@ -324,6 +324,29 @@ def _grpc(settings) -> Optional[str]:
     return f"{scheme}{target}" if _GRPC_TARGET.fullmatch(target) else None
 
 
+_MQTT_HOST = re.compile(r"[A-Za-z0-9.-]+")
+
+
+def _mqtt() -> Optional[Dict[str, Any]]:
+    """The MQTT broker ``POST /mqtt/publish`` publishes to, while this gateway's own client is
+    connected to it: the data plane then keeps a connection of its own and publishes there too.
+    A broker behind TLS (``mqtts://``) is left to this gateway, whose client verifies it against
+    certificates the data plane does not read."""
+    from app import main as gw
+
+    handler = gw.mqtt_handler
+    url = getattr(handler, "broker_url", None)
+    if handler is None or not handler.connected or not isinstance(url, str) or not url.startswith("mqtt://"):
+        return None
+    try:
+        host, port, tls = handler._parse_broker_url()
+    except Exception:
+        return None
+    if tls or not _MQTT_HOST.fullmatch(host) or not 0 < port < 65536:
+        return None
+    return {"host": host, "port": port}
+
+
 def _boundary(settings) -> Dict[str, Any]:
     """The settings of the body checks, in the form the data plane applies them. Names are lower-cased
     here because that is how the checks compare them."""
@@ -700,6 +723,7 @@ async def build_snapshot(db: AsyncSession) -> Dict[str, Any]:
         "ops": _ops(settings),
         "websocket": _websocket(settings, bool(rules) or bool(policy_rows)),
         "grpc": _grpc(settings),
+        "mqtt": _mqtt(),
         "agents": _agents(),
         "agent_failure": _agent_failure(),
         "dynamic_routes": dynamic_routes,

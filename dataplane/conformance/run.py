@@ -8,7 +8,7 @@ Each scenario is sent to the Python gateway directly and to the data plane, and 
 code, the body and the headers the gateway promises are compared. A status, error-code or body
 difference fails the run. Header-name differences are listed as known gaps, not failures.
 """
-import hashlib, json, os, secrets, signal, subprocess, sys, tempfile, threading, time
+import hashlib, json, os, secrets, signal, socket, socketserver, subprocess, sys, tempfile, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -131,6 +131,92 @@ def websocket_backend(tls=None):
         server = serve(handler, "127.0.0.1", 0, **options)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return f"{'wss' if tls else 'ws'}://127.0.0.1:{server.socket.getsockname()[1]}/base"
+
+
+class MqttBroker:
+    """An MQTT 5 broker that acknowledges what it is sent, keeps a note of it and delivers nothing.
+    It can be stopped and started again on the same port, as a broker that goes away and comes back."""
+
+    def __init__(self):
+        self.port, self.server, self.open = 0, None, []
+        self.clients, self.published, self.released, self.subscribed = [], [], [], []
+        self.start()
+
+    def start(self):
+        broker = self
+
+        class Connection(socketserver.BaseRequestHandler):
+            def handle(self):
+                broker.open.append(self.request)
+                try:
+                    broker.serve(self.request)
+                except (EOFError, OSError):
+                    pass
+
+        class Server(socketserver.ThreadingTCPServer):
+            allow_reuse_address = True
+            daemon_threads = True
+
+        self.server = Server(("127.0.0.1", self.port), Connection)
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def stop(self):
+        self.server.shutdown()
+        self.server.server_close()
+        for connection in self.open:
+            try:
+                connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        self.open = []
+
+    def serve(self, connection):
+        def exact(n):
+            out = b""
+            while len(out) < n:
+                got = connection.recv(n - len(out))
+                if not got:
+                    raise EOFError
+                out += got
+            return out
+
+        client = None
+        while True:
+            first = exact(1)[0]
+            length, shift = 0, 0
+            while True:
+                byte = exact(1)[0]
+                length |= (byte & 0x7F) << shift
+                shift += 7
+                if not byte & 0x80:
+                    break
+            body, kind, flags = exact(length), first >> 4, first & 15
+            if kind == 1:  # CONNECT: name, level, flags, keep-alive, no properties, client identifier
+                client = body[13:13 + int.from_bytes(body[11:13], "big")].decode()
+                self.clients.append({"client": client, "level": body[6], "clean_start": bool(body[7] & 2), "keep_alive": int.from_bytes(body[8:10], "big"),
+                                     "properties": body[10]})
+                connection.sendall(bytes([0x20, 3, 0, 0, 0]))
+            elif kind == 3:  # PUBLISH
+                end = 2 + int.from_bytes(body[:2], "big")
+                topic, qos = body[2:end], (flags >> 1) & 3
+                packet_id = body[end:end + 2] if qos else b""
+                end += len(packet_id)
+                properties = body[end + 1:end + 1 + body[end]]
+                self.published.append({"client": client, "topic": topic.decode(), "qos": qos, "retain": bool(flags & 1), "again": bool(flags & 8),
+                                       "properties": properties.hex(), "payload": body[end + 1 + len(properties):]})
+                if qos:
+                    connection.sendall(bytes([0x40 if qos == 1 else 0x50, 2]) + packet_id)
+            elif kind == 6:  # PUBREL
+                self.released.append(client)
+                connection.sendall(bytes([0x70, 2]) + body[:2])
+            elif kind == 8:  # SUBSCRIBE
+                self.subscribed.append(client)
+                connection.sendall(bytes([0x90, 4]) + body[:2] + bytes([0, body[-1] & 3]))
+            elif kind == 12:  # PINGREQ
+                connection.sendall(bytes([0xD0, 0]))
+            elif kind == 14:  # DISCONNECT
+                return
 
 
 def certificates(folder):
@@ -1742,6 +1828,156 @@ def main() -> int:
                    want=lambda r: "refused" in r or r.get("closed") is not None)
             b = grpc_call(strangers[1][7:], "unary", "Say", b"hello", (("x-api-key", strangers[2]["rs"]["key"]),))
             check("behind TLS, gRPC: a backend nobody vouches for is not spoken to", b["code"] == "UNAVAILABLE", f"{b['code']}: {b['details']}")
+
+            # --- MQTT: publishing -------------------------------------------------------------------
+            # A gateway and a data plane of their own, in front of a broker that notes what it is sent.
+            # Each plane keeps its own connection to it; what the broker receives is compared.
+            print()
+            broker = MqttBroker()
+            g, d = free_port(), free_port()
+            own = {**env, "DATABASE_URL": f"sqlite+aiosqlite:///{tmp}/mqtt.db", "MQTT_BROKER_URL": f"mqtt://127.0.0.1:{broker.port}"}
+            mqtt_gateway = subprocess.Popen([sys.executable, "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", str(g),
+                                             "--log-level", "warning"], cwd=ROOT, env=own, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            procs.append(mqtt_gateway)
+            wait_healthy(f"http://127.0.0.1:{g}/health", mqtt_gateway)
+            mpy, mrs = f"http://127.0.0.1:{g}", f"http://127.0.0.1:{d}"
+
+            def mqtt_key(name, per_minute=1000, **more):
+                r = httpx.post(f"{mpy}/admin/api-keys", headers=adm, timeout=10,
+                               params={"name": name, "rate_limit_per_minute": per_minute, "rate_limit_per_hour": 10000, **more})
+                r.raise_for_status()
+                return r.json()["key"]
+
+            mkeys = {side: mqtt_key(f"mqtt-{side}") for side in ("py", "rs")}
+            procs.append(subprocess.Popen([str(BIN), "--listen", f"127.0.0.1:{d}", "--control-token", "conformance-token",
+                                           "--sync-interval-ms", "200", "--max-staleness-ms", "2000", "--report-interval-ms", "300",
+                                           "--backend", f"http://127.0.0.1:{bport}", "--control", f"http://127.0.0.1:{g}"], env=own))
+
+            def publish(base, key, body=None, path="/mqtt/publish", method="POST", headers=None, content=None):
+                """Send one request and wait for what it makes the broker receive. Returns the answer and the messages."""
+                before = len(broker.published)
+                h = {**({"X-API-Key": key} if key else {}), **(headers or {})}
+                r = httpx.request(method, base + path, headers=h, timeout=15, **({"content": content} if content is not None else {"json": body}))
+                if r.status_code == 200:
+                    wait_until(lambda: len(broker.published) > before, 3)
+                else:
+                    time.sleep(0.1)
+                return r, broker.published[before:]
+
+            def from_data_plane(message):
+                return message["client"].startswith("gateway_dataplane_")
+
+            def publishes_natively():
+                r, sent = publish(mrs, mkeys["rs"], {"topic": "conformance/warm-up"})
+                return said_by(r) == "data plane" and all(map(from_data_plane, sent))
+
+            check("MQTT: the data plane starts publishing itself", wait_until(publishes_natively, 10) is not None)
+            ids = [c for c in broker.clients if c["client"].startswith("gateway_dataplane_")]
+            theirs = [c for c in broker.clients if not c["client"].startswith("gateway_dataplane_")]
+            check("MQTT: the data plane connects as the Python gateway's client does, under a name of its own",
+                  len(ids) == 1 and len(theirs) == 1 and {k: v for k, v in ids[0].items() if k != "client"} == {k: v for k, v in theirs[0].items() if k != "client"},
+                  str(ids[:1]))
+
+            def pub_same(name, by, body=None, want=None, keys_=None, **kw):
+                """The same request to both planes: the same answer, and the same message at the broker."""
+                pair = keys_ or mkeys
+                a, sent_a = publish(mpy, pair["py"], body, **kw)
+                b, sent_b = publish(mrs, pair["rs"], body, **kw)
+                note = lambda sent: [{k: v for k, v in m.items() if k != "client"} for m in sent]
+                bad = []
+                if a.status_code != b.status_code or shape(a) != shape(b):
+                    bad.append(f"python [{a.status_code}] {shape(a)} vs data plane [{b.status_code}] {shape(b)}")
+                bad += [f"header {h} on one side only" for h in PROMISED if (h in a.headers) != (h in b.headers)]
+                if note(sent_a) != note(sent_b):
+                    bad.append(f"at the broker: python {note(sent_a)} vs data plane {note(sent_b)}")
+                if said_by(b) != by or any(map(from_data_plane, sent_a)) or any(from_data_plane(m) != (by == "data plane") for m in sent_b):
+                    bad.append(f"answered by the {said_by(b)}, published by {[m['client'] for m in sent_b]}")
+                if want is not None and not want(b, sent_b):
+                    bad.append(f"not what was expected: [{b.status_code}] {b.text[:120]} {note(sent_b)}")
+                gaps.update(set(map(str.lower, a.headers)) ^ set(map(str.lower, b.headers)))
+                shown = f"[{b.status_code}] by the {said_by(b)}" + (f", payload {sent_b[0]['payload'][:70]!r}" if sent_b else "")
+                check(f"MQTT: {name}", not bad, "; ".join(bad) or shown)
+
+            one = lambda topic, qos, payload: lambda r, sent: r.json() == {"status": "published", "topic": topic} and \
+                [(m["topic"], m["qos"], m["retain"], m["again"], m["properties"], m["payload"]) for m in sent] == [(topic, qos, False, False, "", payload)]
+            pub_same("a message is published here, spelled as Python spells it", "data plane",
+                     {"topic": "sensors/7/temp", "payload": {"celsius": 21.5, "unit": "\u00b0C", "ok": True, "tags": ["a", None], "n": 1e21, "small": 1e-7}},
+                     want=one("sensors/7/temp", 1, b'{"celsius": 21.5, "unit": "\\u00b0C", "ok": true, "tags": ["a", null], "n": 1e+21, "small": 1e-07}'))
+            pub_same("without a payload or a quality of service, it is {} at 1", "data plane", {"topic": "t"}, want=one("t", 1, b"{}"))
+            pub_same("quality of service 0", "data plane", {"topic": "t/0", "payload": "text", "qos": 0}, want=one("t/0", 0, b'"text"'))
+            released = len(broker.released)
+            pub_same("quality of service 2", "data plane", {"topic": "t/2", "payload": [1, 2], "qos": 2}, want=one("t/2", 2, b"[1, 2]"))
+            check("MQTT: at quality of service 2 both planes complete the exchange with the broker",
+                  wait_until(lambda: len(broker.released) == released + 2 and any(map("gateway_dataplane_".__eq__, (c[:18] for c in broker.released[released:]))), 3) is not None,
+                  str(broker.released[released:]))
+            pub_same("a body spelled another way, with no content type and a query", "data plane", path="/mqtt/publish?x=1",
+                     content=b' {"qos":0 ,"payload":{"b":"\\u00e9\\ud83d\\ude00","a":[1.50,-0,2E3]},\n"topic":"a\\/b"} ',
+                     want=one("a/b", 0, b'{"b": "\\u00e9\\ud83d\\ude00", "a": [1.5, 0, 2000.0]}'))
+            pub_same("a topic outside ASCII is published and echoed as it is", "data plane", {"topic": "caf\u00e9/\u2603", "payload": 1},
+                     want=lambda r, sent: r.text == '{"status":"published","topic":"caf\u00e9/\u2603"}' and sent[0]["topic"] == "caf\u00e9/\u2603")
+            pub_same("to a browser, a publish is still answered in JSON", "data plane", {"topic": "t"}, headers={"Accept": "text/html"}, want=one("t", 1, b"{}"))
+            pub_same("other members are ignored, a retained message is not asked for", "data plane", {"topic": "t", "payload": 1, "retain": True, "x": {"y": [1]}},
+                     want=one("t", 1, b"1"))
+            # What this side is not sure of is Python's to publish or refuse; nothing is published twice.
+            pub_same("a member named twice is left to Python, which publishes it", "python", content=b'{"topic":"x","payload":{"a":1,"b":2,"a":3},"topic":"t2"}',
+                     want=one("t2", 1, b'{"a": 3, "b": 2}'))
+            pub_same("a number halfway between two spellings is left to Python", "python", content=b'{"topic":"t","payload":600654557994792.25}',
+                     want=one("t", 1, b"600654557994792.2"))
+            pub_same("NaN, which Python reads, is left to Python", "python", content=b'{"topic":"t","payload":[NaN,1E400]}', want=one("t", 1, b"[NaN, Infinity]"))
+            pub_same("a body in UTF-16 is left to Python", "python", content='{"topic":"t16"}'.encode("utf-16"), want=one("t16", 1, b"{}"))
+            pub_same("true as a quality of service is left to Python", "python", content=b'{"topic":"t","qos":true}', want=one("t", 1, b"{}"))
+            nothing = lambda status: lambda r, sent: r.status_code == status and not sent
+            pub_same("without a topic: Python's 400", "python", {"payload": 1}, want=nothing(400))
+            pub_same("a topic with a wildcard: Python's 500", "python", {"topic": "a/+/b", "payload": 1}, want=nothing(500))
+            pub_same("a quality of service of 3: Python's 500", "python", {"topic": "t", "qos": 3}, want=nothing(500))
+            pub_same("a body that is not JSON: Python's 500", "python", content=b"nope", want=nothing(500))
+            pub_same("a body that is a list: Python's 500", "python", [1], want=nothing(500))
+            pub_same("the path with a slash after it is not the publishing path", "python", {"topic": "t"}, path="/mqtt/publish/", want=lambda r, sent: not sent)
+            subscribed = len(broker.subscribed)
+            pub_same("subscribing stays with Python", "python", {"topic": "s/#"}, path="/mqtt/subscribe", want=lambda r, sent: r.status_code == 200 and not sent)
+            check("MQTT: only the Python gateway's client subscribes", len(broker.subscribed) == subscribed + 2 and not any(c.startswith("gateway_dataplane_") for c in broker.subscribed))
+            # Refusals come before the message is read, and nothing reaches the broker.
+            a, _ = publish(mpy, None, {"topic": "t"})
+            b, sent = publish(mrs, None, {"topic": "t"})
+            same_refusal("MQTT: without a key", a, b, "data plane")
+            check("MQTT: without a key nothing is published", not sent)
+            scoped_m = {side: mqtt_key(f"mqtt-scoped-{side}", allowed_paths="/api/users") for side in ("py", "rs")}
+            limited = {side: mqtt_key(f"mqtt-limited-{side}", per_minute=2) for side in ("py", "rs")}
+            wait_until(lambda: said_by(publish(mrs, limited["rs"], {"topic": "t"}, method="GET", path="/api/users")[0]) == "data plane", 5)
+            publish(mpy, limited["py"], {"topic": "t"}, method="GET", path="/api/users")
+            pub_same("a key that may not reach the path is refused here", "data plane", {"topic": "t"}, keys_=scoped_m, want=nothing(403))
+            pub_same("within the key's limit, a message is published", "data plane", {"topic": "limited"}, keys_=limited, want=one("limited", 1, b"{}"))
+            pub_same("past the key's limit, the request is refused here and nothing is published", "data plane", {"topic": "limited"}, keys_=limited, want=nothing(429))
+
+            def counted(base_metrics=mpy):
+                total = 0.0
+                for line in httpx.get(f"{base_metrics}/metrics", timeout=10).text.splitlines():
+                    if line.startswith("gateway_requests_total{") and 'path="/mqtt/publish"' in line and 'protocol="mqtt"' in line and 'status_code="200"' in line:
+                        total += float(line.rsplit(" ", 1)[1])
+                return total
+
+            before = counted()
+            for i in range(5):
+                publish(mrs, mkeys["rs"], {"topic": f"counted/{i}"})
+            check("MQTT: what the data plane published is counted by the product as MQTT requests",
+                  wait_until(lambda: counted() == before + 5, 5) is not None, f"{counted() - before:.0f} of 5")
+
+            # The broker goes away and comes back. While it is away, neither plane publishes; after, both do.
+            broker.stop()
+            down = lambda: publish(mrs, mkeys["rs"], {"topic": "while/away"})[0]
+            check("MQTT: with the broker away, the data plane hands publishing to Python", wait_until(lambda: said_by(down()) == "python", 10) is not None)
+            gone = wait_until(lambda: down().status_code == 503, 15)
+            a, b = publish(mpy, mkeys["py"], {"topic": "while/away"})[0], down()
+            check("MQTT: with the broker away, both planes give Python's answer", gone is not None and a.status_code == b.status_code == 503 and shape(a) == shape(b),
+                  f"[{a.status_code}/{b.status_code}] {b.text[:90]}")
+            seen = len(broker.published)
+            broker.start()
+            back = wait_until(lambda: publishes_natively(), 40)
+            check("MQTT: when the broker is back, the data plane publishes again", back is not None)
+            pub_same("after the broker came back, messages are the same again", "data plane", {"topic": "back", "payload": {"n": 1}}, want=one("back", 1, b'{"n": 1}'))
+            check("MQTT: nothing sent while the broker was away turns up later", not any(m["topic"] == "while/away" for m in broker.published[seen:]))
+            # The gateway is slow to stop with a broker connection it has used; it is not waited for.
+            mqtt_gateway.kill()
 
             # Last: the control plane goes away. The data plane must stop serving natively.
             procs[1].send_signal(signal.SIGTERM)

@@ -10,7 +10,9 @@ mod boundary;
 mod breaker;
 mod govern;
 mod limits;
+mod mqtt;
 mod proxy;
+mod pyjson;
 mod report;
 mod schema;
 mod snapshot;
@@ -209,6 +211,11 @@ fn main() {
     if std::env::args().nth(1).as_deref() == Some("--judge-bodies") {
         return boundary::judge_stdin().unwrap_or_else(|e| fail(e));
     }
+    // `dataplane --judge-publishes` answers, for bodies on stdin, what `POST /mqtt/publish` would
+    // publish for each.
+    if std::env::args().nth(1).as_deref() == Some("--judge-publishes") {
+        return pyjson::judge_stdin().unwrap_or_else(|e| fail(e));
+    }
     let args = parse_args().unwrap_or_else(|e| fail(e));
     // A file bootstraps the snapshot; with a token it is replaced by the control plane's, and until
     // the first answer arrives nothing is served natively.
@@ -225,6 +232,7 @@ fn main() {
         eprintln!("dataplane: backends behind TLS are left to the control plane ({why})");
     }
     let backend = proxy::Backend::parse(&args.backend).unwrap_or_else(|e| fail(format!("--backend {e}")));
+    let (mqtt, mqtt_events) = mqtt::Link::new();
     let state = Arc::new(proxy::State {
         snapshot: ArcSwap::from_pointee(snapshot::Snapshot::empty()),
         generation: AtomicU64::new(0),
@@ -235,8 +243,10 @@ fn main() {
         sync: link,
         reporter,
         access_log: args.access_log.then(accesslog::AccessLog::start),
+        mqtt,
     });
     state.replace(snap);
+    mqtt::start(state.clone(), mqtt_events).unwrap_or_else(|e| fail(format!("cannot start the MQTT thread: {e}")));
     let sockets = intakes(args.listen, args.workers).unwrap_or_else(|e| fail(format!("cannot listen on {}: {e}", args.listen)));
 
     // The conversation with the control plane has a thread of its own, so no amount of traffic
