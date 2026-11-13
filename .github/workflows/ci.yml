@@ -96,3 +96,5 @@ jobs:
         run: python dataplane/conformance/boundary.py
       - name: MQTT publishing against the Python handler
         run: python dataplane/conformance/publish.py
+      - name: Transformation rule patterns against the Python matcher
+        run: python dataplane/conformance/patterns.py

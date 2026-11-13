@@ -213,6 +213,10 @@ fn main() {
     }
     // `dataplane --judge-publishes` answers, for bodies on stdin, what `POST /mqtt/publish` would
     // publish for each.
+    // `dataplane --judge-patterns` answers which paths each transformation rule's pattern matches.
+    if std::env::args().nth(1).as_deref() == Some("--judge-patterns") {
+        return snapshot::judge_patterns().unwrap_or_else(|e| fail(e));
+    }
     if std::env::args().nth(1).as_deref() == Some("--judge-publishes") {
         return pyjson::judge_stdin().unwrap_or_else(|e| fail(e));
     }

@@ -253,6 +253,33 @@ impl TransformRule {
     }
 }
 
+/// `dataplane --judge-patterns`: each line on stdin is `{"rule": <a transformation rule as the
+/// snapshot carries it>, "paths": [...]}`; the answer is a line with, for each path, whether the
+/// rule's pattern matches it (`1` or `0`), or `ask` for a rule this side would not trust. The
+/// conformance suite compares the lines with the Python gateway's own matching.
+pub fn judge_patterns() -> Result<(), String> {
+    use std::io::{BufRead, Write};
+
+    #[derive(Deserialize)]
+    struct Case {
+        rule: TransformRule,
+        paths: Vec<String>,
+    }
+
+    let out = std::io::stdout();
+    let mut out = out.lock();
+    for line in std::io::stdin().lock().lines() {
+        let line = line.map_err(|e| e.to_string())?;
+        let case: Case = serde_json::from_str(&line).map_err(|e| format!("case is not valid: {e}"))?;
+        let said = match case.rule.ready() {
+            Some(rule) => case.paths.iter().map(|p| if rule.applies("GET", p) { '1' } else { '0' }).collect(),
+            None => "ask".to_owned(),
+        };
+        writeln!(out, "{said}").map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 /// `glob_matches`, for a pattern with character classes.
 fn steps_match(steps: &[Step], text: &[u8]) -> bool {
     let (mut s, mut t) = (0, 0);

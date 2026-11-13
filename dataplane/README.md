@@ -195,7 +195,8 @@ matched from the start of the path; and, for such a pattern that is not a valid 
 then contain. A regular expression is matched here only if it means the same to both engines: plain characters, `.`,
 `\d`, `\w`, classes of plain characters and ranges, groups, `|` and repetition, with `^` only in front and `$` only at
 the end. A rule with any other expression (a look-around, a back-reference, a flag) or a pattern outside ASCII keeps
-every path with the Python gateway.
+every path with the Python gateway. `python dataplane/conformance/patterns.py` generates patterns of every kind and
+checks that this side matches each as the Python gateway's own matcher does.
 
 One difference a caller could see, though not in what the JSON says: while any rule is registered, the Python
 gateway reads and rewrites every JSON answer it passes on, matched or not, which changes its spacing and escaping.
@@ -360,6 +361,7 @@ python dataplane/conformance/run.py     # same scenarios against Python and the 
                                         # scenarios (needs the build above)
 python dataplane/conformance/boundary.py  # the body checks against the Python functions, on generated bodies
 python dataplane/conformance/publish.py   # what would be published to MQTT, against the Python handler and client
+python dataplane/conformance/patterns.py  # which paths a transformation rule's pattern matches, against Python's matcher
 ```
 
 The conformance suite is the definition of "same behaviour": a scenario must pass on both before the data plane may
