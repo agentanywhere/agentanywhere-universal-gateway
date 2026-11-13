@@ -82,7 +82,8 @@ as it has workers, or set `--workers` below the core count on a shared machine, 
 * **Anything it cannot reproduce goes to Python.** The snapshot marks a key `native_ok: false` when something about it
   cannot be reproduced exactly (a policy that matches on headers or uses a character class in its path, a scoped IPv6
   network, a key linked to more than one tenant), and turns native serving off for every path when
-  transformation rules or a request-altering plugin exist. Dynamic routes are followed here (see below). A single request also goes to Python when its path is
+  a request-altering plugin exists, or a transformation rule whose reach this side cannot work out. Dynamic routes
+  are followed here, and a transformation rule sends only the requests it applies to (see below). A single request also goes to Python when its path is
   percent-escaped or not ASCII, its method is not one of the plain ones, or the client's address cannot be resolved
   the way Python resolves it. The stock `request-id` plugin is reproduced natively.
 * **Native answers are labelled** with `X-Served-By: dataplane`, so you can see which plane answered.
@@ -147,6 +148,17 @@ tunnel: bytes go both ways until either side closes. If it refuses or cannot be 
 other handshake (a key in `?api_key=`, an unknown key, `/agents/<slug>/...`, any IP rule or policy in force) is tunnelled
 to the Python gateway, which relays or refuses as it always does.
 
+**Transformation rules.** The Python gateway applies them; this side only works out which requests they apply to and
+hands those over. A rule's pattern is matched, as there, against the path the backend is asked for (after a dynamic
+route's rewrite, a protocol's prefix or an agent's slug has been dealt with) and against the request's own path
+without its leading slash, which is what the Python gateway matches when it transforms an answer. Patterns made of
+plain characters, `*` and `?` are matched here. Any other rule (a pattern for every path, a regular expression, a
+character class) keeps every path with the Python gateway.
+
+One difference a caller could see, though not in what the JSON says: while any rule is registered, the Python
+gateway reads and rewrites every JSON answer it passes on, matched or not, which changes its spacing and escaping.
+An answer served here is the backend's, byte for byte.
+
 **Browsers.** A caller that prefers `text/html` (decided as the Python gateway decides it: `text/html` accepted, JSON
 not named before it, no `X-Requested-With: XMLHttpRequest`) is shown errors as pages. A successful request is
 forwarded like any other. An error answered here (401, 403, 429, 502, 503) becomes the Python gateway's page for that
@@ -202,8 +214,8 @@ here is the reverse of everywhere else: **whatever this side cannot be sure of i
   unexpired. A key created less than a sync interval ago is refused until the next sync.
 * The key's allowed paths (matched against `/package.Service/Method`), the IP rules, the policies, the key's rate
   limit, its tenant's quota and the backend's circuit breaker apply as for any native request.
-* A key marked `native_ok: false` is refused, and so is every call while a transformation rule or a
-  request-altering plugin exists: those are rules this side cannot apply. Dynamic routes do not apply to gRPC calls.
+* A key marked `native_ok: false` is refused, and so is a call a transformation rule applies to, and every call
+  while a request-altering plugin exists: those are rules this side cannot apply. Dynamic routes do not apply to gRPC calls.
 * Refusals are gRPC statuses with the request id attached: `UNAUTHENTICATED` (no key, or one that does not work),
   `PERMISSION_DENIED` (scope, IP rule, policy, or rules that cannot be applied), `RESOURCE_EXHAUSTED` (rate limit or
   quota, with `retry-after`), `UNAVAILABLE` (snapshot not fresh, circuit open, backend unreachable), `UNIMPLEMENTED`
@@ -235,7 +247,9 @@ here is the reverse of everywhere else: **whatever this side cannot be sure of i
 | GraphQL, MQTT, the JSON-to-gRPC bridge under `/grpc` | Python |
 | A path that matches a dynamic route to an `http://` or `https://` backend | data plane, to the route's backend |
 | A path that matches a dynamic route to any other backend | Python |
-| Transformation rules, request-altering plugins (when any exist) | Python, for every path |
+| A request a transformation rule applies to (by path pattern and method) | Python, which applies it |
+| Any transformation rule for every path, or with a regular expression or character class | Python, for every path |
+| Request-altering plugins (when any exist) | Python, for every path |
 | The health path, `/ready` and `/live`, on a plain `GET` | data plane |
 | A request with an `Origin` header | data plane, with the gateway's cross-origin headers |
 | A preflight (`OPTIONS`), an `Origin` given twice | Python |
