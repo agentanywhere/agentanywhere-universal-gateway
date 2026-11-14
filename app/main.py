@@ -1818,39 +1818,6 @@ async def mqtt_subscribe(request: Request):
         )
 
 
-@app.post("/graphql")
-async def graphql_proxy(request: Request):
-    """GraphQL proxy endpoint."""
-    if not graphql_handler:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="GraphQL backend not configured"
-        )
-    
-    try:
-        body = await request.json()
-        query = body.get("query")
-        variables = body.get("variables")
-        operation_name = body.get("operationName")
-        
-        if not query:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="GraphQL query is required"
-            )
-        
-        result = await graphql_handler.execute_query(query, variables, operation_name)
-        return JSONResponse(content=result)
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error("graphql_proxy_error", error=str(e))
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"GraphQL request failed: {str(e)}"
-        )
-
-
 # ==================== OAuth2 Endpoints ====================
 
 @app.get("/oauth2/authorize")
@@ -2270,35 +2237,8 @@ async def gateway_proxy(request: Request, path: str):
                     request_id=request_id
                 )
             
-            try:
-                data = await request.json()
-                query = data.get("query")
-                variables = data.get("variables")
-                operation_name = data.get("operationName")
-                
-                if not query:
-                    request_id = getattr(request.state, "request_id", None)
-                    raise ValidationError(
-                        message="GraphQL query is required",
-                        field="query",
-                        details={
-                            "hint": "Include a 'query' field in your request body with a valid GraphQL query.",
-                            "example": {"query": "{ hello }"}
-                        },
-                        request_id=request_id
-                    )
-                
-                result = await graphql_handler.execute_query(query, variables, operation_name)
-                return JSONResponse(content=result)
-            except HTTPException:
-                raise
-            except Exception as e:
-                logger.error("graphql_gateway_error", error=str(e), request_id=request_id)
-                raise HTTPException(
-                    status_code=status.HTTP_502_BAD_GATEWAY,
-                    detail=f"GraphQL request failed: {str(e)}"
-                )
-        
+            # Configured: the request goes to the backend as it came, like any other protocol's.
+
         # Get request body
         body = None
         if request.method in ["POST", "PUT", "PATCH"]:
