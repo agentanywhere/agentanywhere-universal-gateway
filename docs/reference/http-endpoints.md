@@ -22,12 +22,12 @@ The list is generated with `DEBUG=false`, the default. With `DEBUG=true` the
 gateway also serves `/docs`, `/redoc` and `/openapi.json`; otherwise they
 answer 404.
 
-Totals: 162 operations (one per method and path), of which 135 are under `/admin`. 3 admin operations need no credential.
+Totals: 161 operations (one per method and path), of which 135 are under `/admin`. 3 admin operations need no credential.
 
 ## Contents
 
 - [Health, metrics and discovery](#health-metrics-and-discovery) (7)
-- [Data plane](#data-plane) (4)
+- [Data plane](#data-plane) (3)
 - [WebSocket](#websocket) (2)
 - [OAuth2](#oauth2) (6)
 - [Internal](#internal) (2)
@@ -61,7 +61,7 @@ Totals: 162 operations (one per method and path), of which 135 are under `/admin
 |---|---|---|---|---|
 | GET | `/health` | none |  | Liveness probe — fast, no external calls. |
 | GET | `/health/detailed` | none; admin with `OPS_ENDPOINTS_REQUIRE_ADMIN=true` |  | Detailed health: runs every registered dependency probe. |
-| GET | `/ready` | none |  | Readiness probe — green only if critical dependencies are up. |
+| GET | `/ready` | none |  | Readiness probe: green only if critical dependencies are up. |
 | GET | `/live` | none |  | Liveness probe (for Kubernetes `livenessProbe`). |
 | GET | `/metrics` | none; admin with `OPS_ENDPOINTS_REQUIRE_ADMIN=true` |  | Prometheus metrics endpoint. |
 | GET | `/.well-known/agent-card.json` | none |  | A2A Agent Card discovery (RFC 8615 /.well-known). |
@@ -73,7 +73,6 @@ Totals: 162 operations (one per method and path), of which 135 are under `/admin
 |---|---|---|---|---|
 | POST | `/mqtt/publish` | API key |  | Publish message to MQTT topic. |
 | POST | `/mqtt/subscribe` | API key |  | Subscribe to MQTT topic. |
-| POST | `/graphql` | API key |  | GraphQL proxy endpoint. |
 | DELETE, GET, HEAD, OPTIONS, PATCH, POST, PUT | `/{path:path}` | API key (none for OPTIONS) | `path` *path* | Main gateway proxy endpoint. |
 
 ## WebSocket

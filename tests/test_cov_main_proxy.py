@@ -353,32 +353,29 @@ def test_grpc_unary_and_streaming(gwdb, monkeypatch, H):
     handler.call_unary.assert_called_with("Greeter", "SayHello", {})
 
 
-def test_graphql_not_configured_via_dedicated_endpoint(gwdb, monkeypatch, H):
+def test_graphql_not_configured(gwdb, monkeypatch, H):
     monkeypatch.setattr(main, "graphql_handler", None)
-    r = gwdb.post("/graphql", json={"query": "{a}"}, headers=H)
-    assert r.status_code == 503 and r.json()["message"] == "GraphQL backend not configured"
+    for path in ("/graphql", "/api/graphql"):
+        r = gwdb.post(path, json={"query": "{a}"}, headers=H)
+        assert r.status_code == 503 and r.json()["message"] == "GraphQL: GraphQL backend is not configured"
 
 
-def test_graphql_endpoint_success_validation_and_failure(gwdb, monkeypatch, H):
-    handler = SimpleNamespace(execute_query=AsyncMock(return_value={"data": {"a": 1}}), close=AsyncMock())
-    monkeypatch.setattr(main, "graphql_handler", handler)
-    r = gwdb.post("/graphql", json={"query": "{a}", "variables": {"v": 1}, "operationName": "Op"}, headers=H)
-    assert r.json() == {"data": {"a": 1}}
-    handler.execute_query.assert_awaited_with("{a}", {"v": 1}, "Op")
-    r = gwdb.post("/graphql", json={"variables": {}}, headers=H)
-    assert r.status_code == 400 and r.json()["message"] == "GraphQL query is required"
-    handler.execute_query.side_effect = RuntimeError("upstream exploded")
-    r = gwdb.post("/graphql", json={"query": "{a}"}, headers=H)
-    assert r.status_code == 502 and "GraphQL request failed" in r.json()["message"]
-
-
-def test_graphql_via_api_prefix_uses_graphql_handler(gwdb, monkeypatch, H):
-    handler = SimpleNamespace(execute_query=AsyncMock(return_value={"data": {"x": 1}}), close=AsyncMock())
-    monkeypatch.setattr(main, "graphql_handler", handler)
-    backend(monkeypatch, jresp(200, {"from": "router"}))
-    r = gwdb.post("/api/graphql", json={"query": "{a}"}, headers=H)
-    assert r.status_code == 200 and r.json() == {"data": {"x": 1}}
-    handler.execute_query.assert_awaited()
+def test_graphql_passes_the_request_through_as_it_came(gwdb, monkeypatch, H):
+    """The backend gets the caller's method, headers and body, and its answer goes back whole."""
+    monkeypatch.setattr(main, "graphql_handler", SimpleNamespace(close=AsyncMock()))
+    answer = jresp(418, {"errors": [{"message": "no"}]}, headers={"x-upstream": "yes"})
+    calls = backend(monkeypatch, answer)
+    sent = b'{"query":  "{ a }",\n "extensions": {"persisted": 1}}'
+    r = gwdb.post("/graphql?x=1", content=sent, headers={**H, "Content-Type": "application/json",
+                                                         "Authorization": "Bearer caller", "X-Custom": "c"})
+    assert r.status_code == 418 and r.json() == {"errors": [{"message": "no"}]} and r.headers["x-upstream"] == "yes"
+    c = calls[0]
+    assert (c["method"], c["path"], c["body"], c["query_params"]) == ("POST", "/graphql", sent, {"x": "1"})
+    assert c["headers"]["authorization"] == "Bearer caller" and c["headers"]["x-custom"] == "c"
+    # Nothing in the body is the gateway's to require, and a query in the URL is a request too.
+    assert gwdb.post("/api/graphql", json={"variables": {}}, headers=H).status_code == 418
+    assert gwdb.get("/graphql?query=%7Ba%7D", headers=H).status_code == 418
+    assert [c["path"] for c in calls[1:]] == ["/api/graphql", "/graphql"]
 
 
 # ====================================================================== MQTT

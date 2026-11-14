@@ -117,6 +117,7 @@ column. These behaviours changed and may need action:
 | Rate-limit counters are named after a hash of the key. | Current minute and hour windows start again once. |
 | CORS defaults to the local admin console's origins; `*` turns credentials off. | Set `CORS_ORIGINS`. |
 | Docker Compose keeps SQLite at `/app/data/gateway.db` on the `gateway_data` volume, and ignores `*_BACKEND_URL` from `.env` in favour of `DOCKER_*_BACKEND_URL`. | See the next section, and [Deploy with Docker Compose](deploy-with-docker-compose.md). |
+| GraphQL requests are passed to the backend as they came (method, headers, query string, body) and its answer comes back whole. Before, the gateway sent only `query`, `variables` and `operationName`, without the caller's headers, refused a body without `query` with a 400, and turned every backend error into a 502. | Check that the GraphQL server expects the caller's headers (`X-API-Key`, `Authorization` and cookies now reach it), and that clients handle the server's own error statuses. |
 | The `postgres` and `grafana` services refuse to start without `POSTGRES_PASSWORD` and `GRAFANA_ADMIN_PASSWORD`. | Set them in `.env`. |
 
 ## Moving the Compose database to the volume
