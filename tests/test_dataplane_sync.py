@@ -565,10 +565,16 @@ async def test_the_snapshot_names_each_protocols_backend(db_session, monkeypatch
     monkeypatch.setattr(s, "a2a_backend_url", "http://a2a.internal:9001/")
     monkeypatch.setattr(s, "ag_ui_backend_url", None)
     monkeypatch.setattr(s, "acp_backend_url", "")
+    monkeypatch.setattr(s, "graphql_backend_url", None)
     snap = await dataplane_sync.build_snapshot(db_session)
     assert snap["backends"] == {
-        "mcp": "http://mcp.internal:9000", "a2a": "http://a2a.internal:9001/", "ag_ui": None, "acp": None,
+        "mcp": "http://mcp.internal:9000", "a2a": "http://a2a.internal:9001/", "ag_ui": None, "acp": None, "graphql": None,
     }
+    # The GraphQL backend is named without the `/graphql` the request's own path supplies.
+    for configured, named in (("http://gql:4000", "http://gql:4000"), ("http://gql:4000/graphql/", "http://gql:4000"),
+                              ("http://gql:4000/v1/graphql", "http://gql:4000/v1")):
+        monkeypatch.setattr(s, "graphql_backend_url", configured)
+        assert (await dataplane_sync.build_snapshot(db_session))["backends"]["graphql"] == named
 
 
 async def test_the_snapshot_carries_the_body_checks_as_they_are_shipped(db_session, monkeypatch):

@@ -54,10 +54,12 @@ pub enum Protocol {
     Grpc,
     /// `POST /mqtt/publish`, which goes to no backend: the message is published to the broker.
     Mqtt,
+    /// Requests under `/graphql`, passed to the GraphQL server as they came.
+    GraphQl,
 }
 
 /// The protocols whose backends come from the snapshot, in the order `Snapshot::routes` holds them.
-pub const ROUTED: [Protocol; 4] = [Protocol::Mcp, Protocol::A2a, Protocol::AgUi, Protocol::Acp];
+pub const ROUTED: [Protocol; 5] = [Protocol::Mcp, Protocol::A2a, Protocol::AgUi, Protocol::Acp, Protocol::GraphQl];
 
 impl Protocol {
     /// The name the Python gateway gives the protocol: the `X-Protocol` header sent upstream and
@@ -71,6 +73,7 @@ impl Protocol {
             Protocol::Acp => "acp",
             Protocol::Grpc => "grpc",
             Protocol::Mqtt => "mqtt",
+            Protocol::GraphQl => "graphql",
         }
     }
 
@@ -374,7 +377,7 @@ const KEPT_BY_CONTROL: [&str; 2] = ["ws", "agents"];
 
 /// The protocol a path belongs to, decided in the order the Python gateway's router decides it
 /// (prefixes are compared as text, so `/mcpx` is MCP there and here). `None` for what the control
-/// plane keeps: MQTT but for publishing, WebSocket, gRPC, GraphQL, its own endpoints and anything
+/// plane keeps: MQTT but for publishing, WebSocket, gRPC, its own endpoints and anything
 /// without a prefix.
 fn classify(path: &str) -> Option<Protocol> {
     let under = |name: &str| path.starts_with(name) || path.strip_prefix("/api").map(|rest| rest.starts_with(name)).unwrap_or(false);
@@ -388,8 +391,10 @@ fn classify(path: &str) -> Option<Protocol> {
         Some(Protocol::AgUi)
     } else if under("/acp") {
         Some(Protocol::Acp)
-    } else if under("/mqtt") || path.starts_with("/ws") || path.starts_with("/websocket") || under("/grpc") || under("/graphql") {
+    } else if under("/mqtt") || path.starts_with("/ws") || path.starts_with("/websocket") || under("/grpc") {
         None
+    } else if under("/graphql") {
+        Some(Protocol::GraphQl)
     } else {
         let first = path.strip_prefix("/api/")?.split('/').next().unwrap_or("");
         (!KEPT_BY_CONTROL.contains(&first)).then_some(Protocol::Http)
@@ -397,9 +402,11 @@ fn classify(path: &str) -> Option<Protocol> {
 }
 
 /// The path an ACP or AG-UI backend is sent: the gateway's prefix (`/acp`, `/api/acp`, `/agui`,
-/// `/api/agui`) is taken off, so the server sees the paths its specification names.
+/// `/api/agui`) is taken off, so the server sees the paths its specification names. A GraphQL
+/// path loses only a leading `/api`: the server is sent `/graphql` either way.
 fn upstream_path(path: &str, protocol: Protocol) -> &str {
     let segment = match protocol {
+        Protocol::GraphQl => return path.strip_prefix("/api").filter(|rest| rest.starts_with("/graphql")).unwrap_or(path),
         Protocol::Acp => "/acp",
         Protocol::AgUi => "/agui",
         _ => return path,
@@ -2067,12 +2074,15 @@ mod tests {
             ("/api/agui/run", Some(Protocol::AgUi)),
             ("/acp/runs", Some(Protocol::Acp)),
             ("/api/acp/agents", Some(Protocol::Acp)),
+            ("/graphql", Some(Protocol::GraphQl)),
+            ("/api/graphql/batch", Some(Protocol::GraphQl)),
+            ("/graphqlx", Some(Protocol::GraphQl)),
         ] {
             assert_eq!(classify(path), protocol, "{path}");
         }
         for path in [
             "/admin/keys", "/oauth2/token", "/health", "/docs", "/", "/api", "/apix/y", "/rest/x", "/users",
-            "/mqtt/publish/", "/mqtt/subscribe", "/mqtt", "/api/mqtt/publish", "/api/mqtt/x", "/ws/x", "/websocket", "/wss", "/grpc/x", "/api/grpc", "/graphql", "/api/graphql",
+            "/mqtt/publish/", "/mqtt/subscribe", "/mqtt", "/api/mqtt/publish", "/api/mqtt/x", "/ws/x", "/websocket", "/wss", "/grpc/x", "/api/grpc", "/grpc/graphql", "/ws/graphql",
             "/api/ws/x", "/api/agents/a", "/agents/a/mcp",
         ] {
             assert_eq!(classify(path), None, "{path}");
@@ -2092,6 +2102,10 @@ mod tests {
             ("/mcp/tools", Protocol::Mcp, "/mcp/tools"),
             ("/a2a/x", Protocol::A2a, "/a2a/x"),
             ("/api/users", Protocol::Http, "/api/users"),
+            ("/graphql", Protocol::GraphQl, "/graphql"),
+            ("/api/graphql", Protocol::GraphQl, "/graphql"),
+            ("/api/graphql/batch", Protocol::GraphQl, "/graphql/batch"),
+            ("/graphqlx", Protocol::GraphQl, "/graphqlx"),
         ] {
             assert_eq!(upstream_path(path, protocol), sent, "{path}");
         }

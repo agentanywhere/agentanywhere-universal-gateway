@@ -60,6 +60,7 @@ from app.db_models import (
     TenantModel,
     TenantUsageModel,
 )
+from app.routing import graphql_base
 from app.secure_compare import constant_time_equals
 
 router = APIRouter(prefix="/internal/dataplane", include_in_schema=False)
@@ -103,6 +104,7 @@ def _backends(settings) -> Dict[str, Optional[str]]:
         "a2a": settings.a2a_backend_url or None,
         "ag_ui": settings.ag_ui_backend_url or None,
         "acp": settings.acp_backend_url or None,
+        "graphql": graphql_base(settings.graphql_backend_url) if settings.graphql_backend_url else None,
     }
 
 

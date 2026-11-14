@@ -437,6 +437,7 @@ def main() -> int:
                                                 "secure": secure_agent, "stranger": strange_agent}),
                "WEBSOCKET_BACKEND_URL": sockets, "GRPC_BACKEND_URL": f"127.0.0.1:{grpc_port}",
                "MCP_BACKEND_URL": agents, "A2A_BACKEND_URL": agents, "AG_UI_BACKEND_URL": agents, "ACP_BACKEND_URL": agents,
+               "GRAPHQL_BACKEND_URL": f"{agents}/graphql",  # named by its endpoint: `/graphql` is not sent twice
                "CIRCUIT_BREAKER_TIMEOUT": "2", "DEFAULT_TIMEOUT": "2"}  # short, so the breaker and timeout scenarios can wait them out
 
         def start_backend():
@@ -883,6 +884,11 @@ def main() -> int:
                 ("ACP root", "GET", "/acp", None, "/", "acp"),
                 ("AG-UI run", "POST", "/agui/run", thread, "/run", "ag_ui"),
                 ("AG-UI under /api", "POST", "/api/agui/threads/t1", thread, "/threads/t1", "ag_ui"),
+                ("GraphQL query", "POST", "/graphql", {"query": "query Q($n: Int) { a(n: $n) }", "variables": {"n": 1}, "operationName": "Q"}, "/graphql", "graphql"),
+                ("GraphQL under /api", "POST", "/api/graphql", {"query": "{ a }"}, "/graphql", "graphql"),
+                ("GraphQL persisted query, no query text", "POST", "/graphql", {"extensions": {"persistedQuery": {"version": 1, "sha256Hash": "ab"}}}, "/graphql", "graphql"),
+                ("GraphQL batch", "POST", "/api/graphql/batch", [{"query": "{ a }"}, {"query": "{ b }"}], "/graphql/batch", "graphql"),
+                ("GraphQL query in the URL", "GET", "/graphql?query=%7Ba%7D&operationName=Q", None, "/graphql", "graphql"),
             ]
             for name, method, path, body, seen_path, seen_protocol in forwarded:
                 a, b = both(method, path, body)

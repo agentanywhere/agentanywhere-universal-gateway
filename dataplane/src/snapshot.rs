@@ -94,10 +94,10 @@ pub struct Snapshot {
     /// Path prefixes the control plane must handle (dynamic routes, transformation rules, ...).
     pub fallthrough_prefixes: Vec<String>,
     /// Where each protocol in `ROUTED` is sent, as the control plane has it configured.
-    pub protocol_urls: [Option<String>; 4],
+    pub protocol_urls: [Option<String>; 5],
     /// The backends at those addresses, filled in when the snapshot is put to use. A protocol
     /// without one is the control plane's to serve.
-    pub routes: [Option<Arc<Backend>>; 4],
+    pub routes: [Option<Arc<Backend>>; 5],
     /// What the Python gateway checks in a request body before forwarding it.
     pub boundary: Boundary,
     /// The header a key is read from first; `Authorization` is always the second place.

@@ -25,7 +25,7 @@ DATAPLANE_TOKEN=change-me TRUSTED_PROXIES=127.0.0.1 uvicorn app.main:app --port 
 ```
 
 `--backend` is the HTTP backend, `--control` the Python gateway. The MCP, A2A, AG-UI and ACP backends are the ones
-the Python gateway is configured with (`MCP_BACKEND_URL`, `A2A_BACKEND_URL`, `AG_UI_BACKEND_URL`, `ACP_BACKEND_URL`);
+the Python gateway is configured with (`MCP_BACKEND_URL`, `A2A_BACKEND_URL`, `AG_UI_BACKEND_URL`, `ACP_BACKEND_URL`, `GRAPHQL_BACKEND_URL`);
 they arrive with the snapshot, so they are set in one place. The token can also come from `DATAPLANE_TOKEN`.
 `/internal/dataplane` is served only when the token is set, and the data plane answers `404` to any client that asks
 for `/internal/...`. Tunables: `--sync-interval-ms` (default 500), `--max-staleness-ms` (default 5000), `--workers N` (default: one per
@@ -77,7 +77,7 @@ as it has workers, or set `--workers` below the core count on a shared machine, 
   passed here) over tens of thousands of generated bodies.
 * **Each protocol has its backend and its breaker.** A path belongs to the protocol the Python router gives it
   (`/mcp`, `/a2a`, `/agui`, `/acp` and the same under `/api`), ACP and AG-UI backends are sent the path without the
-  gateway's prefix, and `X-Protocol` names the protocol. Two protocols configured with one address share a circuit
+  gateway's prefix, a GraphQL backend the path without `/api`, and `X-Protocol` names the protocol. Two protocols configured with one address share a circuit
   breaker, as they do in Python.
 * **Anything it cannot reproduce goes to Python.** The snapshot marks a key `native_ok: false` when something about it
   cannot be reproduced exactly (a policy that matches on headers or uses a character class in its path, a scoped IPv6
@@ -115,13 +115,13 @@ Its format is the same as what the control plane serves; see `src/snapshot.rs`.
 ## What it handles itself
 
 A request is served natively only when **all** of these hold: the link is fresh; the path is `/api/...`, or belongs to
-MCP, A2A, AG-UI or ACP and that protocol has an `http://` or `https://` backend configured; no `fallthrough_prefixes` entry matches;
+MCP, A2A, AG-UI, ACP or GraphQL and that protocol has an `http://` or `https://` backend configured; no `fallthrough_prefixes` entry matches;
 `X-API-Version` or `Accept-Version` resolves to an active version
 with no backend of its own; the key is in the snapshot, active, unexpired and `native_ok`; and, where the
 gateway checks the body, the body has a `Content-Length`, fits in memory (4 MiB, or the MCP limit if lower) and is
 certain to pass. On those same paths, a request with no credential, or with one the Python gateway has just refused,
 is answered here with the gateway's 401. Anything else, including credentials seen for the first time,
-a preflight from a web page, `/metrics`, `/admin`, `/oauth2`, GraphQL
+a preflight from a web page, `/metrics`, `/admin`, `/oauth2`
 and MQTT other than publishing, goes to the Python gateway untouched, so its answer is the answer.
 
 **HTTP/2.** A client that opens its connection with the HTTP/2 preface (no TLS; `curl --http2-prior-knowledge`, a
@@ -296,7 +296,8 @@ here is the reverse of everywhere else: **whatever this side cannot be sure of i
 | Any other request over HTTP/2 | as the same request over HTTP/1 |
 | `/agents/<slug>/...` to a registered agent, browsers included | data plane |
 | `/agents/<slug>/...` otherwise (unknown slugs, unusual requests) | Python |
-| GraphQL, the JSON-to-gRPC bridge under `/grpc` | Python |
+| `/graphql/*`, `/api/graphql/*` with `GRAPHQL_BACKEND_URL` set | data plane, passed through as they came |
+| The JSON-to-gRPC bridge under `/grpc` | Python |
 | A path that matches a dynamic route to an `http://` or `https://` backend | data plane, to the route's backend |
 | A path that matches a dynamic route to any other backend | Python |
 | A request a transformation rule applies to (by path pattern and method) | Python, which applies it |
