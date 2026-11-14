@@ -33,7 +33,10 @@ use crate::breaker::{self, Breaker};
 use crate::govern::{self, IpRule, Policy, Scope, Subject};
 use crate::pyjson;
 use crate::report::{Event, Reporter, Row, Served};
-use crate::snapshot::{hash_key, AgentFailure, Digest32, DynamicRoute, KeyEntry, Readiness, Snapshot, Wording};
+use crate::snapshot::{
+    change_headers, change_query, change_status, hash_key, Actions, AgentFailure, Digest32, DynamicRoute, HeaderLines, KeyEntry, Readiness, Shaping,
+    Snapshot, Wording,
+};
 use crate::sync::Link;
 
 /// A body is either streamed from the other side or held here whole; neither is boxed. Responses
@@ -697,6 +700,8 @@ struct Native<'a> {
     method: &'static str,
     /// The caller is a browser: an error made here is shown as a page.
     html: bool,
+    /// What the transformation rules that apply do to the request and to its answer.
+    shaping: Shaping<'a>,
 }
 
 /// A request refused here with a 401: it carries no credential that works.
@@ -981,14 +986,167 @@ fn decide<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, now: u6
         Some(route) => route.rewrite.as_deref().unwrap_or(path),
         None => upstream_path(path, protocol),
     };
-    if names_a_version(asked) || snap.transformed(method, asked, path) {
+    if names_a_version(asked) {
         return PYTHON;
+    }
+    // The rules that apply are applied here when this side was told all they do, and when the
+    // request is one they do the same to on both sides.
+    let Some(shaping) = snap.shaping(method, asked, path) else { return PYTHON };
+    if !shaping.is_empty() {
+        // Publishing and gRPC have handlers of their own in the Python gateway.
+        if publishing || protocol == Protocol::Grpc {
+            return PYTHON;
+        }
+        // An answer the Python gateway streams is passed on there with no rule applied.
+        if !shaping.response.is_empty() && may_be_streamed(path) {
+            return PYTHON;
+        }
+        // Of a header given twice, the Python gateway's rules see one line only.
+        let headers = req.headers();
+        let named = |name: &HeaderName| shaping.request.iter().any(|a| a.names(name.as_str()));
+        if headers.len() != headers.keys_len() && headers.keys().any(|name| named(name) && headers.get_all(name).iter().nth(1).is_some()) {
+            return PYTHON;
+        }
+        // A query is taken apart and written again there; only a plain one reads the same here.
+        let plain = matches!(uri.query(), None | Some("")) || uri.query().is_some_and(query_survives);
+        if !plain && shaping.request.iter().any(|a| a.changes_query()) {
+            return PYTHON;
+        }
     }
     // What the backend is asked for must be something this side's HTTP client will send.
     if !plain_path(asked) && sent_path(asked).parse::<hyper::http::uri::PathAndQuery>().is_err() {
         return PYTHON;
     }
-    Decision::Native(Native { protocol, backend, entry, route, version, ip, method, html })
+    Decision::Native(Native { protocol, backend, entry, route, version, ip, method, html, shaping })
+}
+
+/// Whether the Python gateway may pass the answer to a request on as a stream
+/// (`should_proxy_streaming_http`, which also looks at what the caller accepts and at the query).
+fn may_be_streamed(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    path.contains("/agui") || path.contains("/acp") || lower.contains("message:stream") || lower.contains("message%3astream")
+}
+
+/// Apply rules' header changes to a request's or an answer's headers. The Python gateway holds
+/// them as one line per name while it does; a name the rules mention that an answer gives more
+/// than once is one line there, its values joined, and is here too. (A request that gives such
+/// a name twice is not changed here at all.)
+fn shape_headers(headers: &mut HeaderMap, rules: &[&Actions]) {
+    if !rules.iter().any(|a| a.changes_headers()) {
+        return;
+    }
+    let mut lines: HeaderLines<HeaderValue> = Vec::with_capacity(headers.len());
+    for name in headers.keys() {
+        let mut values = headers.get_all(name).iter();
+        let Some(first) = values.next() else { continue };
+        if !rules.iter().any(|a| a.names(name.as_str())) {
+            lines.push((name.as_str().to_owned(), first.clone()));
+            lines.extend(values.map(|v| (name.as_str().to_owned(), v.clone())));
+            continue;
+        }
+        let mut joined = first.as_bytes().to_vec();
+        for more in values {
+            joined.extend_from_slice(b", ");
+            joined.extend_from_slice(more.as_bytes());
+        }
+        lines.push((name.as_str().to_owned(), HeaderValue::from_bytes(&joined).unwrap_or_else(|_| first.clone())));
+    }
+    for actions in rules {
+        change_headers(&mut lines, actions, |text| HeaderValue::from_str(text).ok());
+    }
+    headers.clear();
+    for (name, value) in lines {
+        if let Ok(name) = HeaderName::from_bytes(name.as_bytes()) {
+            headers.append(name, value);
+        }
+    }
+}
+
+/// Apply the rules to a request before it is sent on: its headers, and its query.
+fn shape_request(req: &mut Request<Body>, rules: &[&Actions]) {
+    shape_headers(req.headers_mut(), rules);
+    if rules.iter().any(|a| a.changes_query()) {
+        let uri = req.uri();
+        let target = match change_query(uri.query().unwrap_or(""), rules) {
+            Some(query) => format!("{}?{query}", uri.path()),
+            None => uri.path().to_owned(),
+        };
+        let mut parts = std::mem::take(req.uri_mut()).into_parts();
+        if let Ok(target) = target.parse() {
+            parts.path_and_query = Some(target);
+        }
+        if let Ok(uri) = Uri::from_parts(parts) {
+            *req.uri_mut() = uri;
+        }
+    }
+}
+
+/// Apply the rules to a backend's answer: its headers, and its status.
+fn shape_answer(resp: &mut Response<Body>, rules: &[&Actions]) {
+    shape_headers(resp.headers_mut(), rules);
+    let was = resp.status().as_u16();
+    let becomes = change_status(was, rules);
+    if becomes != was {
+        if let Ok(status) = StatusCode::from_u16(becomes) {
+            *resp.status_mut() = status;
+        }
+    }
+}
+
+/// `dataplane --judge-shapes`: each line on stdin is `{"request": [...], "response": [...],
+/// "headers": [[name, value], ...], "query": "...", "answer": [[name, value], ...], "status": n}`,
+/// the rules' actions as the snapshot carries them and an exchange to apply them to. The answer
+/// is a line with what the backend is then sent and what the caller is: `{"headers", "query",
+/// "answer", "status"}`. The conformance suite compares it with the Python gateway's own code.
+pub fn judge_shapes() -> Result<(), String> {
+    use std::io::{BufRead, Write};
+
+    #[derive(serde::Deserialize)]
+    struct Case {
+        request: Vec<Actions>,
+        response: Vec<Actions>,
+        headers: Vec<(String, String)>,
+        query: String,
+        answer: Vec<(String, String)>,
+        status: u16,
+    }
+
+    fn map(lines: &[(String, String)]) -> Result<HeaderMap, String> {
+        let mut headers = HeaderMap::new();
+        for (name, value) in lines {
+            let name = HeaderName::from_bytes(name.as_bytes()).map_err(|e| e.to_string())?;
+            headers.append(name, HeaderValue::from_str(value).map_err(|e| e.to_string())?);
+        }
+        Ok(headers)
+    }
+
+    fn lines(headers: &HeaderMap) -> Vec<(&str, &str)> {
+        headers.iter().map(|(name, value)| (name.as_str(), value.to_str().unwrap_or("?"))).collect()
+    }
+
+    let out = std::io::stdout();
+    let mut out = out.lock();
+    for line in std::io::stdin().lock().lines() {
+        let line = line.map_err(|e| e.to_string())?;
+        let case: Case = serde_json::from_str(&line).map_err(|e| format!("case is not valid: {e}"))?;
+        let (before, after): (Vec<&Actions>, Vec<&Actions>) = (case.request.iter().collect(), case.response.iter().collect());
+        let target = if case.query.is_empty() { "/x".to_owned() } else { format!("/x?{}", case.query) };
+        let mut req = Request::builder().uri(target).body(full(Bytes::new())).map_err(|e| e.to_string())?;
+        *req.headers_mut() = map(&case.headers)?;
+        shape_request(&mut req, &before);
+        let mut resp = Response::new(full(Bytes::new()));
+        *resp.status_mut() = StatusCode::from_u16(case.status).map_err(|e| e.to_string())?;
+        *resp.headers_mut() = map(&case.answer)?;
+        shape_answer(&mut resp, &after);
+        let said = serde_json::json!({
+            "headers": lines(req.headers()),
+            "query": req.uri().query(),
+            "answer": lines(resp.headers()),
+            "status": resp.status().as_u16(),
+        });
+        writeln!(out, "{said}").map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 /// What the answer to a request from another origin is given, as the Python gateway's CORS
@@ -1451,7 +1609,7 @@ fn admit_grpc<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, now
     if !entry.native_ok || snap.fallthrough_prefixes.iter().any(|p| path.starts_with(p.as_str())) || snap.transformed("POST", path, path) {
         return Err(GrpcRefusal::NOT_APPLICABLE);
     }
-    let native = Native { protocol: Protocol::Grpc, backend: Some(backend), entry, route: None, version: None, ip, method: "POST", html: false };
+    let native = Native { protocol: Protocol::Grpc, backend: Some(backend), entry, route: None, version: None, ip, method: "POST", shaping: Shaping::default(), html: false };
     Ok(GrpcCall { native, key_in_authorization })
 }
 
@@ -2019,12 +2177,18 @@ pub async fn handle(w: Arc<Worker>, peer: SocketAddr, mut req: Request<Incoming>
                         path: wire.as_deref(),
                     };
                     let limit = n.route.and_then(DynamicRoute::timeout).unwrap_or(snap.upstream_timeout);
+                    if !n.shaping.request.is_empty() {
+                        shape_request(&mut req, &n.shaping.request);
+                    }
                     let answer = match grpc {
                         true => forward_grpc(&w, &backend.upstream, peer, req, &t, &snap.key_header, key_in_authorization).await,
                         false => forward(&w, &backend.upstream, peer, req, Some(native), Some(limit)).await,
                     };
                     match answer {
-                        Ok(resp) => {
+                        Ok(mut resp) => {
+                            if !n.shaping.response.is_empty() {
+                                shape_answer(&mut resp, &n.shaping.response);
+                            }
                             if let Some(tr) = backend.breaker.success(&cb) {
                                 announce(st, backend, &cb, tr);
                             }
@@ -3160,6 +3324,75 @@ mod tests {
         assert_eq!(admit_grpc(&unknown, peer(), &call, 100, true).err(), Some(GrpcRefusal::NOT_APPLICABLE));
         // A control plane that says nothing about rules has none.
         assert_eq!(outcome(&governed("", ""), &req, 100, false), "native");
+    }
+
+    #[test]
+    fn a_rule_this_side_was_told_the_actions_of_is_applied_here() {
+        let rules = r#","transform_rules":[
+            {"glob":"/api/shaped/*","methods":[],"native":true,"response":null,"request":{"rename":[["X-Old","X-New"]],"remove":["x-secret"],
+                "set":[["X-Shaped","yes"],["x-client","gateway"]],"query_remove":["debug"],"query_set":[["source","gw"]]}},
+            {"glob":"*shaped/*","methods":["POST"],"native":true,"request":{"rename":[["x-shaped","X-Was"]],"remove":[],"set":[]},
+                "response":{"rename":[["X-Agent","X-Backend"]],"remove":["etag"],"set":[["X-Powered","gateway"]],"status":[[200,201],[418,400]]}},
+            {"glob":"*shaped/twice/*","methods":[],"native":true,"request":null,"response":{"status":[[201,202]]}},
+            {"glob":"/api/kept/*","methods":[],"native":false},
+            {"glob":"/api/nothing/*","methods":[],"native":true,"request":null,"response":null},
+            {"glob":"api/talk/*","methods":[],"native":true,"request":null,"response":{"set":[["X-Powered","gateway"]]}},
+            {"glob":"*","methods":["PUT"],"native":true,"request":{"set":[["X-Shaped","yes"]]},"response":null}]"#;
+        let snap = governed(&format!("{GRPC}{rules}"), "");
+        let ask = |method: &str, uri: &str, headers: &[(&str, &str)]| {
+            let mut req = Request::builder().method(method).uri(uri).header("x-api-key", KEY);
+            for (name, value) in headers {
+                req = req.header(*name, *value);
+            }
+            req.body(()).unwrap()
+        };
+        let shaped = |req: &Request<()>| match decide(&snap, peer(), req, 100, |_| false) {
+            Decision::Native(n) => {
+                let mut sent = Request::builder().uri(req.uri().clone()).body(full(Bytes::new())).unwrap();
+                *sent.headers_mut() = req.headers().clone();
+                shape_request(&mut sent, &n.shaping.request);
+                let mut resp = Response::new(full(Bytes::new()));
+                for (name, value) in [("x-agent", "echo"), ("etag", "1"), ("etag", "2"), ("set-cookie", "a=1"), ("set-cookie", "b=2")] {
+                    resp.headers_mut().append(name, HeaderValue::from_static(value));
+                }
+                shape_answer(&mut resp, &n.shaping.response);
+                let read = |h: &HeaderMap, name: &str| h.get_all(name).iter().map(|v| v.to_str().unwrap()).collect::<Vec<_>>().join(", ");
+                let mut names: Vec<&str> = sent.headers().keys().chain(resp.headers().keys()).map(|k| k.as_str()).collect();
+                names.sort_unstable();
+                names.dedup();
+                let said: Vec<String> = names.iter().filter(|n| **n != "x-api-key").map(|n| format!("{n}={}|{}", read(sent.headers(), n), read(resp.headers(), n))).collect();
+                format!("{} {} {}", sent.uri(), resp.status().as_u16(), said.join(" "))
+            }
+            _ => "ask".to_owned(),
+        };
+        // Renamed, removed, set; a name set in another case stands beside the caller's own.
+        let req = ask("GET", "/api/shaped/1?debug=1&page=2", &[("x-old", "o"), ("x-secret", "s"), ("x-client", "mine"), ("x-shaped", "no"), ("x-keep", "k")]);
+        assert_eq!(shaped(&req), "/api/shaped/1?page=2&source=gw 200 etag=|1, 2 set-cookie=|a=1, b=2 x-agent=|echo x-client=gateway| x-keep=k| x-new=o| x-shaped=no, yes|");
+        // The second rule follows the first, for its method, and changes the answer too: a
+        // header it names that the backend gave twice is one line; another is left as it came.
+        let req = ask("POST", "/api/shaped/1", &[]);
+        assert_eq!(shaped(&req), "/api/shaped/1?source=gw 201 set-cookie=|a=1, b=2 x-backend=|echo x-client=gateway| x-powered=|gateway x-was=yes|");
+        assert_eq!(shaped(&ask("POST", "/api/shaped/twice/1", &[])).split(' ').nth(1), Some("202"));
+        assert_eq!(shaped(&ask("GET", "/api/shaped/twice/1", &[])).split(' ').nth(1), Some("200"));
+        // No rule, a rule that does nothing, and a rule of the Python gateway's.
+        assert_eq!(shaped(&ask("GET", "/api/users?a=b%20c", &[])), "/api/users?a=b%20c 200 etag=|1, 2 set-cookie=|a=1, b=2 x-agent=|echo");
+        assert_eq!(shaped(&ask("GET", "/api/nothing/1", &[])), "/api/nothing/1 200 etag=|1, 2 set-cookie=|a=1, b=2 x-agent=|echo");
+        assert_eq!(shaped(&ask("GET", "/api/kept/1", &[])), "ask");
+        // A header the rules name given twice, and a query that is not plain words with a rule
+        // that changes queries: the Python gateway reads those its own way.
+        assert_eq!(shaped(&ask("GET", "/api/shaped/1", &[("x-old", "a"), ("x-old", "b")])), "ask");
+        assert_ne!(shaped(&ask("GET", "/api/shaped/1", &[("x-keep", "a"), ("x-keep", "b")])), "ask");
+        assert_eq!(shaped(&ask("GET", "/api/shaped/1?q=a%20b", &[])), "ask");
+        assert_eq!(shaped(&ask("GET", "/api/shaped/1?q=1&q=2", &[])), "ask");
+        assert_ne!(shaped(&ask("PUT", "/api/users?q=a%20b", &[])), "ask");
+        // An answer the Python gateway may stream is passed on there with no rule applied.
+        assert!(shaped(&ask("GET", "/api/talk/1", &[])).contains("x-powered=|gateway"));
+        assert_eq!(shaped(&ask("GET", "/api/talk/message:stream", &[])), "ask");
+        assert_eq!(shaped(&ask("GET", "/api/talk/Message%3AStream", &[])), "ask");
+        assert_eq!(shaped(&ask("POST", "/api/shaped/acp/runs", &[])), "ask");
+        assert_ne!(shaped(&ask("GET", "/api/shaped/acp/runs", &[])), "ask");
+        // gRPC and publishing have handlers of their own there, which apply no rule.
+        assert_eq!(shaped(&ask("PUT", "/grpc/x", &[])), "ask");
     }
 
     #[test]

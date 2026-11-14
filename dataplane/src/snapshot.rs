@@ -137,8 +137,9 @@ pub struct Snapshot {
     /// The pages a browser is shown for the errors answered here, by `<status>:<hint><countdown>`.
     /// `None` when the control plane sent none: browsers are then its own.
     pub error_pages: Option<HashMap<String, String>>,
-    /// The transformation rules in force. A request one applies to is the Python gateway's.
-    /// `None`: there are rules this side was not told the reach of, and every request is.
+    /// The transformation rules in force, in the order they are applied. A request one applies
+    /// to is changed here if this side was told what the rule does, and is the Python gateway's
+    /// otherwise. `None`: there are rules this side was not told the reach of, and every request is.
     pub transform_rules: Option<Vec<TransformRule>>,
 }
 
@@ -155,11 +156,135 @@ fn no_rules() -> Option<Vec<TransformRule>> {
     Some(Vec::new())
 }
 
-/// Which requests a transformation rule applies to. The Python gateway applies it; this side
-/// only needs to know that a request is one of them. The pattern arrives in one of the forms the
-/// Python gateway describes it in, each matched here as it matches there.
+/// What a transformation rule does to one side of an exchange, as the Python gateway does it
+/// (`_apply_header_ops`, `_apply_query_ops`, the status map).
+#[derive(Deserialize, Debug, Default, PartialEq)]
+pub struct Actions {
+    /// Headers to rename, `[old, new]`, done first.
+    #[serde(default)]
+    pub rename: Vec<(String, String)>,
+    /// Headers to remove, in lower case, done second.
+    #[serde(default)]
+    pub remove: Vec<String>,
+    /// Headers to set, `[name, value]`, done last.
+    #[serde(default)]
+    pub set: Vec<(String, String)>,
+    /// Query parameters to remove, then to set. A request's only.
+    #[serde(default)]
+    pub query_remove: Vec<String>,
+    #[serde(default)]
+    pub query_set: Vec<(String, String)>,
+    /// Statuses to turn into others, `[was, becomes]`. An answer's only.
+    #[serde(default)]
+    pub status: Vec<(u16, u16)>,
+}
+
+impl Actions {
+    pub fn changes_headers(&self) -> bool {
+        !(self.rename.is_empty() && self.remove.is_empty() && self.set.is_empty())
+    }
+
+    pub fn changes_query(&self) -> bool {
+        !(self.query_remove.is_empty() && self.query_set.is_empty())
+    }
+
+    /// Whether the rule reads or writes the header `name` (in lower case).
+    pub fn names(&self, name: &str) -> bool {
+        self.remove.iter().any(|n| n == name)
+            || self.set.iter().any(|(n, _)| n.eq_ignore_ascii_case(name))
+            || self.rename.iter().any(|(old, new)| old.eq_ignore_ascii_case(name) || new.eq_ignore_ascii_case(name))
+    }
+}
+
+/// The header lines of a request or an answer as the Python gateway holds them while it applies
+/// rules: a dictionary from name to value, in order, where names differ if their case does.
+pub type HeaderLines<V> = Vec<(String, V)>;
+
+fn put<V>(lines: &mut HeaderLines<V>, name: &str, value: V) {
+    match lines.iter_mut().find(|(n, _)| n == name) {
+        Some(line) => line.1 = value,
+        None => lines.push((name.to_owned(), value)),
+    }
+}
+
+/// Apply one rule's header changes as `_apply_header_ops` does: renames (the header is found
+/// whatever its case, and moves to the end under the new name, or takes the place of a header
+/// already called exactly that), then removals (whatever the case), then values set (under
+/// exactly the name given, beside a header whose name differs only in case).
+pub fn change_headers<V>(lines: &mut HeaderLines<V>, actions: &Actions, value: impl Fn(&str) -> Option<V>) {
+    if !actions.rename.is_empty() {
+        // Found by the names the headers had before any rename, the last of a name winning.
+        let mut known: Vec<(String, String)> = Vec::new();
+        for (name, _) in lines.iter() {
+            let lower = name.to_ascii_lowercase();
+            match known.iter_mut().find(|(l, _)| *l == lower) {
+                Some(entry) => entry.1 = name.clone(),
+                None => known.push((lower, name.clone())),
+            }
+        }
+        for (old, new) in &actions.rename {
+            let old = old.to_ascii_lowercase();
+            let Some((_, name)) = known.iter().find(|(l, _)| *l == old) else { continue };
+            let Some(at) = lines.iter().position(|(n, _)| n == name) else { continue };
+            let (_, moved) = lines.remove(at);
+            put(lines, new, moved);
+        }
+    }
+    if !actions.remove.is_empty() {
+        lines.retain(|(name, _)| !actions.remove.iter().any(|r| r.eq_ignore_ascii_case(name)));
+    }
+    for (name, text) in &actions.set {
+        if let Some(v) = value(text) {
+            put(lines, name, v);
+        }
+    }
+}
+
+/// Apply rules' query changes to a query of plain `key=value` pairs, as `_apply_query_ops` does
+/// to the dictionary the Python gateway reads a query into: removals, then values set, each
+/// rule in turn. `None` when no parameter is left.
+pub fn change_query(query: &str, rules: &[&Actions]) -> Option<String> {
+    let mut pairs: Vec<(&str, &str)> = query.split('&').filter_map(|pair| pair.split_once('=')).collect();
+    for actions in rules {
+        pairs.retain(|(key, _)| !actions.query_remove.iter().any(|r| r == key));
+        for (key, value) in &actions.query_set {
+            match pairs.iter_mut().find(|(k, _)| k == key) {
+                Some(pair) => pair.1 = value,
+                None => pairs.push((key, value)),
+            }
+        }
+    }
+    (!pairs.is_empty()).then(|| pairs.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("&"))
+}
+
+/// The status an answer leaves with: each rule in turn maps the one it finds.
+pub fn change_status(status: u16, rules: &[&Actions]) -> u16 {
+    rules.iter().fold(status, |s, actions| actions.status.iter().find(|(was, _)| *was == s).map_or(s, |(_, becomes)| *becomes))
+}
+
+/// The rules that apply to one request, in order: what they do to it, and to its answer.
+#[derive(Default)]
+pub struct Shaping<'a> {
+    pub request: Vec<&'a Actions>,
+    pub response: Vec<&'a Actions>,
+}
+
+impl Shaping<'_> {
+    pub fn is_empty(&self) -> bool {
+        self.request.is_empty() && self.response.is_empty()
+    }
+}
+
+/// A transformation rule: which requests it applies to and, when this side can do the same as
+/// the Python gateway, what it does. The pattern arrives in one of the forms the Python gateway
+/// describes it in, each matched here as it matches there.
 #[derive(Deserialize, Debug)]
 pub struct TransformRule {
+    /// Whether this side was told all the rule does. If not, the Python gateway applies it.
+    #[serde(default)]
+    native: bool,
+    request: Option<Actions>,
+    response: Option<Actions>,
     /// Every path.
     #[serde(default)]
     all: bool,
@@ -661,6 +786,28 @@ impl Snapshot {
         }
         let answered = path.strip_prefix('/').unwrap_or(path);
         rules.iter().any(|r| r.applies(method, asked) || r.applies(method, answered))
+    }
+
+    /// What the rules do to a request and to its answer, matched as `transformed` matches them.
+    /// `None` when one that applies is the Python gateway's to apply.
+    pub fn shaping(&self, method: &str, asked: &str, path: &str) -> Option<Shaping<'_>> {
+        let rules = self.transform_rules.as_ref()?;
+        let mut shaping = Shaping::default();
+        if rules.is_empty() {
+            return Some(shaping);
+        }
+        let answered = path.strip_prefix('/').unwrap_or(path);
+        for rule in rules {
+            let (before, after) = (rule.applies(method, asked), rule.applies(method, answered));
+            if (before || after) && !rule.native {
+                return None;
+            }
+            // A rule that changes nothing on a side is not in the way of anything there.
+            let does = |a: &&Actions| a.changes_headers() || a.changes_query() || !a.status.is_empty();
+            shaping.request.extend(rule.request.as_ref().filter(|_| before).filter(does));
+            shaping.response.extend(rule.response.as_ref().filter(|_| after).filter(does));
+        }
+        Some(shaping)
     }
 }
 

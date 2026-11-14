@@ -1072,7 +1072,9 @@ async def test_the_snapshot_says_which_requests_a_transformation_rule_applies_to
     monkeypatch.setattr(transformation_manager, "rules_by_path", fresh.rules_by_path)
 
     async def listed():
-        return (await dataplane_sync.build_snapshot(db_session))["transform_rules"]
+        rules = (await dataplane_sync.build_snapshot(db_session))["transform_rules"]
+        # What each rule does is the next test's.
+        return rules and [{k: v for k, v in r.items() if k not in ("native", "request", "response")} for r in rules]
 
     def rule(pattern, methods=(), enabled=True):
         return transformation_manager.register_rule(TransformationRule(
@@ -1106,6 +1108,67 @@ async def test_the_snapshot_says_which_requests_a_transformation_rule_applies_to
         assert (await dataplane_sync.build_snapshot(db_session))["fallthrough_prefixes"] == ["/"]
         transformation_manager.remove_rule(odd.id)
     assert len(await listed()) == 2
+
+
+def test_the_snapshot_says_what_a_rule_does_when_the_data_plane_can_do_the_same():
+    from app.transformers import TransformationRule
+
+    def actions(**sides):
+        return dataplane_sync._rule_actions(TransformationRule.from_dict({"name": "r", **sides}))
+
+    nothing = {"rename": [], "remove": [], "set": []}
+    assert actions() == {"request": None, "response": None}
+    assert actions(request_config={
+        "headers_rename": {"X-Old": "X-New"}, "headers_remove": ["X-Secret", "x-secret", "X-B"], "headers_set": {"X-A": "1", "x-b": "two words"},
+        "query_remove": ["debug"], "query_set": {"source": "gw", "empty": ""}}) == {"response": None, "request": {
+            "rename": [["X-Old", "X-New"]], "remove": ["x-b", "x-secret"], "set": [["X-A", "1"], ["x-b", "two words"]],
+            "query_remove": ["debug"], "query_set": [["source", "gw"], ["empty", ""]]}}
+    assert actions(response_config={"headers_set": {"X-A": "1"}, "status_map": {"500": 502, "abc": 200, "0404": 200}}) == {
+        "request": None, "response": {**nothing, "set": [["X-A", "1"]], "status": [[500, 502]]}}
+    # A rule that only changes what is not looked at on that side changes nothing there.
+    assert actions(request_config={"status_map": {"200": 204}}, response_config={"query_set": {"a": "b c"}, "path_rewrite": {"pattern": "a"}}) == {
+        "request": {**nothing, "query_remove": [], "query_set": []}, "response": {**nothing, "status": []}}
+
+    # Anything else is this gateway's to apply: bodies, templates, the path, code...
+    for kept in ({"body_set": {"a": 1}}, {"body_remove": ["a"]}, {"body_rename": {"a": "b"}}, {"template": "{{ body }}"}):
+        assert actions(request_config=kept) is None and actions(response_config=kept) is None, kept
+    assert actions(request_config={"path_rewrite": {"pattern": "^/a", "replacement": "/b"}}) is None
+    for code in ("condition", "transform_request", "transform_response"):
+        assert dataplane_sync._rule_actions(TransformationRule(name="r", **{code: lambda *a: None})) is None
+    # ...a header the gateway or an HTTP library on the way has its own say in, on that side...
+    for name in ("Host", "content-length", "User-Agent", "Accept-Encoding", "X-Forwarded-For", "x-request-id", "X-API-Version", "traceparent"):
+        for kept in ({"headers_set": {name: "v"}}, {"headers_remove": [name]}, {"headers_rename": {name: "X-A"}}, {"headers_rename": {"X-A": name}}):
+            assert actions(request_config=kept) is None, kept
+    for name in ("Content-Type", "content-length", "Set-Cookie", "Vary", "X-Request-ID", "Access-Control-Allow-Origin", "X-RateLimit-Limit", "x-tenant-id"):
+        assert actions(response_config={"headers_set": {name: "v"}}) is None, name
+        assert actions(response_config={"headers_remove": [name]}) is None, name
+    assert actions(request_config={"headers_set": {"Content-Type": "text/plain", "Set-Cookie": "a=b"}}) is not None
+    # ...a name or a value that is not plain, or that the two sides' libraries might write differently...
+    for kept in ({"headers_set": {"bad name": "v"}}, {"headers_set": {"": "v"}}, {"headers_set": {"X-A": "Z\u00fcrich"}}, {"headers_set": {"X-A": "two\nlines"}},
+                 {"headers_set": {"X-A": " lead"}}, {"headers_set": {"X-A": "trail "}}, {"headers_set": {"X-A": 7}}, {"headers_remove": [7]},
+                 {"headers_rename": {"X-A": "X-B", "x-a": "X-C"}}, {"headers_set": ["X-A"]}):
+        assert actions(request_config=kept) is None and actions(response_config=kept) is None, kept
+    for kept in ({"query_set": {"q": "a b"}}, {"query_set": {"q": "caf\u00e9"}}, {"query_set": {"": "v"}}, {"query_set": {"q": 1}}, {"query_remove": [1]}):
+        assert actions(request_config=kept) is None, kept
+    # ...and a status that carries no body, or is none.
+    for kept in ({"200": 204}, {"204": 200}, {"304": 200}, {"200": 99}, {"200": 600}, {"100": 200}, {"200": 0}):
+        assert actions(response_config={"status_map": kept}) is None, kept
+
+
+async def test_a_rule_the_data_plane_cannot_apply_is_marked_and_keeps_only_its_own_requests(db_session, monkeypatch):
+    from app.transformers import TransformationManager, TransformationRule, transformation_manager
+
+    fresh = TransformationManager()
+    monkeypatch.setattr(transformation_manager, "rules_by_id", fresh.rules_by_id)
+    monkeypatch.setattr(transformation_manager, "rules_by_path", fresh.rules_by_path)
+    transformation_manager.register_from_dict({"name": "a", "path_pattern": "/api/a/*", "request_config": {"headers_set": {"X-A": "1"}}})
+    transformation_manager.register_from_dict({"name": "b", "path_pattern": "/api/b/*", "request_config": {"body_set": {"a": 1}}})
+    snap = await dataplane_sync.build_snapshot(db_session)
+    assert snap["transform_rules"] == [
+        {"glob": "/api/a/*", "methods": [], "native": True, "response": None,
+         "request": {"rename": [], "remove": [], "set": [["X-A", "1"]], "query_remove": [], "query_set": []}},
+        {"glob": "/api/b/*", "methods": [], "native": False}]
+    assert snap["fallthrough_prefixes"] != ["/"]
 
 
 def test_a_glob_with_classes_is_described_so_that_it_matches_as_fnmatch_does():

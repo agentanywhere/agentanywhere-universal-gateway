@@ -102,3 +102,5 @@ jobs:
         run: python dataplane/conformance/paths.py
       - name: Preflight answers against the CORS middleware
         run: python dataplane/conformance/preflight.py
+      - name: Applied transformation rules against the Python gateway's own rule code
+        run: python dataplane/conformance/shapes.py

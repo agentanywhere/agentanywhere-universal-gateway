@@ -1526,30 +1526,47 @@ def main() -> int:
                   said_by(b) == "python" and a.status_code == b.status_code and page_headers(a) == page_headers(b), f"[{b.status_code}] {page_headers(b)}")
 
             # --- transformation rules ----------------------------------------------------------------
-            # A rule is applied by the Python gateway. The data plane must hand it exactly the
-            # requests the rule applies to, and keep serving the rest.
+            # A rule that changes headers, query parameters or the status is applied by the data
+            # plane as the Python gateway applies it. Any other rule is applied by the Python
+            # gateway: the data plane must hand it exactly the requests the rule applies to.
             print()
 
-            def shaped(base, key, method, path):
-                return httpx.request(method, base + path, headers={"X-API-Key": key}, timeout=15)
+            def shaped(base, key, method, path, headers=(), **kw):
+                return httpx.request(method, base + path, headers=[("X-API-Key", key), *headers], timeout=15, **kw)
+
+            def lines(pairs):
+                """Header lines as a receiver reads them: for each name, the values in order."""
+                out = {}
+                for name, value in pairs:
+                    out.setdefault(name.lower(), []).append(value)
+                return {name: ", ".join(values) for name, values in out.items()}
+
+            def mark(r):
+                return lines(r.json()["headers"]).get("x-shaped")
 
             def rule_same(name, method, path, by, marked):
                 a, b = shaped(py, keys["py"]["key"], method, path), shaped(rs, keys["rs"]["key"], method, path)
-                mark = lambda r: dict((k.lower(), v) for k, v in r.json()["headers"]).get("x-shaped")
                 ok = a.status_code == b.status_code == 200 and mark(a) == mark(b) == ("yes" if marked else None) and said_by(b) == by
                 check(f"transformation rules: {name}", ok, f"[{b.status_code}] by {said_by(b)}, the backend saw X-Shaped: {mark(a)} and {mark(b)}")
 
-            def rules_reached(path, by):
-                return wait_until(lambda: said_by(shaped(rs, keys["rs"]["key"], "GET", path)) == by)
+            def rules_reached(path, by, marked, method="GET"):
+                def there():
+                    r = shaped(rs, keys["rs"]["key"], method, path)
+                    return said_by(r) == by and mark(r) == ("yes" if marked else None)
+                return wait_until(there)
+
+            def remove_rules(rules):
+                for rule in rules:
+                    httpx.delete(f"{py}/admin/transformations/{rule['id']}", headers=adm, timeout=10).raise_for_status()
 
             made = [post("/admin/transformations", r) for r in (
                 {"name": "mark orders", "path_pattern": "/api/routed/orders/*", "methods": ["GET"], "request_config": {"headers_set": {"X-Shaped": "yes"}}},
                 {"name": "mark an agent's intake", "path_pattern": "/intake/*", "request_config": {"headers_set": {"X-Shaped": "yes"}}})]
-            assert rules_reached("/api/routed/orders/1", "python"), "the rules never reached the data plane"
-            rule_same("a request a rule applies to is Python's, and is changed", "GET", "/api/routed/orders/1", "python", True)
+            assert rules_reached("/api/routed/orders/1", "data plane", True), "the rules never reached the data plane"
+            rule_same("a request a rule applies to is changed here", "GET", "/api/routed/orders/1", "data plane", True)
             rule_same("another method on the same path is served here, unchanged", "POST", "/api/routed/orders/1", "data plane", False)
-            rule_same("a path the rule does not cover is served here", "GET", "/api/routed/other/1", "data plane", False)
-            rule_same("an agent's path is matched as the agent is asked for it", "GET", "/agents/echo/intake/7", "python", True)
+            rule_same("a path the rule does not cover is served here, unchanged", "GET", "/api/routed/other/1", "data plane", False)
+            rule_same("an agent's path is matched as the agent is asked for it, and is Python's", "GET", "/agents/echo/intake/7", "python", True)
             rule_same("and the agent's other paths are served here", "GET", "/agents/echo/outtake/7", "data plane", False)
             r = shaped(rs, keys["rs"]["key"], "GET", "/api/users")
             check("transformation rules: every other path is served here as before", r.status_code == 200 and said_by(r) == "data plane")
@@ -1557,15 +1574,14 @@ def main() -> int:
             check("transformation rules: gRPC calls no rule applies to are still relayed", b["code"] == "OK", b["code"])
 
             everything = post("/admin/transformations", {"name": "mark everything", "path_pattern": "*", "request_config": {"headers_set": {"X-Shaped": "yes"}}})
-            assert rules_reached("/api/routed/other/1", "python"), "the catch-all rule never reached the data plane"
-            rule_same("a rule for every path makes every path Python's", "GET", "/api/routed/other/1", "python", True)
+            assert rules_reached("/api/routed/other/1", "data plane", True), "the catch-all rule never reached the data plane"
+            rule_same("a rule for every path changes every path, here", "GET", "/api/routed/other/1", "data plane", True)
             b = grpc_call(f"127.0.0.1:{dport}", "unary", "Say", b"hello", (("x-api-key", keys["rs"]["key"]),))
             check("transformation rules: and gRPC calls, which Python cannot carry, are refused",
                   (b["code"], b["details"]) == ("PERMISSION_DENIED", "the gateway's rules for this key cannot be applied to gRPC"), f"{b['code']}: {b['details']}")
-            for rule in made + [everything]:
-                httpx.delete(f"{py}/admin/transformations/{rule['id']}", headers=adm, timeout=10).raise_for_status()
-            assert rules_reached("/api/routed/orders/1", "data plane"), "removing the rules never reached the data plane"
-            rule_same("with the rules removed, nothing is changed and all is served here", "GET", "/api/routed/orders/1", "data plane", False)
+            remove_rules(made + [everything])
+            assert rules_reached("/api/routed/orders/1", "data plane", False), "removing the rules never reached the data plane"
+            rule_same("with the rules removed, nothing is changed", "GET", "/api/routed/orders/1", "data plane", False)
 
             # Patterns of the other kinds: a regular expression, a character class, every path for
             # one method, and what looks like a regular expression but is not one (which the Python
@@ -1576,18 +1592,101 @@ def main() -> int:
                 {"name": "mark two shelves", "path_pattern": "/api/routed/shelf-[ab]/*", "request_config": shape_it},
                 {"name": "mark every PUT", "path_pattern": "*", "methods": ["PUT"], "request_config": shape_it},
                 {"name": "not an expression", "path_pattern": "/routed/odd)$", "request_config": shape_it})]
-            assert rules_reached("/api/routed/v2/x", "python"), "the patterns never reached the data plane"
-            rule_same("a regular expression is matched from the start of the path", "GET", "/api/routed/v2/x", "python", True)
-            rule_same("a path the expression does not match is served here", "GET", "/api/routed/v/x", "data plane", False)
-            rule_same("a character class lets through what it names", "GET", "/api/routed/shelf-a/1", "python", True)
+            assert rules_reached("/api/routed/v2/x", "data plane", True), "the patterns never reached the data plane"
+            rule_same("a regular expression is matched from the start of the path", "GET", "/api/routed/v2/x", "data plane", True)
+            rule_same("a path the expression does not match is unchanged", "GET", "/api/routed/v/x", "data plane", False)
+            rule_same("a character class lets through what it names", "GET", "/api/routed/shelf-a/1", "data plane", True)
             rule_same("and nothing else", "GET", "/api/routed/shelf-c/1", "data plane", False)
-            rule_same("a rule for every path with a method is that method's alone", "PUT", "/api/routed/other/1", "python", True)
-            rule_same("and the other methods are served here", "GET", "/api/routed/other/1", "data plane", False)
-            rule_same("a pattern that is no expression after all is looked for in the path", "GET", "/api/routed/odd)$/1", "python", True)
-            rule_same("and a path without it is served here", "GET", "/api/routed/odd/1", "data plane", False)
-            for rule in made:
-                httpx.delete(f"{py}/admin/transformations/{rule['id']}", headers=adm, timeout=10).raise_for_status()
-            assert rules_reached("/api/routed/v2/x", "data plane"), "removing the patterns never reached the data plane"
+            rule_same("a rule for every path with a method is that method's alone", "PUT", "/api/routed/other/1", "data plane", True)
+            rule_same("and the other methods are unchanged", "GET", "/api/routed/other/1", "data plane", False)
+            rule_same("a pattern that is no expression after all is looked for in the path", "GET", "/api/routed/odd)$/1", "data plane", True)
+            rule_same("and a path without it is unchanged", "GET", "/api/routed/odd/1", "data plane", False)
+            remove_rules(made)
+            assert rules_reached("/api/routed/v2/x", "data plane", False), "removing the patterns never reached the data plane"
+
+            # What the rules do, each compared with what the Python gateway does. A request is
+            # matched by the path the backend is asked for; its answer by the request's own path
+            # without the leading slash, so one pattern for both starts with `*`.
+            def exchange_same(name, method, path, by="data plane", headers=(), sees=None, query=None, status=200, given=None, **kw):
+                a = shaped(py, keys["py"]["key"], method, path, headers, **kw)
+                b = shaped(rs, keys["rs"]["key"], method, path, headers, **kw)
+                bad = []
+                if said_by(b) != by:
+                    bad.append(f"answered by the {said_by(b)}")
+                if not a.status_code == b.status_code == status:
+                    bad.append(f"status {a.status_code} and {b.status_code}")
+                else:
+                    seen_a, seen_b = lines(a.json()["headers"]), lines(b.json()["headers"])
+                    for header, want in (sees or {}).items():
+                        if not seen_a.get(header) == seen_b.get(header) == want:
+                            bad.append(f"the backend saw {header}: {seen_a.get(header)!r} and {seen_b.get(header)!r}")
+                    if query is not None and not a.json()["query"] == b.json()["query"] == query:
+                        bad.append(f"the backend saw the query {a.json()['query']!r} and {b.json()['query']!r}")
+                    if a.json()["body_sha256"] != b.json()["body_sha256"]:
+                        bad.append("the backend was sent another body")
+                    for header, want in (given or {}).items():
+                        if not a.headers.get(header) == b.headers.get(header) == want:
+                            bad.append(f"the caller was given {header}: {a.headers.get(header)!r} and {b.headers.get(header)!r}")
+                check(f"transformation rules: {name}", not bad, "; ".join(bad))
+
+            made = [post("/admin/transformations", r) for r in (
+                {"name": "shape requests", "path_pattern": "/api/routed/shaped/*", "request_config": {
+                    "headers_rename": {"X-Old": "X-New"}, "headers_remove": ["X-Secret"],
+                    "headers_set": {"X-Shaped": "yes", "x-client": "gateway", "X-Caller": "gateway"},
+                    "query_remove": ["debug"], "query_set": {"source": "gw", "page": "1"}}},
+                {"name": "and again, after", "path_pattern": "/api/routed/shaped/twice/*", "methods": ["POST"], "request_config": {
+                    "headers_rename": {"x-shaped": "X-Was-Shaped"}, "headers_set": {"X-Shaped": "yes"}}},
+                {"name": "shape answers", "path_pattern": "api/routed/shaped/*", "response_config": {
+                    "headers_rename": {"X-Agent": "X-Backend"}, "headers_remove": ["etag"], "headers_set": {"X-Powered": "gateway"},
+                    "status_map": {"418": 400, "200": 201}}},
+                {"name": "and again, after", "path_pattern": "api/routed/shaped/twice/*", "response_config": {"status_map": {"201": 202}}})]
+            assert rules_reached("/api/routed/shaped/1", "data plane", True), "the rules never reached the data plane"
+            sent = [("X-Old", "o"), ("X-Secret", "s"), ("X-Client", "mine"), ("X-Caller", "mine"), ("X-Keep", "k")]
+            exchange_same("headers are renamed, removed and set, and the rest left alone", "GET", "/api/routed/shaped/1", headers=sent, status=201,
+                          sees={"x-new": "o", "x-old": None, "x-secret": None, "x-shaped": "yes", "x-client": "gateway", "x-keep": "k"})
+            exchange_same("a header set under a name in another case arrives beside the caller's own, as from Python", "GET", "/api/routed/shaped/1",
+                          headers=sent, status=201, sees={"x-caller": "mine, gateway"})
+            exchange_same("query parameters are removed and set, and the rest left alone", "GET", "/api/routed/shaped/1?debug=1&page=7&q=tea", status=201,
+                          query="page=1&q=tea&source=gw")
+            exchange_same("a request without a query is given the parameters set", "GET", "/api/routed/shaped/1", status=201, query="source=gw&page=1")
+            exchange_same("a body goes on as it came", "POST", "/api/routed/shaped/1", status=201, content=b'{"a":  1}', sees={"x-shaped": "yes", "content-length": "9"})
+            exchange_same("an answer's headers are renamed and set, and its status mapped", "GET", "/api/routed/shaped/1", status=201,
+                          given={"x-backend": "echo", "x-agent": None, "x-powered": "gateway"})
+            exchange_same("another status is mapped to another", "GET", "/api/routed/shaped/teapot", status=400, given={"x-backend": "echo"})
+            exchange_same("rules apply in the order they were made, each to what the last left", "POST", "/api/routed/shaped/twice/1", status=202,
+                          sees={"x-was-shaped": "yes", "x-shaped": "yes"}, given={"x-powered": "gateway"})
+            a, b = (shaped(base, keys[k]["key"], "GET", "/api/routed/shaped/1") for base, k in ((py, "py"), (rs, "rs")))
+            check("transformation rules: the answer's body is the backend's own bytes on both sides",
+                  a.content.startswith(b'{"method": "GET", "path": "/api/routed/shaped/1"') and b.content.startswith(b'{"method": "GET", "path": "/api/routed/shaped/1"'),
+                  f"{a.content[:60]!r} and {b.content[:60]!r}")
+            exchange_same("a request that gives a header the rules name twice is Python's", "GET", "/api/routed/shaped/1", by="python", status=201,
+                          headers=[("X-Old", "first"), ("X-Old", "second")], sees={"x-shaped": "yes"})
+            exchange_same("and one that gives another header twice is changed here", "GET", "/api/routed/shaped/1", status=201,
+                          headers=[("X-Keep", "first"), ("X-Old", "o")], sees={"x-new": "o", "x-shaped": "yes"})
+            exchange_same("a query that is not plain words is Python's to take apart", "GET", "/api/routed/shaped/1?q=a%20b&debug=1", by="python", status=201,
+                          sees={"x-shaped": "yes"})
+            exchange_same("an answer Python may stream is Python's, with the request still changed", "GET", "/api/routed/shaped/message:stream/1", by="python",
+                          sees={"x-shaped": "yes"})
+            remove_rules(made)
+            assert rules_reached("/api/routed/shaped/1", "data plane", False), "removing the rules never reached the data plane"
+
+            # Rules this side is not told the actions of: they change a body or the path, or a
+            # header that the gateway or an HTTP library on the way has a say in.
+            for what, config in (("changes a body", {"request_config": {"headers_set": {"X-Shaped": "yes"}, "body_set": {"seen": True}}}),
+                                 ("rewrites the path", {"request_config": {"headers_set": {"X-Shaped": "yes"}, "path_rewrite": {"pattern": "/kept/", "replacement": "/kept/"}}}),
+                                 ("fills in a template", {"request_config": {"headers_set": {"X-Shaped": "yes"}}, "response_config": {"template": "{{ body | tojson }}"}}),
+                                 ("sets the client's name", {"request_config": {"headers_set": {"X-Shaped": "yes", "User-Agent": "gateway"}}}),
+                                 ("sets the kind of content of an answer", {"request_config": {"headers_set": {"X-Shaped": "yes"}},
+                                                                            "response_config": {"headers_set": {"Content-Type": "text/plain"}}}),
+                                 ("maps a status to one without a body", {"request_config": {"headers_set": {"X-Shaped": "yes"}},
+                                                                          "response_config": {"status_map": {"404": 204}}})):
+                made = [post("/admin/transformations", {"name": what, "path_pattern": "*api/routed/kept/*", **config})]
+                assert rules_reached("/api/routed/kept/1", "python", True), f"the rule that {what} never reached the data plane"
+                r = shaped(rs, keys["rs"]["key"], "GET", "/api/routed/other/1")
+                check(f"transformation rules: a rule that {what} is Python's to apply, and other paths are served here",
+                      said_by(r) == "data plane" and mark(r) is None, f"by {said_by(r)}, X-Shaped: {mark(r)}")
+                remove_rules(made)
+                assert rules_reached("/api/routed/kept/1", "data plane", False), "removing the rule never reached the data plane"
 
             # --- MCP tools with a schema -------------------------------------------------------------
             # A registered OpenAPI document gives each operation's tool a JSON Schema, and the Python

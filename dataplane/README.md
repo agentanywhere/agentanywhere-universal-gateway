@@ -83,7 +83,7 @@ as it has workers, or set `--workers` below the core count on a shared machine, 
   cannot be reproduced exactly (a policy that matches on headers or uses a character class in its path, a scoped IPv6
   network, a key linked to more than one tenant), and turns native serving off for every path when
   a request-altering plugin exists, or a transformation rule whose reach this side cannot work out. Dynamic routes
-  are followed here, and a transformation rule sends only the requests it applies to (see below). A single request also goes to Python when its path is
+  are followed here; a transformation rule is applied here when this side can do exactly what it does, and otherwise sends only the requests it applies to (see below). A single request also goes to Python when its path is
   not ASCII as sent, is not UTF-8 once its escapes are decoded or then holds a control character, `?` or `#`, its method is not one of the plain ones, or the client's address cannot be resolved
   the way Python resolves it. The stock `request-id` plugin is reproduced natively.
 * **A path is read decoded and written again, as Python does it.** The Python gateway's server decodes a path's
@@ -190,10 +190,29 @@ again after a reconnect. `/mqtt/subscribe` stays with the Python gateway.
 `python dataplane/conformance/publish.py` generates bodies and checks that whatever this side would publish, the Python
 gateway's own handler and client publish the same bytes.
 
-**Transformation rules.** The Python gateway applies them; this side only works out which requests they apply to and
-hands those over. A rule's pattern is matched, as there, against the path the backend is asked for (after a dynamic
-route's rewrite, a protocol's prefix or an agent's slug has been dealt with) and against the request's own path
-without its leading slash, which is what the Python gateway matches when it transforms an answer. The Python gateway
+**Transformation rules.** A rule that changes headers or query parameters of a request, or headers or the status of
+an answer, is applied here, as the Python gateway applies it: for each rule that applies, in the order the rules were
+made, headers are renamed, then removed, then set, and query parameters are removed, then set; an answer's status is
+mapped by each rule in turn. The quirks are the Python gateway's and are kept: a header is found for renaming or
+removing whatever its case, but is set under exactly the name the rule gives, so a header set as `X-Client` arrives
+beside the caller's own `x-client`, not in its place. Any other rule is the Python gateway's to apply, and a request it
+applies to is handed over: a rule that changes a body, fills in a template or rewrites the path; one that names a
+header the gateway or an HTTP library on the way has its own say in (`Host`, `Content-Length`, `User-Agent`, `Accept`,
+`X-Forwarded-For`, `X-Request-ID`, the version and trace headers; on an answer also `Content-Type`, `Set-Cookie`,
+`Vary` and the cross-origin, rate-limit and tenant headers); one with a header name or value that is not plain ASCII
+without a space at either end, or a query word of other than unreserved characters; one that maps a status to or from
+one without a body (below 200, 204, 205, 304). So are a request that gives a header the rules name more than once
+(the Python gateway's rules see one line of it), a request whose query is not plain `key=value` words when a rule
+changes the query, and a request whose answer the Python gateway may pass on as a stream (it applies no rule to
+those) when a rule would change the answer. gRPC and `POST /mqtt/publish` have handlers of their own there, which
+apply no rule; a rule that matches one keeps it with the Python gateway, as before, and so does a rule that matches
+an agent's path. `python dataplane/conformance/shapes.py` generates rules as the admin API takes them and exchanges to
+apply them to, and checks that what the backend is sent and what the caller is given are what the Python gateway's
+own rule code, HTTP client and web framework make of them.
+
+A rule's pattern is matched, as there, against the path the backend is asked for (after a dynamic
+route's rewrite, a protocol's prefix or an agent's slug has been dealt with) and, for the answer, against the request's
+own path without its leading slash. The Python gateway
 describes each pattern in the form this side matches exactly as it does: a glob of plain characters, `*` and `?`; a
 glob with character classes, each class given as the characters Python's own `fnmatch` lets it match; `*` or `**`,
 which is every path (for the rule's methods); a regular expression (a pattern that starts with `^` or ends with `$`),
@@ -204,9 +223,8 @@ the end. A rule with any other expression (a look-around, a back-reference, a fl
 every path with the Python gateway. `python dataplane/conformance/patterns.py` generates patterns of every kind and
 checks that this side matches each as the Python gateway's own matcher does.
 
-One difference a caller could see, though not in what the JSON says: while any rule is registered, the Python
-gateway reads and rewrites every JSON answer it passes on, matched or not, which changes its spacing and escaping.
-An answer served here is the backend's, byte for byte.
+An answer's body is the backend's, byte for byte, on both sides: the Python gateway reads and rewrites a body only
+for a rule that changes bodies, and such a rule is its own to apply.
 
 **Browsers.** A caller that prefers `text/html` (decided as the Python gateway decides it: `text/html` accepted, JSON
 not named before it, no `X-Requested-With: XMLHttpRequest`) is shown errors as pages. A successful request is
@@ -312,7 +330,8 @@ here is the reverse of everywhere else: **whatever this side cannot be sure of i
 | The JSON-to-gRPC bridge under `/grpc` | Python |
 | A path that matches a dynamic route to an `http://` or `https://` backend | data plane, to the route's backend |
 | A path that matches a dynamic route to any other backend | Python |
-| A request a transformation rule applies to (by path pattern and method) | Python, which applies it |
+| A request a transformation rule applies to (by path pattern and method), when the rule changes headers, query parameters or the status | data plane, which applies it |
+| The same, when the rule changes a body, a path or a header the gateway has its own say in, or the request is one the two sides would read differently | Python, which applies it |
 | Any transformation rule whose regular expression the two engines could read differently | Python, for every path |
 | Request-altering plugins (when any exist) | Python, for every path |
 | The health path, `/ready` and `/live`, on a plain `GET` | data plane |
@@ -376,6 +395,7 @@ python dataplane/conformance/run.py     # same scenarios against Python and the 
 python dataplane/conformance/boundary.py  # the body checks against the Python functions, on generated bodies
 python dataplane/conformance/publish.py   # what would be published to MQTT, against the Python handler and client
 python dataplane/conformance/patterns.py  # which paths a transformation rule's pattern matches, against Python's matcher
+python dataplane/conformance/shapes.py    # what applied transformation rules make of a request and its answer, against Python's rule code
 python dataplane/conformance/preflight.py # what a preflight is answered, against the CORS middleware itself
 python dataplane/conformance/paths.py     # how an escaped path is read and written again, against uvicorn's and httpx's own code
 ```

@@ -193,10 +193,12 @@ def _tokens(settings) -> list:
 
 
 def _transform_rules() -> Optional[list]:
-    """Which requests a transformation rule applies to, so that the data plane can leave exactly
-    those to this gateway: for each rule that is switched on, its path pattern and its methods (none
-    means all). A rule matches a request by the path the backend is asked for and, for the answer,
-    by the request's path without its leading slash (``TransformationRule.matches``).
+    """The transformation rules that are switched on, in the order they are applied: for each, its
+    path pattern and its methods (none means all), and what it does when the data plane can do the
+    same (``_rule_actions``). A rule matches a request by the path the backend is asked for and,
+    for the answer, by the request's path without its leading slash (``TransformationRule.matches``).
+    The data plane applies the rules it was told the actions of and leaves a request any other
+    rule applies to with this gateway.
 
     Each pattern is described in the form the data plane matches exactly as this gateway does
     (see ``_rule_pattern``). With a rule whose pattern has no such form, the answer is ``None``
@@ -211,7 +213,108 @@ def _transform_rules() -> Optional[list]:
         methods = [m.upper() for m in (rule.methods or []) if isinstance(m, str)]
         if described is None or len(methods) != len(rule.methods or []):
             return None
-        out.append({**described, "methods": sorted(set(methods))})
+        try:
+            actions = _rule_actions(rule)
+        except Exception:  # noqa: BLE001 - a rule this code did not expect is applied here
+            actions = None
+        out.append({**described, "methods": sorted(set(methods)), "native": actions is not None, **(actions or {})})
+    return out
+
+
+_HEADER_NAME = re.compile(r"[A-Za-z0-9_-]+")
+# No space at either end, where the two sides' HTTP libraries may differ.
+_HEADER_VALUE = re.compile(r"(?:[\x21-\x7e](?:[\x20-\x7e]*[\x21-\x7e])?)?")
+# What a query is written with unchanged by every HTTP library on the way.
+_QUERY_WORD = re.compile(r"[A-Za-z0-9._~-]*")
+# Headers a rule's change to which is not the last word on them: the gateway, its HTTP client or
+# its server reads or writes them too, each side in its own way.
+_REQUEST_HEADERS_KEPT = frozenset((
+    "host", "content-length", "transfer-encoding", "connection", "keep-alive", "upgrade", "te", "trailer", "expect",
+    "proxy-authenticate", "proxy-authorization", "proxy-connection", "accept", "accept-encoding", "user-agent",
+    "x-forwarded-for", "x-protocol", "traceparent", "x-request-id", "x-api-version", "accept-version",
+))
+_RESPONSE_HEADERS_KEPT = frozenset((
+    "content-type", "content-length", "content-encoding", "transfer-encoding", "connection", "keep-alive", "upgrade",
+    "te", "trailer", "proxy-authenticate", "proxy-authorization", "set-cookie", "date", "server", "vary", "retry-after",
+    "x-request-id", "x-response-time", "x-api-version", "traceparent", "warning", "sunset", "deprecation",
+    "x-served-by", "x-dataplane-auth", "x-content-type-options",
+))
+_RESPONSE_PREFIXES_KEPT = ("access-control-", "x-ratelimit-", "x-tenant-", "x-anomaly-")
+# The statuses a rule may turn into one another here: those that carry a body, as every server
+# on the way writes them.
+_STATUS_MAPPED = frozenset(range(200, 600)) - {204, 205, 304}
+
+
+def _header_actions(cfg: Any, kept: frozenset, prefixes: tuple = ()) -> Optional[Dict[str, Any]]:
+    """A rule's changes to headers (``_apply_header_ops``): renamed, then removed, then set."""
+
+    def name(n: Any) -> bool:
+        return (isinstance(n, str) and _HEADER_NAME.fullmatch(n) is not None
+                and n.lower() not in kept and not n.lower().startswith(prefixes))
+
+    def value(v: Any) -> bool:
+        return isinstance(v, str) and _HEADER_VALUE.fullmatch(v) is not None
+
+    rename, remove, to_set = cfg.headers_rename, cfg.headers_remove, cfg.headers_set
+    if not (isinstance(rename, dict) and isinstance(remove, list) and isinstance(to_set, dict)):
+        return None
+    if not all(name(old) and name(new) for old, new in rename.items()):
+        return None
+    # Two names for one header to rename: the second finds it gone, which is an error there.
+    if len({old.lower() for old in rename}) != len(rename):
+        return None
+    if not all(name(n) for n in remove) or not all(name(n) and value(v) for n, v in to_set.items()):
+        return None
+    return {"rename": [[old, new] for old, new in rename.items()], "remove": sorted({n.lower() for n in remove}),
+            "set": [[n, v] for n, v in to_set.items()]}
+
+
+def _rule_actions(rule: Any) -> Optional[Dict[str, Any]]:
+    """What a transformation rule does, when the data plane can do exactly the same: change
+    headers and query parameters of the request, and headers and the status of the answer.
+    ``None`` for a rule that does anything else (changes a body or the path, or is code), or
+    that names a header, a value or a status the two sides might treat differently. Such a rule
+    is applied here: the data plane hands over the requests it applies to."""
+    if rule.condition is not None or rule.transform_request is not None or rule.transform_response is not None:
+        return None
+    out: Dict[str, Any] = {"request": None, "response": None}
+    for side in ("request", "response"):
+        cfg = rule.request_config if side == "request" else rule.response_config
+        if cfg is None:
+            continue
+        # A body or a template is read and written again; a path is rewritten by expression.
+        if cfg.body_set or cfg.body_remove or cfg.body_rename or cfg.template:
+            return None
+        if side == "request":
+            if cfg.path_rewrite:
+                return None
+            actions = _header_actions(cfg, _REQUEST_HEADERS_KEPT)
+            remove, to_set = cfg.query_remove, cfg.query_set
+            if actions is None or not (isinstance(remove, list) and isinstance(to_set, dict)):
+                return None
+            if not all(isinstance(q, str) for q in remove):
+                return None
+            if not all(isinstance(k, str) and k and _QUERY_WORD.fullmatch(k) and isinstance(v, str) and _QUERY_WORD.fullmatch(v)
+                       for k, v in to_set.items()):
+                return None
+            actions["query_remove"] = list(remove)
+            actions["query_set"] = [[k, v] for k, v in to_set.items()]
+        else:
+            actions = _header_actions(cfg, _RESPONSE_HEADERS_KEPT, _RESPONSE_PREFIXES_KEPT)
+            statuses = cfg.status_map
+            if actions is None or not isinstance(statuses, dict):
+                return None
+            mapped = []
+            for was, becomes in statuses.items():
+                if not (isinstance(was, str) and type(becomes) is int and becomes in _STATUS_MAPPED):
+                    return None
+                # A key that is not a status as Python writes one never matches anything.
+                if was.isascii() and was.isdigit() and str(int(was)) == was:
+                    if int(was) not in _STATUS_MAPPED:
+                        return None
+                    mapped.append([int(was), becomes])
+            actions["status"] = mapped
+        out[side] = actions
     return out
 
 
