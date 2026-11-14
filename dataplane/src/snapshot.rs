@@ -93,6 +93,11 @@ pub struct Snapshot {
     pub policies: Vec<Policy>,
     /// Path prefixes the control plane must handle (dynamic routes, transformation rules, ...).
     pub fallthrough_prefixes: Vec<String>,
+    /// The beginnings of the paths the Python gateway answers itself (health, metrics, admin,
+    /// OAuth2, ...). With these, a path with no protocol's prefix that is none of them goes to the
+    /// HTTP backend, as it does there. `None`: the control plane has not said, or sends such paths
+    /// somewhere else, and they are its to answer.
+    pub own_paths: Option<Vec<String>>,
     /// Where each protocol in `ROUTED` is sent, as the control plane has it configured.
     pub protocol_urls: [Option<String>; 5],
     /// The backends at those addresses, filled in when the snapshot is put to use. A protocol
@@ -452,6 +457,8 @@ struct SnapshotFile {
     tokens: Vec<TokenRecord>,
     #[serde(default)]
     fallthrough_prefixes: Vec<String>,
+    #[serde(default)]
+    own_paths: Option<Vec<String>>,
     #[serde(default = "yes")]
     rate_limit_enabled: bool,
     api_versions: Option<VersionsRecord>,
@@ -813,6 +820,7 @@ impl Snapshot {
             ip_rules,
             policies,
             fallthrough_prefixes: file.fallthrough_prefixes,
+            own_paths: file.own_paths,
             protocol_urls: ROUTED.map(|p| file.backends.get(p.name()).cloned().flatten().filter(|u| !u.is_empty())),
             routes: Default::default(),
             // Without the section, the gateway's shipped defaults apply.

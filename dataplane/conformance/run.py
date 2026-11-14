@@ -901,6 +901,32 @@ def main() -> int:
                     check(f"{name}: the backend saw the same request from both", a.json() == b.json(),
                           "" if a.json() == b.json() else f"{a.json()} vs {b.json()}")
 
+            # A path with no protocol's prefix goes to the HTTP backend, from both planes alike.
+            for name, method, path, body in [
+                ("no prefix", "GET", "/users/7?expand=1", None),
+                ("no prefix, with a body", "POST", "/orders", {"n": 1}),
+                ("the root", "GET", "/", None),
+                ("under /rest", "PUT", "/rest/items/3", {"n": 2}),
+                ("under /http", "DELETE", "/http/items/3", None),
+                ("/api with nothing after it", "GET", "/api", None),
+                ("a prefix that only looks like /api", "GET", "/apix/y", None),
+                ("/agents with no slug", "GET", "/agents", None),
+                ("a HEAD request", "HEAD", "/users", None),
+            ]:
+                a, b = both(method, path, body)
+                compare(f"Plain path: {name}", a, b)
+                check(f"Plain path: {name}: answered by the data plane", b.headers.get("x-served-by") == "dataplane",
+                      f"[{b.status_code}] served-by={b.headers.get('x-served-by')}")
+            a, b = httpx.get(f"{py}/users", timeout=15), httpx.get(f"{rs}/users", timeout=15)
+            compare("Plain path: without a key", a, b)
+            # The gateway's own endpoints stay its own, wherever a request for them arrives.
+            # (`/health`, `/ready` and `/live` are answered by the data plane's own probes, checked elsewhere.)
+            for path in ("/health/detailed", "/metrics", "/oauth2/providers", "/.well-known/agent-card.json",
+                         "/admin/api-keys", "/docs", "/openapi.json", "/healthz", "/mqtt/subscribe"):
+                a, b = both("GET", path, None)
+                check(f"Own path {path}: left to Python, same status", b.headers.get("x-served-by") != "dataplane" and a.status_code == b.status_code,
+                      f"[{a.status_code}/{b.status_code}] served-by={b.headers.get('x-served-by')}")
+
             # Bodies the gateway refuses at the boundary: the answer must be Python's, word for word.
             refused = [
                 ("MCP body that is not JSON", "POST", "/mcp", None, b"{not json"),
@@ -1738,7 +1764,7 @@ def main() -> int:
             b = grpc_refused("a rate-limited call says so", "RESOURCE_EXHAUSTED", "rate limit exceeded", say_key)
             check("gRPC: and says when to come back", {**b["before"], **b["after"]}.get("retry-after") == "60")
             b = over2("/conf.Echo/Say", {"X-API-Key": "{key}", "Content-Type": "application/grpc-web"}, "POST")
-            check("gRPC: gRPC-Web is not gRPC and is left to Python", b.headers.get("x-served-by") != "dataplane" and "grpc-status" not in b.headers,
+            check("gRPC: gRPC-Web is not gRPC: it is an ordinary request to the HTTP backend", "grpc-status" not in b.headers,
                   f"[{b.status_code}]") if shutil.which("curl") else None
 
             # Counted and logged like any request served here, under the method called.

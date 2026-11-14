@@ -97,6 +97,26 @@ def _versions() -> Dict[str, Any]:
     }
 
 
+def _own_paths(settings) -> Optional[List[str]]:
+    """How the paths this gateway answers itself begin, when every other path with no protocol's
+    prefix goes to the HTTP backend (``Router._get_backend_url``). ``None`` when they go elsewhere
+    (no HTTP backend: the MCP one takes them), or when a route here could match any path."""
+    if not settings.http_backend_url:
+        return None
+    from app.main import DOCS_PATHS, app, gateway_proxy
+
+    # What the authentication middleware lets through or answers by how the path begins.
+    own = {"/admin", "/internal/dataplane", "/oauth2", "/agents/", *DOCS_PATHS}
+    for route in app.routes:
+        if getattr(route, "endpoint", None) is gateway_proxy:
+            continue
+        literal = route.path.split("{", 1)[0]
+        if literal in ("", "/"):
+            return None
+        own.add(literal)
+    return sorted(own)
+
+
 def _backends(settings) -> Dict[str, Optional[str]]:
     """Where the router sends each protocol the data plane can carry (``Router._get_backend_url``)."""
     return {
@@ -783,6 +803,7 @@ async def build_snapshot(db: AsyncSession) -> Dict[str, Any]:
         "upstream_timeout_seconds": float(settings.default_timeout),
         "api_versions": _versions(),
         "backends": _backends(settings),
+        "own_paths": None if all_paths_via_python else _own_paths(settings),
         "boundary": _boundary(settings),
         # Where a key is read from (the Authorization header is always the second place), and how a
         # request without a usable one is refused.

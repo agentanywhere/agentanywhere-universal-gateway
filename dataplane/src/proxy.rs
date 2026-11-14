@@ -377,9 +377,10 @@ const KEPT_BY_CONTROL: [&str; 2] = ["ws", "agents"];
 
 /// The protocol a path belongs to, decided in the order the Python gateway's router decides it
 /// (prefixes are compared as text, so `/mcpx` is MCP there and here). `None` for what the control
-/// plane keeps: MQTT but for publishing, WebSocket, gRPC, its own endpoints and anything
-/// without a prefix.
-fn classify(path: &str) -> Option<Protocol> {
+/// plane keeps: MQTT but for publishing, WebSocket, gRPC and its own endpoints. A path with no
+/// prefix, or under `/rest` or `/http`, is plain HTTP when the control plane has said which paths
+/// are its own (`own`) and this is none of them; until it has, only `/api/...` is.
+fn classify(path: &str, own: Option<&[String]>) -> Option<Protocol> {
     let under = |name: &str| path.starts_with(name) || path.strip_prefix("/api").map(|rest| rest.starts_with(name)).unwrap_or(false);
     if path == PUBLISH {
         Some(Protocol::Mqtt)
@@ -395,9 +396,10 @@ fn classify(path: &str) -> Option<Protocol> {
         None
     } else if under("/graphql") {
         Some(Protocol::GraphQl)
+    } else if let Some(rest) = path.strip_prefix("/api/") {
+        (!KEPT_BY_CONTROL.contains(&rest.split('/').next().unwrap_or(""))).then_some(Protocol::Http)
     } else {
-        let first = path.strip_prefix("/api/")?.split('/').next().unwrap_or("");
-        (!KEPT_BY_CONTROL.contains(&first)).then_some(Protocol::Http)
+        own.filter(|own| !own.iter().any(|p| path.starts_with(p.as_str()))).map(|_| Protocol::Http)
     }
 }
 
@@ -655,7 +657,7 @@ fn decide<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, now: u6
     if let Some(rest) = path.strip_prefix("/agents/") {
         return agent_call(snap, peer, req, rest).map(Decision::Agent).unwrap_or(PYTHON);
     }
-    let Some(protocol) = classify(path) else { return PYTHON };
+    let Some(protocol) = classify(path, snap.own_paths.as_deref()) else { return PYTHON };
     if snap.fallthrough_prefixes.iter().any(|p| path.starts_with(p.as_str())) {
         return PYTHON;
     }
@@ -2078,15 +2080,32 @@ mod tests {
             ("/api/graphql/batch", Some(Protocol::GraphQl)),
             ("/graphqlx", Some(Protocol::GraphQl)),
         ] {
-            assert_eq!(classify(path), protocol, "{path}");
+            assert_eq!(classify(path, None), protocol, "{path}");
         }
         for path in [
             "/admin/keys", "/oauth2/token", "/health", "/docs", "/", "/api", "/apix/y", "/rest/x", "/users",
             "/mqtt/publish/", "/mqtt/subscribe", "/mqtt", "/api/mqtt/publish", "/api/mqtt/x", "/ws/x", "/websocket", "/wss", "/grpc/x", "/api/grpc", "/grpc/graphql", "/ws/graphql",
             "/api/ws/x", "/api/agents/a", "/agents/a/mcp",
         ] {
-            assert_eq!(classify(path), None, "{path}");
+            assert_eq!(classify(path, None), None, "{path}");
         }
+    }
+
+    #[test]
+    fn a_path_with_no_prefix_is_plain_http_once_the_control_plane_names_its_own() {
+        let own: Vec<String> = ["/admin", "/health", "/oauth2", "/metrics", "/.well-known/agent-card.json"].map(String::from).to_vec();
+        for path in ["/", "/users", "/users/7", "/rest/x", "/http/x", "/api", "/apix/y", "/agents", "/v/x", "/heal", "/.well-known/other"] {
+            assert_eq!(classify(path, Some(&own)), Some(Protocol::Http), "{path}");
+        }
+        // The control plane's own, by how they begin, and what it kept before.
+        for path in [
+            "/health", "/health/detailed", "/healthz", "/admin/keys", "/oauth2/token", "/metrics", "/.well-known/agent-card.json",
+            "/mqtt/subscribe", "/ws/x", "/wss", "/websocket", "/grpc/x", "/api/ws/x", "/api/agents/a",
+        ] {
+            assert_eq!(classify(path, Some(&own)), None, "{path}");
+        }
+        assert_eq!(classify("/mcp/x", Some(&own)), Some(Protocol::Mcp));
+        assert_eq!(classify("/graphql", Some(&own)), Some(Protocol::GraphQl));
     }
 
     #[test]

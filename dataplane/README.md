@@ -114,7 +114,8 @@ Its format is the same as what the control plane serves; see `src/snapshot.rs`.
 
 ## What it handles itself
 
-A request is served natively only when **all** of these hold: the link is fresh; the path is `/api/...`, or belongs to
+A request is served natively only when **all** of these hold: the link is fresh; the path is `/api/...`, has no protocol's prefix and is not one the Python gateway answers itself
+(with `HTTP_BACKEND_URL` set there), or belongs to
 MCP, A2A, AG-UI, ACP or GraphQL and that protocol has an `http://` or `https://` backend configured; no `fallthrough_prefixes` entry matches;
 `X-API-Version` or `Accept-Version` resolves to an active version
 with no backend of its own; the key is in the snapshot, active, unexpired and `native_ok`; and, where the
@@ -297,6 +298,8 @@ here is the reverse of everywhere else: **whatever this side cannot be sure of i
 | `/agents/<slug>/...` to a registered agent, browsers included | data plane |
 | `/agents/<slug>/...` otherwise (unknown slugs, unusual requests) | Python |
 | `/graphql/*`, `/api/graphql/*` with `GRAPHQL_BACKEND_URL` set | data plane, passed through as they came |
+| Any other path (`/users`, `/rest/...`, `/http/...`, `/`) with `HTTP_BACKEND_URL` set | data plane, to `--backend` |
+| The same without `HTTP_BACKEND_URL` (Python sends them to the MCP backend) | Python |
 | The JSON-to-gRPC bridge under `/grpc` | Python |
 | A path that matches a dynamic route to an `http://` or `https://` backend | data plane, to the route's backend |
 | A path that matches a dynamic route to any other backend | Python |

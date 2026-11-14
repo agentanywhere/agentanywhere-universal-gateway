@@ -268,6 +268,26 @@ async def test_tenant_usage_reported_by_the_data_plane_counts_against_the_quota(
     assert not await TenantRepository.check_quota(db_session, tenant, "minute", 3)
 
 
+async def test_the_snapshot_names_the_paths_this_gateway_answers_itself(db_session, monkeypatch):
+    """With them, the data plane can send every other path with no prefix to the HTTP backend."""
+    s = get_settings()
+    monkeypatch.setattr(s, "http_backend_url", "http://backend.internal:9100")
+    own = (await dataplane_sync.build_snapshot(db_session))["own_paths"]
+    for path in ("/admin", "/oauth2", "/internal/dataplane", "/agents/", "/docs", "/openapi.json", s.health_check_path,
+                 s.metrics_path, "/health/detailed", "/ready", "/live", "/mqtt/publish", "/mqtt/subscribe", "/ws/",
+                 "/.well-known/agent-card.json", "/.well-known/ag-ui.json"):
+        assert path in own, path
+    # Every route but the catch-all is covered, so a route added later is too.
+    from app.main import app, gateway_proxy
+    for route in app.routes:
+        if getattr(route, "endpoint", None) is not gateway_proxy:
+            assert any(route.path.startswith(p) for p in own), route.path
+    assert "/" not in own and "" not in own
+    # Without an HTTP backend those paths go to the MCP backend: this gateway's to route.
+    monkeypatch.setattr(s, "http_backend_url", None)
+    assert (await dataplane_sync.build_snapshot(db_session))["own_paths"] is None
+
+
 async def test_a_request_altering_plugin_sends_every_path_to_python(db_session, monkeypatch):
     from types import SimpleNamespace
 
