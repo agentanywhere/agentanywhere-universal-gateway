@@ -53,6 +53,13 @@ See [docs/known-limitations.md](docs/known-limitations.md) for the full list.
 
 ### Fixed
 
+- Transformations: a rule that sets a header which cannot be written is now
+  refused when it is made (400), instead of failing every request it applies
+  to (502). That is a header name that is not a token, or a value that starts
+  or ends with a space, holds a line break or another control character, or
+  holds characters outside ASCII on a request or outside Latin-1 on an
+  answer.
+
 - Database migrations: the Alembic migrations `001` and `002` were replaced by
   one baseline, `0001`, that creates the full current schema. It is safe to
   run on a database the gateway already created at startup, works on SQLite

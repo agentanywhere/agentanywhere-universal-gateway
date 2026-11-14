@@ -623,3 +623,33 @@ def test_plugin_reload_registers_builtins_and_honours_overrides(client, tmp_path
 
     r = client.post("/admin/plugins/reload", json={"plugins_disabled": ["request-id"], "plugin_paths": [str(tmp_path)]}, headers=AUTH)
     assert "request-id" not in r.json()["registered"]
+
+
+@pytest.mark.parametrize("side,config", [
+    ("request_config", {"headers_set": {"X-A": "trail "}}),
+    ("request_config", {"headers_set": {"X-A": " lead"}}),
+    ("request_config", {"headers_set": {"X-A": "two\nlines"}}),
+    ("request_config", {"headers_set": {"X-A": "Zürich"}}),
+    ("request_config", {"headers_set": {"X-A": 7}}),
+    ("request_config", {"headers_set": {"bad name": "v"}}),
+    ("request_config", {"headers_set": {"": "v"}}),
+    ("request_config", {"headers_rename": {"X-Old": "X:New"}}),
+    ("request_config", {"headers_set": ["X-A"]}),
+    ("response_config", {"headers_set": {"X-A": "split\r\nSet-Cookie: a=b"}}),
+    ("response_config", {"headers_set": {"X-A": "snow ☃"}}),
+    ("response_config", {"headers_set": {"café": "v"}}),
+])
+def test_a_rule_whose_header_cannot_be_written_is_refused(client, side, config):
+    """Such a rule would fail every request it applies to, so it is not made."""
+    r = client.post("/admin/transformations", json={"name": "r", side: config}, headers=AUTH)
+    assert r.status_code == 400, r.text
+    assert client.get("/admin/transformations", headers=AUTH).json() == []
+
+
+def test_a_rule_with_ordinary_headers_is_made(client):
+    rule = {"name": "r", "request_config": {"headers_set": {"X-A": "two words", "X_b.c~1": "", "X-C": "a\tb"},
+                                            "headers_rename": {"anything at all": "X-New"}, "headers_remove": ["bad name"]},
+            "response_config": {"headers_set": {"X-City": "Zürich"}}}
+    r = client.post("/admin/transformations", json=rule, headers=AUTH)
+    assert r.status_code == 200, r.text
+    assert client.delete(f"/admin/transformations/{r.json()['id']}", headers=AUTH).status_code == 200

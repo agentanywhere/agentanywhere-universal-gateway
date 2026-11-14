@@ -1630,7 +1630,7 @@ async def create_transformation(
           }
         }
     """
-    from app.transformers import transformation_manager
+    from app.transformers import header_problem, transformation_manager
 
     if not payload.get("name"):
         raise HTTPException(
@@ -1642,6 +1642,11 @@ async def create_transformation(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="At least one of 'request_config' or 'response_config' is required",
         )
+
+    # A header that cannot be written would fail every request the rule applies to.
+    problem = header_problem(payload)
+    if problem:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=problem)
 
     rule = transformation_manager.register_from_dict(payload)
     return rule.to_dict()
