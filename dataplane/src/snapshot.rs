@@ -9,6 +9,7 @@ use crate::breaker;
 use crate::govern::{IpRule, IpRules, Net, Policy, Scope, ScopeRule};
 use crate::limits::Window;
 use crate::proxy::{Backend, ROUTED};
+use crate::pyjson;
 use crate::tenant::{Tenant, Usage};
 use hyper::header::{HeaderName, HeaderValue};
 use serde::Deserialize;
@@ -177,6 +178,24 @@ pub struct Actions {
     /// Statuses to turn into others, `[was, becomes]`. An answer's only.
     #[serde(default)]
     pub status: Vec<(u16, u16)>,
+    /// Fields of a body that is a JSON object, by dotted path: to rename, `[old, new]`, then to
+    /// remove, then to set, `[path, value]` with the value as JSON text. A request's only.
+    #[serde(default)]
+    body_rename: Vec<(String, String)>,
+    #[serde(default)]
+    body_remove: Vec<String>,
+    #[serde(default)]
+    body_set: Vec<(String, String)>,
+    /// The same, ready to apply, in order.
+    #[serde(skip)]
+    body: Vec<BodyStep>,
+}
+
+#[derive(Debug, PartialEq)]
+enum BodyStep {
+    Rename(pyjson::Path, pyjson::Path),
+    Remove(pyjson::Path),
+    Set(pyjson::Path, pyjson::Value),
 }
 
 impl Actions {
@@ -186,6 +205,40 @@ impl Actions {
 
     pub fn changes_query(&self) -> bool {
         !(self.query_remove.is_empty() && self.query_set.is_empty())
+    }
+
+    pub fn changes_body(&self) -> bool {
+        !self.body.is_empty()
+    }
+
+    /// Make the changes to a body ready to apply. `None` if this side cannot be certain of how
+    /// Python writes a value the rule sets.
+    pub fn ready(&mut self) -> Option<()> {
+        self.body.clear();
+        self.body.extend(self.body_rename.iter().map(|(old, new)| BodyStep::Rename(pyjson::path(old), pyjson::path(new))));
+        self.body.extend(self.body_remove.iter().map(|at| BodyStep::Remove(pyjson::path(at))));
+        for (at, value) in &self.body_set {
+            self.body.push(BodyStep::Set(pyjson::path(at), pyjson::parse(value.as_bytes())?));
+        }
+        Some(())
+    }
+
+    /// Apply the rule's changes to a body that is a JSON object, as `_apply_body_ops` does: a
+    /// field that is there and not `null` moves to its new path, then fields are removed, then
+    /// set (each to a copy of the rule's value).
+    pub fn change_body(&self, body: &mut pyjson::Value) {
+        for step in &self.body {
+            match step {
+                BodyStep::Rename(old, new) => {
+                    if let Some(value) = body.get(old).cloned() {
+                        body.remove(old);
+                        body.set(new, value);
+                    }
+                }
+                BodyStep::Remove(at) => body.remove(at),
+                BodyStep::Set(at, value) => body.set(at, value.clone()),
+            }
+        }
     }
 
     /// Whether the rule reads or writes the header `name` (in lower case).
@@ -337,6 +390,12 @@ impl TransformRule {
     /// Work out how the rule's pattern is matched. `None` when it is in no form this side knows,
     /// or in more than one: then no rule can be trusted, and every request is the Python gateway's.
     fn ready(mut self) -> Option<TransformRule> {
+        // A body is changed here on the way to the backend only.
+        let request = self.request.as_mut().map(Actions::ready).unwrap_or(Some(()));
+        let response = self.response.as_mut().map(|a| a.ready().filter(|_| !a.changes_body())).unwrap_or(Some(()));
+        if request.is_none() || response.is_none() {
+            self.native = false;
+        }
         let forms = [self.all, self.glob.is_some(), self.parts.is_some(), self.regex.is_some(), self.contains.is_some()];
         if forms.iter().filter(|f| **f).count() != 1 {
             return None;
@@ -803,7 +862,7 @@ impl Snapshot {
                 return None;
             }
             // A rule that changes nothing on a side is not in the way of anything there.
-            let does = |a: &&Actions| a.changes_headers() || a.changes_query() || !a.status.is_empty();
+            let does = |a: &&Actions| a.changes_headers() || a.changes_query() || a.changes_body() || !a.status.is_empty();
             shaping.request.extend(rule.request.as_ref().filter(|_| before).filter(does));
             shaping.response.extend(rule.response.as_ref().filter(|_| after).filter(does));
         }

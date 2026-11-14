@@ -6,13 +6,16 @@ Run from the repository root, after `cargo build --release` in dataplane/:
     python dataplane/conformance/shapes.py [cases] [seed]
 
 The Python gateway tells the data plane what a rule does only when the data plane can do exactly the
-same (`app.dataplane_sync._rule_actions`): change headers and query parameters of the request, and
-headers and the status of the answer. Any other rule is applied by the Python gateway. So the
-property that must hold is:
+same (`app.dataplane_sync._rule_actions`): change headers, query parameters and the fields of a JSON
+body of the request, and headers and the status of the answer. Any other rule is applied by the
+Python gateway. So the property that must hold is:
 
     for every set of rules the data plane is told the actions of, and every exchange:
-        the backend is sent the headers and the query the Python gateway would send it, and
+        the backend is sent the headers, the query and the body the Python gateway would send it, and
         the caller is given the headers and the status the Python gateway would give.
+
+A body the data plane is not certain how Python would read or write, it hands over with its request
+(it says `ask`), and so do no harm; the script fails if it does that for ordinary bodies.
 
 This script generates rules as the admin API takes them and exchanges to apply them to. The Python
 side is the gateway's own: its rule classes, the dictionaries it reads headers and a query into, its
@@ -62,8 +65,47 @@ def some(rng, make, most=3):
     return [make() for _ in range(rng.choice([0, 0, 1, 1, 2, most]))]
 
 
-def header_actions(rng):
-    name = lambda: pick(rng, NAMES, KEPT)  # noqa: E731
+PATHS = ["a", "b", "c", "a.b", "a.b.c", "meta", "meta.source", "meta.user", "user", "", "a..b", "é", "x y", "😀.a", "b.a"]
+PARTS = ["a", "b", "c", "meta", "source", "user", "", "é", "x y", "😀"]
+TEXTS = ["", "x", "é☃", "😀", "a\"b\\c", "line\nend", "\u007f\u0001", "</script>", "1"]
+NUMBERS = [0, 1, -7, 10 ** 20, 1.5, -0.0, 0.1, 1e22, 1e-7, 123456789012345678.0, 2.5e-5, 100.0]
+
+
+def a_value(rng, depth=0):
+    kind = rng.random()
+    if depth < 3 and kind < 0.25:
+        return {rng.choice(PARTS): a_value(rng, depth + 1) for _ in range(rng.randint(0, 3))}
+    if depth < 3 and kind < 0.35:
+        return [a_value(rng, depth + 1) for _ in range(rng.randint(0, 3))]
+    return rng.choice([None, True, False, rng.choice(TEXTS), rng.choice(NUMBERS), rng.randint(-1000, 1000), rng.random() * 10 ** rng.randint(-8, 20)])
+
+
+ODD_SET = [float("nan"), float("inf"), {1: "a"}, (1, 2), 10 ** 400, "\ud800", {"k": {"\udc00": 1}}, b"bytes"]
+# Bodies that are not an object, are not JSON, or are JSON Python reads in a way of its own.
+ODD_BODIES = [b"[1, 2]", b'"text"', b"5", b"null", b"true", b"not json", b"\xff\xfe{}", b'{"a":1,"a":{"b":2},"c":3}', b'{"a":NaN}',
+              b'{"a":1e400}', b'{"a":-0,"b":1.50,"c":1E2}', b'{"a":"\\ud83d\\ude00\\ud800"}', b"\xef\xbb\xbf{}", b'{"a":' + b"[" * 70 + b"]" * 70 + b"}",
+              b'{"a":' + b"9" * 400 + b"}", b" \n{\"a\" :\t1 }\r\n", b'{"a":1,}', b"{'a':1}", b'{"a":"\x01"}', b'{"a":{"b":null},"b":null}',
+              b'{"a":600654557994792.25}', b'{"":{"":1}}', b"{}", b'{"a":1}{"b":2}', b'{"a":Infinity}', b'{"a":01}']
+
+
+def a_body(rng):
+    if rng.random() < 0.2:
+        return rng.choice(ODD_BODIES)
+    value = {rng.choice(PARTS): a_value(rng, 1) for _ in range(rng.randint(0, 5))}
+    style = rng.choice([{}, {"separators": (",", ":")}, {"indent": 2}, {"ensure_ascii": False}, {"ensure_ascii": False, "separators": (",", ":")}])
+    return json.dumps(value, **style).encode("utf-8")
+
+
+def body_actions(rng):
+    return {
+        "body_rename": dict(some(rng, lambda: (rng.choice(PATHS), rng.choice(PATHS)))),
+        "body_remove": some(rng, lambda: rng.choice(PATHS)),
+        "body_set": dict(some(rng, lambda: (rng.choice(PATHS), rng.choice(ODD_SET) if rng.random() < 0.03 else a_value(rng)))),
+    }
+
+
+def header_actions(rng, names=NAMES):
+    name = lambda: pick(rng, names, KEPT)  # noqa: E731
     return {
         "headers_rename": dict(some(rng, lambda: (name(), name()))),
         "headers_remove": some(rng, name),
@@ -75,13 +117,13 @@ def a_rule(rng, n):
     rule = {"name": f"rule {n}", "path_pattern": "*"}
     if rng.random() < 0.8:
         rule["request_config"] = {
-            **header_actions(rng),
+            **header_actions(rng, NAMES + ["content-type", "Content-Type"]),
+            **(body_actions(rng) if rng.random() < 0.5 else {}),
             "query_remove": some(rng, lambda: rng.choice(KEYS)),
             "query_set": dict(some(rng, lambda: (rng.choice(KEYS), pick(rng, WORDS, ODD_WORDS)))),
         }
         if rng.random() < 0.03:
-            rule["request_config"].update(rng.choice([{"body_set": {"a": 1}}, {"template": "{{ body }}"},
-                                                      {"path_rewrite": {"pattern": "^/x", "replacement": "/y"}}]))
+            rule["request_config"].update(rng.choice([{"template": "{{ body }}"}, {"path_rewrite": {"pattern": "^/x", "replacement": "/y"}}]))
     if rng.random() < 0.8:
         rule["response_config"] = {
             **header_actions(rng),
@@ -95,16 +137,24 @@ def a_rule(rng, n):
 def an_exchange(rng):
     """A request and an answer as they reach the rules. A request's names are in lower case and
     given once (the data plane hands over a request that gives a name the rules mention twice);
-    an answer may give a name more than once."""
+    an answer may give a name more than once. Half the requests carry a body, with its length
+    and, usually, what it is."""
     names = sorted({n.lower() for n in rng.sample(NAMES, rng.randint(0, 8))})
     rng.shuffle(names)
     headers = [[n, rng.choice(VALUES)] for n in names]
+    body = a_body(rng) if rng.random() < 0.5 else None
+    if body is not None:
+        headers.append(["content-length", str(len(body))])
+        if rng.random() < 0.7:
+            headers.append(["content-type", rng.choice(["application/json", "text/plain", "application/json; charset=utf-8"])])
+        rng.shuffle(headers)
     keys = rng.sample(KEYS, rng.randint(0, 4))
     query = "&".join(f"{k}={rng.choice(WORDS)}" for k in keys)
     answer = []
     for n in rng.sample(NAMES, rng.randint(0, 8)):
         answer += [[n, rng.choice(VALUES)] for _ in range(rng.choice([1, 1, 1, 2, 3]))]
-    return {"headers": headers, "query": query, "answer": answer, "status": rng.choice(STATUSES + [204, 304])}
+    return {"headers": headers, "query": query, "body": body.hex() if body is not None else None, "answer": answer,
+            "status": rng.choice(STATUSES + [204, 304])}
 
 
 def as_read(lines):
@@ -123,8 +173,20 @@ def python_says(rules, case):
     before = RequestTransformer()
     before.rules = rules
     query = dict(QueryParams(case["query"]))
-    headers, query, _, _ = before.transform("GET", "/x", dict(case["headers"]), query, None)
-    sent = httpx.Request("GET", "http://backend:9000/x", headers=headers, params=query)
+    came = bytes.fromhex(case["body"]) if case["body"] is not None else None
+    method = "GET" if came is None else "POST"
+    headers, query, body, _ = before.transform(method, "/x", dict(case["headers"]), query, came)
+    # As `_prepare_upstream_parts` hands the body to the HTTP client.
+    content = json_payload = None
+    if isinstance(body, bytes):
+        content = body
+    elif isinstance(body, str) and body is not came:
+        content = body.encode("utf-8")
+    elif body is not None:
+        json_payload = body
+    if body is not came:
+        headers = {k: v for k, v in headers.items() if k.lower() != "content-length"}
+    sent = httpx.Request(method, "http://backend:9000/x", headers=headers, params=query, content=content, json=json_payload)
     sent_headers = [(n, v) for n, v in sent.headers.raw if n.lower() != b"host"]
 
     after = ResponseTransformer()
@@ -135,6 +197,7 @@ def python_says(rules, case):
     return {
         "headers": as_read(sent_headers),
         "query": sent.url.query.decode("ascii") or None,
+        "body": sent.read().hex() if came is not None else None,
         "answer": as_read((n, v) for n, v in given.raw_headers if n != b"content-length"),
         "status": given.status_code,
     }
@@ -161,24 +224,33 @@ def main():
         sys.exit(f"dataplane --judge-shapes failed: {out.stderr.strip()}")
     answers = [json.loads(line) for line in out.stdout.splitlines()]
     assert len(answers) == len(cases), (len(answers), len(cases))
-    wrong, changed = [], 0
+    wrong, changed, asked, rewritten = [], 0, 0, 0
     for (described, rules, case), got in zip(cases, answers):
+        if got in ("ask", "unready"):
+            # Handed over with its request, or the rule kept with Python once its value is read.
+            asked += 1
+            continue
         got["headers"], got["answer"] = as_read(got["headers"]), as_read(got["answer"])
         want = python_says(rules, case)
         if got != want:
             wrong.append((described, case, want, got))
-        untouched = {"headers": as_read(case["headers"]), "query": case["query"] or None, "answer": as_read(case["answer"]), "status": case["status"]}
+        untouched = {"headers": as_read(case["headers"]), "query": case["query"] or None, "body": case["body"],
+                     "answer": as_read(case["answer"]), "status": case["status"]}
         changed += want != untouched
+        rewritten += want["body"] != case["body"]
     for described, case, want, got in wrong[:8]:
-        differ = [part for part in want if want[part] != got[part]]
+        differ = [part for part in want if want[part] != got.get(part)]
         print(f"DIFFERENT in {differ}\n  rules  {json.dumps(described)}\n  case   {json.dumps(case)}")
         for part in differ:
-            print(f"  python {part}: {want[part]}\n  plane  {part}: {got[part]}")
-    print(f"{count} exchanges under rules the data plane is told the actions of ({changed} of them changed by the rules): "
-          f"{len(wrong)} different; {kept} sets of rules kept with Python")
+            print(f"  python {part}: {want[part]}\n  plane  {part}: {got.get(part)}")
+    print(f"{count} exchanges under rules the data plane is told the actions of ({changed} of them changed by the rules, "
+          f"{rewritten} with a body written anew): {len(wrong)} different; {asked} handed over for their body; "
+          f"{kept} sets of rules kept with Python")
     if kept > 2 * count:
         print("too many ordinary rules are being kept with Python")
-    sys.exit(1 if wrong or kept > 2 * count or changed < count // 2 else 0)
+    if asked > count // 20 or rewritten < count // 20:
+        print("too few ordinary bodies are being written here")
+    sys.exit(1 if wrong or kept > 2 * count or changed < count // 2 or asked > count // 20 or rewritten < count // 20 else 0)
 
 
 if __name__ == "__main__":

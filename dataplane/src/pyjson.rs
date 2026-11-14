@@ -284,6 +284,64 @@ impl Reader<'_> {
             _ => self.number(out),
         }
     }
+
+    /// Any value, held. A member named twice keeps its first place and its last value, as in
+    /// a Python dictionary.
+    fn tree(&mut self, depth: usize) -> Option<Value> {
+        if depth > MAX_DEPTH {
+            return None;
+        }
+        match self.peek()? {
+            b'{' => {
+                self.at += 1;
+                self.blank();
+                let mut members: Vec<(Vec<u8>, Value)> = Vec::new();
+                if self.take(b'}').is_none() {
+                    loop {
+                        let mut name = Vec::new();
+                        self.string(Sink::Dumped(&mut name))?;
+                        self.blank();
+                        self.take(b':')?;
+                        self.blank();
+                        let value = self.tree(depth + 1)?;
+                        match members.iter_mut().find(|(n, _)| *n == name) {
+                            Some(member) => member.1 = value,
+                            None => members.push((name, value)),
+                        }
+                        self.blank();
+                        if self.take(b',').is_none() {
+                            self.take(b'}')?;
+                            break;
+                        }
+                        self.blank();
+                    }
+                }
+                Some(Value::Object(members))
+            }
+            b'[' => {
+                self.at += 1;
+                self.blank();
+                let mut items = Vec::new();
+                if self.take(b']').is_none() {
+                    loop {
+                        items.push(self.tree(depth + 1)?);
+                        self.blank();
+                        if self.take(b',').is_none() {
+                            self.take(b']')?;
+                            break;
+                        }
+                        self.blank();
+                    }
+                }
+                Some(Value::List(items))
+            }
+            _ => {
+                let mut out = Vec::new();
+                self.value(Some(&mut out), depth)?;
+                Some(Value::Atom(out))
+            }
+        }
+    }
 }
 
 /// One character of a string as `json.dumps` writes it: ASCII that prints as itself, the rest escaped.
@@ -361,6 +419,132 @@ pub fn quoted(text: &str) -> String {
     }
     out.push('"');
     out
+}
+
+/// A JSON value as Python holds it after `json.loads`, kept in the spelling `json.dumps` gives it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Value {
+    /// `null`, `true`, `false`, a number or a string, as `json.dumps` writes it.
+    Atom(Vec<u8>),
+    List(Vec<Value>),
+    /// Members in order, each under its name as `json.dumps` writes it (without the quotes).
+    Object(Vec<(Vec<u8>, Value)>),
+}
+
+/// A dotted path into an object, as a transformation rule gives one: the names to follow.
+pub type Path = Vec<Vec<u8>>;
+
+/// A rule's dotted path, split as the Python gateway splits it.
+pub fn path(dotted: &str) -> Path {
+    dotted
+        .split('.')
+        .map(|part| {
+            let mut name = Vec::new();
+            part.chars().for_each(|c| dump_char(&mut name, c as u32));
+            name
+        })
+        .collect()
+}
+
+/// The value `text` is to Python, when this side is certain of how Python would write it again.
+/// `None` both for text that is not JSON and for JSON this side is not certain about (deeper than
+/// 64 levels, `NaN`, a number too large to hold, a byte-order mark).
+pub fn parse(text: &[u8]) -> Option<Value> {
+    std::str::from_utf8(text).ok()?;
+    let mut r = Reader { text, at: 0 };
+    r.blank();
+    let value = r.tree(0)?;
+    r.blank();
+    (r.at == text.len()).then_some(value)
+}
+
+impl Value {
+    /// As `json.dumps` writes it.
+    pub fn dump(&self, out: &mut Vec<u8>) {
+        match self {
+            Value::Atom(text) => out.extend_from_slice(text),
+            Value::List(items) => {
+                out.push(b'[');
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        out.extend_from_slice(b", ");
+                    }
+                    item.dump(out);
+                }
+                out.push(b']');
+            }
+            Value::Object(members) => {
+                out.push(b'{');
+                for (i, (name, value)) in members.iter().enumerate() {
+                    if i > 0 {
+                        out.extend_from_slice(b", ");
+                    }
+                    out.push(b'"');
+                    out.extend_from_slice(name);
+                    out.extend_from_slice(b"\": ");
+                    value.dump(out);
+                }
+                out.push(b'}');
+            }
+        }
+    }
+
+    fn members(&self) -> Option<&Vec<(Vec<u8>, Value)>> {
+        match self {
+            Value::Object(members) => Some(members),
+            _ => None,
+        }
+    }
+
+    /// The value at a path (`_get_nested`): nothing where the path leads nowhere, and nothing
+    /// for a `null` found there, which Python does not tell apart.
+    pub fn get(&self, path: &[Vec<u8>]) -> Option<&Value> {
+        let mut at = self;
+        for name in path {
+            at = &at.members()?.iter().find(|(n, _)| n == name)?.1;
+        }
+        (*at != Value::Atom(b"null".to_vec())).then_some(at)
+    }
+
+    /// Take away what is at a path (`_remove_nested`); nothing happens where it leads nowhere.
+    pub fn remove(&mut self, path: &[Vec<u8>]) {
+        let Some((last, way)) = path.split_last() else { return };
+        let mut at = self;
+        for name in way {
+            let Value::Object(members) = at else { return };
+            let Some(member) = members.iter_mut().find(|(n, _)| n == name) else { return };
+            at = &mut member.1;
+        }
+        if let Value::Object(members) = at {
+            members.retain(|(n, _)| n != last);
+        }
+    }
+
+    /// Put a value at a path (`_set_nested`). Whatever stands in the way that is not an object
+    /// is replaced by one. A member that is there keeps its place; a new one goes last.
+    pub fn set(&mut self, path: &[Vec<u8>], value: Value) {
+        let Some((last, way)) = path.split_last() else { return };
+        let mut at = self;
+        for name in way {
+            let Value::Object(members) = at else { return };
+            let i = match members.iter().position(|(n, _)| n == name) {
+                Some(i) => i,
+                None => {
+                    members.push((name.clone(), Value::Object(Vec::new())));
+                    members.len() - 1
+                }
+            };
+            if !matches!(members[i].1, Value::Object(_)) {
+                members[i].1 = Value::Object(Vec::new());
+            }
+            at = &mut members[i].1;
+        }
+        let Value::Object(members) = at else { return };
+        match members.iter_mut().find(|(n, _)| n == last) {
+            Some(member) => member.1 = value,
+            None => members.push((last.clone(), value)),
+        }
+    }
 }
 
 /// What the Python gateway would publish for this body, when that is certain and it would answer

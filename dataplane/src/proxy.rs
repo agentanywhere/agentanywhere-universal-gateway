@@ -1062,9 +1062,39 @@ fn shape_headers(headers: &mut HeaderMap, rules: &[&Actions]) {
     }
 }
 
-/// Apply the rules to a request before it is sent on: its headers, and its query.
-fn shape_request(req: &mut Request<Body>, rules: &[&Actions]) {
+/// The longest body this side reads to apply rules to; a longer one is the Python gateway's.
+const RULE_BODY_MAX: u64 = 1 << 20;
+
+/// What rules that change fields make of a request's body, as the Python gateway does it: a body
+/// that is a JSON object is read, changed by each rule in turn and written again in Python's
+/// spelling; any other is left as it came (`Ok(None)`). `Err` for a body this side is not certain
+/// how Python would read or write, which is then the Python gateway's.
+fn reshape(body: &[u8], rules: &[&Actions]) -> Result<Option<Vec<u8>>, ()> {
+    // Not UTF-8 is not JSON to Python either.
+    if std::str::from_utf8(body).is_err() {
+        return Ok(None);
+    }
+    match pyjson::parse(body).ok_or(())? {
+        mut object @ pyjson::Value::Object(_) => {
+            for actions in rules {
+                actions.change_body(&mut object);
+            }
+            let mut out = Vec::with_capacity(body.len() + 64);
+            object.dump(&mut out);
+            Ok(Some(out))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Apply the rules to a request before it is sent on: its headers, and its query. `rewritten`
+/// says the rules made a new body for it (already in place, with its length): the Python
+/// gateway's HTTP client then calls it JSON unless the headers say what it is.
+fn shape_request(req: &mut Request<Body>, rules: &[&Actions], rewritten: bool) {
     shape_headers(req.headers_mut(), rules);
+    if rewritten && !req.headers().contains_key(CONTENT_TYPE) {
+        req.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    }
     if rules.iter().any(|a| a.changes_query()) {
         let uri = req.uri();
         let target = match change_query(uri.query().unwrap_or(""), rules) {
@@ -1107,8 +1137,14 @@ pub fn judge_shapes() -> Result<(), String> {
         response: Vec<Actions>,
         headers: Vec<(String, String)>,
         query: String,
+        /// The request's body, in hex, when it has one.
+        body: Option<String>,
         answer: Vec<(String, String)>,
         status: u16,
+    }
+
+    fn unhex(text: &str) -> Result<Vec<u8>, String> {
+        (0..text.len() / 2).map(|i| u8::from_str_radix(text.get(2 * i..2 * i + 2).unwrap_or("?"), 16).map_err(|e| e.to_string())).collect()
     }
 
     fn map(lines: &[(String, String)]) -> Result<HeaderMap, String> {
@@ -1128,12 +1164,32 @@ pub fn judge_shapes() -> Result<(), String> {
     let mut out = out.lock();
     for line in std::io::stdin().lock().lines() {
         let line = line.map_err(|e| e.to_string())?;
-        let case: Case = serde_json::from_str(&line).map_err(|e| format!("case is not valid: {e}"))?;
+        let mut case: Case = serde_json::from_str(&line).map_err(|e| format!("case is not valid: {e}"))?;
+        if case.request.iter_mut().any(|a| a.ready().is_none()) {
+            writeln!(out, "\"unready\"").map_err(|e| e.to_string())?;
+            continue;
+        }
         let (before, after): (Vec<&Actions>, Vec<&Actions>) = (case.request.iter().collect(), case.response.iter().collect());
         let target = if case.query.is_empty() { "/x".to_owned() } else { format!("/x?{}", case.query) };
         let mut req = Request::builder().uri(target).body(full(Bytes::new())).map_err(|e| e.to_string())?;
         *req.headers_mut() = map(&case.headers)?;
-        shape_request(&mut req, &before);
+        let mut body = case.body.as_deref().map(unhex).transpose()?;
+        let mut rewritten = false;
+        if let Some(came) = body.as_ref().filter(|b| !b.is_empty() && before.iter().any(|a| a.changes_body())) {
+            match reshape(came, &before) {
+                Ok(None) => {}
+                Ok(Some(made)) => {
+                    req.headers_mut().insert(CONTENT_LENGTH, HeaderValue::from(made.len()));
+                    rewritten = true;
+                    body = Some(made);
+                }
+                Err(()) => {
+                    writeln!(out, "\"ask\"").map_err(|e| e.to_string())?;
+                    continue;
+                }
+            }
+        }
+        shape_request(&mut req, &before, rewritten);
         let mut resp = Response::new(full(Bytes::new()));
         *resp.status_mut() = StatusCode::from_u16(case.status).map_err(|e| e.to_string())?;
         *resp.headers_mut() = map(&case.answer)?;
@@ -1141,6 +1197,7 @@ pub fn judge_shapes() -> Result<(), String> {
         let said = serde_json::json!({
             "headers": lines(req.headers()),
             "query": req.uri().query(),
+            "body": body.map(|b| b.iter().map(|byte| format!("{byte:02x}")).collect::<String>()),
             "answer": lines(resp.headers()),
             "status": resp.status().as_u16(),
         });
@@ -2113,6 +2170,32 @@ pub async fn handle(w: Arc<Worker>, peer: SocketAddr, mut req: Request<Incoming>
         }
     }
 
+    // Rules that change fields of the body: it is read here whole, before anything is counted,
+    // and written again as the Python gateway would write it. If that is not certain, or the
+    // body is long or of no stated length, the request is handed over as it came. The Python
+    // gateway reads a body for these methods only.
+    let mut rewritten = false;
+    if refused.is_none() && matches!(n.method, "POST" | "PUT" | "PATCH") && n.shaping.request.iter().any(|a| a.changes_body()) {
+        match req.body().size_hint().exact() {
+            Some(0) => {}
+            Some(len) if len <= RULE_BODY_MAX => {
+                let (mut parts, body) = req.into_parts();
+                let Ok(read) = body.collect().await else { return Ok(body_unreadable()) };
+                let bytes = read.to_bytes();
+                match reshape(&bytes, &n.shaping.request) {
+                    Ok(None) => req = Request::from_parts(parts, full(bytes)),
+                    Ok(Some(body)) => {
+                        parts.headers.insert(CONTENT_LENGTH, HeaderValue::from(body.len()));
+                        rewritten = true;
+                        req = Request::from_parts(parts, full(body));
+                    }
+                    Err(()) => return Ok(to_control(&w, peer, Request::from_parts(parts, full(bytes))).await),
+                }
+            }
+            _ => return Ok(to_control(&w, peer, req).await),
+        }
+    }
+
     // A message to publish is read here whole, before anything is counted. Unless what the
     // Python gateway would publish for it is certain, and this side's connection to the broker
     // stands, the request is handed over as it came.
@@ -2178,7 +2261,7 @@ pub async fn handle(w: Arc<Worker>, peer: SocketAddr, mut req: Request<Incoming>
                     };
                     let limit = n.route.and_then(DynamicRoute::timeout).unwrap_or(snap.upstream_timeout);
                     if !n.shaping.request.is_empty() {
-                        shape_request(&mut req, &n.shaping.request);
+                        shape_request(&mut req, &n.shaping.request, rewritten);
                     }
                     let answer = match grpc {
                         true => forward_grpc(&w, &backend.upstream, peer, req, &t, &snap.key_header, key_in_authorization).await,
@@ -3350,7 +3433,7 @@ mod tests {
             Decision::Native(n) => {
                 let mut sent = Request::builder().uri(req.uri().clone()).body(full(Bytes::new())).unwrap();
                 *sent.headers_mut() = req.headers().clone();
-                shape_request(&mut sent, &n.shaping.request);
+                shape_request(&mut sent, &n.shaping.request, false);
                 let mut resp = Response::new(full(Bytes::new()));
                 for (name, value) in [("x-agent", "echo"), ("etag", "1"), ("etag", "2"), ("set-cookie", "a=1"), ("set-cookie", "b=2")] {
                     resp.headers_mut().append(name, HeaderValue::from_static(value));

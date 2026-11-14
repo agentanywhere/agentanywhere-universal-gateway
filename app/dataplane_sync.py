@@ -269,12 +269,57 @@ def _header_actions(cfg: Any, kept: frozenset, prefixes: tuple = ()) -> Optional
             "set": [[n, v] for n, v in to_set.items()]}
 
 
+def _plain_json(value: Any, depth: int = 0) -> bool:
+    """Whether a value a rule sets is plain JSON: what it is once in a body is then what the
+    data plane makes of its JSON text."""
+    if value is None or type(value) is bool:
+        return True
+    if type(value) is int:
+        return abs(value) < 10 ** 300
+    if type(value) is float:
+        return value == value and value not in (float("inf"), float("-inf"))
+    if type(value) is str:
+        return _encodes(value)
+    if depth >= 16:
+        return False
+    if type(value) is list:
+        return all(_plain_json(item, depth + 1) for item in value)
+    if type(value) is dict:
+        return all(type(k) is str and _encodes(k) and _plain_json(v, depth + 1) for k, v in value.items())
+    return False
+
+
+def _encodes(text: str) -> bool:
+    """Whether text can be written as UTF-8 (half a surrogate pair cannot)."""
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _body_actions(cfg: Any) -> Optional[Dict[str, Any]]:
+    """A rule's changes to the fields of a request's body (``_apply_body_ops``): renamed, then
+    removed, then set. A value to set goes as its JSON text."""
+    rename, remove, to_set = cfg.body_rename, cfg.body_remove, cfg.body_set
+    if not (isinstance(rename, dict) and isinstance(remove, list) and isinstance(to_set, dict)):
+        return None
+    paths = [*rename.keys(), *rename.values(), *remove, *to_set.keys()]
+    if not all(type(path) is str and _encodes(path) for path in paths):
+        return None
+    if not all(_plain_json(value) for value in to_set.values()):
+        return None
+    return {"body_rename": [[old, new] for old, new in rename.items()], "body_remove": list(remove),
+            "body_set": [[path, json.dumps(value)] for path, value in to_set.items()]}
+
+
 def _rule_actions(rule: Any) -> Optional[Dict[str, Any]]:
     """What a transformation rule does, when the data plane can do exactly the same: change
-    headers and query parameters of the request, and headers and the status of the answer.
-    ``None`` for a rule that does anything else (changes a body or the path, or is code), or
-    that names a header, a value or a status the two sides might treat differently. Such a rule
-    is applied here: the data plane hands over the requests it applies to."""
+    headers, query parameters and the fields of a JSON body of the request, and headers and the
+    status of the answer. ``None`` for a rule that does anything else (changes an answer's body
+    or the path, fills in a template, or is code), or that names a header, a value or a status
+    the two sides might treat differently. Such a rule is applied here: the data plane hands
+    over the requests it applies to."""
     if rule.condition is not None or rule.transform_request is not None or rule.transform_response is not None:
         return None
     out: Dict[str, Any] = {"request": None, "response": None}
@@ -282,16 +327,20 @@ def _rule_actions(rule: Any) -> Optional[Dict[str, Any]]:
         cfg = rule.request_config if side == "request" else rule.response_config
         if cfg is None:
             continue
-        # A body or a template is read and written again; a path is rewritten by expression.
-        if cfg.body_set or cfg.body_remove or cfg.body_rename or cfg.template:
+        # A template is filled in by an engine of this side's; an answer's body cannot be handed
+        # over once the backend has given it, should the data plane not be certain of it.
+        if cfg.template or (side == "response" and (cfg.body_set or cfg.body_remove or cfg.body_rename)):
             return None
         if side == "request":
+            # A path is rewritten by expression.
             if cfg.path_rewrite:
                 return None
             actions = _header_actions(cfg, _REQUEST_HEADERS_KEPT)
+            fields = _body_actions(cfg)
             remove, to_set = cfg.query_remove, cfg.query_set
-            if actions is None or not (isinstance(remove, list) and isinstance(to_set, dict)):
+            if actions is None or fields is None or not (isinstance(remove, list) and isinstance(to_set, dict)):
                 return None
+            actions.update(fields)
             if not all(isinstance(q, str) for q in remove):
                 return None
             if not all(isinstance(k, str) and k and _QUERY_WORD.fullmatch(k) and isinstance(v, str) and _QUERY_WORD.fullmatch(v)
