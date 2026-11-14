@@ -100,6 +100,11 @@ See [docs/known-limitations.md](docs/known-limitations.md) for the full list.
 - `admin-ui/src/lib/utils.ts` was never committed (the root `.gitignore`
   ignored every `lib/`), so the console did not type-check or build from a
   clean clone.
+- Transformation rules: an answer's body is read and written again only when
+  a rule that changes bodies applies to the request. Before, registering any
+  rule had every JSON answer rewritten (other spacing and escaping), a JSON
+  string answer lost its quotes, and a rule for headers or the status was
+  skipped when the body was not UTF-8 text.
 
 ### Changed (may need action on upgrade; see docs/how-to/upgrade.md)
 
