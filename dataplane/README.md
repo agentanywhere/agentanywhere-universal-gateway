@@ -122,7 +122,7 @@ with no backend of its own; the key is in the snapshot, active, unexpired and `n
 gateway checks the body, the body has a `Content-Length`, fits in memory (4 MiB, or the MCP limit if lower) and is
 certain to pass. On those same paths, a request with no credential, or with one the Python gateway has just refused,
 is answered here with the gateway's 401. Anything else, including credentials seen for the first time,
-a preflight from a web page, `/metrics`, `/admin`, `/oauth2`
+an `OPTIONS` request that is not a preflight, `/metrics`, `/admin`, `/oauth2`
 and MQTT other than publishing, goes to the Python gateway untouched, so its answer is the answer.
 
 **HTTP/2.** A client that opens its connection with the HTTP/2 preface (no TLS; `curl --http2-prior-knowledge`, a
@@ -214,7 +214,9 @@ Python gateway's CORS middleware writes, from `CORS_ORIGINS` and `CORS_ALLOW_CRE
 origin is named back with `Vary: Origin`, `*` is answered with `*` (or with the origin itself when the request has a
 cookie), and the credentials header is added when allowed, all over whatever the backend sent under those names. As
 in the Python gateway, these go on answers from a backend (and the 502 or 503 standing in for one), the health
-endpoints and agents; the gateway's own 401, 403 and 429 carry none. A preflight is the Python gateway's to answer.
+endpoints and agents; the gateway's own 401, 403 and 429 carry none. A preflight (an `OPTIONS` request with `Origin` and
+`Access-Control-Request-Method`) to a path this side serves is answered here, from the middleware's own set-up as the
+snapshot describes it; `conformance/preflight.py` compares the answers with the middleware's over generated set-ups.
 
 **Backends behind TLS.** An `https://` backend (a protocol's, a dynamic route's, an agent's, or `--backend`) is spoken
 to over TLS, HTTP/1.1, and its certificate is verified as the Python gateway's HTTP client verifies it: against the
@@ -308,7 +310,8 @@ here is the reverse of everywhere else: **whatever this side cannot be sure of i
 | Request-altering plugins (when any exist) | Python, for every path |
 | The health path, `/ready` and `/live`, on a plain `GET` | data plane |
 | A request with an `Origin` header | data plane, with the gateway's cross-origin headers |
-| A preflight (`OPTIONS`), an `Origin` given twice | Python |
+| A preflight to a path served here | data plane |
+| Any other `OPTIONS` request, a preflight header given twice, an `Origin` given twice | Python |
 | `/health/detailed`, `/metrics`, `/oauth2`, `/admin` and the console | Python |
 
 ## Known gaps (why this is not production-ready)
@@ -366,6 +369,7 @@ python dataplane/conformance/run.py     # same scenarios against Python and the 
 python dataplane/conformance/boundary.py  # the body checks against the Python functions, on generated bodies
 python dataplane/conformance/publish.py   # what would be published to MQTT, against the Python handler and client
 python dataplane/conformance/patterns.py  # which paths a transformation rule's pattern matches, against Python's matcher
+python dataplane/conformance/preflight.py # what a preflight is answered, against the CORS middleware itself
 ```
 
 The conformance suite is the definition of "same behaviour": a scenario must pass on both before the data plane may

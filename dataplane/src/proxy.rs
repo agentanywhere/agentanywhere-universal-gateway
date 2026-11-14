@@ -594,12 +594,101 @@ struct Unauthenticated<'a> {
     method: &'static str,
 }
 
+/// The answer to a preflight, as the Python gateway's CORS middleware words it.
+struct Preflighted<'a> {
+    allowed: bool,
+    headers: Vec<(String, String)>,
+    body: String,
+    version: Option<&'a str>,
+    ip: IpAddr,
+}
+
+/// Answer a preflight (an `OPTIONS` request with `Origin` and `Access-Control-Request-Method`)
+/// as Starlette's `CORSMiddleware.preflight_response` does: whether it is allowed, the headers
+/// and the text. `None` for anything else, or for one this side cannot be sure of reading the
+/// same way (a header sent twice, or not plain text).
+fn preflight(rules: &crate::snapshot::CrossOrigin, headers: &HeaderMap) -> Option<(bool, Vec<(String, String)>, String)> {
+    let how = rules.preflight.as_ref()?;
+    let once = |name: &str| {
+        let mut all = headers.get_all(name).iter();
+        match (all.next(), all.next()) {
+            (None, _) => Some(None),
+            (Some(v), None) => v.to_str().ok().filter(|s| s.is_ascii()).map(Some),
+            _ => None,
+        }
+    };
+    let origin = once("origin")??;
+    let method = once("access-control-request-method")??;
+    let asked = once("access-control-request-headers")?;
+    let mut answer = how.headers.clone();
+    let mut set = |name: &str, value: &str| match answer.iter_mut().find(|(n, _)| n == name) {
+        Some(found) => found.1 = value.to_owned(),
+        None => answer.push((name.to_owned(), value.to_owned())),
+    };
+    let mut failures = Vec::new();
+    if rules.any_origin || rules.origins.contains(origin) {
+        if how.explicit_origin {
+            set("Access-Control-Allow-Origin", origin);
+        }
+    } else {
+        failures.push("origin");
+    }
+    if !how.methods.iter().any(|m| m == method) {
+        failures.push("method");
+    }
+    match asked {
+        Some(asked) if how.all_headers => set("Access-Control-Allow-Headers", asked),
+        Some(asked) => {
+            let lower = asked.to_ascii_lowercase();
+            if lower.split(',').any(|h| !how.allow_headers.iter().any(|a| a == h.trim_matches([' ', '\t']))) {
+                failures.push("headers");
+            }
+        }
+        None => {}
+    }
+    let body = if failures.is_empty() { "OK".to_owned() } else { format!("Disallowed CORS {}", failures.join(", ")) };
+    Some((failures.is_empty(), answer, body))
+}
+
+/// For `conformance/preflight.py`: read one case per line (`{"rules": ..., "headers": [[name,
+/// value], ...]}`) and answer each with `{"status", "headers", "body"}`, or `null` for a request
+/// this side leaves to the Python gateway.
+pub fn judge_preflights() -> Result<(), String> {
+    use std::io::{BufRead, Write};
+
+    #[derive(serde::Deserialize)]
+    struct Case {
+        rules: crate::snapshot::CrossOrigin,
+        headers: Vec<(String, String)>,
+    }
+
+    let out = std::io::stdout();
+    let mut out = out.lock();
+    for line in std::io::stdin().lock().lines() {
+        let line = line.map_err(|e| e.to_string())?;
+        let case: Case = serde_json::from_str(&line).map_err(|e| format!("case is not valid: {e}"))?;
+        let mut sent = HeaderMap::new();
+        for (name, value) in &case.headers {
+            let name = HeaderName::from_bytes(name.as_bytes()).map_err(|e| e.to_string())?;
+            sent.append(name, HeaderValue::from_bytes(value.as_bytes()).map_err(|e| e.to_string())?);
+        }
+        let said = match preflight(&case.rules, &sent) {
+            Some((allowed, headers, body)) => serde_json::json!({"status": if allowed { 200 } else { 400 }, "headers": headers, "body": body}),
+            None => serde_json::Value::Null,
+        };
+        writeln!(out, "{said}").map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 /// What to do with a request.
 enum Decision<'a> {
     Native(Native<'a>),
     /// A request for an agent behind the agent edge, forwarded here without a gateway key.
     Agent(AgentCall<'a>),
     Refuse(Unauthenticated<'a>),
+    /// A preflight from a web page in another origin, answered here.
+    Preflight(Preflighted<'a>),
     /// The Python gateway answers, which is always right: it is the answer whenever this side
     /// cannot be sure of deciding the same. With a digest: the request carries one credential this
     /// side does not know, and if the Python gateway refuses it, that is worth remembering.
@@ -685,6 +774,8 @@ fn decide<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, now: u6
         "PATCH"
     } else if m == Method::HEAD {
         "HEAD"
+    } else if m == Method::OPTIONS {
+        "OPTIONS"
     } else {
         return PYTHON;
     };
@@ -695,6 +786,14 @@ fn decide<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, now: u6
         found => found.map(|(v, _)| v),
     };
     let Some(ip) = govern::client_ip(peer, req.headers(), &snap.trusted_proxies) else { return PYTHON };
+    // A preflight carries no credential and is answered before any is looked for. Any other
+    // `OPTIONS` request is the Python gateway's.
+    if method == "OPTIONS" {
+        return match snap.cross_origin.as_ref().and_then(|rules| preflight(rules, req.headers())) {
+            Some((allowed, headers, body)) => Decision::Preflight(Preflighted { allowed, headers, body, version, ip }),
+            None => PYTHON,
+        };
+    }
     // Publishing is a POST to a broker the Python gateway is connected to; anything else on that
     // path is its to answer.
     let publishing = protocol == Protocol::Mqtt;
@@ -1674,6 +1773,19 @@ pub async fn handle(w: Arc<Worker>, peer: SocketAddr, mut req: Request<Incoming>
         Decision::Native(n) => n,
         Decision::Agent(a) => return Ok(serve_agent(&w, &a, granted.as_ref(), peer, req, started, at).await),
         Decision::Refuse(u) => return Ok(unauthenticated(&w, &u, &req, started, at)),
+        Decision::Preflight(p) => {
+            let t = trace_for(req.headers());
+            let mut resp = Response::new(full(p.body));
+            *resp.status_mut() = if p.allowed { StatusCode::OK } else { StatusCode::BAD_REQUEST };
+            for (name, value) in &p.headers {
+                if let (Ok(name), Ok(value)) = (HeaderName::from_bytes(name.as_bytes()), HeaderValue::from_str(value)) {
+                    resp.headers_mut().insert(name, value);
+                }
+            }
+            resp.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("text/plain; charset=utf-8"));
+            let a = Answered { method: "OPTIONS", ip: p.ip, version: p.version, rejected: false, error: None };
+            return Ok(finish(&w, resp, &a, &req, &t, started, at));
+        }
         Decision::Ask(credential) => {
             let (resp, refused) = ask_control(&w, peer, req.map(Either::Left)).await;
             if let Some(digest) = credential.filter(|_| refused && resp.status() == StatusCode::UNAUTHORIZED) {
@@ -2109,6 +2221,54 @@ mod tests {
     }
 
     #[test]
+    fn a_preflight_is_answered_as_the_cors_middleware_answers_it() {
+        let rules = |json: &str| serde_json::from_str::<crate::snapshot::CrossOrigin>(json).unwrap();
+        let listed = rules(
+            r#"{"any_origin":false,"origins":["https://app.example"],"credentials":true,"preflight":{
+                "headers":[["Vary","Origin"],["Access-Control-Allow-Methods","GET, POST"],["Access-Control-Max-Age","600"],
+                           ["Access-Control-Allow-Headers","Accept, Accept-Language, Content-Language, Content-Type, X-API-Key"],
+                           ["Access-Control-Allow-Credentials","true"]],
+                "explicit_origin":true,"methods":["GET","POST"],"all_headers":false,
+                "allow_headers":["accept","accept-language","content-language","content-type","x-api-key"]}}"#,
+        );
+        let ask = |rules: &crate::snapshot::CrossOrigin, sent: &[(&str, &str)]| {
+            let mut h = HeaderMap::new();
+            for (name, value) in sent {
+                h.append(HeaderName::from_bytes(name.as_bytes()).unwrap(), HeaderValue::from_str(value).unwrap());
+            }
+            preflight(rules, &h)
+        };
+        let named = |headers: &[(String, String)], name: &str| headers.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone());
+        let (ok, headers, body) = ask(&listed, &[("origin", "https://app.example"), ("access-control-request-method", "POST"),
+                                                  ("access-control-request-headers", "X-API-Key , content-type")]).unwrap();
+        assert!(ok && body == "OK");
+        assert_eq!(named(&headers, "Access-Control-Allow-Origin").as_deref(), Some("https://app.example"));
+        assert_eq!(headers[0], ("Vary".to_owned(), "Origin".to_owned()));
+        // Everything wrong at once is said at once, in this order, and the origin is not named back.
+        let (ok, headers, body) = ask(&listed, &[("origin", "https://evil.example"), ("access-control-request-method", "DELETE"),
+                                                  ("access-control-request-headers", "x-other")]).unwrap();
+        assert!(!ok && body == "Disallowed CORS origin, method, headers" && named(&headers, "Access-Control-Allow-Origin").is_none());
+        // The method is compared as written.
+        assert_eq!(ask(&listed, &[("origin", "https://app.example"), ("access-control-request-method", "post")]).unwrap().2, "Disallowed CORS method");
+        let any = rules(
+            r#"{"any_origin":true,"origins":[],"credentials":false,"preflight":{
+                "headers":[["Access-Control-Allow-Origin","*"],["Access-Control-Allow-Methods","GET"],["Access-Control-Max-Age","600"]],
+                "explicit_origin":false,"methods":["GET"],"all_headers":true,"allow_headers":[]}}"#,
+        );
+        let (ok, headers, _) = ask(&any, &[("origin", "https://anyone.example"), ("access-control-request-method", "GET"),
+                                            ("access-control-request-headers", "X-Whatever, Y")]).unwrap();
+        assert!(ok);
+        assert_eq!(named(&headers, "Access-Control-Allow-Origin").as_deref(), Some("*"));
+        assert_eq!(named(&headers, "Access-Control-Allow-Headers").as_deref(), Some("X-Whatever, Y"), "named back as asked");
+        // Not a preflight, or one this side will not read for the Python gateway.
+        assert!(ask(&listed, &[("origin", "https://app.example")]).is_none());
+        assert!(ask(&listed, &[("access-control-request-method", "GET")]).is_none());
+        assert!(ask(&listed, &[("origin", "https://app.example"), ("access-control-request-method", "GET"), ("access-control-request-method", "POST")]).is_none());
+        let silent = rules(r#"{"any_origin":true,"origins":[],"credentials":false}"#);
+        assert!(ask(&silent, &[("origin", "https://app.example"), ("access-control-request-method", "GET")]).is_none());
+    }
+
+    #[test]
     fn acp_and_ag_ui_backends_see_their_own_paths() {
         for (path, protocol, sent) in [
             ("/acp", Protocol::Acp, "/"),
@@ -2447,6 +2607,7 @@ mod tests {
             Decision::Ask(None) => "ask".into(),
             Decision::Ask(Some(_)) => "learn".into(),
             Decision::Refuse(u) => u.wording.message_json.clone(),
+            Decision::Preflight(p) => format!("preflight: {}", p.body),
         }
     }
 

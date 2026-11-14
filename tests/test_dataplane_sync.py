@@ -1013,15 +1013,24 @@ async def test_the_snapshot_lists_the_dynamic_routes_in_force_in_matching_order(
 async def test_the_snapshot_says_how_a_request_from_another_origin_is_answered(db_session, monkeypatch):
     from app import main as gw
 
-    async def said():
-        return (await dataplane_sync.build_snapshot(db_session))["cross_origin"]
+    async def said(preflight=False):
+        found = (await dataplane_sync.build_snapshot(db_session))["cross_origin"]
+        return found["preflight"] if preflight else found and {k: v for k, v in found.items() if k != "preflight"}
 
     monkeypatch.setattr(gw, "_cors_options", {"allow_origins": ["http://b.example", "http://a.example"], "allow_credentials": True,
                                               "allow_methods": ["*"], "allow_headers": ["*"]})
     assert await said() == {"any_origin": False, "origins": ["http://a.example", "http://b.example"], "credentials": True}
+    # A preflight is answered from what the middleware itself holds once set up this way.
+    asked = await said(preflight=True)
+    assert asked["explicit_origin"] is True and asked["all_headers"] is True and "DELETE" in asked["methods"]
+    assert asked["headers"][0] == ["Vary", "Origin"] and ["Access-Control-Allow-Credentials", "true"] in asked["headers"]
     monkeypatch.setattr(gw, "_cors_options", {"allow_origins": ["*", "http://a.example"], "allow_credentials": False,
                                               "allow_methods": ["GET"], "allow_headers": []})
     assert await said() == {"any_origin": True, "origins": ["http://a.example"], "credentials": False}
+    asked = await said(preflight=True)
+    assert asked["explicit_origin"] is False and asked["all_headers"] is False and asked["methods"] == ["GET"]
+    assert asked["headers"][0] == ["Access-Control-Allow-Origin", "*"]
+    assert asked["allow_headers"] == ["accept", "accept-language", "content-language", "content-type"]
     # An option the data plane does not reproduce: such requests stay with this gateway.
     monkeypatch.setattr(gw, "_cors_options", {"allow_origins": [], "allow_credentials": False, "allow_origin_regex": "https://.*"})
     assert await said() is None

@@ -217,6 +217,10 @@ fn main() {
     if std::env::args().nth(1).as_deref() == Some("--judge-patterns") {
         return snapshot::judge_patterns().unwrap_or_else(|e| fail(e));
     }
+    // `dataplane --judge-preflights` answers, for preflights on stdin, what a web page is told.
+    if std::env::args().nth(1).as_deref() == Some("--judge-preflights") {
+        return proxy::judge_preflights().unwrap_or_else(|e| fail(e));
+    }
     if std::env::args().nth(1).as_deref() == Some("--judge-publishes") {
         return pyjson::judge_stdin().unwrap_or_else(|e| fail(e));
     }

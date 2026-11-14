@@ -345,6 +345,23 @@ pub struct CrossOrigin {
     pub origins: std::collections::HashSet<String>,
     /// Whether answers say credentials are allowed.
     pub credentials: bool,
+    /// How a preflight is answered. `None`: the control plane has not said, and answers them.
+    #[serde(default)]
+    pub preflight: Option<Preflight>,
+}
+
+/// What the Python gateway's CORS middleware answers a preflight with, as it was set up.
+#[derive(Deserialize, Debug, PartialEq)]
+pub struct Preflight {
+    /// The headers every answer starts from, in order.
+    pub headers: Vec<(String, String)>,
+    /// An origin that is welcome is named back (otherwise the headers already say `*`).
+    pub explicit_origin: bool,
+    pub methods: Vec<String>,
+    /// Any header may be sent: the ones asked for are named back.
+    pub all_headers: bool,
+    /// Otherwise, the headers that may be sent, in lower case.
+    pub allow_headers: Vec<String>,
 }
 
 /// A route registered through the admin API: where a matching request goes instead.

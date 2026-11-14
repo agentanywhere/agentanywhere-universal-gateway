@@ -1463,8 +1463,18 @@ def main() -> int:
                 from_page(f"{whose}: an agent", origin, "GET", "/agents/echo/a", wants=named)
                 from_page(f"{whose}: an agent that hangs up", origin, "GET", "/agents/echo/drop", wants=lambda h: h == {})
                 from_page(f"{whose}: an agent that is not registered", origin, "GET", "/agents/nobody/a", by="python")
+                pre = lambda method="POST", **more: {"Access-Control-Request-Method": method, **more}
                 from_page(f"{whose}: asking first (a preflight)", origin, "OPTIONS", "/api/users",
-                          {"Access-Control-Request-Method": "POST", "Access-Control-Request-Headers": "x-api-key"}, by="python")
+                          pre(**{"Access-Control-Request-Headers": "x-api-key"}),
+                          wants=lambda h: h.get("access-control-allow-headers") == "x-api-key" and (h.get("access-control-allow-origin") == origin) == listed)
+                from_page(f"{whose}: a preflight that names no headers", origin, "OPTIONS", "/mcp", pre("DELETE"))
+                from_page(f"{whose}: a preflight for a method nobody has", origin, "OPTIONS", "/users/7", pre("BREW"))
+                from_page(f"{whose}: a preflight for several headers", origin, "OPTIONS", "/graphql",
+                          pre(**{"Access-Control-Request-Headers": "Content-Type , X-API-Key,authorization"}))
+                from_page(f"{whose}: a preflight for one of the gateway's own paths", origin, "OPTIONS", "/admin/api-keys", pre("GET"), by="python")
+                from_page(f"{whose}: OPTIONS that is not a preflight", origin, "OPTIONS", "/api/users", by="python")
+                a, b = (httpx.options(f"{base}/api/users", timeout=10, headers={"Origin": origin, **pre(), "X-Request-ID": "pre-1"}) for base in (py, rs))
+                compare(f"from a web page ({whose}: the whole preflight answer)", a, b)
             a, b = (httpx.get(f"{base}/api/users", timeout=10, headers=[("Origin", "http://localhost:3001"), ("Origin", "http://elsewhere.example"),
                                                                          ("X-API-Key", k)]) for base, k in ((py, keys["py"]["key"]), (rs, keys["rs"]["key"])))
             check("from a web page: an origin given twice is Python's to answer",
@@ -2041,7 +2051,13 @@ def main() -> int:
                         total += float(line.rsplit(" ", 1)[1])
                 return total
 
+            # The publishes above are reported a moment after they are answered: wait for the count to settle.
             before = counted()
+            for _ in range(20):
+                time.sleep(0.5)
+                if counted() == before:
+                    break
+                before = counted()
             for i in range(5):
                 publish(mrs, mkeys["rs"], {"topic": f"counted/{i}"})
             check("MQTT: what the data plane published is counted by the product as MQTT requests",

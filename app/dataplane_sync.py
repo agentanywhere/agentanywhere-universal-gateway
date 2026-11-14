@@ -332,12 +332,37 @@ def _cross_origin() -> Optional[Dict[str, Any]]:
     options = dict(gw._cors_options)
     origins = options.pop("allow_origins", None)
     credentials = options.pop("allow_credentials", None)
-    options.pop("allow_methods", None)  # these two only matter to a preflight, which is answered here
-    options.pop("allow_headers", None)
+    methods = options.pop("allow_methods", None)  # these two only matter to a preflight
+    headers = options.pop("allow_headers", None)
     plain = isinstance(origins, list) and all(isinstance(o, str) and o.isascii() for o in origins) and isinstance(credentials, bool)
     if options or not plain:
         return None
-    return {"any_origin": "*" in origins, "origins": sorted(set(origins) - {"*"}), "credentials": credentials}
+    return {"any_origin": "*" in origins, "origins": sorted(set(origins) - {"*"}), "credentials": credentials,
+            "preflight": _preflight(origins, credentials, methods, headers)}
+
+
+def _preflight(origins, credentials, methods, headers) -> Optional[Dict[str, Any]]:
+    """How the CORS middleware answers a preflight, read off a middleware set up with the same
+    options, so that the data plane's answers are its answers. ``None`` when that cannot be put
+    in plain words (the preflight then stays here)."""
+    from starlette.middleware.cors import CORSMiddleware
+
+    try:
+        cors = CORSMiddleware(None, allow_origins=origins, allow_credentials=credentials,
+                              allow_methods=methods, allow_headers=headers)
+        said = [[str(name), str(value)] for name, value in cors.preflight_headers.items()]
+        names = [str(m) for m in cors.allow_methods] + [str(h) for h in cors.allow_headers]
+        if not all(text.isascii() for pair in said for text in pair) or not all(n.isascii() for n in names):
+            return None
+        return {
+            "headers": said,
+            "explicit_origin": bool(cors.preflight_explicit_allow_origin),
+            "methods": [str(m) for m in cors.allow_methods],
+            "all_headers": bool(cors.allow_all_headers),
+            "allow_headers": [str(h) for h in cors.allow_headers],
+        }
+    except Exception:  # noqa: BLE001 - options this code did not expect: answer preflights here
+        return None
 
 
 _ROUTE_REWRITE = re.compile(r"/[A-Za-z0-9._~/-]*")
