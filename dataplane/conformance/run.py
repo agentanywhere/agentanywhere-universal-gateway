@@ -1608,7 +1608,7 @@ def main() -> int:
             # What the rules do, each compared with what the Python gateway does. A request is
             # matched by the path the backend is asked for; its answer by the request's own path
             # without the leading slash, so one pattern for both starts with `*`.
-            def exchange_same(name, method, path, by="data plane", headers=(), sees=None, query=None, status=200, given=None, arrives=None, **kw):
+            def exchange_same(name, method, path, by="data plane", headers=(), sees=None, query=None, status=200, given=None, arrives=None, asked=None, **kw):
                 # A body given in pieces is sent without its length, anew to each side.
                 pieces = kw.pop("pieces", None)
                 more = (lambda: {"content": iter(pieces)}) if pieces else dict
@@ -1624,6 +1624,8 @@ def main() -> int:
                     for header, want in (sees or {}).items():
                         if not seen_a.get(header) == seen_b.get(header) == want:
                             bad.append(f"the backend saw {header}: {seen_a.get(header)!r} and {seen_b.get(header)!r}")
+                    if asked is not None and not a.json()["path"] == b.json()["path"] == asked:
+                        bad.append(f"the backend was asked for {a.json()['path']!r} and {b.json()['path']!r}")
                     if query is not None and not a.json()["query"] == b.json()["query"] == query:
                         bad.append(f"the backend saw the query {a.json()['query']!r} and {b.json()['query']!r}")
                     if a.json()["body_sha256"] != b.json()["body_sha256"]:
@@ -1714,11 +1716,32 @@ def main() -> int:
             remove_rules(made)
             assert rules_reached("/api/routed/bodies/1", "data plane", False), "removing the rules never reached the data plane"
 
+            # Rules that replace plain text in the path the backend is asked for.
+            made = [post("/admin/transformations", r) for r in (
+                {"name": "move the old paths", "path_pattern": "/api/routed/old/*", "request_config": {
+                    "headers_set": {"X-Shaped": "yes"}, "path_rewrite": {"pattern": "^/api/routed/old/", "replacement": "/api/routed/new/"}}},
+                {"name": "and drop a word, wherever it stands", "path_pattern": "/api/routed/old/*", "request_config": {
+                    "path_rewrite": {"pattern": "/draft", "replacement": ""}}},
+                {"name": "name a version", "path_pattern": "/api/routed/versioned/*", "request_config": {
+                    "headers_set": {"X-Shaped": "yes"}, "path_rewrite": {"pattern": "^/api/routed/versioned", "replacement": "/v1"}}})]
+            assert rules_reached("/api/routed/old/1", "data plane", True), "the rules never reached the data plane"
+            exchange_same("text at the start of a path is replaced", "GET", "/api/routed/old/1?q=tea", asked="/api/routed/new/1", query="q=tea", sees={"x-shaped": "yes"})
+            exchange_same("the start is replaced once, and a later rule works on what is left", "GET", "/api/routed/old/draft/api/routed/old/draft/2",
+                          asked="/api/routed/new/api/routed/old/2")
+            exchange_same("a body goes with the request to its new path", "POST", "/api/routed/old/draft/3", content=b'{"a":  1}', arrives=b'{"a":  1}',
+                          asked="/api/routed/new/3")
+            exchange_same("an escaped path is rewritten as it reads", "GET", "/api/routed/old/a%20b/%64raft/x", asked="/api/routed/new/a%20b/x")
+            exchange_same("a path rewritten to one that names a version is Python's to resolve", "GET", "/api/routed/versioned/users", by="python",
+                          sees={"x-shaped": "yes"})
+            exchange_same("a path the rules do not cover is asked for as it came", "GET", "/api/routed/other/old/draft", asked="/api/routed/other/old/draft")
+            remove_rules(made)
+            assert rules_reached("/api/routed/old/1", "data plane", False), "removing the rules never reached the data plane"
+
             # Rules this side is not told the actions of: they change an answer's body or the
-            # path, fill in a template, or change a header that the gateway or an HTTP library on
+            # path by expression, fill in a template, or change a header that the gateway or an HTTP library on
             # the way has a say in.
             for what, config in (("changes an answer's body", {"request_config": {"headers_set": {"X-Shaped": "yes"}}, "response_config": {"body_set": {"seen": True}}}),
-                                 ("rewrites the path", {"request_config": {"headers_set": {"X-Shaped": "yes"}, "path_rewrite": {"pattern": "/kept/", "replacement": "/kept/"}}}),
+                                 ("rewrites the path by expression", {"request_config": {"headers_set": {"X-Shaped": "yes"}, "path_rewrite": {"pattern": "/kept/(\\d+)", "replacement": "/kept/\\1"}}}),
                                  ("fills in a template", {"request_config": {"headers_set": {"X-Shaped": "yes"}}, "response_config": {"template": "{{ body | tojson }}"}}),
                                  ("sets the client's name", {"request_config": {"headers_set": {"X-Shaped": "yes", "User-Agent": "gateway"}}}),
                                  ("sets the kind of content of an answer", {"request_config": {"headers_set": {"X-Shaped": "yes"}},

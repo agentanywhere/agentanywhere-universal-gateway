@@ -190,13 +190,15 @@ again after a reconnect. `/mqtt/subscribe` stays with the Python gateway.
 `python dataplane/conformance/publish.py` generates bodies and checks that whatever this side would publish, the Python
 gateway's own handler and client publish the same bytes.
 
-**Transformation rules.** A rule that changes headers, query parameters or the fields of a JSON body of a request, or
-headers or the status of an answer, is applied here, as the Python gateway applies it: for each rule that applies, in
-the order the rules were made, headers are renamed, then removed, then set, query parameters are removed, then set,
-and fields of the body are renamed, then removed, then set; an answer's status is mapped by each rule in turn. The quirks are the Python gateway's and are kept: a header is found for renaming or
+**Transformation rules.** A rule that changes headers, query parameters or the fields of a JSON body of a request,
+replaces plain text in its path, or changes headers or the status of an answer, is applied here, as the Python
+gateway applies it: for each rule that applies, in the order the rules were made, headers are renamed, then removed,
+then set, query parameters are removed, then set, fields of the body are renamed, then removed, then set, and the
+path is rewritten; an answer's status is mapped by each rule in turn. The quirks are the Python gateway's and are kept: a header is found for renaming or
 removing whatever its case, but is set under exactly the name the rule gives, so a header set as `X-Client` arrives
 beside the caller's own `x-client`, not in its place. Any other rule is the Python gateway's to apply, and a request it
-applies to is handed over: a rule that changes an answer's body, fills in a template or rewrites the path; one that names a
+applies to is handed over: a rule that changes an answer's body, fills in a template or rewrites the path by a
+regular expression; one that names a
 header the gateway or an HTTP library on the way has its own say in (`Host`, `Content-Length`, `User-Agent`, `Accept`,
 `X-Forwarded-For`, `X-Request-ID`, the version and trace headers; on an answer also `Content-Type`, `Set-Cookie`,
 `Vary` and the cross-origin, rate-limit and tenant headers); one with a header name or value that is not plain ASCII
@@ -233,6 +235,13 @@ it came. A request is handed to the Python gateway whole when this side is not c
 body: one that opens as an object and then is not JSON, is nested more than 64 levels deep or holds `NaN`, a number
 too large to hold or one of the few whose digits the two sides might choose differently; one over 1 MiB; one sent
 without a `Content-Length`. A rule that sets a value which is not plain JSON is the Python gateway's to apply.
+
+A path rewrite is done here when it needs no expression: its pattern is plain text (letters, digits, `/`, `_`, `~`,
+an escaped `.` or `-`), with `^` in front to replace it at the start of the path only and otherwise wherever it
+stands, and its replacement is plain text too. It is applied to the path the backend is asked for, each rule to what
+the last left, while the rules themselves were chosen by the path before any rewrite, as in the Python gateway. A
+request whose rewritten path no longer starts with `/`, or names an API version (`/v1/...`, which the Python gateway
+then resolves), is handed over.
 
 An answer's body is the backend's, byte for byte, on both sides: the Python gateway reads and rewrites a body only
 for a rule that changes bodies, and such a rule is its own to apply. This side could not hand an answer over once the
@@ -342,8 +351,8 @@ here is the reverse of everywhere else: **whatever this side cannot be sure of i
 | The JSON-to-gRPC bridge under `/grpc` | Python |
 | A path that matches a dynamic route to an `http://` or `https://` backend | data plane, to the route's backend |
 | A path that matches a dynamic route to any other backend | Python |
-| A request a transformation rule applies to (by path pattern and method), when the rule changes headers, query parameters, the fields of the request's JSON body or the status | data plane, which applies it |
-| The same, when the rule changes an answer's body, a path or a header the gateway has its own say in, fills in a template, or the request is one the two sides would read differently | Python, which applies it |
+| A request a transformation rule applies to (by path pattern and method), when the rule changes headers, query parameters, the fields of the request's JSON body or the status, or replaces plain text in the path | data plane, which applies it |
+| The same, when the rule changes an answer's body or a header the gateway has its own say in, rewrites the path by expression, fills in a template, or the request is one the two sides would read differently | Python, which applies it |
 | Any transformation rule whose regular expression the two engines could read differently | Python, for every path |
 | Request-altering plugins (when any exist) | Python, for every path |
 | The health path, `/ready` and `/live`, on a plain `GET` | data plane |

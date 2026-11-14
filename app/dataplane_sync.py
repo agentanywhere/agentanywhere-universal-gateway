@@ -315,12 +315,37 @@ def _body_actions(cfg: Any) -> Optional[Dict[str, Any]]:
     return {name: steps for name, steps in fields.items() if steps}
 
 
+# A path rewrite that is no expression at all: plain text (a dot or a dash may be escaped), with
+# `^` in front or not, replaced by plain text.
+_REWRITE_FROM = re.compile(r"\^?(?:[A-Za-z0-9/_~]|\\[.\-])+")
+_REWRITE_TO = re.compile(r"[A-Za-z0-9/_.~-]*")
+
+
+def _path_actions(cfg: Any) -> Optional[Dict[str, Any]]:
+    """A rule's rewrite of the path the backend is asked for (``_apply_path_rewrite``), when it
+    replaces plain text by plain text: ``{"path": {"from", "to", "start"}}``. Nothing for a rule
+    that rewrites nothing; ``None`` for any other expression."""
+    rewrite = cfg.path_rewrite
+    if not rewrite:
+        return {}
+    if type(rewrite) is not dict:
+        return None
+    pattern, replacement = rewrite.get("pattern"), rewrite.get("replacement", "")
+    if not pattern:
+        return {}
+    if not (type(pattern) is str and _REWRITE_FROM.fullmatch(pattern) and type(replacement) is str and _REWRITE_TO.fullmatch(replacement)):
+        return None
+    start = pattern.startswith("^")
+    return {"path": {"from": pattern[start:].replace("\\", ""), "to": replacement, "start": start}}
+
+
 def _rule_actions(rule: Any) -> Optional[Dict[str, Any]]:
     """What a transformation rule does, when the data plane can do exactly the same: change
-    headers, query parameters and the fields of a JSON body of the request, and headers and the
-    status of the answer. ``None`` for a rule that does anything else (changes an answer's body
-    or the path, fills in a template, or is code), or that names a header, a value or a status
-    the two sides might treat differently. Such a rule is applied here: the data plane hands
+    headers, query parameters and the fields of a JSON body of the request, replace plain text
+    in its path, and change headers and the status of the answer. ``None`` for a rule that does
+    anything else (changes an answer's body, rewrites the path by expression, fills in a
+    template, or is code), or that names a header, a value or a status the two sides might treat
+    differently. Such a rule is applied here: the data plane hands
     over the requests it applies to."""
     if rule.condition is not None or rule.transform_request is not None or rule.transform_response is not None:
         return None
@@ -334,15 +359,13 @@ def _rule_actions(rule: Any) -> Optional[Dict[str, Any]]:
         if cfg.template or (side == "response" and (cfg.body_set or cfg.body_remove or cfg.body_rename)):
             return None
         if side == "request":
-            # A path is rewritten by expression.
-            if cfg.path_rewrite:
-                return None
             actions = _header_actions(cfg, _REQUEST_HEADERS_KEPT)
-            fields = _body_actions(cfg)
+            fields, path = _body_actions(cfg), _path_actions(cfg)
             remove, to_set = cfg.query_remove, cfg.query_set
-            if actions is None or fields is None or not (isinstance(remove, list) and isinstance(to_set, dict)):
+            if actions is None or fields is None or path is None or not (isinstance(remove, list) and isinstance(to_set, dict)):
                 return None
             actions.update(fields)
+            actions.update(path)
             if not all(isinstance(q, str) for q in remove):
                 return None
             if not all(isinstance(k, str) and k and _QUERY_WORD.fullmatch(k) and isinstance(v, str) and _QUERY_WORD.fullmatch(v)

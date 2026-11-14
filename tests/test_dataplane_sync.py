@@ -1143,7 +1143,15 @@ def test_the_snapshot_says_what_a_rule_does_when_the_data_plane_can_do_the_same(
                  {"body_set": {"a": 10 ** 400}}, {"body_set": {"a": "\ud800"}}, {"body_set": {"a": {"\udc00": 1}}}, {"body_set": {"\ud800": 1}},
                  {"body_remove": [1]}, {"body_remove": ["\ud800"]}, {"body_rename": {"a": 1}}, {"body_set": ["a"]}, {"body_set": {"a": b"bytes"}}):
         assert actions(request_config=kept) is None, kept
-    assert actions(request_config={"path_rewrite": {"pattern": "^/a", "replacement": "/b"}}) is None
+    # A path rewrite that replaces plain text is told; one that is an expression is not.
+    assert actions(request_config={"path_rewrite": {"pattern": "^/a", "replacement": "/b"}})["request"]["path"] == {"from": "/a", "to": "/b", "start": True}
+    assert actions(request_config={"path_rewrite": {"pattern": r"/x\.y/a\-b"}})["request"]["path"] == {"from": "/x.y/a-b", "to": "", "start": False}
+    for nothing_to_do in ({}, {"replacement": "/b"}, {"pattern": ""}):
+        assert "path" not in actions(request_config={"headers_set": {"X-A": "1"}, "path_rewrite": nothing_to_do})["request"]
+    for kept in ({"pattern": "^/a$"}, {"pattern": "/a.b"}, {"pattern": "/(a)", "replacement": r"/\1"}, {"pattern": "/a+"}, {"pattern": "^"}, {"pattern": "/a|/b"},
+                 {"pattern": "/a", "replacement": r"\g<0>"}, {"pattern": "/a", "replacement": "/a b"}, {"pattern": "/a", "replacement": "/b?q=1"},
+                 {"pattern": "/caf\u00e9"}, {"pattern": 5}, {"pattern": "/a", "replacement": 5}, "text"):
+        assert actions(request_config={"path_rewrite": kept}) is None, kept
     for code in ("condition", "transform_request", "transform_response"):
         assert dataplane_sync._rule_actions(TransformationRule(name="r", **{code: lambda *a: None})) is None
     # ...a header the gateway or an HTTP library on the way has its own say in, on that side...

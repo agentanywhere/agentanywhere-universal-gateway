@@ -11,7 +11,8 @@ body of the request, and headers and the status of the answer. Any other rule is
 Python gateway. So the property that must hold is:
 
     for every set of rules the data plane is told the actions of, and every exchange:
-        the backend is sent the headers, the query and the body the Python gateway would send it, and
+        the backend is asked for the path, and sent the headers, the query and the body, that the
+        Python gateway would ask for and send, and
         the caller is given the headers and the status the Python gateway would give.
 
 A body the data plane is not certain how Python would read or write, it hands over with its request
@@ -113,6 +114,20 @@ def header_actions(rng, names=NAMES):
     }
 
 
+SEGMENTS = ["a", "b", "ab", "v1", "v2", "x.y", "a-b", "", "users", "é", "a b", ".", ".."]
+FROM = ["/a", "a", "^/a", "^/a/", "/", "^/", "b/a", "x\\.y", "a\\-b", "^/v1", "v1", "/users/", "^/ab/a", "//", "ab"]
+ODD_FROM = ["^/a$", "/(a)", "a+", ".", "a|b", "[ab]", "^", "(?i)a", "a$", "\\d", 5, "é", "a b"]
+TO = ["", "/", "/b", "b", "/v2", "v2", "/a/a", "x.y", "a-b", "~", "/users", "ab"]
+ODD_TO = ["\\1", "\\g<0>", "a b", "é", "?q=1", "#f", "%20", 7]
+
+
+def a_rewrite(rng):
+    rewrite = {"pattern": pick(rng, FROM, ODD_FROM, 0.08)}
+    if rng.random() < 0.9:
+        rewrite["replacement"] = pick(rng, TO, ODD_TO, 0.08)
+    return rng.choice([rewrite] * 12 + [{}, {"replacement": "/x"}, {"pattern": ""}, "text"])
+
+
 def a_rule(rng, n):
     rule = {"name": f"rule {n}", "path_pattern": "*"}
     if rng.random() < 0.8:
@@ -123,7 +138,9 @@ def a_rule(rng, n):
             "query_set": dict(some(rng, lambda: (rng.choice(KEYS), pick(rng, WORDS, ODD_WORDS)))),
         }
         if rng.random() < 0.03:
-            rule["request_config"].update(rng.choice([{"template": "{{ body }}"}, {"path_rewrite": {"pattern": "^/x", "replacement": "/y"}}]))
+            rule["request_config"]["template"] = "{{ body }}"
+        if rng.random() < 0.3:
+            rule["request_config"]["path_rewrite"] = a_rewrite(rng)
     if rng.random() < 0.8:
         rule["response_config"] = {
             **header_actions(rng),
@@ -153,7 +170,8 @@ def an_exchange(rng):
     answer = []
     for n in rng.sample(NAMES, rng.randint(0, 8)):
         answer += [[n, rng.choice(VALUES)] for _ in range(rng.choice([1, 1, 1, 2, 3]))]
-    return {"headers": headers, "query": query, "body": body.hex() if body is not None else None, "answer": answer,
+    path = "/" + "/".join(rng.choice(SEGMENTS) for _ in range(rng.randint(0, 5)))
+    return {"headers": headers, "query": query, "body": body.hex() if body is not None else None, "path": path, "answer": answer,
             "status": rng.choice(STATUSES + [204, 304])}
 
 
@@ -175,7 +193,7 @@ def python_says(rules, case):
     query = dict(QueryParams(case["query"]))
     came = bytes.fromhex(case["body"]) if case["body"] is not None else None
     method = "GET" if came is None else "POST"
-    headers, query, body, _ = before.transform(method, "/x", dict(case["headers"]), query, came)
+    headers, query, body, path = before.transform(method, case["path"], dict(case["headers"]), query, came)
     # As `_prepare_upstream_parts` hands the body to the HTTP client.
     content = json_payload = None
     if isinstance(body, bytes):
@@ -198,6 +216,7 @@ def python_says(rules, case):
         "headers": as_read(sent_headers),
         "query": sent.url.query.decode("ascii") or None,
         "body": sent.read().hex() if came is not None else None,
+        "path": path,
         "answer": as_read((n, v) for n, v in given.raw_headers if n != b"content-length"),
         "status": given.status_code,
     }
@@ -224,7 +243,7 @@ def main():
         sys.exit(f"dataplane --judge-shapes failed: {out.stderr.strip()}")
     answers = [json.loads(line) for line in out.stdout.splitlines()]
     assert len(answers) == len(cases), (len(answers), len(cases))
-    wrong, changed, asked, rewritten = [], 0, 0, 0
+    wrong, changed, asked, rewritten, moved = [], 0, 0, 0, 0
     for (described, rules, case), got in zip(cases, answers):
         if got in ("ask", "unready"):
             # Handed over with its request, or the rule kept with Python once its value is read.
@@ -234,23 +253,26 @@ def main():
         want = python_says(rules, case)
         if got != want:
             wrong.append((described, case, want, got))
-        untouched = {"headers": as_read(case["headers"]), "query": case["query"] or None, "body": case["body"],
+        untouched = {"headers": as_read(case["headers"]), "query": case["query"] or None, "body": case["body"], "path": case["path"],
                      "answer": as_read(case["answer"]), "status": case["status"]}
         changed += want != untouched
         rewritten += want["body"] != case["body"]
+        moved += want["path"] != case["path"]
     for described, case, want, got in wrong[:8]:
         differ = [part for part in want if want[part] != got.get(part)]
         print(f"DIFFERENT in {differ}\n  rules  {json.dumps(described)}\n  case   {json.dumps(case)}")
         for part in differ:
             print(f"  python {part}: {want[part]}\n  plane  {part}: {got.get(part)}")
     print(f"{count} exchanges under rules the data plane is told the actions of ({changed} of them changed by the rules, "
-          f"{rewritten} with a body written anew): {len(wrong)} different; {asked} handed over for their body; "
+          f"{rewritten} with a body written anew, {moved} with a path rewritten): {len(wrong)} different; {asked} handed over for their body; "
           f"{kept} sets of rules kept with Python")
     if kept > 2 * count:
         print("too many ordinary rules are being kept with Python")
     if asked > count // 20 or rewritten < count // 20:
         print("too few ordinary bodies are being written here")
-    sys.exit(1 if wrong or kept > 2 * count or changed < count // 2 or asked > count // 20 or rewritten < count // 20 else 0)
+    if moved < count // 20:
+        print("too few ordinary rewrites are being done here")
+    sys.exit(1 if wrong or kept > 2 * count or changed < count // 2 or asked > count // 20 or rewritten < count // 20 or moved < count // 20 else 0)
 
 
 if __name__ == "__main__":

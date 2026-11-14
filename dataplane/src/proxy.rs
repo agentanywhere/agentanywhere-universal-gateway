@@ -702,6 +702,8 @@ struct Native<'a> {
     html: bool,
     /// What the transformation rules that apply do to the request and to its answer.
     shaping: Shaping<'a>,
+    /// The path the backend is asked for, when a rule rewrites it.
+    rewritten: Option<String>,
 }
 
 /// A request refused here with a 401: it carries no credential that works.
@@ -1013,11 +1015,18 @@ fn decide<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, now: u6
             return PYTHON;
         }
     }
+    // A path rules rewrite is still a path, and one that names no version: the Python gateway
+    // resolves a version from the path it ends up with.
+    let rewritten = shaping.rewritten(asked);
+    if rewritten.as_deref().is_some_and(|to| !to.starts_with('/') || names_a_version(to)) {
+        return PYTHON;
+    }
+    let asked = rewritten.as_deref().unwrap_or(asked);
     // What the backend is asked for must be something this side's HTTP client will send.
     if !plain_path(asked) && sent_path(asked).parse::<hyper::http::uri::PathAndQuery>().is_err() {
         return PYTHON;
     }
-    Decision::Native(Native { protocol, backend, entry, route, version, ip, method, html, shaping })
+    Decision::Native(Native { protocol, backend, entry, route, version, ip, method, html, shaping, rewritten })
 }
 
 /// Whether the Python gateway may pass the answer to a request on as a stream
@@ -1140,6 +1149,9 @@ pub fn judge_shapes() -> Result<(), String> {
         query: String,
         /// The request's body, in hex, when it has one.
         body: Option<String>,
+        /// The path the backend would be asked for.
+        #[serde(default)]
+        path: Option<String>,
         answer: Vec<(String, String)>,
         status: u16,
     }
@@ -1199,6 +1211,7 @@ pub fn judge_shapes() -> Result<(), String> {
             "headers": lines(req.headers()),
             "query": req.uri().query(),
             "body": body.map(|b| b.iter().map(|byte| format!("{byte:02x}")).collect::<String>()),
+            "path": case.path.as_deref().map(|asked| Shaping { request: before.clone(), response: Vec::new() }.rewritten(asked).unwrap_or_else(|| asked.to_owned())),
             "answer": lines(resp.headers()),
             "status": resp.status().as_u16(),
         });
@@ -1667,7 +1680,7 @@ fn admit_grpc<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, now
     if !entry.native_ok || snap.fallthrough_prefixes.iter().any(|p| path.starts_with(p.as_str())) || snap.transformed("POST", path, path) {
         return Err(GrpcRefusal::NOT_APPLICABLE);
     }
-    let native = Native { protocol: Protocol::Grpc, backend: Some(backend), entry, route: None, version: None, ip, method: "POST", shaping: Shaping::default(), html: false };
+    let native = Native { protocol: Protocol::Grpc, backend: Some(backend), entry, route: None, version: None, ip, method: "POST", shaping: Shaping::default(), rewritten: None, html: false };
     Ok(GrpcCall { native, key_in_authorization })
 }
 
@@ -2246,9 +2259,10 @@ pub async fn handle(w: Arc<Worker>, peer: SocketAddr, mut req: Request<Incoming>
                 } else if !backend.breaker.allow(&cb, Instant::now()) {
                     (circuit_open(&t), Some("SERVICE_UNAVAILABLE"))
                 } else {
-                    let asked = match n.route {
-                        Some(route) => route.rewrite.as_deref().unwrap_or(path),
-                        None => upstream_path(path, n.protocol),
+                    let asked = match (n.rewritten.as_deref(), n.route) {
+                        (Some(rewritten), _) => rewritten,
+                        (None, Some(route)) => route.rewrite.as_deref().unwrap_or(path),
+                        (None, None) => upstream_path(path, n.protocol),
                     };
                     // Asked for as it came when nothing about it changes on the way.
                     let untouched = backend.upstream.prefix.is_empty() && asked == uri.path() && plain_path(asked);

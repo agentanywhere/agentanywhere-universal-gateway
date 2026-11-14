@@ -189,6 +189,30 @@ pub struct Actions {
     /// The same, ready to apply, in order.
     #[serde(skip)]
     body: Vec<BodyStep>,
+    /// Text to replace in the path the backend is asked for. A request's only.
+    path: Option<PathRewrite>,
+}
+
+/// A path rewrite that needs no expression: plain text replaced by plain text, either wherever
+/// it stands in the path or at its start only.
+#[derive(Deserialize, Debug, PartialEq)]
+pub struct PathRewrite {
+    from: String,
+    to: String,
+    #[serde(default)]
+    start: bool,
+}
+
+impl PathRewrite {
+    fn apply(&self, path: &str) -> String {
+        match self.start {
+            true => match path.strip_prefix(self.from.as_str()) {
+                Some(rest) => format!("{}{rest}", self.to),
+                None => path.to_owned(),
+            },
+            false => path.replace(self.from.as_str(), &self.to),
+        }
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -211,9 +235,17 @@ impl Actions {
         !self.body.is_empty()
     }
 
+    pub fn changes_path(&self) -> bool {
+        self.path.is_some()
+    }
+
     /// Make the changes to a body ready to apply. `None` if this side cannot be certain of how
     /// Python writes a value the rule sets.
     pub fn ready(&mut self) -> Option<()> {
+        // Nothing replaces nothing: such a rule is not described this way.
+        if self.path.as_ref().is_some_and(|p| p.from.is_empty()) {
+            return None;
+        }
         self.body.clear();
         self.body.extend(self.body_rename.iter().map(|(old, new)| BodyStep::Rename(pyjson::path(old), pyjson::path(new))));
         self.body.extend(self.body_remove.iter().map(|at| BodyStep::Remove(pyjson::path(at))));
@@ -326,6 +358,16 @@ impl Shaping<'_> {
     pub fn is_empty(&self) -> bool {
         self.request.is_empty() && self.response.is_empty()
     }
+
+    /// The path the backend is asked for once each rule in turn has rewritten it
+    /// (`_apply_path_rewrite`), when any does.
+    pub fn rewritten(&self, asked: &str) -> Option<String> {
+        let mut path: Option<String> = None;
+        for rewrite in self.request.iter().filter_map(|a| a.path.as_ref()) {
+            path = Some(rewrite.apply(path.as_deref().unwrap_or(asked)));
+        }
+        path
+    }
 }
 
 /// A transformation rule: which requests it applies to and, when this side can do the same as
@@ -392,7 +434,7 @@ impl TransformRule {
     fn ready(mut self) -> Option<TransformRule> {
         // A body is changed here on the way to the backend only.
         let request = self.request.as_mut().map(Actions::ready).unwrap_or(Some(()));
-        let response = self.response.as_mut().map(|a| a.ready().filter(|_| !a.changes_body())).unwrap_or(Some(()));
+        let response = self.response.as_mut().map(|a| a.ready().filter(|_| !a.changes_body() && !a.changes_path())).unwrap_or(Some(()));
         if request.is_none() || response.is_none() {
             self.native = false;
         }
@@ -862,7 +904,7 @@ impl Snapshot {
                 return None;
             }
             // A rule that changes nothing on a side is not in the way of anything there.
-            let does = |a: &&Actions| a.changes_headers() || a.changes_query() || a.changes_body() || !a.status.is_empty();
+            let does = |a: &&Actions| a.changes_headers() || a.changes_query() || a.changes_body() || a.changes_path() || !a.status.is_empty();
             shaping.request.extend(rule.request.as_ref().filter(|_| before).filter(does));
             shaping.response.extend(rule.response.as_ref().filter(|_| after).filter(does));
         }
@@ -1056,6 +1098,35 @@ impl Snapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rules_for_a_body_and_a_path_are_read_and_applied_in_order() {
+        let snap = Snapshot::from_json(
+            r#"{"keys":[],"transform_rules":[
+                {"all":true,"native":true,"response":null,"request":{"body_rename":[["user","meta.user"]],"body_remove":["secret"],
+                    "body_set":[["meta.source","\"gateway\""],["n","1.5"]],"path":{"from":"/old/","to":"/new/","start":true}}},
+                {"glob":"/old/*","native":true,"response":null,"request":{"body_set":[["meta.user.seen","true"]],"path":{"from":"/draft","to":""}}},
+                {"glob":"/odd/*","native":true,"response":null,"request":{"body_set":[["a","NaN"]]}},
+                {"glob":"/answer/*","native":true,"request":null,"response":{"body_set":[["a","1"]]}},
+                {"glob":"/nothing/*","native":true,"response":null,"request":{"path":{"from":"","to":"/x"}}}]}"#,
+        )
+        .unwrap();
+        let shaping = snap.shaping("POST", "/old/draft/1/old/draft", "/old/draft/1/old/draft").unwrap();
+        assert_eq!(shaping.rewritten("/old/draft/1/old/draft").as_deref(), Some("/new/1/old"));
+        let mut body = pyjson::parse(br#"{"user": "ana", "secret": 1, "keep": null}"#).unwrap();
+        shaping.request.iter().for_each(|a| a.change_body(&mut body));
+        let mut out = Vec::new();
+        body.dump(&mut out);
+        assert_eq!(String::from_utf8(out).unwrap(), r#"{"keep": null, "meta": {"user": {"seen": true}, "source": "gateway"}, "n": 1.5}"#);
+        // A path only the first rule covers is rewritten by it alone.
+        let shaping = snap.shaping("GET", "/other/old/", "/other/old/").unwrap();
+        assert_eq!(shaping.rewritten("/other/old/").as_deref(), Some("/other/old/"));
+        // A value this side cannot be certain of, a body rule for an answer and a rewrite of
+        // nothing each leave the rule to the Python gateway.
+        for path in ["/odd/1", "/answer/1", "/nothing/1"] {
+            assert!(snap.shaping("POST", path, path).is_none(), "{path}");
+        }
+    }
 
     #[test]
     fn hex_round_trips_a_digest() {
