@@ -213,6 +213,14 @@ class TransformationRule:
                 return False
         return True
 
+    def changes_response_body(self) -> bool:
+        """Whether applying the rule to an answer can change its body (rather than only its
+        headers or status), which is when the body has to be read."""
+        cfg = self.response_config
+        return self.transform_response is not None or (
+            cfg is not None and bool(cfg.body_set or cfg.body_remove or cfg.body_rename or cfg.template)
+        )
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "id": self.id,

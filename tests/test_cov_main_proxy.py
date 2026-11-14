@@ -99,12 +99,48 @@ def test_proxy_empty_body_response(gwdb, monkeypatch, H):
 
 @pytest.fixture
 def a_rule(monkeypatch):
-    """Register one (non-matching) rule: with no rule at all the proxy skips transformation."""
+    """Register one rule for every path that can change a body: with no rule that applies, the
+    proxy skips transformation, and the body is read only for a rule that can change it."""
     from app.transformers import TransformationRule, transformation_manager as tm
 
-    rule = TransformationRule(name="placeholder", path_pattern="/never-matches/*")
+    rule = TransformationRule(name="placeholder", path_pattern="*", transform_response=lambda s, h, b, ctx: None)
     monkeypatch.setitem(tm.rules_by_id, rule.id, rule)
     return rule
+
+
+def response_rule(monkeypatch, pattern="*", **config):
+    from app.transformers import TransformConfig, TransformationRule, transformation_manager as tm
+
+    rule = TransformationRule(name="r", path_pattern=pattern, response_config=TransformConfig(**config))
+    monkeypatch.setitem(tm.rules_by_id, rule.id, rule)
+    return rule
+
+
+SPACED = b'{"a":1,   "caf\xc3\xa9": [1.0, 2e3]}'
+
+
+def test_a_rule_for_headers_and_status_leaves_the_body_as_it_came(gwdb, monkeypatch, H):
+    response_rule(monkeypatch, headers_set={"X-Seen": "yes"}, status_map={"200": 201})
+    for body in (SPACED, b'"only a string"', b"\xff\xfe\x00", b""):
+        backend(monkeypatch, httpx.Response(200, content=body, headers={"content-type": "application/json"}))
+        r = gwdb.get("/api/t", headers=H)
+        assert r.status_code == 201 and r.headers["x-seen"] == "yes" and r.content == body, body
+
+
+def test_a_rule_that_does_not_apply_leaves_the_answer_as_it_came(gwdb, monkeypatch, H):
+    response_rule(monkeypatch, pattern="api/elsewhere/*", body_set={"seen": True}, headers_set={"X-Seen": "yes"})
+    backend(monkeypatch, httpx.Response(200, content=SPACED, headers={"content-type": "application/json"}))
+    r = gwdb.get("/api/t", headers=H)
+    assert r.status_code == 200 and "x-seen" not in r.headers and r.content == SPACED
+
+
+def test_a_rule_for_the_body_changes_an_object_and_leaves_other_text_alone(gwdb, monkeypatch, H):
+    response_rule(monkeypatch, body_set={"seen": True})
+    backend(monkeypatch, httpx.Response(200, content=SPACED, headers={"content-type": "application/json"}))
+    assert gwdb.get("/api/t", headers=H).json() == {"a": 1, "caf\u00e9": [1.0, 2000.0], "seen": True}
+    for body in (b'"only a string"', b"[1,  2]", b"plain text"):
+        backend(monkeypatch, httpx.Response(200, content=body, headers={"content-type": "application/json"}))
+        assert gwdb.get("/api/t", headers=H).content == body, body
 
 
 def test_response_transformation_applied(gwdb, monkeypatch, H, a_rule):
