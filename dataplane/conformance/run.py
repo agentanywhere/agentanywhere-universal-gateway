@@ -1526,9 +1526,10 @@ def main() -> int:
                   said_by(b) == "python" and a.status_code == b.status_code and page_headers(a) == page_headers(b), f"[{b.status_code}] {page_headers(b)}")
 
             # --- transformation rules ----------------------------------------------------------------
-            # A rule that changes headers, query parameters or the status is applied by the data
-            # plane as the Python gateway applies it. Any other rule is applied by the Python
-            # gateway: the data plane must hand it exactly the requests the rule applies to.
+            # A rule that changes headers, query parameters, the fields of a request's JSON body or
+            # the status is applied by the data plane as the Python gateway applies it. Any other
+            # rule is applied by the Python gateway: the data plane must hand it exactly the
+            # requests the rule applies to.
             print()
 
             def shaped(base, key, method, path, headers=(), **kw):
@@ -1607,9 +1608,12 @@ def main() -> int:
             # What the rules do, each compared with what the Python gateway does. A request is
             # matched by the path the backend is asked for; its answer by the request's own path
             # without the leading slash, so one pattern for both starts with `*`.
-            def exchange_same(name, method, path, by="data plane", headers=(), sees=None, query=None, status=200, given=None, **kw):
-                a = shaped(py, keys["py"]["key"], method, path, headers, **kw)
-                b = shaped(rs, keys["rs"]["key"], method, path, headers, **kw)
+            def exchange_same(name, method, path, by="data plane", headers=(), sees=None, query=None, status=200, given=None, arrives=None, **kw):
+                # A body given in pieces is sent without its length, anew to each side.
+                pieces = kw.pop("pieces", None)
+                more = (lambda: {"content": iter(pieces)}) if pieces else dict
+                a = shaped(py, keys["py"]["key"], method, path, headers, **kw, **more())
+                b = shaped(rs, keys["rs"]["key"], method, path, headers, **kw, **more())
                 bad = []
                 if said_by(b) != by:
                     bad.append(f"answered by the {said_by(b)}")
@@ -1624,6 +1628,8 @@ def main() -> int:
                         bad.append(f"the backend saw the query {a.json()['query']!r} and {b.json()['query']!r}")
                     if a.json()["body_sha256"] != b.json()["body_sha256"]:
                         bad.append("the backend was sent another body")
+                    if arrives is not None and b.json()["body_sha256"] != hashlib.sha256(arrives).hexdigest():
+                        bad.append("the backend was not sent the body expected")
                     for header, want in (given or {}).items():
                         if not a.headers.get(header) == b.headers.get(header) == want:
                             bad.append(f"the caller was given {header}: {a.headers.get(header)!r} and {b.headers.get(header)!r}")
@@ -1670,9 +1676,48 @@ def main() -> int:
             remove_rules(made)
             assert rules_reached("/api/routed/shaped/1", "data plane", False), "removing the rules never reached the data plane"
 
-            # Rules this side is not told the actions of: they change a body or the path, or a
-            # header that the gateway or an HTTP library on the way has a say in.
-            for what, config in (("changes a body", {"request_config": {"headers_set": {"X-Shaped": "yes"}, "body_set": {"seen": True}}}),
+            # Rules that change the fields of a request's body. A body that is a JSON object is
+            # written again as Python writes it, with its new length; any other goes on as it
+            # came. A body this side is not certain of goes to the Python gateway with its request.
+            made = [post("/admin/transformations", r) for r in (
+                {"name": "shape bodies", "path_pattern": "/api/routed/bodies/*", "request_config": {
+                    "headers_set": {"X-Shaped": "yes"}, "body_rename": {"user": "meta.user", "gone": "kept"}, "body_remove": ["secret", "deep.secret"],
+                    "body_set": {"meta.source": "gateway", "n": 1.5, "tags": ["a", {"b": None}]}}},
+                {"name": "and again, after", "path_pattern": "/api/routed/bodies/twice/*", "request_config": {
+                    "body_rename": {"meta": "about"}, "body_set": {"tags.first": True}}})]
+            assert rules_reached("/api/routed/bodies/1", "data plane", True), "the rules never reached the data plane"
+            json_type = [("Content-Type", "application/json")]
+            came = '{"user":"ana","secret":"s","keep":"é😀","deep":{"secret":1,"kept":[1.0,2e3,-0]},"gone":null,"n":7}'.encode()
+            made_of_it = (b'{"keep": "\\u00e9\\ud83d\\ude00", "deep": {"kept": [1.0, 2000.0, 0]}, "gone": null, "n": 1.5, '
+                          b'"meta": {"user": "ana", "source": "gateway"}, "tags": ["a", {"b": null}]}')
+            exchange_same("a body's fields are renamed, removed and set, and it is written as Python writes it", "POST", "/api/routed/bodies/1",
+                          headers=json_type, content=came, arrives=made_of_it,
+                          sees={"x-shaped": "yes", "content-length": str(len(made_of_it)), "content-type": "application/json"})
+            exchange_same("a later rule works on what the earlier one left", "PUT", "/api/routed/bodies/twice/1", headers=json_type, content=b'{"user": "ana"}',
+                          arrives=b'{"n": 1.5, "tags": {"first": true}, "about": {"user": "ana", "source": "gateway"}}')
+            exchange_same("a body of another kind is called JSON once it is written anew", "PATCH", "/api/routed/bodies/1", content=b"{}",
+                          arrives=b'{"meta": {"source": "gateway"}, "n": 1.5, "tags": ["a", {"b": null}]}', sees={"content-type": "application/json"})
+            exchange_same("and keeps the kind the caller gave it", "POST", "/api/routed/bodies/1", headers=[("Content-Type", "text/plain")], content=b"{}",
+                          sees={"content-type": "text/plain"})
+            for name, body in (("that is a list", b"[1,  2]"), ("that is not JSON", b"user=ana&secret=s"), ("that is not text", b"\xff\xfe\x00{}"),
+                               ("that is nothing", b"")):
+                exchange_same(f"a body {name} goes on as it came", "POST", "/api/routed/bodies/1", headers=json_type, content=body, arrives=body,
+                              sees={"x-shaped": "yes", "content-length": str(len(body))})
+            exchange_same("a request without a body is served here", "GET", "/api/routed/bodies/1", sees={"x-shaped": "yes"})
+            for name, body in (("with a number Python writes its own way", b'{"a": 1e400}'), ("nested very deep", b'{"a": ' + b"[" * 80 + b"]" * 80 + b"}"),
+                               ("that is nearly an object", b'{"a": 1,}')):
+                exchange_same(f"a body {name} is Python's to read", "POST", "/api/routed/bodies/1", by="python", headers=json_type, content=body,
+                              sees={"x-shaped": "yes"})
+            exchange_same("a body of no stated length is Python's to read", "POST", "/api/routed/bodies/1", by="python", headers=json_type,
+                          pieces=[b'{"user":', b'"ana"}'], sees={"x-shaped": "yes"})
+            exchange_same("a path the rules do not cover keeps its body", "POST", "/api/routed/other/1", headers=json_type, content=came, arrives=came)
+            remove_rules(made)
+            assert rules_reached("/api/routed/bodies/1", "data plane", False), "removing the rules never reached the data plane"
+
+            # Rules this side is not told the actions of: they change an answer's body or the
+            # path, fill in a template, or change a header that the gateway or an HTTP library on
+            # the way has a say in.
+            for what, config in (("changes an answer's body", {"request_config": {"headers_set": {"X-Shaped": "yes"}}, "response_config": {"body_set": {"seen": True}}}),
                                  ("rewrites the path", {"request_config": {"headers_set": {"X-Shaped": "yes"}, "path_rewrite": {"pattern": "/kept/", "replacement": "/kept/"}}}),
                                  ("fills in a template", {"request_config": {"headers_set": {"X-Shaped": "yes"}}, "response_config": {"template": "{{ body | tojson }}"}}),
                                  ("sets the client's name", {"request_config": {"headers_set": {"X-Shaped": "yes", "User-Agent": "gateway"}}}),

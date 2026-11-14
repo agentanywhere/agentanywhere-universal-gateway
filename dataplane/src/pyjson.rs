@@ -684,6 +684,47 @@ mod tests {
         assert_eq!(publish(deep.as_bytes()), None);
     }
 
+    fn dumped(value: &Value) -> String {
+        let mut out = Vec::new();
+        value.dump(&mut out);
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn a_body_is_held_and_written_again_as_python_would() {
+        let body = parse(" {\"b\":1,\"a\":{\"x\":[1.0,2e3,-0,null,true],\"y\":\"é😀\"},\"b\":{\"z\":2}}\n".as_bytes()).unwrap();
+        // A member named twice keeps its first place and its last value.
+        assert_eq!(dumped(&body), r#"{"b": {"z": 2}, "a": {"x": [1.0, 2000.0, 0, null, true], "y": "\u00e9\ud83d\ude00"}}"#);
+        assert_eq!(dumped(&parse(b"[]").unwrap()), "[]");
+        assert_eq!(dumped(&parse(b"{}").unwrap()), "{}");
+        for unsure in [&b"{\"a\":NaN}"[..], b"{\"a\":1e400}", b"{\"a\":1,}", b"", b"{} x", b"\xef\xbb\xbf{}", b"{\"a\":\"\xff\"}"] {
+            assert_eq!(parse(unsure), None, "{unsure:?}");
+        }
+        assert_eq!(parse(format!("{}{}", "[".repeat(80), "]".repeat(80)).as_bytes()), None);
+    }
+
+    #[test]
+    fn fields_are_found_removed_and_set_as_python_does() {
+        let mut body = parse(br#"{"a": {"b": 1, "c": null}, "d": 5, "": {"": 7}, "e": "x"}"#).unwrap();
+        assert_eq!(body.get(&path("a.b")).map(dumped).as_deref(), Some("1"));
+        assert_eq!(body.get(&path(".")).map(dumped).as_deref(), Some("7"));
+        // A null is not told apart from nothing; a path through what is no object leads nowhere.
+        assert_eq!(body.get(&path("a.c")), None);
+        assert_eq!(body.get(&path("d.x")), None);
+        assert_eq!(body.get(&path("z")), None);
+        body.remove(&path("a.b"));
+        body.remove(&path("d.x"));
+        body.remove(&path("z.y"));
+        assert_eq!(dumped(&body), r#"{"a": {"c": null}, "d": 5, "": {"": 7}, "e": "x"}"#);
+        // What is in the way and no object is replaced by one, in its place; the new goes last.
+        body.set(&path("d.x.y"), Value::Atom(b"true".to_vec()));
+        body.set(&path("a.c"), Value::Atom(b"2".to_vec()));
+        body.set(&path("caf\u{e9}"), parse(br#"{"k": []}"#).unwrap());
+        assert_eq!(dumped(&body), r#"{"a": {"c": 2}, "d": {"x": {"y": true}}, "": {"": 7}, "e": "x", "caf\u00e9": {"k": []}}"#);
+        body.remove(&path("caf\u{e9}.k"));
+        assert_eq!(body.get(&path("caf\u{e9}")).map(dumped).as_deref(), Some("{}"));
+    }
+
     #[test]
     fn a_topic_is_echoed_as_the_python_gateway_echoes_it() {
         assert_eq!(quoted("a/b"), "\"a/b\"");

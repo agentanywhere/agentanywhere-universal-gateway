@@ -1070,8 +1070,9 @@ const RULE_BODY_MAX: u64 = 1 << 20;
 /// spelling; any other is left as it came (`Ok(None)`). `Err` for a body this side is not certain
 /// how Python would read or write, which is then the Python gateway's.
 fn reshape(body: &[u8], rules: &[&Actions]) -> Result<Option<Vec<u8>>, ()> {
-    // Not UTF-8 is not JSON to Python either.
-    if std::str::from_utf8(body).is_err() {
+    // Not UTF-8 is not JSON to Python either, and nothing is an object that does not open as one.
+    let opens = body.iter().find(|b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'));
+    if opens != Some(&b'{') || std::str::from_utf8(body).is_err() {
         return Ok(None);
     }
     match pyjson::parse(body).ok_or(())? {
