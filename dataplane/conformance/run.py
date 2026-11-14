@@ -622,9 +622,13 @@ def main() -> int:
             assert wait_until(lambda: served_natively(scoped["rs"]["key"])), "scoped key never became native"
             same("a scoped key inside its paths", *both("GET", "/api/users/1", scoped))
             same("a scoped key outside its paths (403)", *both("GET", "/api/orders", scoped))
+            # A key's paths are compared with the path decoded, on both planes.
             a, b = both("GET", "/api/users%2F1", scoped)
-            same("an escaped path is left to Python", a, b, native=False)
-            check("an escaped path is not answered by the data plane", b.headers.get("x-served-by") != "dataplane")
+            same("an escaped path inside a scoped key's paths", a, b)
+            check("an escaped path inside a scoped key's paths is answered by the data plane", b.headers.get("x-served-by") == "dataplane" and b.status_code != 403)
+            a, b = both("GET", "/api/%6Frders", scoped)
+            same("an escaped path outside a scoped key's paths (403)", a, b)
+            check("an escaped path outside a scoped key's paths is refused by the data plane", b.headers.get("x-served-by") == "dataplane" and b.status_code == 403)
 
             plain = {"py": keys["py"], "rs": keys["rs"]}
             far = {"X-Forwarded-For": "198.51.100.9"}
@@ -919,6 +923,47 @@ def main() -> int:
                       f"[{b.status_code}] served-by={b.headers.get('x-served-by')}")
             a, b = httpx.get(f"{py}/users", timeout=15), httpx.get(f"{rs}/users", timeout=15)
             compare("Plain path: without a key", a, b)
+
+            # An escaped path is read decoded by both planes and reaches the backend written the same way.
+            # (name, method, path, body, the path the backend must see; None where the backend has no such page)
+            for name, method, path, body, seen in [
+                ("a space", "GET", "/mcp/files/report%202024.pdf", None, "/mcp/files/report%202024.pdf"),
+                ("letters beyond ASCII", "GET", "/mcp/caf%C3%A9/%E6%97%A5%E6%9C%AC?x=1", None, "/mcp/caf%C3%A9/%E6%97%A5%E6%9C%AC"),
+                ("lower-case escapes", "GET", "/mcp/caf%c3%a9", None, "/mcp/caf%C3%A9"),
+                ("an escaped slash", "GET", "/mcp/a%2Fb", None, "/mcp/a/b"),
+                ("an escaped letter", "GET", "/mcp/%61bc", None, "/mcp/abc"),
+                ("a percent sign", "GET", "/mcp/discount/100%25", None, "/mcp/discount/100%25"),
+                ("an escape of an escape", "GET", "/mcp/x%2520y", None, "/mcp/x%20y"),
+                ("a % that starts no escape", "GET", "/mcp/50%/off", None, "/mcp/50%25/off"),
+                ("characters a path may hold unescaped", "GET", "/mcp/it's;[1]@:x,(y)*+=&$!", None, "/mcp/it's;[1]@:x,(y)*+=&$!"),
+                ("characters escaped on the way", "GET", "/mcp/a%7Cb%5Ec%22d%3Ce%3E", None, "/mcp/a%7Cb%5Ec%22d%3Ce%3E"),
+                ("with a body", "POST", "/mcp/notes/my%20note", {"jsonrpc": "2.0", "id": 1, "method": "ping"}, "/mcp/notes/my%20note"),
+                ("a protocol named with an escape", "GET", "/%6Dcp/sessions/7", None, "/mcp/sessions/7"),
+                ("ACP, whose prefix is taken off", "GET", "/acp/agents/caf%C3%A9", None, "/agents/caf%C3%A9"),
+                ("dot segments", "GET", "/mcp/a/../b/./c", None, "/mcp/b/c"),
+                ("escaped dot segments", "GET", "/mcp/a/%2E%2E/b", None, "/mcp/b"),
+                ("dot segments past the root (the backend has no /x)", "GET", "/mcp/../../x", None, None),
+                ("dot segments that stop at the root", "GET", "/mcp/a/../../mcp/x", None, "/mcp/x"),
+                ("to the HTTP backend", "GET", "/api/files/report%202024.pdf", None, None),
+                ("no prefix at all", "GET", "/my%20files/a", None, None),
+            ]:
+                a, b = both(method, path, body)
+                compare(f"Escaped path: {name}", a, b)
+                ok = b.headers.get("x-served-by") == "dataplane" and (seen is None or (b.status_code == 200 and b.json().get("path") == seen))
+                check(f"Escaped path: {name}: answered by the data plane" + (f", backend saw {seen}" if seen else ""), ok,
+                      "" if ok else f"[{b.status_code}] served-by={b.headers.get('x-served-by')} {b.text[:160]}")
+            for name, path in [("an escaped ?", "/api/a%3Fb"), ("an escaped #", "/api/a%23b"), ("a control character", "/api/a%0Ab"),
+                               ("bytes that are not UTF-8", "/api/%FF%FE"), ("one of the gateway's own paths, escaped", "/%61dmin/api-keys"),
+                               ("an agent, escaped", "/agents/echo/a%20b")]:
+                a, b = both("GET", path, None)
+                check(f"Escaped path: {name}: left to Python, same status", b.headers.get("x-served-by") != "dataplane" and a.status_code == b.status_code,
+                      f"[{a.status_code}/{b.status_code}] served-by={b.headers.get('x-served-by')}")
+            a, b = httpx.get(f"{py}/api/a%20b", timeout=15), httpx.get(f"{rs}/api/a%20b", timeout=15)
+            compare("Escaped path: without a key", a, b)
+            for path in ("/%69nternal/dataplane/snapshot", "/internal%2Fdataplane/snapshot", "/%69nternal/%FF"):
+                b = httpx.get(f"{rs}{path}", timeout=15)
+                check(f"Escaped path: {path} does not reach the control plane's internal endpoints", b.status_code == 404 and "x-served-by" not in b.headers,
+                      f"[{b.status_code}] {b.text[:80]}")
             # The gateway's own endpoints stay its own, wherever a request for them arrives.
             # (`/health`, `/ready` and `/live` are answered by the data plane's own probes, checked elsewhere.)
             for path in ("/health/detailed", "/metrics", "/oauth2/providers", "/.well-known/agent-card.json",

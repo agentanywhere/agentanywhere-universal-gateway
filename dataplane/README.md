@@ -84,8 +84,13 @@ as it has workers, or set `--workers` below the core count on a shared machine, 
   network, a key linked to more than one tenant), and turns native serving off for every path when
   a request-altering plugin exists, or a transformation rule whose reach this side cannot work out. Dynamic routes
   are followed here, and a transformation rule sends only the requests it applies to (see below). A single request also goes to Python when its path is
-  percent-escaped or not ASCII, its method is not one of the plain ones, or the client's address cannot be resolved
+  not ASCII as sent, is not UTF-8 once its escapes are decoded or then holds a control character, `?` or `#`, its method is not one of the plain ones, or the client's address cannot be resolved
   the way Python resolves it. The stock `request-id` plugin is reproduced natively.
+* **A path is read decoded and written again, as Python does it.** The Python gateway's server decodes a path's
+  percent-escapes before anything looks at it, and its HTTP client drops `.` and `..` segments and escapes the path
+  again on the way to a backend. This side does both the same way, so `/api/a%20b`, `/%61pi/x` and `/api/a/../b`
+  match keys' paths, policies, routes and protocols as they do there and reach the backend spelled the same.
+  `conformance/paths.py` compares both steps with uvicorn's and httpx's own code over generated paths.
 * **Native answers are labelled** with `X-Served-By: dataplane`, so you can see which plane answered.
 * **What it served is reported back**, so the console, metrics, SLOs and logs stay complete:
   * Counts and latencies are aggregated per method, path pattern and status, in the same histogram buckets the Python
@@ -302,6 +307,8 @@ here is the reverse of everywhere else: **whatever this side cannot be sure of i
 | `/graphql/*`, `/api/graphql/*` with `GRAPHQL_BACKEND_URL` set | data plane, passed through as they came |
 | Any other path (`/users`, `/rest/...`, `/http/...`, `/`) with `HTTP_BACKEND_URL` set | data plane, to `--backend` |
 | The same without `HTTP_BACKEND_URL` (Python sends them to the MCP backend) | Python |
+| A percent-escaped path, or one with `.` or `..` segments, on any of the above | data plane, read and written as Python does |
+| A path that decodes to a control character, `?`, `#` or bytes that are not UTF-8; an escaped path under `/agents/` | Python |
 | The JSON-to-gRPC bridge under `/grpc` | Python |
 | A path that matches a dynamic route to an `http://` or `https://` backend | data plane, to the route's backend |
 | A path that matches a dynamic route to any other backend | Python |
@@ -370,6 +377,7 @@ python dataplane/conformance/boundary.py  # the body checks against the Python f
 python dataplane/conformance/publish.py   # what would be published to MQTT, against the Python handler and client
 python dataplane/conformance/patterns.py  # which paths a transformation rule's pattern matches, against Python's matcher
 python dataplane/conformance/preflight.py # what a preflight is answered, against the CORS middleware itself
+python dataplane/conformance/paths.py     # how an escaped path is read and written again, against uvicorn's and httpx's own code
 ```
 
 The conformance suite is the definition of "same behaviour": a scenario must pass on both before the data plane may

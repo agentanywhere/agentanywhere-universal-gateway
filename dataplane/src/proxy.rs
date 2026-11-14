@@ -423,6 +423,121 @@ fn upstream_path(path: &str, protocol: Protocol) -> &str {
     path
 }
 
+/// A byte the Python gateway's HTTP client (httpx) leaves as it is in a path: unreserved, a
+/// sub-delimiter, or one of `:/[]@`.
+fn path_safe(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=:/[]@".contains(&b)
+}
+
+/// Whether a path reaches a backend exactly as written: nothing to escape, no `.` or `..` segment.
+fn plain_path(path: &str) -> bool {
+    path.bytes().all(path_safe) && !path.contains("/.")
+}
+
+/// The bytes of a path with its percent-escapes decoded. A `%` that does not start an escape stays.
+fn unescaped(raw: &str) -> Vec<u8> {
+    let bytes = raw.as_bytes();
+    let hex = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match (bytes[i], bytes.get(i + 1).copied().and_then(hex), bytes.get(i + 2).copied().and_then(hex)) {
+            (b'%', Some(high), Some(low)) => {
+                out.push(high << 4 | low);
+                i += 3;
+            }
+            (b, _, _) => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// The path as the Python gateway reads it: its server decodes percent-escapes before anything
+/// looks at the path, so keys' paths, policies, routes and protocols are all decided on the
+/// decoded text. `None` for a path the two sides might not read alike, which is the Python
+/// gateway's: not ASCII as sent, not UTF-8 once decoded, or holding a control character, `?` or `#`.
+fn decoded(raw: &str) -> Option<Cow<'_, str>> {
+    if !raw.is_ascii() {
+        return None;
+    }
+    if !raw.contains('%') {
+        return Some(Cow::Borrowed(raw));
+    }
+    let text = String::from_utf8(unescaped(raw)).ok()?;
+    (!text.chars().any(|c| c.is_ascii_control() || c == '?' || c == '#')).then_some(Cow::Owned(text))
+}
+
+/// The path a backend is asked for, given the whole path the Python gateway hands its HTTP
+/// client (the backend's own prefix, then the request's decoded path). That client drops `.` and
+/// `..` segments, then escapes what a path may not hold; a path already made only of safe
+/// characters and whole escapes is left as it is, and otherwise a `%` is escaped too.
+fn sent_path(full: &str) -> String {
+    let mut kept: Vec<&str> = Vec::new();
+    for part in full.split('/') {
+        match part {
+            "." => {}
+            ".." => {
+                if !kept.is_empty() && kept != [""] {
+                    kept.pop();
+                }
+            }
+            other => kept.push(other),
+        }
+    }
+    let path = kept.join("/");
+    if path.is_empty() {
+        return "/".to_owned();
+    }
+    let b = path.as_bytes();
+    let whole_escapes = (0..b.len()).all(|i| b[i] != b'%' || (b.get(i + 1).is_some_and(u8::is_ascii_hexdigit) && b.get(i + 2).is_some_and(u8::is_ascii_hexdigit)));
+    if whole_escapes && b.iter().all(|c| path_safe(*c) || *c == b'%') {
+        return path;
+    }
+    let mut out = String::with_capacity(path.len() + 8);
+    for c in b {
+        match path_safe(*c) {
+            true => out.push(*c as char),
+            false => out.push_str(&format!("%{c:02X}")),
+        }
+    }
+    out
+}
+
+/// For `conformance/paths.py`: read one case per line (`{"prefix": ..., "path": ...}`, the path
+/// as a client sends it) and answer each with `{"decoded", "sent"}`, or `null` for a path this
+/// side leaves to the Python gateway.
+pub fn judge_paths() -> Result<(), String> {
+    use std::io::{BufRead, Write};
+
+    #[derive(serde::Deserialize)]
+    struct Case {
+        prefix: String,
+        path: String,
+    }
+
+    let out = std::io::stdout();
+    let mut out = out.lock();
+    for line in std::io::stdin().lock().lines() {
+        let line = line.map_err(|e| e.to_string())?;
+        let case: Case = serde_json::from_str(&line).map_err(|e| format!("case is not valid: {e}"))?;
+        let said = match decoded(&case.path) {
+            Some(path) => {
+                let sent = sent_path(&format!("{}{path}", case.prefix));
+                match sent.parse::<hyper::http::uri::PathAndQuery>() {
+                    Ok(_) => serde_json::json!({"decoded": path, "sent": sent}),
+                    Err(_) => serde_json::Value::Null,
+                }
+            }
+            None => serde_json::Value::Null,
+        };
+        writeln!(out, "{said}").map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 /// `/v<digits>[.<digits>]` followed by `/` or nothing: a path that names its API version, which
 /// the Python gateway resolves differently from one that does not.
 fn names_a_version(path: &str) -> bool {
@@ -737,12 +852,10 @@ fn bearer_token(value: &[u8]) -> Option<&[u8]> {
 fn decide<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, now: u64, denied: impl Fn(&Digest32) -> bool) -> Decision<'a> {
     const PYTHON: Decision<'static> = Decision::Ask(None);
     let uri = req.uri();
-    let path = uri.path();
-    // An escaped or non-ASCII path reads differently once decoded, and what the key may reach
-    // and what a policy matches are decided on the decoded one.
-    if uri.authority().is_some() || !path.is_ascii() || path.contains('%') {
-        return PYTHON;
-    }
+    // An escaped path reads differently once decoded, and what the key may reach, what a policy
+    // matches and where the request goes are all decided on the decoded one.
+    let Some(path) = decoded(uri.path()).filter(|_| uri.authority().is_none()) else { return PYTHON };
+    let path = &*path;
     if let Some(rest) = path.strip_prefix("/agents/") {
         return agent_call(snap, peer, req, rest).map(Decision::Agent).unwrap_or(PYTHON);
     }
@@ -871,6 +984,10 @@ fn decide<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, now: u6
     if names_a_version(asked) || snap.transformed(method, asked, path) {
         return PYTHON;
     }
+    // What the backend is asked for must be something this side's HTTP client will send.
+    if !plain_path(asked) && sent_path(asked).parse::<hyper::http::uri::PathAndQuery>().is_err() {
+        return PYTHON;
+    }
     Decision::Native(Native { protocol, backend, entry, route, version, ip, method, html })
 }
 
@@ -993,6 +1110,10 @@ fn query_survives(query: &str) -> bool {
 /// unknown slug, a browser, and anything unusual about the request are the Python gateway's.
 fn agent_call<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, after: &str) -> Option<AgentCall<'a>> {
     let (uri, headers) = (req.uri(), req.headers());
+    // An escaped path under the agent edge is forwarded by other code there: the Python gateway's.
+    if uri.path().contains('%') {
+        return None;
+    }
     let (slug, rest) = after.split_once('/').unwrap_or((after, ""));
     let backend = snap.agents.get(slug)?;
     let failure = snap.agent_failure.as_ref()?;
@@ -1611,7 +1732,8 @@ struct Answered<'a> {
 /// counted, and logged without a key.
 fn finish<B>(w: &Worker, mut resp: Response<Body>, a: &Answered, req: &Request<B>, t: &Trace, started: Instant, at: Duration) -> Response<Body> {
     let st = &*w.shared;
-    let path = req.uri().path();
+    let path = decoded(req.uri().path()).unwrap_or(Cow::Borrowed(req.uri().path()));
+    let path = &*path;
     let status = resp.status().as_u16();
     let seconds = started.elapsed().as_secs_f64();
     let bytes_out = resp.body().size_hint().exact().unwrap_or(0);
@@ -1723,7 +1845,8 @@ pub async fn handle(w: Arc<Worker>, peer: SocketAddr, mut req: Request<Incoming>
         as_http1_names_it(&mut req);
     }
     // The control plane's internal endpoints are never reachable from clients.
-    if req.uri().path().starts_with("/internal/") {
+    // However the path is escaped: the Python gateway decodes it before routing it.
+    if unescaped(req.uri().path()).starts_with(b"/internal/") {
         let mut resp = Response::new(full("{\"detail\":\"Not Found\"}"));
         *resp.status_mut() = StatusCode::NOT_FOUND;
         resp.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -1800,7 +1923,8 @@ pub async fn handle(w: Arc<Worker>, peer: SocketAddr, mut req: Request<Incoming>
     }
     let t = trace_for(req.headers());
     let uri = req.uri().clone();
-    let path = uri.path();
+    let path = decoded(uri.path()).unwrap_or(Cow::Borrowed(uri.path()));
+    let path = &*path;
     let tenant = entry.tenant.as_deref();
     let user_agent = (st.reporter.is_some() || st.access_log.is_some()).then(|| req.headers().get(USER_AGENT).cloned()).flatten();
     let referrer = st.access_log.as_ref().and_then(|_| req.headers().get(REFERER).cloned());
@@ -1880,15 +2004,19 @@ pub async fn handle(w: Arc<Worker>, peer: SocketAddr, mut req: Request<Incoming>
                 } else if !backend.breaker.allow(&cb, Instant::now()) {
                     (circuit_open(&t), Some("SERVICE_UNAVAILABLE"))
                 } else {
+                    let asked = match n.route {
+                        Some(route) => route.rewrite.as_deref().unwrap_or(path),
+                        None => upstream_path(path, n.protocol),
+                    };
+                    // Asked for as it came when nothing about it changes on the way.
+                    let untouched = backend.upstream.prefix.is_empty() && asked == uri.path() && plain_path(asked);
+                    let wire = (!untouched && !grpc).then(|| sent_path(&format!("{}{asked}", backend.upstream.prefix)));
                     let native = Sent {
                         trace: &t,
                         version: n.version,
                         inject_request_id: snap.inject_request_id,
                         protocol: n.route.map(|r| r.protocol.as_str()).unwrap_or(n.protocol.name()),
-                        path: match n.route {
-                            Some(route) => route.rewrite.as_deref(),
-                            None => Some(upstream_path(path, n.protocol)).filter(|p| *p != path),
-                        },
+                        path: wire.as_deref(),
                     };
                     let limit = n.route.and_then(DynamicRoute::timeout).unwrap_or(snap.upstream_timeout);
                     let answer = match grpc {
@@ -2023,7 +2151,8 @@ struct Sent<'a> {
     inject_request_id: bool,
     /// The protocol name the backend is told.
     protocol: &'a str,
-    /// The path to ask the backend for, when it is not the one the client asked for.
+    /// The whole path to ask the backend for (its own prefix included), when it is not the one
+    /// the client asked for.
     path: Option<&'a str>,
 }
 
@@ -2061,8 +2190,8 @@ async fn forward(
     let asked = parts.path_and_query.as_ref();
     let target = match native.as_ref().and_then(|sent| sent.path) {
         Some(path) => Some(match asked.and_then(|p| p.query()) {
-            Some(query) => format!("{}{path}?{query}", to.prefix),
-            None => format!("{}{path}", to.prefix),
+            Some(query) => format!("{path}?{query}"),
+            None => path.to_owned(),
         }),
         None if asked.is_none() || !to.prefix.is_empty() => Some(format!("{}{}", to.prefix, asked.map(|p| p.as_str()).unwrap_or("/"))),
         None => None,
@@ -2266,6 +2395,47 @@ mod tests {
         assert!(ask(&listed, &[("origin", "https://app.example"), ("access-control-request-method", "GET"), ("access-control-request-method", "POST")]).is_none());
         let silent = rules(r#"{"any_origin":true,"origins":[],"credentials":false}"#);
         assert!(ask(&silent, &[("origin", "https://app.example"), ("access-control-request-method", "GET")]).is_none());
+    }
+
+    #[test]
+    fn an_escaped_path_is_read_decoded_and_written_again_as_httpx_writes_it() {
+        for (raw, read) in [
+            ("/api/users", Some("/api/users")),
+            ("/api/a%20b", Some("/api/a b")),
+            ("/api/caf%C3%A9", Some("/api/caf\u{e9}")),
+            ("/%61pi/x", Some("/api/x")),
+            ("/api/a%2Fb", Some("/api/a/b")),
+            ("/api/100%", Some("/api/100%")),
+            ("/api/%zz%4", Some("/api/%zz%4")),
+            ("/api/%2525", Some("/api/%25")),
+            ("/api/a%3Fb", None),
+            ("/api/a%23b", None),
+            ("/api/a%00b", None),
+            ("/api/a%7Fb", None),
+            ("/api/%FF", None),
+            ("/api/caf\u{e9}", None),
+        ] {
+            assert_eq!(decoded(raw).as_deref(), read, "{raw}");
+        }
+        for (whole, sent) in [
+            ("/api/users", "/api/users"),
+            ("/api/a b", "/api/a%20b"),
+            ("/api/caf\u{e9}", "/api/caf%C3%A9"),
+            ("/api/a|b", "/api/a%7Cb"),
+            ("/api/it's;[1]@:x", "/api/it's;[1]@:x"),
+            // Made only of safe characters and whole escapes: left alone. Otherwise a `%` is escaped too.
+            ("/api/%41", "/api/%41"),
+            ("/api/100%", "/api/100%25"),
+            ("/api/a b%20c", "/api/a%20b%2520c"),
+            ("/api/a/../b", "/api/b"),
+            ("/api/./a/.", "/api/a"),
+            ("/base/../../x", "/x"),
+            ("/..", "/"),
+            ("/a/...", "/a/..."),
+        ] {
+            assert_eq!(sent_path(whole), sent, "{whole}");
+        }
+        assert!(plain_path("/api/users/7") && !plain_path("/api/a b") && !plain_path("/api/./a") && !plain_path("/api/.hidden"));
     }
 
     #[test]
@@ -2481,7 +2651,11 @@ mod tests {
     fn what_this_side_cannot_be_sure_of_goes_to_python() {
         let snap = governed("", "");
         for (method, uri) in [
-            ("GET", "/api/a%2Fb"),
+            ("GET", "/api/a%3Fb"),
+            ("GET", "/api/a%23b"),
+            ("GET", "/api/a%00b"),
+            ("GET", "/api/%C3%28"),
+            ("GET", "/%61dmin/api-keys"),
             ("GET", "/api/caf\u{e9}"),
             ("OPTIONS", "/api/users"),
             ("PROPFIND", "/api/users"),
@@ -2741,7 +2915,7 @@ mod tests {
         // Without the wording (a plugin may authenticate some other way), the Python gateway answers.
         assert_eq!(outcome(&governed("", ""), &with_headers(&[]), 0, false), "ask");
         // What the Python gateway does not treat as a gateway request is not refused here either.
-        for (method, uri) in [("GET", "/health"), ("GET", "/admin/api-keys"), ("OPTIONS", "/api/users"), ("GET", "/agents/a"), ("GET", "/api/a%20b")] {
+        for (method, uri) in [("GET", "/health"), ("GET", "/admin/api-keys"), ("OPTIONS", "/api/users"), ("GET", "/agents/a"), ("GET", "/api/a%3Fb"), ("GET", "/api/a%0Ab"), ("GET", "/api/%FF")] {
             let req = Request::builder().method(method).uri(uri).body(()).unwrap();
             assert_eq!(outcome(&snap, &req, 0, false), "ask", "{method} {uri}");
         }

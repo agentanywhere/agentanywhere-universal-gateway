@@ -221,6 +221,10 @@ fn main() {
     if std::env::args().nth(1).as_deref() == Some("--judge-preflights") {
         return proxy::judge_preflights().unwrap_or_else(|e| fail(e));
     }
+    // `dataplane --judge-paths` answers, for paths on stdin, how each is read and what a backend is asked for.
+    if std::env::args().nth(1).as_deref() == Some("--judge-paths") {
+        return proxy::judge_paths().unwrap_or_else(|e| fail(e));
+    }
     if std::env::args().nth(1).as_deref() == Some("--judge-publishes") {
         return pyjson::judge_stdin().unwrap_or_else(|e| fail(e));
     }

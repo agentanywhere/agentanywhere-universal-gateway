@@ -98,5 +98,7 @@ jobs:
         run: python dataplane/conformance/publish.py
       - name: Transformation rule patterns against the Python matcher
         run: python dataplane/conformance/patterns.py
+      - name: Escaped paths against the server and client the Python gateway uses
+        run: python dataplane/conformance/paths.py
       - name: Preflight answers against the CORS middleware
         run: python dataplane/conformance/preflight.py
