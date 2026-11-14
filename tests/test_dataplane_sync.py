@@ -1117,13 +1117,12 @@ def test_the_snapshot_says_what_a_rule_does_when_the_data_plane_can_do_the_same(
         return dataplane_sync._rule_actions(TransformationRule.from_dict({"name": "r", **sides}))
 
     nothing = {"rename": [], "remove": [], "set": []}
-    no_fields = {"body_rename": [], "body_remove": [], "body_set": []}
     assert actions() == {"request": None, "response": None}
     assert actions(request_config={
         "headers_rename": {"X-Old": "X-New"}, "headers_remove": ["X-Secret", "x-secret", "X-B"], "headers_set": {"X-A": "1", "x-b": "two words"},
         "query_remove": ["debug"], "query_set": {"source": "gw", "empty": ""}}) == {"response": None, "request": {
             "rename": [["X-Old", "X-New"]], "remove": ["x-b", "x-secret"], "set": [["X-A", "1"], ["x-b", "two words"]],
-            "query_remove": ["debug"], "query_set": [["source", "gw"], ["empty", ""]], **no_fields}}
+            "query_remove": ["debug"], "query_set": [["source", "gw"], ["empty", ""]]}}
     # The fields of a request's body: a value to set goes as its JSON text.
     assert actions(request_config={"body_rename": {"user": "meta.user"}, "body_remove": ["secret"],
                                    "body_set": {"meta.source": "gateway", "n": 1.5, "tags": ["a", {"b": None}], "caf\u00e9": "\u00e9"}})["request"] == {
@@ -1133,7 +1132,7 @@ def test_the_snapshot_says_what_a_rule_does_when_the_data_plane_can_do_the_same(
         "request": None, "response": {**nothing, "set": [["X-A", "1"]], "status": [[500, 502]]}}
     # A rule that only changes what is not looked at on that side changes nothing there.
     assert actions(request_config={"status_map": {"200": 204}}, response_config={"query_set": {"a": "b c"}, "path_rewrite": {"pattern": "a"}}) == {
-        "request": {**nothing, "query_remove": [], "query_set": [], **no_fields}, "response": {**nothing, "status": []}}
+        "request": {**nothing, "query_remove": [], "query_set": []}, "response": {**nothing, "status": []}}
 
     # Anything else is this gateway's to apply: an answer's body, templates, the path, code...
     for kept in ({"body_set": {"a": 1}}, {"body_remove": ["a"]}, {"body_rename": {"a": "b"}}):

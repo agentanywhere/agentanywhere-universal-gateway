@@ -309,8 +309,10 @@ def _body_actions(cfg: Any) -> Optional[Dict[str, Any]]:
         return None
     if not all(_plain_json(value) for value in to_set.values()):
         return None
-    return {"body_rename": [[old, new] for old, new in rename.items()], "body_remove": list(remove),
-            "body_set": [[path, json.dumps(value)] for path, value in to_set.items()]}
+    fields = {"body_rename": [[old, new] for old, new in rename.items()], "body_remove": list(remove),
+              "body_set": [[path, json.dumps(value)] for path, value in to_set.items()]}
+    # Most rules change no body, and say nothing of it.
+    return {name: steps for name, steps in fields.items() if steps}
 
 
 def _rule_actions(rule: Any) -> Optional[Dict[str, Any]]:
