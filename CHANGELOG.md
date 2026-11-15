@@ -53,6 +53,8 @@ See [docs/known-limitations.md](docs/known-limitations.md) for the full list.
 
 ### Fixed
 
+- A backend that sets more than one cookie has each `Set-Cookie` line passed on as its own line. They were
+  joined into one line by commas, which a browser does not read as cookies.
 - Transformations: a rule that changes a request's body now works. The new
   body was sent with the length the caller declared for the old one, so the
   request never reached the backend and the caller got a 502. Three related

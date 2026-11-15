@@ -2448,12 +2448,30 @@ async def answer_from(response, method: str, path: str, request_headers: Dict[st
         except Exception as exc:
             logger.warning("plugin_response_transform_failed", error=str(exc))
 
-    return Response(
+    answer = Response(
         content=content,
         status_code=final_status_code,
         headers=response_headers,
         media_type=response.headers.get("content-type", "application/json")
     )
+    _keep_cookie_lines(answer, response)
+    return answer
+
+
+def _keep_cookie_lines(answer: Response, upstream) -> None:
+    """Give the caller each ``Set-Cookie`` line of a backend's answer as its own line.
+
+    The answer's headers are read into a dictionary on the way, where the lines of one name
+    are joined by a comma, and cookies joined that way are no longer cookies a browser can
+    read. The lines are put back as they came, unless a rule or a plugin has changed the
+    header since."""
+    cookies = [value for name, value in upstream.headers.raw if name.lower() == b"set-cookie"]
+    if len(cookies) < 2:
+        return
+    lines = answer.raw_headers
+    found = [i for i, (name, _) in enumerate(lines) if name == b"set-cookie"]
+    if len(found) == 1 and lines[found[0]][1] == b", ".join(cookies):
+        lines[found[0]:found[0] + 1] = [(b"set-cookie", cookie) for cookie in cookies]
 
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
