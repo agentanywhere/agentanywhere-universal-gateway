@@ -53,6 +53,10 @@ See [docs/known-limitations.md](docs/known-limitations.md) for the full list.
 
 ### Fixed
 
+- Agent edge: a WebSocket relayed to an agent (`/agents/<slug>/...`) now passes
+  on the close code and reason of whichever side closes first, as `/ws` does.
+  The caller was told 1000 whatever the agent closed with, and the agent
+  likewise.
 - A backend that sets more than one cookie has each `Set-Cookie` line passed on as its own line. They were
   joined into one line by commas, which a browser does not read as cookies.
 - Transformations: a rule that changes a request's body now works. The new

@@ -147,12 +147,20 @@ The gateway's own health endpoints are answered here on a plain `GET`, each for 
 With the Python gateway down, the health path and `/ready` therefore answer 502 and `/live` still answers 200.
 
 **WebSocket.** A handshake for `/ws/...` is relayed here when `WEBSOCKET_BACKEND_URL` is a `ws://` address (or `wss://`, see TLS below) and the
-key is certain to be let in: sent in `X-API-Key`, known, working and allowed that path, with no IP rule or policy
-configured. The backend is asked for the rest of the path and the query, and sent only the handshake, the subprotocols
+key is certain to be let in: known, working and allowed that path, with no IP rule or policy
+configured. The key is read where the Python gateway reads it: in the query's `api_key` (the last one given, unless it
+is empty), or else in `X-API-Key`. The backend is asked for the rest of the path and the query, without `api_key` and
+without empty parts, and sent only the handshake, the subprotocols
 offered and the caller's `Authorization` and `Cookie`; never the gateway's key. Once it accepts, the connection is a
 tunnel: bytes go both ways until either side closes. If it refuses or cannot be reached, the caller gets 403. Every
-other handshake (a key in `?api_key=`, an unknown key, `/agents/<slug>/...`, any IP rule or policy in force) is tunnelled
+other handshake (an unknown key, a key or a name in the query that is escaped, any IP rule or policy in force) is tunnelled
 to the Python gateway, which relays or refuses as it always does.
+
+A handshake for `/agents/<slug>/...` is relayed here to a registered agent, at its address read as `ws://` for
+`http://` and `wss://` for `https://`. As for any other request to an agent, no gateway key is asked for. The agent is
+asked for the rest of the path and the query exactly as they came, and sent the same few headers. An agent behind TLS
+is this side's only with `SSL_CERT_FILE` given, as for a `wss://` backend; an unknown slug is the Python gateway's to
+refuse.
 
 **OAuth2 tokens.** An access token the Python gateway issued is a credential in `Authorization: Bearer <token>`, and
 the snapshot lists each by its SHA-256 digest, never the token. One that is listed and has not run out is served here
@@ -381,8 +389,9 @@ here is the reverse of everywhere else: **whatever this side cannot be sure of i
 | An OAuth2 token in `Authorization: Bearer`, listed in the snapshot, under the IP rules and policies | data plane |
 | A credential seen for the first time; two credentials of which the key does not work | Python |
 | Browsers | data plane, with the gateway's error pages |
-| WebSocket under `/ws/`, key in `X-API-Key`, no IP rules or policies | data plane |
-| Any other WebSocket (`?api_key=`, `/agents/<slug>`, rules or policies in force) | Python, through a tunnel |
+| WebSocket under `/ws/`, key in `X-API-Key` or in the query's `api_key`, no IP rules or policies | data plane |
+| WebSocket under `/agents/<slug>/` to a registered agent | data plane |
+| Any other WebSocket (IP rules or policies in force, an escaped key, an unknown slug) | Python, through a tunnel |
 | gRPC calls (HTTP/2, `application/grpc`) | data plane only; refused when it cannot be sure |
 | `POST /mqtt/publish` (broker at `mqtt://`, or `mqtts://` with `SSL_CERT_FILE`), body certain to publish the same message | data plane, over its own connection to the broker |
 | Any other publish (a body this side is not sure of, `mqtts://` without `SSL_CERT_FILE`, the connection down), `/mqtt/subscribe` | Python |
@@ -417,7 +426,8 @@ here is the reverse of everywhere else: **whatever this side cannot be sure of i
   and the backend. Messages, subprotocol and close codes are the same either way.
 * **A WebSocket is checked when it opens, not while it is open.** A key revoked afterwards keeps its open connections,
   here and in the Python gateway alike. Connections are not counted, limited or written to the request log by either.
-* **WebSockets with IP rules or policies, and `wss://` backends without `SSL_CERT_FILE`, are relayed by the Python gateway**, not here.
+* **WebSockets with IP rules or policies, and `wss://` backends and agents without `SSL_CERT_FILE`, are relayed by the Python gateway**, not here.
+* **An agent's WebSocket message above 1 MiB passes here.** The Python gateway's relay closes the connection on one from the agent.
 
 * **`/ready` can be one sync interval behind** (500 ms by default), or as long as a sync that hangs takes to fail
   (five seconds), because it repeats the Python gateway's last answer instead of asking the database itself.

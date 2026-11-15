@@ -1722,7 +1722,6 @@ async def _relay_backend_ws(client_ws: WebSocket, backend_url: str, path: str):
     and the close code of whichever side closes first is passed on to the other.
     """
     import websockets
-    from websockets.exceptions import ConnectionClosed
 
     uri = websocket_backend_uri(backend_url, path, websocket_query(client_ws))
     fwd_headers = {
@@ -1742,6 +1741,20 @@ async def _relay_backend_ws(client_ws: WebSocket, backend_url: str, path: str):
         return
 
     await client_ws.accept(subprotocol=getattr(upstream, "subprotocol", None))
+    try:
+        await _relay_ws(client_ws, upstream)
+    finally:
+        try:
+            await upstream.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+async def _relay_ws(client_ws: WebSocket, upstream):
+    """Pass messages both ways between a caller and the server its connection is relayed to,
+    until either side closes. Text stays text and binary stays binary, and the close code and
+    reason of whichever side closes first are passed on to the other."""
+    from websockets.exceptions import ConnectionClosed
 
     async def client_to_upstream():
         code, reason = 1000, ""
@@ -1783,13 +1796,7 @@ async def _relay_backend_ws(client_ws: WebSocket, backend_url: str, path: str):
             except Exception:  # noqa: BLE001
                 pass
 
-    try:
-        await asyncio.gather(client_to_upstream(), upstream_to_client())
-    finally:
-        try:
-            await upstream.close()
-        except Exception:  # noqa: BLE001
-            pass
+    await asyncio.gather(client_to_upstream(), upstream_to_client())
 
 
 def websocket_query(websocket: WebSocket) -> str:
@@ -1798,42 +1805,9 @@ def websocket_query(websocket: WebSocket) -> str:
 
 
 async def _relay_agent_ws(client_ws: WebSocket, upstream, slug: str):
-    """Bidirectionally relay frames between the browser client and the upstream
-    agent WebSocket until either side closes."""
-    async def client_to_upstream():
-        try:
-            while True:
-                msg = await client_ws.receive()
-                if msg.get("type") == "websocket.disconnect":
-                    break
-                if msg.get("text") is not None:
-                    await upstream.send(msg["text"])
-                elif msg.get("bytes") is not None:
-                    await upstream.send(msg["bytes"])
-        except Exception:
-            pass
-        finally:
-            try:
-                await upstream.close()
-            except Exception:
-                pass
-
-    async def upstream_to_client():
-        try:
-            async for message in upstream:
-                if isinstance(message, (bytes, bytearray)):
-                    await client_ws.send_bytes(bytes(message))
-                else:
-                    await client_ws.send_text(message)
-        except Exception:
-            pass
-        finally:
-            try:
-                await client_ws.close()
-            except Exception:
-                pass
-
-    await asyncio.gather(client_to_upstream(), upstream_to_client())
+    """Relay between the caller and the upstream agent's WebSocket until either side closes,
+    passing on the close code of whichever closes first, as for ``/ws``."""
+    await _relay_ws(client_ws, upstream)
 
 
 @app.websocket("/agents/{full_path:path}")

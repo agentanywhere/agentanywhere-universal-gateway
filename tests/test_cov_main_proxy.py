@@ -914,6 +914,32 @@ def test_agent_ws_relays_both_directions(gw, monkeypatch, edge):
     assert headers == {"Authorization": "Bearer t", "Cookie": "s=1"}
 
 
+def test_agent_ws_close_code_reaches_the_client(gw, monkeypatch, edge):
+    import websockets
+    up = BackendWS(incoming=["bye"], close_code=4001, close_reason="done")
+    monkeypatch.setattr(websockets, "connect", AsyncMock(return_value=up))
+    with gw.websocket_connect("/agents/demo/ws") as ws:
+        assert ws.receive_text() == "bye"
+        with pytest.raises(WebSocketDisconnect) as ei:
+            ws.receive_text()
+    assert (ei.value.code, ei.value.reason) == (4001, "done")
+
+
+def test_agent_ws_client_close_code_reaches_the_agent(gw, monkeypatch, edge):
+    import websockets
+    up = BackendWS(echo=True)
+    monkeypatch.setattr(websockets, "connect", AsyncMock(return_value=up))
+    with gw.websocket_connect("/agents/demo/ws") as ws:
+        ws.send_text("one")
+        assert ws.receive_text() == "echo:one"
+        ws.close(code=4002)
+        for _ in range(100):                     # the relay hears of the close a moment later
+            if up.closed_with:
+                break
+            time.sleep(0.01)
+    assert up.closed_with == (4002, "")
+
+
 def test_agent_ws_old_websockets_signature_falls_back(gw, monkeypatch, edge):
     import websockets
     up = FakeWS(incoming=["x"])

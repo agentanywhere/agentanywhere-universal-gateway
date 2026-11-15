@@ -1218,7 +1218,8 @@ def main() -> int:
                     want=lambda r: r.get("answers") == ['["Bearer t", "s=1", null]'])
             ws_same("the subprotocol is the one the agent chose", "/agents/talker/chat", ["hello"], subprotocols=["chat.v1", "chat.v2"], by="data plane",
                     want=lambda r: r.get("subprotocol") == "chat.v2")
-            ws_same("the agent's close code reaches the client", "/agents/talker/chat", ["hello", "close:4001"], by="data plane")
+            ws_same("the agent's close code and reason reach the client", "/agents/talker/chat", ["hello", "close:4001"], by="data plane",
+                    want=lambda r: r.get("closed") == [4001, "bye"])
             ws_same("an agent behind TLS", "/agents/sealed/chat", ["hello"], by="data plane", want=lambda r: r.get("answers") == ["hello"])
             ws_same("an agent that refuses the handshake", "/agents/talker/refuse", want=lambda r: "refused" in r)
             ws_same("an agent that does not speak WebSocket", "/agents/echo/chat", want=lambda r: "refused" in r)
