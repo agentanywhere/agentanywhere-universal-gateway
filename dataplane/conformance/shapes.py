@@ -94,7 +94,9 @@ ODD_SET = [float("nan"), float("inf"), {1: "a"}, (1, 2), 10 ** 400, "\ud800", {"
 ODD_BODIES = [b"[1, 2]", b'"text"', b"5", b"null", b"true", b"not json", b"\xff\xfe{}", b'{"a":1,"a":{"b":2},"c":3}', b'{"a":NaN}',
               b'{"a":1e400}', b'{"a":-0,"b":1.50,"c":1E2}', b'{"a":"\\ud83d\\ude00\\ud800"}', b"\xef\xbb\xbf{}", b'{"a":' + b"[" * 70 + b"]" * 70 + b"}",
               b'{"a":' + b"9" * 400 + b"}", b" \n{\"a\" :\t1 }\r\n", b'{"a":1,}', b"{'a':1}", b'{"a":"\x01"}', b'{"a":{"b":null},"b":null}',
-              b'{"a":600654557994792.25}', b'{"":{"":1}}', b"{}", b'{"a":1}{"b":2}', b'{"a":Infinity}', b'{"a":01}']
+              b'{"a":600654557994792.25}', b'{"":{"":1}}', b"{}", b'{"a":1}{"b":2}', b'{"a":Infinity}', b'{"a":01}',
+              # A JSON string that spells an object, which an answer is read a second time for.
+              b'"{\\"a\\": 1, \\"user\\": \\"ana\\", \\"secret\\": 2}"', b' "{\\"meta\\": {\\"source\\": 1}}"', b'"[1, 2]"']
 
 
 def a_body(rng):

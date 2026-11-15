@@ -1019,15 +1019,19 @@ fn decide<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, now: u6
     };
     // The rules that apply are applied here when this side was told all they do, and when the
     // request is one they do the same to on both sides.
-    let Some(shaping) = snap.shaping(method, asked, path) else { return PYTHON };
+    let Some(mut shaping) = snap.shaping(method, asked, path) else { return PYTHON };
     if !shaping.is_empty() {
         // Publishing and gRPC have handlers of their own in the Python gateway.
         if publishing || protocol == Protocol::Grpc {
             return PYTHON;
         }
         // An answer the Python gateway streams is passed on there with no rule applied.
-        if !shaping.response.is_empty() && may_be_streamed(path) {
-            return PYTHON;
+        if !shaping.response.is_empty() {
+            match streamed(path, method, req.headers(), uri.query()) {
+                Some(false) => {}
+                Some(true) => shaping.response.clear(),
+                None => return PYTHON,
+            }
         }
         // Of a header given twice, the Python gateway's rules see one line only.
         let headers = req.headers();
@@ -1059,11 +1063,42 @@ fn decide<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, now: u6
     Decision::Native(Native { protocol, backend, entry, route, version, told, ip, method, html, shaping, rewritten })
 }
 
-/// Whether the Python gateway may pass the answer to a request on as a stream
-/// (`should_proxy_streaming_http`, which also looks at what the caller accepts and at the query).
-fn may_be_streamed(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    path.contains("/agui") || path.contains("/acp") || lower.contains("message:stream") || lower.contains("message%3astream")
+/// Whether the Python gateway passes the answer to a request on as a stream
+/// (`should_proxy_streaming_http`): an A2A streaming message, an AG-UI request that asks for
+/// events (in `Accept` or with `?sse=`), an ACP run that does (a POST that accepts them, or
+/// `?stream=`). `None` when the query is not one this side is sure to read as it is read there.
+fn streamed(path: &str, method: &str, headers: &HeaderMap, query: Option<&str>) -> Option<bool> {
+    if path.contains("message:stream") {
+        return Some(true);
+    }
+    let (agui, acp) = (path.contains("/agui"), path.contains("/acp"));
+    if !agui && !acp {
+        return Some(false);
+    }
+    let events = headers.get(ACCEPT).is_some_and(|v| {
+        let accept = v.as_bytes().to_ascii_lowercase();
+        accept.windows(17).any(|w| w == b"text/event-stream")
+    });
+    // An escaped query is read decoded there, and of a name given twice the last value counts
+    // and is the only one sent on: both are the Python gateway's to read.
+    let query = query.unwrap_or("");
+    let asks = |name: &str| {
+        if query.contains(['%', '+']) {
+            return None;
+        }
+        let mut given = query.split('&').map(|pair| pair.split_once('=').unwrap_or((pair, ""))).filter(|(key, _)| *key == name);
+        match (given.next(), given.next()) {
+            (found, None) => Some(found.is_some_and(|(_, value)| matches!(value, "1" | "true" | "yes"))),
+            _ => None,
+        }
+    };
+    if agui && (events || asks("sse")?) {
+        return Some(true);
+    }
+    if acp && path.contains("/runs") && ((method == "POST" && events) || asks("stream")?) {
+        return Some(true);
+    }
+    Some(false)
 }
 
 /// Apply rules' header changes to a request's or an answer's headers. The Python gateway holds
@@ -1200,8 +1235,9 @@ async fn shaped_by_control(w: &Worker, answer: Response<Body>, method: &str, pat
         false => format!("%{b:02X}"),
     }).collect();
     headers.insert("x-answer-path", HeaderValue::from_str(&escaped).map_err(|_| ())?);
-    for (name, value) in &parts.headers {
-        let name = HeaderName::from_bytes(format!("{ANSWER_HEADER}{name}").as_bytes()).map_err(|_| ())?;
+    // Each line under a name of its own, so that two lines of one name stay two on the way.
+    for (i, (name, value)) in parts.headers.iter().enumerate() {
+        let name = HeaderName::from_bytes(format!("{ANSWER_HEADER}{i:04}-{name}").as_bytes()).map_err(|_| ())?;
         headers.append(name, value.clone());
     }
     let said = tokio::time::timeout(Duration::from_secs(30), w.send(to, ask)).await.map_err(|_| ())?.map_err(|_| ())?;
@@ -2924,6 +2960,69 @@ mod tests {
     }
 
     #[test]
+    fn an_answer_is_streamed_when_python_would_stream_it() {
+        let asked = |path: &str, method: &str, accept: Option<&str>, query: Option<&str>| {
+            let mut headers = HeaderMap::new();
+            if let Some(accept) = accept {
+                headers.insert(ACCEPT, HeaderValue::from_str(accept).unwrap());
+            }
+            streamed(path, method, &headers, query)
+        };
+        let events = Some("application/json, Text/Event-Stream;q=0.9");
+        assert_eq!(asked("/a2a/v1/message:stream", "POST", None, None), Some(true));
+        assert_eq!(asked("/a2a/v1/message%3Astream", "POST", None, None), Some(false));
+        assert_eq!(asked("/api/users", "POST", events, Some("sse=1&stream=1")), Some(false));
+        // AG-UI: events accepted, or asked for in the query, where the last word counts.
+        assert_eq!(asked("/agui/run", "POST", None, None), Some(false));
+        assert_eq!(asked("/api/agui/run", "GET", events, None), Some(true));
+        for (query, is) in [("sse=1", true), ("sse=true", true), ("a=1&sse=yes", true), ("sse", false),
+                            ("sse=TRUE", false), ("xsse=1", false), ("sse=1=1", false), ("&&sse=1", true), ("stream=1", false)] {
+            assert_eq!(asked("/agui/run", "POST", None, Some(query)), Some(is), "{query}");
+        }
+        assert_eq!(asked("/agui/run", "POST", None, Some("sse=0&sse=1")), None);
+        assert_eq!(asked("/agui/run", "POST", None, Some("sse=%31")), None);
+        assert_eq!(asked("/agui/run", "POST", None, Some("q=a+b")), None);
+        assert_eq!(asked("/agui/run", "POST", events, Some("q=a+b")), Some(true));
+        // ACP: a run, posted by a caller that accepts events or asked for as a stream.
+        assert_eq!(asked("/acp/runs", "POST", events, None), Some(true));
+        assert_eq!(asked("/acp/runs", "GET", events, None), Some(false));
+        assert_eq!(asked("/acp/runs/42", "GET", None, Some("stream=yes")), Some(true));
+        assert_eq!(asked("/acp/agents", "POST", events, Some("stream=1")), Some(false));
+        assert_eq!(asked("/acp/runs", "GET", None, Some("stream=%31")), None);
+    }
+
+    #[test]
+    fn an_answers_body_is_changed_only_where_python_would_change_it_the_same() {
+        let snap = Snapshot::from_json(
+            r#"{"keys":[],"transform_rules":[{"all":true,"native":true,"request":null,
+                "response":{"body_rename":[["user","meta.user"]],"body_remove":["secret"],"body_set":[["seen","true"]]}},
+                {"all":true,"native":true,"request":null,"response":{"set":[["x-a","1"]]}}]}"#,
+        )
+        .unwrap();
+        let shaping = snap.shaping("GET", "/x", "/x").unwrap();
+        let made = |body: &[u8]| match reshape_answer(body, &shaping.response) {
+            AnswerBody::AsItCame => "as it came".to_owned(),
+            AnswerBody::Unsure => "unsure".to_owned(),
+            AnswerBody::Changed(body) => String::from_utf8(body).unwrap(),
+        };
+        assert_eq!(made(br#" {"user":"ana","secret":1,"n":1.50}"#), r#"{"n": 1.5, "meta": {"user": "ana"}, "seen": true}"#);
+        assert_eq!(made(b"{}"), r#"{"seen": true}"#);
+        // What is no object goes on as it came: nothing, other JSON, no JSON at all.
+        for body in [&b""[..], b"[1, {\"secret\": 2}]", b"5", b"null", b"plain words", b"\xef\xbb\xbf{}", b"\x0b{}"] {
+            assert_eq!(made(body), "as it came", "{body:?}");
+        }
+        // What the Python gateway reads its own way is its to say.
+        for body in [&b"{\"a\": \"caf\xe9\"}"[..], b"\"{\\\"a\\\": 1}\"", b"{\"a\": NaN}", b"{\"a\": 1,", b"{'a': 1}", b"\xff"] {
+            assert_eq!(made(body), "unsure", "{body:?}");
+        }
+        // Nothing left in the object: the body goes on as it came.
+        let only = Snapshot::from_json(r#"{"keys":[],"transform_rules":[{"all":true,"native":true,"request":null,"response":{"body_remove":["secret"]}}]}"#).unwrap();
+        let shaping = only.shaping("GET", "/x", "/x").unwrap();
+        assert!(matches!(reshape_answer(br#"{"secret": 1}"#, &shaping.response), AnswerBody::AsItCame));
+        assert!(matches!(reshape_answer(br#"{"secret": 1, "a": 2}"#, &shaping.response), AnswerBody::Changed(body) if body == br#"{"a": 2}"#));
+    }
+
+    #[test]
     fn a_version_in_the_path_is_recognised_as_python_recognises_it() {
         for (path, named) in [("/v1", ("1", "")), ("/v1/", ("1", "/")), ("/v2/runs", ("2", "/runs")), ("/v10.5/x", ("10.5", "/x")), ("/v0.0", ("0.0", ""))] {
             assert_eq!(version_named(path), Some(named), "{path}");
@@ -3722,9 +3821,11 @@ mod tests {
         assert_ne!(shaped(&ask("PUT", "/api/users?q=a%20b", &[])), "ask");
         // An answer the Python gateway may stream is passed on there with no rule applied.
         assert!(shaped(&ask("GET", "/api/talk/1", &[])).contains("x-powered=|gateway"));
-        assert_eq!(shaped(&ask("GET", "/api/talk/message:stream", &[])), "ask");
-        assert_eq!(shaped(&ask("GET", "/api/talk/Message%3AStream", &[])), "ask");
-        assert_eq!(shaped(&ask("POST", "/api/shaped/acp/runs", &[])), "ask");
+        let streamed = shaped(&ask("GET", "/api/talk/message:stream", &[]));
+        assert!(streamed != "ask" && !streamed.contains("x-powered"), "{streamed}");
+        assert!(shaped(&ask("GET", "/api/talk/Message%3AStream", &[])).contains("x-powered=|gateway"));
+        assert_ne!(shaped(&ask("POST", "/api/shaped/acp/runs", &[])), "ask");
+        assert_eq!(shaped(&ask("POST", "/api/shaped/acp/runs?stream=%31", &[])), "ask");
         assert_ne!(shaped(&ask("GET", "/api/shaped/acp/runs", &[])), "ask");
         // gRPC and publishing have handlers of their own there, which apply no rule.
         assert_eq!(shaped(&ask("PUT", "/grpc/x", &[])), "ask");

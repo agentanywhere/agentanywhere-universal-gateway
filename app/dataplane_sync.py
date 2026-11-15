@@ -441,12 +441,12 @@ def _path_actions(cfg: Any) -> Optional[Dict[str, Any]]:
 
 def _rule_actions(rule: Any) -> Optional[Dict[str, Any]]:
     """What a transformation rule does, when the data plane can do exactly the same: change
-    headers, query parameters and the fields of a JSON body of the request, replace plain text
-    in its path, and change headers and the status of the answer. ``None`` for a rule that does
-    anything else (changes an answer's body, rewrites the path by expression, fills in a
-    template, or is code), or that names a header, a value or a status the two sides might treat
-    differently. Such a rule is applied here: the data plane hands
-    over the requests it applies to."""
+    headers, query parameters and the fields of a JSON body of the request, rewrite its path, and
+    change headers, the status and the fields of a JSON body of the answer. ``None`` for a rule
+    that does anything else (fills in a template, rewrites the path by an expression the two
+    engines read differently, or is code), or that names a header, a value or a status the two
+    sides might treat differently. Such a rule is applied here: the data plane hands over the
+    requests it applies to."""
     if rule.condition is not None or rule.transform_request is not None or rule.transform_response is not None:
         return None
     out: Dict[str, Any] = {"request": None, "response": None}
@@ -1456,8 +1456,9 @@ async def shape_answer(request: Request, x_dataplane_token: Optional[str] = Head
     known to be short, or has a body it might read or write differently.
 
     The answer comes as the request: its body as the backend sent it, its status in
-    ``X-Answer-Status``, each of its headers as ``X-Answer-H-<name>``, and the request it answers
-    in ``X-Answer-Method`` and ``X-Answer-Path`` (percent-escaped). What goes back is one line of
+    ``X-Answer-Status``, each of its header lines as ``X-Answer-H-<n>-<name>`` (``n`` its place
+    among them, in four digits, so that two lines of one name stay two), and the request it
+    answers in ``X-Answer-Method`` and ``X-Answer-Path`` (percent-escaped). What goes back is one line of
     JSON, ``{"status", "headers"}``, then the body. Made by the code that answers a request
     served here (``app.main.answer_from``), so the two cannot differ."""
     import httpx
@@ -1473,7 +1474,10 @@ async def shape_answer(request: Request, x_dataplane_token: Optional[str] = Head
     except (KeyError, ValueError):
         raise HTTPException(status_code=400, detail="not an answer")
     prefix = ANSWER_HEADER.encode()
-    headers = [(name[len(prefix):], value) for name, value in request.headers.raw if name.startswith(prefix)]
+    numbered = sorted((name[len(prefix):], value) for name, value in request.headers.raw if name.startswith(prefix))
+    if any(len(name) < 6 or not name[:4].isdigit() or name[4:5] != b"-" for name, _ in numbered):
+        raise HTTPException(status_code=400, detail="not an answer")
+    headers = [(name[5:], value) for name, value in numbered]
     answer = httpx.Response(status, headers=headers, content=await request.body())
     made = await answer_from(answer, method, path, {}, None)
     lines = [[name.decode("latin-1"), value.decode("latin-1")] for name, value in made.raw_headers]

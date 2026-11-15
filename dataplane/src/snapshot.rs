@@ -1199,11 +1199,13 @@ mod tests {
         // A path only the first rule covers is rewritten by it alone.
         let shaping = snap.shaping("GET", "/other/old/", "/other/old/").unwrap();
         assert_eq!(shaping.rewritten("/other/old/").unwrap().as_deref(), Some("/other/old/"));
-        // A value this side cannot be certain of, a body rule for an answer and a rewrite of
-        // nothing each leave the rule to the Python gateway.
-        for path in ["/odd/1", "/answer/1", "/nothing/1"] {
+        // A value this side cannot be certain of and a rewrite of nothing each leave the rule
+        // to the Python gateway.
+        for path in ["/odd/1", "/nothing/1"] {
             assert!(snap.shaping("POST", path, path).is_none(), "{path}");
         }
+        // A rule for an answer's body is this side's to apply.
+        assert!(snap.shaping("POST", "/answer/1", "/answer/1").is_some());
     }
 
     #[test]

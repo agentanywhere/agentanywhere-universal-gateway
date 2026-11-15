@@ -1723,8 +1723,8 @@ def main() -> int:
                           headers=[("X-Keep", "first"), ("X-Old", "o")], sees={"x-new": "o", "x-shaped": "yes"})
             exchange_same("a query that is not plain words is Python's to take apart", "GET", "/api/routed/shaped/1?q=a%20b&debug=1", by="python", status=201,
                           sees={"x-shaped": "yes"})
-            exchange_same("an answer Python may stream is Python's, with the request still changed", "GET", "/api/routed/shaped/message:stream/1", by="python",
-                          sees={"x-shaped": "yes"})
+            exchange_same("an answer that is streamed has no rule applied to it, with the request still changed", "GET", "/api/routed/shaped/message:stream/1",
+                          sees={"x-shaped": "yes"}, given={"x-powered": None})
             remove_rules(made)
             assert rules_reached("/api/routed/shaped/1", "data plane", False), "removing the rules never reached the data plane"
 
@@ -1814,7 +1814,8 @@ def main() -> int:
                 if a.content != b.content:
                     bad.append(f"the caller was given {a.content[:120]!r} and {b.content[:120]!r}")
                 for header in ("content-type", "content-length", "content-encoding", "x-powered", "x-agent", "set-cookie"):
-                    if a.headers.get_list(header) != b.headers.get_list(header):
+                    # To HEAD the Python gateway says a length of 0; this side says the backend's.
+                    if a.headers.get_list(header) != b.headers.get_list(header) and (method, header) != ("HEAD", "content-length"):
                         bad.append(f"{header}: {a.headers.get_list(header)} and {b.headers.get_list(header)}")
                 if want is not None and not bad and not want(b):
                     bad.append(f"not the expected answer: [{b.status_code}] {b.content[:160]!r}")
@@ -1848,6 +1849,32 @@ def main() -> int:
             remove_rules(made)
             assert wait_until(lambda: tidied(False)), "removing the rules never reached the data plane"
 
+            # An answer the Python gateway passes on as a stream has no rule for answers applied
+            # to it. Whether it is one is decided here as there: by the path, by what the caller
+            # accepts and by the query.
+            made = [post("/admin/transformations", {"name": "mark answers", "path_pattern": pattern, "response_config": {
+                "headers_set": {"X-Powered": "gateway"}, "body_set": {"seen": True}}}) for pattern in ("agui/*", "acp/*")]
+            assert wait_until(lambda: shaped(rs, keys["rs"]["key"], "GET", "/acp/agents").headers.get("x-powered") == "gateway"), "the rule never reached the data plane"
+
+            def stream_same(name, method, path, marked, by="data plane", headers=(), **kw):
+                a, b = shaped(py, keys["py"]["key"], method, path, headers, **kw), shaped(rs, keys["rs"]["key"], method, path, headers, **kw)
+                want = "gateway" if marked else None
+                ok = a.status_code == b.status_code and a.headers.get("x-powered") == b.headers.get("x-powered") == want and a.content == b.content and said_by(b) == by
+                check(f"transformation rules: {name}", ok, f"[{a.status_code}/{b.status_code}] by the {said_by(b)}, X-Powered {a.headers.get('x-powered')} and {b.headers.get('x-powered')}")
+
+            events = [("Accept", "text/event-stream")]
+            stream_same("an answer that is not streamed is changed", "POST", "/agui/run", True, json=thread)
+            stream_same("one the caller accepts as events is passed on as it comes", "POST", "/agui/run", False, headers=events, json=thread)
+            stream_same("so is one asked for as events in the query", "POST", "/agui/run?sse=1", False, json=thread)
+            stream_same("a word given twice in the query is Python's to read: the last counts", "POST", "/agui/run?sse=0&sse=yes", False, by="python", json=thread)
+            stream_same("and may be no", "POST", "/agui/run?sse=yes&sse=0", True, by="python", json=thread)
+            stream_same("an escaped query is Python's to read", "POST", "/agui/run?sse=%31", False, by="python", json=thread)
+            stream_same("an ACP run that accepts events is passed on as it comes", "POST", "/acp/runs", False, headers=events, json=run)
+            stream_same("and one asked for as a stream", "POST", "/acp/runs?stream=true", False, json=run)
+            stream_same("what is no run is changed, whatever it accepts", "GET", "/acp/agents?stream=true", True, headers=events)
+            remove_rules(made)
+            assert wait_until(lambda: "x-powered" not in shaped(rs, keys["rs"]["key"], "GET", "/acp/agents").headers), "removing the rule never reached the data plane"
+
             # A rewrite by an expression both engines read alike, with the groups it puts back.
             made = [post("/admin/transformations", r) for r in (
                 {"name": "turn a user's things around", "path_pattern": "/api/routed/users/*", "request_config": {
@@ -1873,7 +1900,7 @@ def main() -> int:
             # Rules this side is not told the actions of: they change an answer's body or the
             # path by expression, fill in a template, or change a header that the gateway or an HTTP library on
             # the way has a say in.
-            for what, config in (("sets a value in an answer's body that is not plain JSON", {"request_config": {"headers_set": {"X-Shaped": "yes"}}, "response_config": {"body_set": {"seen": float("inf")}}}),
+            for what, config in (("sets a value in an answer's body that is not plain JSON", {"request_config": {"headers_set": {"X-Shaped": "yes"}}, "response_config": {"body_set": {"seen": 10 ** 400}}}),
                                  ("rewrites the path by an expression only Python's engine reads", {"request_config": {"headers_set": {"X-Shaped": "yes"}, "path_rewrite": {"pattern": "/kept/(?=\\d)", "replacement": "/kept/n"}}}),
                                  ("rewrites the path by an expression that can match nothing", {"request_config": {"headers_set": {"X-Shaped": "yes"}, "path_rewrite": {"pattern": "(?:/x)*", "replacement": ""}}}),
                                  ("fills in a template", {"request_config": {"headers_set": {"X-Shaped": "yes"}}, "response_config": {"template": "{{ body | tojson }}"}}),

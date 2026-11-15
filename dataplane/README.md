@@ -197,16 +197,15 @@ then set, query parameters are removed, then set, fields of the body are renamed
 path is rewritten; an answer's status is mapped by each rule in turn. The quirks are the Python gateway's and are kept: a header is found for renaming or
 removing whatever its case, but is set under exactly the name the rule gives, so a header set as `X-Client` arrives
 beside the caller's own `x-client`, not in its place. Any other rule is the Python gateway's to apply, and a request it
-applies to is handed over: a rule that changes an answer's body, fills in a template or rewrites the path by a
-regular expression; one that names a
+applies to is handed over: a rule that fills in a template, sets a value in a body that is not plain JSON, or
+rewrites the path by a regular expression of Python's own; one that names a
 header the gateway or an HTTP library on the way has its own say in (`Host`, `Content-Length`, `User-Agent`, `Accept`,
 `X-Forwarded-For`, `X-Request-ID`, the version and trace headers; on an answer also `Content-Type`, `Set-Cookie`,
 `Vary` and the cross-origin, rate-limit and tenant headers); one with a header name or value that is not plain ASCII
 without a space at either end, or a query word of other than unreserved characters; one that maps a status to or from
 one without a body (below 200, 204, 205, 304). So are a request that gives a header the rules name more than once
 (the Python gateway's rules see one line of it), a request whose query is not plain `key=value` words when a rule
-changes the query, and a request whose answer the Python gateway may pass on as a stream (it applies no rule to
-those) when a rule would change the answer. gRPC and `POST /mqtt/publish` have handlers of their own there, which
+changes the query. gRPC and `POST /mqtt/publish` have handlers of their own there, which
 apply no rule; a rule that matches one keeps it with the Python gateway, as before, and so does a rule that matches
 an agent's path. `python dataplane/conformance/shapes.py` generates rules as the admin API takes them and exchanges to
 apply them to, and checks that what the backend is sent and what the caller is given are what the Python gateway's
@@ -272,9 +271,27 @@ path on the way (`/v2/runs` is asked for as `/runs`, `/v2` as `/`). A version th
 is removed or has a backend of its own keeps its requests with the Python gateway, which announces or refuses it; so
 does a path whose first segment has a digit from another script, which Python's expression counts as a digit.
 
-An answer's body is the backend's, byte for byte, on both sides: the Python gateway reads and rewrites a body only
-for a rule that changes bodies, and such a rule is its own to apply. This side could not hand an answer over once the
-backend has given it, should it not be certain of the body, so it does not start.
+An answer's body is read only for a rule that changes its fields; without one it is the backend's, byte for byte.
+Such a rule is applied here to an answer that states a length of 1 MiB or less, is not compressed and is UTF-8. As
+in the Python gateway, a JSON object is changed by each rule in turn and written again in Python's spelling, unless
+nothing is left in it, and then the body goes on as it came; so does a body that is no JSON, or JSON of another kind.
+The answer's headers and status are changed by the same rules.
+
+A request cannot be handed over once the backend has answered it, so an answer this side is not certain of is shown
+to the Python gateway instead: `POST /internal/dataplane/shape-answer`, with the data plane's token, carries the
+backend's status, header lines and body, and is answered with the status, headers and body the caller is to be given.
+The code that answers a request served by the Python gateway makes that answer (`app.main.answer_from`), so the
+caller is given what the Python gateway alone would have given. It is asked for an answer that is compressed, states
+no length (sent in pieces) or one over 1 MiB, is not UTF-8 (no rule is applied to such an answer there), is a JSON
+string (read a second time there for the object it may spell), or holds anything this side might read or write
+differently (a number JSON does not have, a member named twice in a way that matters). If the Python gateway cannot
+be asked, the caller gets a 502: the backend's answer is not passed on unchanged. Without a link to the Python
+gateway (`--snapshot` alone), a request such a rule applies to is handed over whole, as before.
+
+An answer the Python gateway passes on as a stream has no rule for answers applied to it. Whether it is one is
+decided here as there: an A2A `message:stream` path, an AG-UI path whose caller accepts `text/event-stream` or asks
+with `?sse=`, an ACP run posted by a caller that accepts events or asked for with `?stream=`. A query that is escaped,
+or gives `sse` or `stream` twice, is the Python gateway's to read, and so is the request.
 
 **Browsers.** A caller that prefers `text/html` (decided as the Python gateway decides it: `text/html` accepted, JSON
 not named before it, no `X-Requested-With: XMLHttpRequest`) is shown errors as pages. A successful request is
@@ -380,8 +397,10 @@ here is the reverse of everywhere else: **whatever this side cannot be sure of i
 | The JSON-to-gRPC bridge under `/grpc` | Python |
 | A path that matches a dynamic route to an `http://` or `https://` backend | data plane, to the route's backend |
 | A path that matches a dynamic route to any other backend | Python |
-| A request a transformation rule applies to (by path pattern and method), when the rule changes headers, query parameters, the fields of the request's JSON body or the status, or rewrites the path by plain text or by an expression both engines read alike | data plane, which applies it |
-| The same, when the rule changes an answer's body or a header the gateway has its own say in, rewrites the path by an expression of Python's own, fills in a template, or the request is one the two sides would read differently | Python, which applies it |
+| A request a transformation rule applies to (by path pattern and method), when the rule changes headers, query parameters, the fields of the request's JSON body, the status or the headers of the answer, or rewrites the path by plain text or by an expression both engines read alike | data plane, which applies it |
+| An answer whose body a rule changes, when it is short, not compressed and a JSON object this side reads as Python does | data plane, which applies the rule |
+| Any other answer whose body a rule changes | data plane, with the answer shaped by Python (`/internal/dataplane/shape-answer`) |
+| The same, when the rule changes a header the gateway has its own say in, rewrites the path by an expression of Python's own, fills in a template, or the request is one the two sides would read differently | Python, which applies it |
 | Any transformation rule whose regular expression the two engines could read differently | Python, for every path |
 | Request-altering plugins (when any exist) | Python, for every path |
 | The health path, `/ready` and `/live`, on a plain `GET` | data plane |
@@ -434,6 +453,11 @@ here is the reverse of everywhere else: **whatever this side cannot be sure of i
 * **Tail latency needs dedicated cores** (see Threads). On a machine shared with the load generator and the backend,
   p95 and p99 were worse than the earlier work-stealing build at low concurrency; with pinned cores on Linux they were
   equal or better. No comparison against other gateways has been run yet.
+* **An answer to `HEAD` keeps the length the backend stated.** The Python gateway states a length of 0.
+* **A query that gives a name twice reaches the backend whole here.** The Python gateway reads a query into a
+  dictionary and sends on the last value of each name only; so a backend sees `?tag=a&tag=b` from this side and
+  `?tag=b` from that one. Where a rule changes the query, or the request is for an agent, such a request is the
+  Python gateway's.
 * The `Server` response header differs (uvicorn on one side), and native answers add `X-Served-By`.
 
 ## Tests
