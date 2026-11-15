@@ -260,6 +260,7 @@ fn main() {
         reporter,
         access_log: args.access_log.then(accesslog::AccessLog::start),
         mqtt,
+        token: args.token.as_deref().and_then(|t| hyper::header::HeaderValue::from_str(t).ok()),
     });
     state.replace(snap);
     mqtt::start(state.clone(), mqtt_events).unwrap_or_else(|e| fail(format!("cannot start the MQTT thread: {e}")));

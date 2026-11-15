@@ -45,7 +45,7 @@ import time
 from datetime import datetime, time as dtime, timezone
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -454,9 +454,8 @@ def _rule_actions(rule: Any) -> Optional[Dict[str, Any]]:
         cfg = rule.request_config if side == "request" else rule.response_config
         if cfg is None:
             continue
-        # A template is filled in by an engine of this side's; an answer's body cannot be handed
-        # over once the backend has given it, should the data plane not be certain of it.
-        if cfg.template or (side == "response" and (cfg.body_set or cfg.body_remove or cfg.body_rename)):
+        # A template is filled in by an engine of this side's.
+        if cfg.template:
             return None
         if side == "request":
             actions = _header_actions(cfg, _REQUEST_HEADERS_KEPT)
@@ -475,9 +474,12 @@ def _rule_actions(rule: Any) -> Optional[Dict[str, Any]]:
             actions["query_set"] = [[k, v] for k, v in to_set.items()]
         else:
             actions = _header_actions(cfg, _RESPONSE_HEADERS_KEPT, _RESPONSE_PREFIXES_KEPT)
-            statuses = cfg.status_map
-            if actions is None or not isinstance(statuses, dict):
+            fields, statuses = _body_actions(cfg), cfg.status_map
+            if actions is None or fields is None or not isinstance(statuses, dict):
                 return None
+            # An answer whose body the data plane is not certain of, it shows to this gateway
+            # (`shape_answer`), which then applies the rule.
+            actions.update(fields)
             mapped = []
             for was, becomes in statuses.items():
                 if not (isinstance(was, str) and type(becomes) is int and becomes in _STATUS_MAPPED):
@@ -1442,6 +1444,40 @@ async def report(
     out["keys_updated"] = await apply_key_usage(db, body.keys_used)
     out["events"] = await apply_events(db, body.events)
     return out
+
+
+ANSWER_HEADER = "x-answer-h-"
+
+
+@router.post("/shape-answer")
+async def shape_answer(request: Request, x_dataplane_token: Optional[str] = Header(default=None)) -> Response:
+    """What a caller is given for a backend's answer the data plane holds and is not certain of
+    changing as this gateway's transformation rules change it: one that is compressed, is not
+    known to be short, or has a body it might read or write differently.
+
+    The answer comes as the request: its body as the backend sent it, its status in
+    ``X-Answer-Status``, each of its headers as ``X-Answer-H-<name>``, and the request it answers
+    in ``X-Answer-Method`` and ``X-Answer-Path`` (percent-escaped). What goes back is one line of
+    JSON, ``{"status", "headers"}``, then the body. Made by the code that answers a request
+    served here (``app.main.answer_from``), so the two cannot differ."""
+    import httpx
+    from urllib.parse import unquote
+
+    from app.main import answer_from
+
+    _authorize(x_dataplane_token)
+    try:
+        status = int(request.headers["x-answer-status"])
+        method = request.headers["x-answer-method"]
+        path = unquote(request.headers["x-answer-path"], errors="strict")
+    except (KeyError, ValueError):
+        raise HTTPException(status_code=400, detail="not an answer")
+    prefix = ANSWER_HEADER.encode()
+    headers = [(name[len(prefix):], value) for name, value in request.headers.raw if name.startswith(prefix)]
+    answer = httpx.Response(status, headers=headers, content=await request.body())
+    made = await answer_from(answer, method, path, {}, None)
+    lines = [[name.decode("latin-1"), value.decode("latin-1")] for name, value in made.raw_headers]
+    return Response(json.dumps({"status": made.status_code, "headers": lines}).encode() + b"\n" + made.body, media_type="application/octet-stream")
 
 
 @router.get("/snapshot")

@@ -31,6 +31,7 @@ difference, and if ordinary rules are not being described to the data plane at a
 
 Headers are compared as a receiver reads them: for each name, whatever its case, the values in order.
 """
+import asyncio
 import json
 import random
 import signal
@@ -46,7 +47,8 @@ from starlette.datastructures import QueryParams  # noqa: E402
 from starlette.responses import Response  # noqa: E402
 
 from app.dataplane_sync import _path_actions, _rule_actions  # noqa: E402
-from app.transformers import RequestTransformer, ResponseTransformer, TransformConfig, TransformationRule, _apply_path_rewrite  # noqa: E402
+from app.main import answer_from  # noqa: E402
+from app.transformers import RequestTransformer, ResponseTransformer, TransformConfig, TransformationRule, _apply_path_rewrite, transformation_manager  # noqa: E402
 
 BIN = ROOT / "dataplane/target/release/dataplane"
 NAMES = ["x-a", "X-A", "X-a", "x-b", "X-B", "x-c", "X-C", "x-trace-me", "X-Trace-Me", "authorization", "Authorization",
@@ -179,8 +181,10 @@ def a_rule(rng, n):
             **header_actions(rng),
             "status_map": dict(some(rng, lambda: (str(pick(rng, STATUSES, ["abc", "0200", "204", "20"])), pick(rng, STATUSES, ODD_STATUSES)))),
         }
-        if rng.random() < 0.03:
-            rule["response_config"]["body_remove"] = ["secret"]
+        if rng.random() < 0.5:
+            rule["response_config"].update(body_actions(rng))
+        if rng.random() < 0.02:
+            rule["response_config"]["template"] = "{{ body }}"
     return rule
 
 
@@ -204,8 +208,15 @@ def an_exchange(rng):
     for n in rng.sample(NAMES, rng.randint(0, 8)):
         answer += [[n, rng.choice(VALUES)] for _ in range(rng.choice([1, 1, 1, 2, 3]))]
     path = "/" + "/".join(rng.choice(SEGMENTS) for _ in range(rng.randint(0, 5)))
+    status = rng.choice(STATUSES + [204, 304])
+    # Most answers that may have a body have one, with its length and, usually, what it is.
+    given = a_body(rng) if status not in (204, 304) and rng.random() < 0.7 else None
+    if given is not None:
+        answer.append(["content-length", str(len(given))])
+        if rng.random() < 0.7:
+            answer.append(["content-type", rng.choice(["application/json", "text/plain", "application/json; charset=utf-8"])])
     return {"headers": headers, "query": query, "body": body.hex() if body is not None else None, "path": path, "answer": answer,
-            "status": rng.choice(STATUSES + [204, 304])}
+            "answer_body": given.hex() if given is not None else None, "status": status}
 
 
 def as_read(lines):
@@ -240,17 +251,28 @@ def python_says(rules, case):
     sent = httpx.Request(method, "http://backend:9000/x", headers=headers, params=query, content=content, json=json_payload)
     sent_headers = [(n, v) for n, v in sent.headers.raw if n.lower() != b"host"]
 
-    after = ResponseTransformer()
-    after.rules = rules
-    arrived = httpx.Response(case["status"], headers=[tuple(line) for line in case["answer"]])
-    status, answer, _ = after.transform(case["status"], dict(arrived.headers), None, {"method": "GET", "path": "x"})
-    given = Response(content=None, status_code=status or case["status"], headers=answer)
+    lines = [tuple(line) for line in case["answer"]]
+    if case["answer_body"] is not None:
+        # An answer with a body, through the gateway's own code for answers.
+        transformation_manager.rules_by_id = {rule.id: rule for rule in rules}
+        arrived = httpx.Response(case["status"], headers=lines, content=bytes.fromhex(case["answer_body"]))
+        given = asyncio.run(answer_from(arrived, "GET", "x", {}, None))
+        said = [(n, v) for n, v in given.raw_headers if n != b"content-type" or any(name.lower() == "content-type" for name, _ in lines)]
+        answer, body = as_read(said), given.body.hex()
+    else:
+        after = ResponseTransformer()
+        after.rules = rules
+        arrived = httpx.Response(case["status"], headers=lines)
+        status, answer, _ = after.transform(case["status"], dict(arrived.headers), None, {"method": "GET", "path": "x"})
+        given = Response(content=None, status_code=status or case["status"], headers=answer)
+        answer, body = as_read((n, v) for n, v in given.raw_headers if n != b"content-length"), None
     return {
         "headers": as_read(sent_headers),
         "query": sent.url.query.decode("ascii") or None,
         "body": sent.read().hex() if came is not None else None,
         "path": path,
-        "answer": as_read((n, v) for n, v in given.raw_headers if n != b"content-length"),
+        "answer": answer,
+        "given": body,
         "status": given.status_code,
     }
 
@@ -336,12 +358,16 @@ def main():
         sys.exit(f"dataplane --judge-shapes failed: {out.stderr.strip()}")
     answers = [json.loads(line) for line in out.stdout.splitlines()]
     assert len(answers) == len(cases), (len(answers), len(cases))
-    wrong, changed, asked, rewritten, moved, expressed, left, slow = [], 0, 0, 0, 0, 0, 0, 0
+    wrong, changed, asked, rewritten, moved, expressed, left, slow, unsure, answered = [], 0, 0, 0, 0, 0, 0, 0, 0, 0
     for (described, rules, case), got, line in zip(cases, answers, lines):
         by_expression = any("regex" in (a.get("path") or {}) for a in json.loads(line)["request"])
         if got == "ask" and by_expression and not case["path"].isascii():
             # Beyond ASCII the two engines' classes differ: such a path is rewritten by Python.
             left += 1
+            continue
+        if got == "ask python":
+            # An answer whose body this side is not certain of: the Python gateway is asked.
+            unsure += 1
             continue
         if got in ("ask", "unready"):
             # Handed over with its request, or the rule kept with Python once its value is read.
@@ -361,7 +387,8 @@ def main():
         if got != want:
             wrong.append((described, case, want, got))
         untouched = {"headers": as_read(case["headers"]), "query": case["query"] or None, "body": case["body"], "path": case["path"],
-                     "answer": as_read(case["answer"]), "status": case["status"]}
+                     "answer": as_read(case["answer"]), "given": case["answer_body"], "status": case["status"]}
+        answered += want["given"] != case["answer_body"]
         changed += want != untouched
         rewritten += want["body"] != case["body"]
         moved += want["path"] != case["path"]
@@ -373,7 +400,8 @@ def main():
             print(f"  python {part}: {want[part]}\n  plane  {part}: {got.get(part)}")
     print(f"{count} exchanges under rules the data plane is told the actions of ({changed} of them changed by the rules, "
           f"{rewritten} with a body written anew, {moved} with a path rewritten, {expressed} of those by expression): {len(wrong)} different; "
-          f"{asked} handed over for their body, {left} for a path beyond ASCII; {slow} not compared, Python's engine taking too long; "
+          f"{answered} with an answer's body written anew; "
+          f"{asked} handed over for their body, {left} for a path beyond ASCII, {unsure} answers left for Python to shape; {slow} not compared, Python's engine taking too long; "
           f"{kept} sets of rules kept with Python")
     if kept > 2 * count:
         print("too many ordinary rules are being kept with Python")
@@ -381,7 +409,7 @@ def main():
         print("too few ordinary bodies are being written here")
     if moved < count // 20 or expressed < count // 100:
         print("too few ordinary rewrites are being done here")
-    few = slow > count // 100 or asked > count // 20 or rewritten < count // 20 or moved < count // 20 or expressed < count // 100
+    few = answered < count // 20 or unsure > count // 10 or slow > count // 100 or asked > count // 20 or rewritten < count // 20 or moved < count // 20 or expressed < count // 100
     alike = rewrites(5 * count, seed)
     sys.exit(1 if wrong or kept > 2 * count or changed < count // 2 or few or not alike else 0)
 

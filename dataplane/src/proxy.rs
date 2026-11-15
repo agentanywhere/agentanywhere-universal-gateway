@@ -249,6 +249,8 @@ pub struct State {
     pub access_log: Option<AccessLog>,
     /// This side's connection to the MQTT broker.
     pub mqtt: Arc<crate::mqtt::Link>,
+    /// What this side presents to the Python gateway to ask it to shape an answer.
+    pub token: Option<HeaderValue>,
 }
 
 impl State {
@@ -1125,6 +1127,131 @@ fn reshape(body: &[u8], rules: &[&Actions]) -> Result<Option<Vec<u8>>, ()> {
     }
 }
 
+/// What rules that change fields make of an answer's body.
+enum AnswerBody {
+    /// The body goes on as the backend sent it.
+    AsItCame,
+    /// The body the rules made of it.
+    Changed(Vec<u8>),
+    /// This side is not certain what the Python gateway would make of it, which then says.
+    Unsure,
+}
+
+/// What rules that change fields make of an answer's body, as the Python gateway does it: a
+/// body that is a JSON object is read, changed by each rule in turn and written again, unless
+/// nothing is left in it, and then it goes on as it came. So does a body that is no JSON, or
+/// JSON of another kind. A body that is not UTF-8 has no rule applied to it there at all, and
+/// one that is a JSON string is read a second time for the object it may spell: both are the
+/// Python gateway's to say, as is any object this side might read or write differently.
+fn reshape_answer(body: &[u8], rules: &[&Actions]) -> AnswerBody {
+    if body.is_empty() {
+        return AnswerBody::AsItCame;
+    }
+    if std::str::from_utf8(body).is_err() {
+        return AnswerBody::Unsure;
+    }
+    match body.iter().find(|b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r')) {
+        Some(b'{') => {}
+        Some(b'"') => return AnswerBody::Unsure,
+        _ => return AnswerBody::AsItCame,
+    }
+    match pyjson::parse(body) {
+        Some(mut object @ pyjson::Value::Object(_)) => {
+            for actions in rules {
+                actions.change_body(&mut object);
+            }
+            if matches!(&object, pyjson::Value::Object(members) if members.is_empty()) {
+                return AnswerBody::AsItCame;
+            }
+            let mut out = Vec::with_capacity(body.len() + 64);
+            object.dump(&mut out);
+            AnswerBody::Changed(out)
+        }
+        _ => AnswerBody::Unsure,
+    }
+}
+
+/// The header an answer's own header travels under when the Python gateway is asked to shape it.
+const ANSWER_HEADER: &str = "x-answer-h-";
+
+/// Ask the Python gateway what the caller is given for an answer this side holds: its status,
+/// headers and body as the rules that apply leave them. Its code for answers makes it, so the
+/// answer is the one it would have given. `Err` when it cannot be asked or does not say.
+async fn shaped_by_control(w: &Worker, answer: Response<Body>, method: &str, path: &str) -> Result<Response<Body>, ()> {
+    let token = w.shared.token.as_ref().ok_or(())?;
+    let to = &w.shared.control;
+    let (parts, body) = answer.into_parts();
+    let uri = Uri::builder()
+        .scheme(to.scheme.clone())
+        .authority(to.authority.clone())
+        .path_and_query(format!("{}/internal/dataplane/shape-answer", to.prefix))
+        .build()
+        .map_err(|_| ())?;
+    let mut ask = Request::new(body);
+    *ask.method_mut() = Method::POST;
+    *ask.uri_mut() = uri;
+    let headers = ask.headers_mut();
+    headers.insert("x-dataplane-token", token.clone());
+    headers.insert("x-answer-status", HeaderValue::from(parts.status.as_u16()));
+    headers.insert("x-answer-method", HeaderValue::from_str(method).map_err(|_| ())?);
+    // The request's own path without its leading slash, which the rules for an answer are chosen by.
+    let escaped: String = path.strip_prefix('/').unwrap_or(path).bytes().map(|b| match b.is_ascii_alphanumeric() || b"-._~/".contains(&b) {
+        true => (b as char).to_string(),
+        false => format!("%{b:02X}"),
+    }).collect();
+    headers.insert("x-answer-path", HeaderValue::from_str(&escaped).map_err(|_| ())?);
+    for (name, value) in &parts.headers {
+        let name = HeaderName::from_bytes(format!("{ANSWER_HEADER}{name}").as_bytes()).map_err(|_| ())?;
+        headers.append(name, value.clone());
+    }
+    let said = tokio::time::timeout(Duration::from_secs(30), w.send(to, ask)).await.map_err(|_| ())?.map_err(|_| ())?;
+    if said.status() != StatusCode::OK {
+        return Err(());
+    }
+    let read = said.into_body().collect().await.map_err(|_| ())?.to_bytes();
+    let end = read.iter().position(|b| *b == b'\n').ok_or(())?;
+
+    #[derive(serde::Deserialize)]
+    struct Made {
+        status: u16,
+        headers: Vec<(String, String)>,
+    }
+    let made: Made = serde_json::from_slice(&read[..end]).map_err(|_| ())?;
+    let mut resp = Response::new(full(read.slice(end + 1..)));
+    *resp.status_mut() = StatusCode::from_u16(made.status).map_err(|_| ())?;
+    for (name, value) in made.headers {
+        // A header value is bytes; it is told here with each byte as a character.
+        let bytes: Vec<u8> = value.chars().map(|c| u8::try_from(u32::from(c))).collect::<Result<_, _>>().map_err(|_| ())?;
+        resp.headers_mut().append(HeaderName::from_bytes(name.as_bytes()).map_err(|_| ())?, HeaderValue::from_bytes(&bytes).map_err(|_| ())?);
+    }
+    Ok(resp)
+}
+
+/// Give a backend's answer the shape the rules for answers give it, when one of them changes
+/// fields of its body. A body known to be short and not compressed is read here; where this
+/// side is certain of what the Python gateway would make of it, the rules are applied here,
+/// and otherwise that gateway is asked. `Err` when the body cannot be read or it cannot be asked.
+async fn answer_with_body_rules(w: &Worker, resp: Response<Body>, rules: &[&Actions], method: &str, path: &str) -> Result<Response<Body>, ()> {
+    let lengths = resp.headers().get_all(CONTENT_LENGTH).iter().count();
+    let short = lengths == 1 && resp.headers().get(CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok()).is_some_and(|n| n <= RULE_BODY_MAX);
+    if !short || resp.headers().contains_key(hyper::header::CONTENT_ENCODING) {
+        return shaped_by_control(w, resp, method, path).await;
+    }
+    let (mut parts, body) = resp.into_parts();
+    let bytes = body.collect().await.map_err(|_| ())?.to_bytes();
+    let body = match reshape_answer(&bytes, rules) {
+        AnswerBody::Unsure => return shaped_by_control(w, Response::from_parts(parts, full(bytes)), method, path).await,
+        AnswerBody::AsItCame => bytes,
+        AnswerBody::Changed(body) => {
+            parts.headers.insert(CONTENT_LENGTH, HeaderValue::from(body.len()));
+            Bytes::from(body)
+        }
+    };
+    let mut resp = Response::from_parts(parts, full(body));
+    shape_answer(&mut resp, rules);
+    Ok(resp)
+}
+
 /// Apply the rules to a request before it is sent on: its headers, and its query. `rewritten`
 /// says the rules made a new body for it (already in place, with its length): the Python
 /// gateway's HTTP client then calls it JSON unless the headers say what it is.
@@ -1181,6 +1308,9 @@ pub fn judge_shapes() -> Result<(), String> {
         #[serde(default)]
         path: Option<String>,
         answer: Vec<(String, String)>,
+        /// The answer's body, in hex, when it has one.
+        #[serde(default)]
+        answer_body: Option<String>,
         status: u16,
     }
 
@@ -1206,7 +1336,7 @@ pub fn judge_shapes() -> Result<(), String> {
     for line in std::io::stdin().lock().lines() {
         let line = line.map_err(|e| e.to_string())?;
         let mut case: Case = serde_json::from_str(&line).map_err(|e| format!("case is not valid: {e}"))?;
-        if case.request.iter_mut().any(|a| a.ready().is_none()) {
+        if case.request.iter_mut().chain(case.response.iter_mut()).any(|a| a.ready().is_none()) {
             writeln!(out, "\"unready\"").map_err(|e| e.to_string())?;
             continue;
         }
@@ -1234,6 +1364,20 @@ pub fn judge_shapes() -> Result<(), String> {
         let mut resp = Response::new(full(Bytes::new()));
         *resp.status_mut() = StatusCode::from_u16(case.status).map_err(|e| e.to_string())?;
         *resp.headers_mut() = map(&case.answer)?;
+        let mut given = case.answer_body.as_deref().map(unhex).transpose()?;
+        if let Some(came) = given.as_ref().filter(|_| after.iter().any(|a| a.changes_body())) {
+            match reshape_answer(came, &after) {
+                AnswerBody::AsItCame => {}
+                AnswerBody::Changed(made) => {
+                    resp.headers_mut().insert(CONTENT_LENGTH, HeaderValue::from(made.len()));
+                    given = Some(made);
+                }
+                AnswerBody::Unsure => {
+                    writeln!(out, "\"ask python\"").map_err(|e| e.to_string())?;
+                    continue;
+                }
+            }
+        }
         shape_answer(&mut resp, &after);
         let path = match case.path.as_deref().map(|asked| Shaping { request: before.clone(), response: Vec::new() }.rewritten(asked).map(|to| to.unwrap_or_else(|| asked.to_owned()))) {
             Some(Err(())) => {
@@ -1249,6 +1393,7 @@ pub fn judge_shapes() -> Result<(), String> {
             "body": body.map(|b| b.iter().map(|byte| format!("{byte:02x}")).collect::<String>()),
             "path": path,
             "answer": lines(resp.headers()),
+            "given": given.map(|b| b.iter().map(|byte| format!("{byte:02x}")).collect::<String>()),
             "status": resp.status().as_u16(),
         });
         writeln!(out, "{said}").map_err(|e| e.to_string())?;
@@ -2224,6 +2369,12 @@ pub async fn handle(w: Arc<Worker>, peer: SocketAddr, mut req: Request<Incoming>
         }
     }
 
+    // An answer whose body rules change may have to be shown to the Python gateway, which this
+    // side can only do when it is linked to it.
+    if w.shared.token.is_none() && n.shaping.response.iter().any(|a| a.changes_body()) {
+        return Ok(to_control(&w, peer, req).await);
+    }
+
     // Rules that change fields of the body: it is read here whole, before anything is counted,
     // and written again as the Python gateway would write it. If that is not certain, or the
     // body is long or of no stated length, the request is handed over as it came. The Python
@@ -2324,13 +2475,23 @@ pub async fn handle(w: Arc<Worker>, peer: SocketAddr, mut req: Request<Incoming>
                     };
                     match answer {
                         Ok(mut resp) => {
-                            if !n.shaping.response.is_empty() {
-                                shape_answer(&mut resp, &n.shaping.response);
-                            }
                             if let Some(tr) = backend.breaker.success(&cb) {
                                 announce(st, backend, &cb, tr);
                             }
-                            (resp, None)
+                            if n.shaping.response.iter().any(|a| a.changes_body()) {
+                                match answer_with_body_rules(&w, resp, &n.shaping.response, n.method, path).await {
+                                    Ok(resp) => (resp, None),
+                                    Err(()) => {
+                                        error_type = Some("RemoteProtocolError");
+                                        (backend_unavailable(&t), Some("BACKEND_ERROR"))
+                                    }
+                                }
+                            } else {
+                                if !n.shaping.response.is_empty() {
+                                    shape_answer(&mut resp, &n.shaping.response);
+                                }
+                                (resp, None)
+                            }
                         }
                         Err(unanswered) => {
                             if let Some(tr) = backend.breaker.failure(&cb, Instant::now()) {

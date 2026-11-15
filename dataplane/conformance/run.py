@@ -299,6 +299,24 @@ def agent_backend(tls=None):
                 return
             out = json.dumps({"method": self.command, "path": path, "query": query, "headers": [[k, v] for k, v in self.headers.items()],
                               "body_sha256": hashlib.sha256(body).hexdigest(), "body_bytes": len(body)}).encode()
+            # Answers for the rules that change an answer's body to meet.
+            odd = {"/list": b'[1, {"secret": 2}]', "/words": b"plain words", "/latin": b'{"secret": 1, "name": "caf\xe9"}',
+                   "/quoted": json.dumps(json.dumps({"secret": 1, "kept": "yes"})).encode(), "/nan": b'{"secret": 1, "n": NaN}',
+                   "/only-secret": b'{"secret": "s"}', "/spaced": b' \n{"secret" : 1, "caf\\u00e9": "\xc3\xa9", "n": 1.50, "big": 12345678901234567890}\n',
+                   "/big": json.dumps({"secret": 1, "fill": "x" * 1_200_000}).encode(), "/broken": b'{"secret": 1,'}
+            for ending, text in odd.items():
+                if path.endswith(ending):
+                    out = text
+            if path.endswith("/chunked"):
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                if self.command != "HEAD":
+                    for piece in (out[:20], out[20:]):
+                        self.wfile.write(f"{len(piece):x}\r\n".encode() + piece + b"\r\n")
+                    self.wfile.write(b"0\r\n\r\n")
+                return
             self.send_response(418 if path.endswith("/teapot") else 200)
             if path.endswith("/gzip"):
                 out = gzip.compress(out)
@@ -1769,6 +1787,67 @@ def main() -> int:
             remove_rules(made)
             assert rules_reached("/api/routed/old/1", "data plane", False), "removing the rules never reached the data plane"
 
+            # Rules that change the fields of an answer's body. A short answer that is a JSON
+            # object is changed here; one this side is not certain of is shown to the Python
+            # gateway, whose answer it then gives. Either way the caller is given what the
+            # Python gateway alone would give, byte for byte.
+            made = [post("/admin/transformations", r) for r in (
+                {"name": "tidy answers", "path_pattern": "*api/routed/answers/*", "request_config": {"headers_set": {"X-Shaped": "yes"}}, "response_config": {
+                    "body_remove": ["headers", "secret"], "body_rename": {"path": "asked.path"}, "body_set": {"seen": True, "meta.by": "gateway"},
+                    "headers_set": {"X-Powered": "gateway"}, "status_map": {"200": 201}}},
+                {"name": "and again, after", "path_pattern": "api/routed/answers/twice/*", "response_config": {
+                    "body_rename": {"meta.by": "by"}, "body_set": {"asked.twice": [1, {"a": None}]}}},
+                {"name": "only take away", "path_pattern": "api/routed/taken/*", "response_config": {"body_remove": ["secret"], "headers_set": {"X-Powered": "gateway"}}})]
+            def tidied(want):
+                r = shaped(rs, keys["rs"]["key"], "GET", "/api/routed/answers/1")
+                return said_by(r) == "data plane" and ("seen" in r.json()) == want
+
+            assert wait_until(lambda: tidied(True)), "the rules never reached the data plane"
+
+            def answer_same(name, method, path, want=None, **kw):
+                a, b = shaped(py, keys["py"]["key"], method, path, **kw), shaped(rs, keys["rs"]["key"], method, path, **kw)
+                bad = []
+                if said_by(b) != "data plane":
+                    bad.append(f"answered by the {said_by(b)}")
+                if a.status_code != b.status_code:
+                    bad.append(f"status {a.status_code} and {b.status_code}")
+                if a.content != b.content:
+                    bad.append(f"the caller was given {a.content[:120]!r} and {b.content[:120]!r}")
+                for header in ("content-type", "content-length", "content-encoding", "x-powered", "x-agent", "set-cookie"):
+                    if a.headers.get_list(header) != b.headers.get_list(header):
+                        bad.append(f"{header}: {a.headers.get_list(header)} and {b.headers.get_list(header)}")
+                if want is not None and not bad and not want(b):
+                    bad.append(f"not the expected answer: [{b.status_code}] {b.content[:160]!r}")
+                check(f"transformation rules: {name}", not bad, "; ".join(bad))
+
+            answer_same("an answer's fields are renamed, removed and set, and its headers and status changed", "GET", "/api/routed/answers/1?q=tea",
+                        want=lambda r: r.status_code == 201 and r.headers["x-powered"] == "gateway" and r.json() == {
+                            "method": "GET", "query": "q=tea", "body_sha256": hashlib.sha256(b"").hexdigest(), "body_bytes": 0,
+                            "asked": {"path": "/api/routed/answers/1"}, "seen": True, "meta": {"by": "gateway"}})
+            answer_same("each rule works on what the last left", "POST", "/api/routed/answers/twice/1", content=b'{"a": 1}',
+                        want=lambda r: r.json()["by"] == "gateway" and r.json()["asked"] == {"path": "/api/routed/answers/twice/1", "twice": [1, {"a": None}]}
+                        and r.json()["meta"] == {})
+            answer_same("the answer is written as Python writes it", "GET", "/api/routed/answers/spaced",
+                        want=lambda r: r.content == b'{"caf\\u00e9": "\\u00e9", "n": 1.5, "big": 12345678901234567890, "seen": true, "meta": {"by": "gateway"}}')
+            answer_same("an answer to HEAD has no body to change", "HEAD", "/api/routed/answers/1", want=lambda r: r.status_code == 201 and r.content == b"")
+            answer_same("an answer that is JSON of another kind goes on as it came", "GET", "/api/routed/answers/list", want=lambda r: r.content == b'[1, {"secret": 2}]')
+            answer_same("so does one that is no JSON", "GET", "/api/routed/answers/words", want=lambda r: r.content == b"plain words" and r.status_code == 201)
+            answer_same("and one with nothing left in it", "GET", "/api/routed/taken/only-secret", want=lambda r: r.content == b'{"secret": "s"}')
+            answer_same("an answer with another status is changed too", "GET", "/api/routed/answers/teapot", want=lambda r: r.status_code == 418 and r.json()["seen"] is True)
+            # What this side is not certain of, the Python gateway shapes, and the caller is given that.
+            answer_same("a compressed answer is read and changed", "GET", "/api/routed/answers/gzip",
+                        want=lambda r: r.json()["seen"] is True and "headers" not in r.json() and "content-encoding" not in r.headers)
+            answer_same("an answer sent in pieces", "GET", "/api/routed/answers/chunked", want=lambda r: r.json()["seen"] is True and "headers" not in r.json())
+            answer_same("an answer too long to hold here", "GET", "/api/routed/answers/big", want=lambda r: r.json()["seen"] is True and "secret" not in r.json())
+            answer_same("an answer that is not UTF-8 has no rule applied to it", "GET", "/api/routed/answers/latin",
+                        want=lambda r: r.content == b'{"secret": 1, "name": "caf\xe9"}' and r.status_code == 200 and "x-powered" not in r.headers)
+            answer_same("an answer that is a JSON string is read again for the object it spells", "GET", "/api/routed/answers/quoted",
+                        want=lambda r: r.json() == {"kept": "yes", "seen": True, "meta": {"by": "gateway"}})
+            answer_same("an answer with a number JSON does not have", "GET", "/api/routed/answers/nan", want=lambda r: b"NaN" in r.content and b"secret" not in r.content)
+            answer_same("an answer that is JSON cut short goes on as it came", "GET", "/api/routed/answers/broken", want=lambda r: r.content == b'{"secret": 1,')
+            remove_rules(made)
+            assert wait_until(lambda: tidied(False)), "removing the rules never reached the data plane"
+
             # A rewrite by an expression both engines read alike, with the groups it puts back.
             made = [post("/admin/transformations", r) for r in (
                 {"name": "turn a user's things around", "path_pattern": "/api/routed/users/*", "request_config": {
@@ -1794,7 +1873,7 @@ def main() -> int:
             # Rules this side is not told the actions of: they change an answer's body or the
             # path by expression, fill in a template, or change a header that the gateway or an HTTP library on
             # the way has a say in.
-            for what, config in (("changes an answer's body", {"request_config": {"headers_set": {"X-Shaped": "yes"}}, "response_config": {"body_set": {"seen": True}}}),
+            for what, config in (("sets a value in an answer's body that is not plain JSON", {"request_config": {"headers_set": {"X-Shaped": "yes"}}, "response_config": {"body_set": {"seen": float("inf")}}}),
                                  ("rewrites the path by an expression only Python's engine reads", {"request_config": {"headers_set": {"X-Shaped": "yes"}, "path_rewrite": {"pattern": "/kept/(?=\\d)", "replacement": "/kept/n"}}}),
                                  ("rewrites the path by an expression that can match nothing", {"request_config": {"headers_set": {"X-Shaped": "yes"}, "path_rewrite": {"pattern": "(?:/x)*", "replacement": ""}}}),
                                  ("fills in a template", {"request_config": {"headers_set": {"X-Shaped": "yes"}}, "response_config": {"template": "{{ body | tojson }}"}}),

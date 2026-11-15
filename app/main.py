@@ -2290,6 +2290,172 @@ async def _proxy_agent_route(request: Request, agent_route, request_id: str) -> 
     return response
 
 
+async def answer_from(response, method: str, path: str, request_headers: Dict[str, str], request_id, request: Optional[Request] = None) -> Response:
+    """The answer a caller is given for a backend's answer: its headers without those of the
+    connection, its body as read, and both as the transformation rules that apply (to ``path``,
+    the request's own without its leading slash) leave them. With the ``request`` itself, the
+    plugins that change answers are run too.
+
+    The data plane asks for this through ``/internal/dataplane/shape-answer`` when it holds an
+    answer whose body it is not certain of changing as this does."""
+    # Create response
+    response_headers = dict(response.headers)
+    logger.debug("response_headers_original", headers=dict(response_headers), request_id=request_id)
+
+    # Remove hop-by-hop headers, Content-Length (recomputed) and Content-Encoding
+    # (httpx already decoded the body — see _STRIP_RESPONSE_HEADERS).
+    response_headers = {k: v for k, v in response_headers.items()
+                      if k.lower() not in _STRIP_RESPONSE_HEADERS}
+    logger.debug("response_headers_after_hop_by_hop", headers=dict(response_headers), request_id=request_id)
+
+    # Get response body
+    # httpx.Response.aread() is the async method to read content as bytes
+    # We must use aread() in async context for AsyncClient responses
+    try:
+        content = await response.aread()
+        logger.debug("response_content_read", content_length=len(content), request_id=request_id)
+    except AttributeError:
+        # Fallback: if aread() doesn't exist, try .content property
+        try:
+            content = response.content
+            logger.debug("response_content_read_fallback_content", content_length=len(content), request_id=request_id)
+        except Exception as e:
+            logger.error("response_read_error", error=str(e), request_id=request_id)
+            content = b""
+    except Exception as e:
+        logger.error("response_read_error", error=str(e), request_id=request_id)
+        # Final fallback: try to get text and encode
+        try:
+            content = response.text.encode('utf-8')
+            logger.debug("response_content_read_fallback_text", content_length=len(content), request_id=request_id)
+        except:
+            content = b""
+
+    # Apply response transformations
+    from app.transformers import transformation_manager
+    request_context = {
+        "method": method,
+        "path": path,
+        "headers": request_headers,
+    }
+
+    # Stays None when transformation is skipped or fails (including binary
+    # bodies that are not UTF-8), so the upstream status passes through.
+    status_code = None
+    try:
+        rules = (
+            transformation_manager.get_rules_for_path(path, method)
+            if transformation_manager.rules_by_id else []
+        )
+        if not rules:
+            # No rule applies to this request, so there is nothing to do. Parsing the body
+            # and writing it back would change its bytes (spacing, escaping, number
+            # formatting) and cost time that grows with its size.
+            raise _NoTransformation()
+        # The body is read only for a rule that can change it. A rule for headers or the
+        # status applies whatever the body is, and leaves its bytes alone.
+        body_json = None
+        if content and any(rule.changes_response_body() for rule in rules):
+            try:
+                body_json = json.loads(content.decode('utf-8'))
+            except:
+                body_json = content.decode('utf-8')
+
+        transformed_status, transformed_headers, transformed_body = transformation_manager.transform_response(
+            status_code=response.status_code,
+            headers=response_headers,
+            body=body_json,
+            request_context=request_context
+        )
+
+        # Convert transformed body back to bytes if needed. Text that came back as it went in
+        # is the backend's own bytes already (a JSON string, say, keeps its quotes).
+        if transformed_body and isinstance(transformed_body, dict):
+            content = json.dumps(transformed_body).encode('utf-8')
+        elif transformed_body and isinstance(transformed_body, str) and transformed_body is not body_json:
+            content = transformed_body.encode('utf-8')
+
+        response_headers = transformed_headers
+        status_code = transformed_status
+    except _NoTransformation:
+        pass
+    except Exception as e:
+        logger.warning("response_transformation_error", error=str(e))
+
+    # Ensure content is bytes
+    if isinstance(content, str):
+        content = content.encode('utf-8')
+    elif content is None:
+        content = b""
+
+    # Double-check Content-Length removal (case-insensitive)
+    # Starlette will calculate it automatically based on actual content length
+    original_headers_count = len(response_headers)
+    response_headers = {k: v for k, v in response_headers.items() 
+                      if k.lower() != "content-length"}
+    if len(response_headers) < original_headers_count:
+        logger.info("content_length_removed_final", 
+                   removed_count=original_headers_count - len(response_headers),
+                   request_id=request_id)
+
+    # Log final headers before creating Response (for debugging)
+    content_length_in_headers = any(k.lower() == "content-length" for k in response_headers.keys())
+    logger.info("response_final_preparation", 
+                content_length_bytes=len(content),
+                status_code=status_code if status_code else response.status_code,
+                headers_count=len(response_headers),
+                headers_keys=list(response_headers.keys())[:10],  # First 10 keys
+                content_length_in_headers=content_length_in_headers,
+                request_id=request_id)
+
+    if content_length_in_headers:
+        logger.error("content_length_still_present", 
+                    headers=dict(response_headers),
+                    request_id=request_id)
+        # Force remove one more time
+        response_headers = {k: v for k, v in response_headers.items() 
+                          if k.lower() != "content-length"}
+
+    # Use status_code from transformation or original response
+    final_status_code = status_code if status_code else response.status_code
+
+    # Plugin: response transformations
+    if settings.plugins_enabled and request is not None:
+        try:
+            resp_ctx = PluginContext(
+                method=method,
+                path=f"/{path}",
+                headers=dict(response_headers),
+                body=content,
+                status_code=final_status_code,
+                request_id=request_id,
+                api_key=getattr(getattr(request.state, "api_key", None), "key", None),
+                tenant_id=getattr(request.state, "tenant_id", None),
+            )
+            resp_ctx = plugin_registry.transform_response(resp_ctx)
+            response_headers = dict(resp_ctx.headers)
+            if resp_ctx.body is not None:
+                if isinstance(resp_ctx.body, (bytes, bytearray)):
+                    content = bytes(resp_ctx.body)
+                elif isinstance(resp_ctx.body, str):
+                    content = resp_ctx.body.encode("utf-8")
+                elif isinstance(resp_ctx.body, dict):
+                    content = json.dumps(resp_ctx.body).encode("utf-8")
+            if resp_ctx.status_code:
+                final_status_code = resp_ctx.status_code
+            response_headers = {k: v for k, v in response_headers.items() if k.lower() != "content-length"}
+            plugin_registry.run_hook("response_post", resp_ctx)
+        except Exception as exc:
+            logger.warning("plugin_response_transform_failed", error=str(exc))
+
+    return Response(
+        content=content,
+        status_code=final_status_code,
+        headers=response_headers,
+        media_type=response.headers.get("content-type", "application/json")
+    )
+
+
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
 async def gateway_proxy(request: Request, path: str):
     """Main gateway proxy endpoint."""
@@ -2524,162 +2690,7 @@ async def gateway_proxy(request: Request, path: str):
             route_config=dynamic_route,
         )
         
-        # Create response
-        response_headers = dict(response.headers)
-        logger.debug("response_headers_original", headers=dict(response_headers), request_id=request_id)
-        
-        # Remove hop-by-hop headers, Content-Length (recomputed) and Content-Encoding
-        # (httpx already decoded the body — see _STRIP_RESPONSE_HEADERS).
-        response_headers = {k: v for k, v in response_headers.items()
-                          if k.lower() not in _STRIP_RESPONSE_HEADERS}
-        logger.debug("response_headers_after_hop_by_hop", headers=dict(response_headers), request_id=request_id)
-        
-        # Get response body
-        # httpx.Response.aread() is the async method to read content as bytes
-        # We must use aread() in async context for AsyncClient responses
-        try:
-            content = await response.aread()
-            logger.debug("response_content_read", content_length=len(content), request_id=request_id)
-        except AttributeError:
-            # Fallback: if aread() doesn't exist, try .content property
-            try:
-                content = response.content
-                logger.debug("response_content_read_fallback_content", content_length=len(content), request_id=request_id)
-            except Exception as e:
-                logger.error("response_read_error", error=str(e), request_id=request_id)
-                content = b""
-        except Exception as e:
-            logger.error("response_read_error", error=str(e), request_id=request_id)
-            # Final fallback: try to get text and encode
-            try:
-                content = response.text.encode('utf-8')
-                logger.debug("response_content_read_fallback_text", content_length=len(content), request_id=request_id)
-            except:
-                content = b""
-        
-        # Apply response transformations
-        from app.transformers import transformation_manager
-        request_context = {
-            "method": request.method,
-            "path": path,
-            "headers": dict(request.headers),
-        }
-        
-        # Stays None when transformation is skipped or fails (including binary
-        # bodies that are not UTF-8), so the upstream status passes through.
-        status_code = None
-        try:
-            rules = (
-                transformation_manager.get_rules_for_path(path, request.method)
-                if transformation_manager.rules_by_id else []
-            )
-            if not rules:
-                # No rule applies to this request, so there is nothing to do. Parsing the body
-                # and writing it back would change its bytes (spacing, escaping, number
-                # formatting) and cost time that grows with its size.
-                raise _NoTransformation()
-            # The body is read only for a rule that can change it. A rule for headers or the
-            # status applies whatever the body is, and leaves its bytes alone.
-            body_json = None
-            if content and any(rule.changes_response_body() for rule in rules):
-                try:
-                    body_json = json.loads(content.decode('utf-8'))
-                except:
-                    body_json = content.decode('utf-8')
-
-            transformed_status, transformed_headers, transformed_body = transformation_manager.transform_response(
-                status_code=response.status_code,
-                headers=response_headers,
-                body=body_json,
-                request_context=request_context
-            )
-
-            # Convert transformed body back to bytes if needed. Text that came back as it went in
-            # is the backend's own bytes already (a JSON string, say, keeps its quotes).
-            if transformed_body and isinstance(transformed_body, dict):
-                content = json.dumps(transformed_body).encode('utf-8')
-            elif transformed_body and isinstance(transformed_body, str) and transformed_body is not body_json:
-                content = transformed_body.encode('utf-8')
-
-            response_headers = transformed_headers
-            status_code = transformed_status
-        except _NoTransformation:
-            pass
-        except Exception as e:
-            logger.warning("response_transformation_error", error=str(e))
-        
-        # Ensure content is bytes
-        if isinstance(content, str):
-            content = content.encode('utf-8')
-        elif content is None:
-            content = b""
-        
-        # Double-check Content-Length removal (case-insensitive)
-        # Starlette will calculate it automatically based on actual content length
-        original_headers_count = len(response_headers)
-        response_headers = {k: v for k, v in response_headers.items() 
-                          if k.lower() != "content-length"}
-        if len(response_headers) < original_headers_count:
-            logger.info("content_length_removed_final", 
-                       removed_count=original_headers_count - len(response_headers),
-                       request_id=request_id)
-        
-        # Log final headers before creating Response (for debugging)
-        content_length_in_headers = any(k.lower() == "content-length" for k in response_headers.keys())
-        logger.info("response_final_preparation", 
-                    content_length_bytes=len(content),
-                    status_code=status_code if status_code else response.status_code,
-                    headers_count=len(response_headers),
-                    headers_keys=list(response_headers.keys())[:10],  # First 10 keys
-                    content_length_in_headers=content_length_in_headers,
-                    request_id=request_id)
-        
-        if content_length_in_headers:
-            logger.error("content_length_still_present", 
-                        headers=dict(response_headers),
-                        request_id=request_id)
-            # Force remove one more time
-            response_headers = {k: v for k, v in response_headers.items() 
-                              if k.lower() != "content-length"}
-        
-        # Use status_code from transformation or original response
-        final_status_code = status_code if status_code else response.status_code
-
-        # Plugin: response transformations
-        if settings.plugins_enabled:
-            try:
-                resp_ctx = PluginContext(
-                    method=request.method,
-                    path=f"/{path}",
-                    headers=dict(response_headers),
-                    body=content,
-                    status_code=final_status_code,
-                    request_id=request_id,
-                    api_key=getattr(getattr(request.state, "api_key", None), "key", None),
-                    tenant_id=getattr(request.state, "tenant_id", None),
-                )
-                resp_ctx = plugin_registry.transform_response(resp_ctx)
-                response_headers = dict(resp_ctx.headers)
-                if resp_ctx.body is not None:
-                    if isinstance(resp_ctx.body, (bytes, bytearray)):
-                        content = bytes(resp_ctx.body)
-                    elif isinstance(resp_ctx.body, str):
-                        content = resp_ctx.body.encode("utf-8")
-                    elif isinstance(resp_ctx.body, dict):
-                        content = json.dumps(resp_ctx.body).encode("utf-8")
-                if resp_ctx.status_code:
-                    final_status_code = resp_ctx.status_code
-                response_headers = {k: v for k, v in response_headers.items() if k.lower() != "content-length"}
-                plugin_registry.run_hook("response_post", resp_ctx)
-            except Exception as exc:
-                logger.warning("plugin_response_transform_failed", error=str(exc))
-
-        return Response(
-            content=content,
-            status_code=final_status_code,
-            headers=response_headers,
-            media_type=response.headers.get("content-type", "application/json")
-        )
+        return await answer_from(response, request.method, path, dict(request.headers), request_id, request)
     
     except HTTPException:
         raise

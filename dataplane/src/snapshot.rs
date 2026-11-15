@@ -497,9 +497,9 @@ impl TransformRule {
     /// Work out how the rule's pattern is matched. `None` when it is in no form this side knows,
     /// or in more than one: then no rule can be trusted, and every request is the Python gateway's.
     fn ready(mut self) -> Option<TransformRule> {
-        // A body is changed here on the way to the backend only.
+        // A path is rewritten on the way to the backend only.
         let request = self.request.as_mut().map(Actions::ready).unwrap_or(Some(()));
-        let response = self.response.as_mut().map(|a| a.ready().filter(|_| !a.changes_body() && !a.changes_path())).unwrap_or(Some(()));
+        let response = self.response.as_mut().map(|a| a.ready().filter(|_| !a.changes_path())).unwrap_or(Some(()));
         if request.is_none() || response.is_none() {
             self.native = false;
         }
