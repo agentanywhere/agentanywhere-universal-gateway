@@ -370,9 +370,10 @@ const HOP_BY_HOP: [&str; 8] = [
     "upgrade",
 ];
 
-/// The one MQTT path with a handler of its own in the Python gateway that this side answers too.
+/// The MQTT paths with handlers of their own in the Python gateway that this side answers too.
 /// Every other path under `/mqtt` is the Python gateway's.
 const PUBLISH: &str = "/mqtt/publish";
+const SUBSCRIBE: &str = "/mqtt/subscribe";
 /// The longest body to publish from that is read here; a longer one is the Python gateway's.
 const PUBLISH_BODY_MAX: u64 = 1 << 20;
 
@@ -387,7 +388,7 @@ const KEPT_BY_CONTROL: [&str; 2] = ["ws", "agents"];
 /// are its own (`own`) and this is none of them; until it has, only `/api/...` is.
 fn classify(path: &str, own: Option<&[String]>) -> Option<Protocol> {
     let under = |name: &str| path.starts_with(name) || path.strip_prefix("/api").map(|rest| rest.starts_with(name)).unwrap_or(false);
-    if path == PUBLISH {
+    if path == PUBLISH || path == SUBSCRIBE {
         Some(Protocol::Mqtt)
     } else if under("/mcp") {
         Some(Protocol::Mcp)
@@ -2531,7 +2532,7 @@ pub async fn handle(w: Arc<Worker>, peer: SocketAddr, mut req: Request<Incoming>
     // A message to publish is read here whole, before anything is counted. Unless what the
     // Python gateway would publish for it is certain, and this side's connection to the broker
     // stands, the request is handed over as it came.
-    let mut publish = None;
+    let (mut publish, mut subscribe) = (None, None);
     if refused.is_none() && n.protocol == Protocol::Mqtt {
         let ready = snap.mqtt.as_ref().is_some_and(|broker| st.mqtt.serves(broker));
         match req.body().size_hint().exact() {
@@ -2539,12 +2540,15 @@ pub async fn handle(w: Arc<Worker>, peer: SocketAddr, mut req: Request<Incoming>
                 let (parts, body) = req.into_parts();
                 let Ok(read) = body.collect().await else { return Ok(body_unreadable()) };
                 let bytes = read.to_bytes();
-                publish = pyjson::publish(&bytes);
+                match path == SUBSCRIBE {
+                    true => subscribe = pyjson::subscribe(&bytes),
+                    false => publish = pyjson::publish(&bytes),
+                }
                 req = Request::from_parts(parts, full(bytes));
             }
             _ => {}
         }
-        if publish.is_none() {
+        if publish.is_none() && subscribe.is_none() {
             return Ok(to_control(&w, peer, req).await);
         }
     }
@@ -2573,6 +2577,12 @@ pub async fn handle(w: Arc<Worker>, peer: SocketAddr, mut req: Request<Incoming>
                     let mut resp = Response::new(full(format!("{{\"status\":\"published\",\"topic\":{}}}", pyjson::quoted(&message.topic))));
                     resp.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
                     st.mqtt.publish(message);
+                    (resp, None)
+                } else if let Some(wanted) = subscribe.take() {
+                    // Answered as the Python gateway answers: once the broker is being asked.
+                    let mut resp = Response::new(full(format!("{{\"status\":\"subscribed\",\"topic\":{}}}", pyjson::quoted(&wanted.topic))));
+                    resp.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                    st.mqtt.subscribe(wanted);
                     (resp, None)
                 } else if !backend.breaker.allow(&cb, Instant::now()) {
                     (circuit_open(&t), Some("SERVICE_UNAVAILABLE"))
@@ -2896,6 +2906,7 @@ mod tests {
         for (path, protocol) in [
             ("/api/users", Some(Protocol::Http)),
             ("/mqtt/publish", Some(Protocol::Mqtt)),
+            ("/mqtt/subscribe", Some(Protocol::Mqtt)),
             ("/api/v1/orders/7", Some(Protocol::Http)),
             ("/mcp", Some(Protocol::Mcp)),
             ("/mcp/tools", Some(Protocol::Mcp)),
@@ -2915,7 +2926,7 @@ mod tests {
         }
         for path in [
             "/admin/keys", "/oauth2/token", "/health", "/docs", "/", "/api", "/apix/y", "/rest/x", "/users",
-            "/mqtt/publish/", "/mqtt/subscribe", "/mqtt", "/api/mqtt/publish", "/api/mqtt/x", "/ws/x", "/websocket", "/wss", "/grpc/x", "/api/grpc", "/grpc/graphql", "/ws/graphql",
+            "/mqtt/publish/", "/mqtt/subscribe/", "/mqtt/subscriptions", "/mqtt", "/api/mqtt/publish", "/api/mqtt/subscribe", "/api/mqtt/x", "/ws/x", "/websocket", "/wss", "/grpc/x", "/api/grpc", "/grpc/graphql", "/ws/graphql",
             "/api/ws/x", "/api/agents/a", "/agents/a/mcp",
         ] {
             assert_eq!(classify(path, None), None, "{path}");
@@ -2931,7 +2942,7 @@ mod tests {
         // The control plane's own, by how they begin, and what it kept before.
         for path in [
             "/health", "/health/detailed", "/healthz", "/admin/keys", "/oauth2/token", "/metrics", "/.well-known/agent-card.json",
-            "/mqtt/subscribe", "/ws/x", "/wss", "/websocket", "/grpc/x", "/api/ws/x", "/api/agents/a",
+            "/mqtt/topics", "/ws/x", "/wss", "/websocket", "/grpc/x", "/api/ws/x", "/api/agents/a",
         ] {
             assert_eq!(classify(path, Some(&own)), None, "{path}");
         }

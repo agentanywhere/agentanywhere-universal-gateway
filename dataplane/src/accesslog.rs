@@ -35,7 +35,7 @@ impl AccessLog {
                 let _ = out.flush();
                 let n = lost.swap(0, Ordering::Relaxed);
                 if n > 0 {
-                    eprintln!("dataplane: {n} access-log lines dropped (stdout is not keeping up)");
+                    eprintln!("dataplane: {n} log lines dropped (stdout is not keeping up)");
                 }
             }
         });
@@ -49,6 +49,17 @@ impl AccessLog {
         if self.tx.try_send(line).is_err() {
             self.dropped.fetch_add(1, Ordering::Relaxed);
         }
+    }
+}
+
+/// Lines written to this process's output from a thread that must not wait for it: the writer is
+/// started with the first line.
+#[derive(Default)]
+pub struct Lines(std::sync::OnceLock<AccessLog>);
+
+impl Lines {
+    pub fn write(&self, line: String) {
+        self.0.get_or_init(AccessLog::start).write(line);
     }
 }
 

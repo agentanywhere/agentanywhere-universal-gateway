@@ -51,6 +51,11 @@ class Recording(paho.Client):
         super().__init__(client_id="conformance", protocol=paho.MQTTv5)
         self._max_inflight_messages = 0
         self.sent = None
+        self.asked = None
+
+    def _send_subscribe(self, dup, topics, properties=None):
+        self.asked = (bool(dup), [(bytes(t), o.pack()) for t, o in topics], properties)
+        return (paho.MQTT_ERR_SUCCESS, 1)
 
     def _send_publish(self, mid, topic, payload=b"", qos=0, retain=False, dup=False, info=None, properties=None):
         self.sent = (bytes(topic), int(qos), bytes(payload), bool(retain), bool(dup), properties)
@@ -79,6 +84,26 @@ def python_publishes(handler, body):
     if sent is None or sent[3:] != (False, False, None) or answer != {"status": "published", "topic": sent[0].decode("utf-8")}:
         return None
     return sent[:3]
+
+
+def python_subscribes(handler, body):
+    """What the Python gateway subscribes to for a body: (topic filter, qos), or None when it answers anything but 200."""
+    handler.client.asked = None
+    handler.client._sock = object()  # the client asks the broker only while it has a connection
+    try:
+        answer = asyncio.run(gateway.mqtt_subscribe(Posted(body)))
+    except BaseException:  # noqa: BLE001 - an HTTP error or a crash: not subscribed either way
+        return None
+    finally:
+        handler.client._sock = None
+    asked = handler.client.asked
+    # One filter, with no option but the quality of service, and no properties.
+    if asked is None or asked[0] or asked[2] is not None or len(asked[1]) != 1 or asked[1][0][1][0] > 2:
+        return None
+    filter_, options = asked[1][0]
+    if answer != {"status": "subscribed", "topic": filter_.decode("utf-8")}:
+        return None
+    return filter_, options[0]
 
 
 NUMBERS = ["0", "-0", "1", "-7", "42", "1.5", "-0.0", "0.1", "1e22", "1E16", "1e15", "1e-7", "0.0001", "0.00001", "1.0E+2", "0.30000000000000004",
@@ -139,6 +164,12 @@ def topic(rng):
         return '"' + "/".join(rng.choice(["sensors", "t", "a", "site-7", "temp", "$SYS", "é", "x y"]) for _ in range(rng.randrange(1, 4))) + '"'
     if roll < 0.8:
         return string(rng, 0.3)
+    if roll < 0.9:
+        # Filters: wildcards where a subscription may have them, and where it may not.
+        levels = [rng.choice(["a", "b", "+", "+", "#", "a+", "+a", "a#", "#a", "++", "", "é", "x y"]) for _ in range(rng.randrange(1, 5))]
+        if rng.random() < 0.5 and "#" in levels:
+            levels = [l for l in levels if l != "#"] + ["#"]
+        return json.dumps("/".join(levels), ensure_ascii=rng.random() < 0.5)
     return rng.choice(['""', "null", "5", "0", "true", "false", "[]", "{}", '["t"]', '"a/+/b"', '"a/#"', '"#"', '"+"', '"' + "x" * 65535 + '"',
                        '"' + "x" * 65536 + '"', '"' + "é" * 32768 + '"', '"\\u0000"', '"/"', '" "', '"\\ud800"', '"\\ud83d\\ude00"', '"\\u0023"', '"\\u002b"'])
 
@@ -237,7 +268,41 @@ def main() -> int:
     print(f"{'FAIL' if wrong else 'PASS'}  whatever the data plane publishes, Python publishes the same")
     for raw, want, got in wrong[:20]:
         print("   ", show(raw), "\n        python:", want and (want[0][:60], want[1], want[2][:200]), "\n        rust:  ", (got[0][:60], got[1], got[2][:200]))
-    return 1 if wrong or slow_ordinary or same == 0 else 0
+
+    # The same bodies posted to /mqtt/subscribe: whatever the data plane subscribes to, Python subscribes to the same.
+    plain = [json.dumps(b).encode() for b in ({"topic": "s/#"}, {"topic": "a/+/b", "qos": 0}, {"topic": "#", "qos": 2}, {"topic": "sensors/temp", "payload": {"x": 1}}, {"topic": "+/+"})]
+    bodies = plain + bodies[len(ORDINARY):]
+    expected = [python_subscribes(handler, b) for b in bodies]
+    run = subprocess.run([str(BIN), "--judge-subscribes"], input=("\n".join(b.hex() for b in bodies) + "\n").encode(), capture_output=True, timeout=600)
+    lines = run.stdout.decode().split("\n")[:-1]
+    if run.returncode != 0 or len(lines) != len(bodies):
+        print("dataplane --judge-subscribes failed:", run.stderr.decode()[-500:], f"{len(lines)} answers for {len(bodies)} bodies")
+        return 2
+    astray, left, slow_plain, alike = [], [], [], 0
+    for i, (raw, want, line) in enumerate(zip(bodies, expected, lines)):
+        if line == "ask":
+            if want is not None:
+                left.append(raw)
+                if i < len(plain):
+                    slow_plain.append(raw)
+            continue
+        said = json.loads(line)
+        got = (bytes.fromhex(said["topic"]), said["qos"])
+        if got == want:
+            alike += 1
+        else:
+            astray.append((raw, want, got))
+    subscribed = sum(e is not None for e in expected)
+    print(f"\n{len(bodies)} bodies posted to subscribe: Python subscribes for {subscribed}, answers something else for {len(bodies) - subscribed}")
+    print(f"data plane: subscribes for {alike + len(astray)} itself, leaves {len(bodies) - alike - len(astray)} to Python")
+    print(f"left to Python although Python subscribes (correct, slower): {len(left)}")
+    for raw in left[:5]:
+        print("   ", show(raw))
+    print(f"{'FAIL' if alike == 0 or slow_plain else 'PASS'}  ordinary subscriptions are made without asking")
+    print(f"{'FAIL' if astray else 'PASS'}  whatever the data plane subscribes to, Python subscribes to the same")
+    for raw, want, got in astray[:20]:
+        print("   ", show(raw), "\n        python:", want, "\n        rust:  ", got)
+    return 1 if wrong or slow_ordinary or same == 0 or astray or slow_plain or alike == 0 else 0
 
 
 if __name__ == "__main__":

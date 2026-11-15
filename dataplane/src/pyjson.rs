@@ -547,9 +547,39 @@ impl Value {
     }
 }
 
+/// What to subscribe to.
+#[derive(Debug, PartialEq)]
+pub struct Subscribe {
+    /// The topic filter.
+    pub topic: String,
+    pub qos: u8,
+}
+
 /// What the Python gateway would publish for this body, when that is certain and it would answer
 /// 200. `None` for a body it would refuse and for one this side is not sure of.
 pub fn publish(body: &[u8]) -> Option<Publish> {
+    let (topic, qos, payload) = members(body, true)?;
+    // Without a topic the answer is a 400; with wildcards or too long, a 500.
+    let topic = topic.filter(|t| !t.is_empty() && t.len() <= MAX_TOPIC && !t.contains(['+', '#']))?;
+    Some(Publish { topic, qos: qos.unwrap_or(1), payload: payload.unwrap_or_else(|| b"{}".to_vec()) })
+}
+
+/// What the Python gateway would subscribe to for this body, when that is certain and it would
+/// answer 200. `None` for a body it would refuse and for one this side is not sure of.
+pub fn subscribe(body: &[u8]) -> Option<Subscribe> {
+    let (topic, qos, _) = members(body, false)?;
+    // Without a topic the answer is a 400; with a filter its client does not take, a 500. That
+    // client takes a wildcard only as a whole level, and `#` only as the last.
+    let topic = topic.filter(|t| {
+        !t.is_empty() && t.len() <= MAX_TOPIC && !t.contains('\0') && !t.contains("#/") && !t.split('/').any(|level| level.len() > 1 && level.contains(['+', '#']))
+    })?;
+    Some(Subscribe { topic, qos: qos.unwrap_or(1) })
+}
+
+/// The members of a body posted to publish or to subscribe: its topic, its quality of service
+/// and, when asked for, its payload as `json.dumps` writes it. `None` for a body that is not a
+/// JSON object this side reads exactly as the Python gateway does.
+fn members(body: &[u8], with_payload: bool) -> Option<(Option<String>, Option<u8>, Option<Vec<u8>>)> {
     // UTF-8 without a byte-order mark; Python also reads UTF-16 and UTF-32.
     std::str::from_utf8(body).ok()?;
     let mut r = Reader { text: body, at: 0 };
@@ -582,7 +612,7 @@ pub fn publish(body: &[u8]) -> Option<Publish> {
                         _ => return None,
                     });
                 }
-                "payload" => {
+                "payload" if with_payload => {
                     let mut out = Vec::new();
                     r.value(Some(&mut out), 1)?;
                     payload = Some(out);
@@ -602,15 +632,13 @@ pub fn publish(body: &[u8]) -> Option<Publish> {
     if r.at != body.len() {
         return None;
     }
-    // Without a topic the answer is a 400; with wildcards or too long, a 500.
-    let topic = topic.filter(|t| !t.is_empty() && t.len() <= MAX_TOPIC && !t.contains(['+', '#']))?;
-    Some(Publish { topic, qos: qos.unwrap_or(1), payload: payload.unwrap_or_else(|| b"{}".to_vec()) })
+    Some((topic, qos, payload))
 }
 
-/// `dataplane --judge-publishes`: for each body on stdin (one per line, in hex), what would be
-/// published, as a line of JSON, or `ask`. The conformance suite compares the lines with what the
+/// `dataplane --judge-publishes` and `--judge-subscribes`: for each body on stdin (one per line, in hex), what would be
+/// published or subscribed to, as a line of JSON, or `ask`. The conformance suite compares the lines with what the
 /// Python gateway's own code makes of the same bodies.
-pub fn judge_stdin() -> Result<(), String> {
+pub fn judge_stdin(subscribing: bool) -> Result<(), String> {
     use std::io::{BufRead, Write};
     let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
     let out = std::io::stdout();
@@ -625,9 +653,16 @@ pub fn judge_stdin() -> Result<(), String> {
             .map(|i| line.get(2 * i..2 * i + 2).and_then(|pair| u8::from_str_radix(pair, 16).ok()))
             .collect::<Option<_>>()
             .ok_or("a body is not hex")?;
-        let said = match publish(&body) {
-            Some(p) => format!("{{\"topic\":\"{}\",\"qos\":{},\"payload\":\"{}\"}}", hex(p.topic.as_bytes()), p.qos, hex(&p.payload)),
-            None => "ask".to_owned(),
+        let said = if subscribing {
+            match subscribe(&body) {
+                Some(sub) => format!("{{\"topic\":\"{}\",\"qos\":{}}}", hex(sub.topic.as_bytes()), sub.qos),
+                None => "ask".to_owned(),
+            }
+        } else {
+            match publish(&body) {
+                Some(p) => format!("{{\"topic\":\"{}\",\"qos\":{},\"payload\":\"{}\"}}", hex(p.topic.as_bytes()), p.qos, hex(&p.payload)),
+                None => "ask".to_owned(),
+            }
         };
         writeln!(out, "{said}").map_err(|e| e.to_string())?;
     }
@@ -637,6 +672,49 @@ pub fn judge_stdin() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_subscription_is_read_only_when_the_python_gateway_would_make_it() {
+        let wanted = |body: &str| subscribe(body.as_bytes()).map(|s| (s.topic, s.qos));
+        assert_eq!(wanted("{\"topic\":\"s/#\"}"), Some(("s/#".into(), 1)));
+        assert_eq!(wanted(" { \"qos\" : 0 , \"topic\" : \"a/+/b\" } "), Some(("a/+/b".into(), 0)));
+        // A payload, or anything else, is not read: whatever it is, it does not matter.
+        assert_eq!(wanted("{\"topic\":\"+\",\"qos\":2,\"payload\":{\"x\":[1.5,null]},\"retain\":[true]}"), Some(("+".into(), 2)));
+        assert_eq!(wanted("{\"topic\":\"#\"}"), Some(("#".into(), 1)));
+        assert_eq!(wanted("{\"topic\":\"/+/\"}"), Some(("/+/".into(), 1)));
+        assert_eq!(wanted("{\"topic\":\"caf\\u00e9/\\u2603\"}"), Some(("caf\u{e9}/\u{2603}".into(), 1)));
+        for refused in [
+            "{\"topic\":\"\"}",
+            "{}",
+            "{\"qos\":1}",
+            "{\"topic\":null}",
+            "{\"topic\":5}",
+            "{\"topic\":[\"t\"]}",
+            "{\"topic\":\"a/#/b\"}",
+            "{\"topic\":\"#/\"}",
+            "{\"topic\":\"a+/b\"}",
+            "{\"topic\":\"a/b#\"}",
+            "{\"topic\":\"++\"}",
+            "{\"topic\":\"a\\u0000b\"}",
+            "{\"topic\":\"t\",\"qos\":3}",
+            "{\"topic\":\"t\",\"qos\":\"1\"}",
+            "{\"topic\":\"t\",\"qos\":1.0}",
+            "{\"topic\":\"t\",\"qos\":true}",
+            "{\"topic\":\"t\",\"qos\":null}",
+            "{\"topic\":\"t\",\"topic\":\"u\"}",
+            "[\"t\"]",
+            "nope",
+            "{\"topic\":\"t\"}x",
+            "",
+        ] {
+            assert_eq!(wanted(refused), None, "{refused}");
+        }
+        assert!(wanted(&format!("{{\"topic\":\"{}\"}}", "x".repeat(65_535))).is_some());
+        assert!(wanted(&format!("{{\"topic\":\"{}\"}}", "x".repeat(65_536))).is_none());
+        // A publish still reads its payload, and takes no wildcard.
+        assert_eq!(publish("{\"topic\":\"s/#\"}".as_bytes()), None);
+        assert_eq!(publish("{\"topic\":\"t\",\"payload\":{\"a\":1}}".as_bytes()).map(|p| p.payload), Some("{\"a\": 1}".as_bytes().to_vec()));
+    }
 
     fn published(body: &str) -> Option<(String, u8, String)> {
         publish(body.as_bytes()).map(|p| (p.topic, p.qos, String::from_utf8(p.payload).unwrap()))

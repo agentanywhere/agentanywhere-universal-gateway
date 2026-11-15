@@ -134,7 +134,8 @@ def websocket_backend(tls=None):
 
 
 class MqttBroker:
-    """An MQTT 5 broker that acknowledges what it is sent, keeps a note of it and delivers nothing.
+    """An MQTT 5 broker that acknowledges what it is sent, keeps a note of it and delivers only what
+    it is told to (`deliver`), noting how each client acknowledges that.
     It can be stopped and started again on the same port, as a broker that goes away and comes back.
     Given a certificate and its key, it is behind TLS."""
 
@@ -145,7 +146,21 @@ class MqttBroker:
             self.secure = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             self.secure.load_cert_chain(*tls)
         self.clients, self.published, self.released, self.subscribed = [], [], [], []
+        # What each SUBSCRIBE asked for after its packet identifier, the connection of each client by
+        # name, and how each client acknowledged what it was delivered.
+        self.subscriptions, self.connections, self.acknowledged = [], {}, []
         self.start()
+
+    def deliver(self, client, topic, payload, qos, packet_id=7):
+        """Send the named client a message, as for a subscription of its own."""
+        body = len(topic.encode()).to_bytes(2, "big") + topic.encode() + (packet_id.to_bytes(2, "big") if qos else b"") + b"\x00" + payload
+        length, n = bytearray(), len(body)
+        while True:
+            length.append(n % 128 | (0x80 if n >= 128 else 0))
+            n //= 128
+            if not n:
+                break
+        self.connections[client].sendall(bytes([0x30 | qos << 1]) + bytes(length) + body)
 
     def start(self):
         broker = self
@@ -201,6 +216,7 @@ class MqttBroker:
                 client = body[13:13 + int.from_bytes(body[11:13], "big")].decode()
                 self.clients.append({"client": client, "level": body[6], "clean_start": bool(body[7] & 2), "keep_alive": int.from_bytes(body[8:10], "big"),
                                      "properties": body[10]})
+                self.connections[client] = connection
                 connection.sendall(bytes([0x20, 3, 0, 0, 0]))
             elif kind == 3:  # PUBLISH
                 end = 2 + int.from_bytes(body[:2], "big")
@@ -215,8 +231,13 @@ class MqttBroker:
             elif kind == 6:  # PUBREL
                 self.released.append(client)
                 connection.sendall(bytes([0x70, 2]) + body[:2])
+            elif kind in (4, 5, 7):  # PUBACK, PUBREC, PUBCOMP for a message delivered to this client
+                self.acknowledged.append((client, kind, int.from_bytes(body[:2], "big")))
+                if kind == 5:
+                    connection.sendall(bytes([0x62, 2]) + body[:2])
             elif kind == 8:  # SUBSCRIBE
                 self.subscribed.append(client)
+                self.subscriptions.append((client, flags, body[2:]))
                 connection.sendall(bytes([0x90, 4]) + body[:2] + bytes([0, body[-1] & 3]))
             elif kind == 12:  # PINGREQ
                 connection.sendall(bytes([0xD0, 0]))
@@ -988,7 +1009,7 @@ def main() -> int:
             # The gateway's own endpoints stay its own, wherever a request for them arrives.
             # (`/health`, `/ready` and `/live` are answered by the data plane's own probes, checked elsewhere.)
             for path in ("/health/detailed", "/metrics", "/oauth2/providers", "/.well-known/agent-card.json",
-                         "/admin/api-keys", "/docs", "/openapi.json", "/healthz", "/mqtt/subscribe"):
+                         "/admin/api-keys", "/docs", "/openapi.json", "/healthz", "/mqtt/topics"):
                 a, b = both("GET", path, None)
                 check(f"Own path {path}: left to Python, same status", b.headers.get("x-served-by") != "dataplane" and a.status_code == b.status_code,
                       f"[{a.status_code}/{b.status_code}] served-by={b.headers.get('x-served-by')}")
@@ -2390,7 +2411,8 @@ def main() -> int:
             mkeys = {side: mqtt_key(f"mqtt-{side}") for side in ("py", "rs")}
             procs.append(subprocess.Popen([str(BIN), "--listen", f"127.0.0.1:{d}", "--control-token", "conformance-token",
                                            "--sync-interval-ms", "200", "--max-staleness-ms", "2000", "--report-interval-ms", "300",
-                                           "--backend", f"http://127.0.0.1:{bport}", "--control", f"http://127.0.0.1:{g}"], env=own))
+                                           "--backend", f"http://127.0.0.1:{bport}", "--control", f"http://127.0.0.1:{g}"], env=own,
+                                          stdout=open(f"{tmp}/mqtt-dataplane.out", "w")))
 
             def publish(base, key, body=None, path="/mqtt/publish", method="POST", headers=None, content=None):
                 """Send one request and wait for what it makes the broker receive. Returns the answer and the messages."""
@@ -2472,9 +2494,74 @@ def main() -> int:
             pub_same("a body that is not JSON: Python's 500", "python", content=b"nope", want=nothing(500))
             pub_same("a body that is a list: Python's 500", "python", [1], want=nothing(500))
             pub_same("the path with a slash after it is not the publishing path", "python", {"topic": "t"}, path="/mqtt/publish/", want=lambda r, sent: not sent)
-            subscribed = len(broker.subscribed)
-            pub_same("subscribing stays with Python", "python", {"topic": "s/#"}, path="/mqtt/subscribe", want=lambda r, sent: r.status_code == 200 and not sent)
-            check("MQTT: only the Python gateway's client subscribes", len(broker.subscribed) == subscribed + 2 and not any(c.startswith("gateway_dataplane_") for c in broker.subscribed))
+            # Subscribing: each plane's own connection subscribes, with the same packet.
+            def subscribe(base, key, body, content):
+                before = len(broker.subscriptions)
+                r = httpx.post(f"{base}/mqtt/subscribe", headers={"X-API-Key": key}, timeout=15, **({"content": content} if content is not None else {"json": body}))
+                wait_until(lambda: len(broker.subscriptions) > before, 2 if r.status_code == 200 else 0.2)
+                return r, broker.subscriptions[before:]
+
+            def sub_same(name, by, body=None, want=None, content=None):
+                a, asked_a = subscribe(mpy, mkeys["py"], body, content)
+                b, asked_b = subscribe(mrs, mkeys["rs"], body, content)
+                ours_ = lambda asked: [c.startswith("gateway_dataplane_") for c, *_ in asked]
+                bad = []
+                if a.status_code != b.status_code or shape(a) != shape(b):
+                    bad.append(f"python [{a.status_code}] {shape(a)} vs data plane [{b.status_code}] {shape(b)}")
+                if [x[1:] for x in asked_a] != [x[1:] for x in asked_b]:
+                    bad.append(f"at the broker: python {asked_a} vs data plane {asked_b}")
+                if said_by(b) != by or any(ours_(asked_a)) or any(o != (by == "data plane") for o in ours_(asked_b)):
+                    bad.append(f"answered by the {said_by(b)}, subscribed by {[c for c, *_ in asked_b]}")
+                if want is not None and not want(b, asked_b):
+                    bad.append(f"not what was expected: [{b.status_code}] {b.text[:120]} {asked_b}")
+                check(f"MQTT: {name}", not bad, "; ".join(bad) or f"[{b.status_code}] by the {said_by(b)}" + (f", asked {asked_b[0][2]!r}" if asked_b else ""))
+
+            asks = lambda topic, qos: lambda r, asked: r.json() == {"status": "subscribed", "topic": topic} and \
+                [(flags, packet) for _, flags, packet in asked] == [(2, b"\x00" + len(topic.encode()).to_bytes(2, "big") + topic.encode() + bytes([qos]))]
+            unasked = lambda status: lambda r, asked: r.status_code == status and not asked
+            sub_same("a subscription is made here, on this side's own connection", "data plane", {"topic": "s/#"}, want=asks("s/#", 1))
+            sub_same("a filter with a wildcard for one level, at quality of service 0", "data plane", {"topic": "a/+/b", "qos": 0}, want=asks("a/+/b", 0))
+            sub_same("quality of service 2, and members the handler does not read", "data plane", {"topic": "#", "qos": 2, "payload": {"x": 1}, "retain": True}, want=asks("#", 2))
+            sub_same("a filter outside ASCII", "data plane", {"topic": "caf\u00e9/\u2603/+"}, want=asks("caf\u00e9/\u2603/+", 1))
+            sub_same("a filter with # before its end: Python's 500", "python", {"topic": "a/#/b"}, want=unasked(500))
+            sub_same("a wildcard that is not a whole level: Python's 500", "python", {"topic": "a+/b"}, want=unasked(500))
+            sub_same("no topic: Python's 400", "python", {"qos": 1}, want=unasked(400))
+            sub_same("a quality of service of 3: Python's 500", "python", {"topic": "t", "qos": 3}, want=unasked(500))
+            sub_same("a body that is not JSON: Python's 500", "python", content=b"nope", want=unasked(500))
+
+            # What the broker then sends is acknowledged by each plane's client alike, and written out.
+            def acknowledges(client, qos, packet_id, payload=b'{"celsius": 21.5}', topic="s/kitchen"):
+                before = len(broker.acknowledged)
+                broker.deliver(client, topic, payload, qos, packet_id)
+                wait_until(lambda: len(broker.acknowledged) - before >= qos, 3)
+                time.sleep(0.2)
+                return [x[1:] for x in broker.acknowledged[before:]]
+
+            ours = next(c for c in broker.connections if c.startswith("gateway_dataplane_"))
+            theirs_ = next(c for c in broker.connections if not c.startswith("gateway_dataplane_"))
+            for qos, wanted in ((0, []), (1, [(4, 31)]), (2, [(5, 32), (7, 32)])):
+                a, b = acknowledges(theirs_, qos, 31 + qos // 2), acknowledges(ours, qos, 31 + qos // 2)
+                check(f"MQTT: a message at quality of service {qos} is acknowledged as the Python gateway's client acknowledges it",
+                      a == b == wanted, f"python {a} vs data plane {b}")
+            acknowledges(ours, 0, 0, b"plain words", "s/note")
+            acknowledges(ours, 0, 0, b"\xff\xfe", "s/bytes")
+
+            def written():
+                out = []
+                for line in open(f"{tmp}/mqtt-dataplane.out").read().splitlines():
+                    try:
+                        out.append(json.loads(line))
+                    except ValueError:
+                        out.append({"unreadable": line})
+                return [{k: v for k, v in l.items() if k != "@timestamp"} for l in out if str(l.get("event", "")).startswith("mqtt_message") or "unreadable" in l]
+
+            received = {"topic": "s/kitchen", "payload": {"celsius": 21.5}, "event": "mqtt_message_received", "level": "info", "logger": "dataplane"}
+            wait_until(lambda: len(written()) >= 5, 3)
+            check("MQTT: each message the broker sends is written out once, as the Python gateway logs it",
+                  written() == [received] * 3 + [{**received, "topic": "s/note", "payload": {"raw": "plain words"}},
+                                                 {"error": "a message that is not UTF-8", "event": "mqtt_message_error", "level": "info", "logger": "dataplane"}],
+                  str(written())[:400])
+            pub_same("publishing goes on as before", "data plane", {"topic": "after/subscribing"}, want=one("after/subscribing", 1, b"{}"))
             # Refusals come before the message is read, and nothing reaches the broker.
             a, _ = publish(mpy, None, {"topic": "t"})
             b, sent = publish(mrs, None, {"topic": "t"})
@@ -2508,6 +2595,7 @@ def main() -> int:
                   wait_until(lambda: counted() == before + 5, 5) is not None, f"{counted() - before:.0f} of 5")
 
             # The broker goes away and comes back. While it is away, neither plane publishes; after, both do.
+            asked_before_it_left = len(broker.subscriptions)
             broker.stop()
             down = lambda: publish(mrs, mkeys["rs"], {"topic": "while/away"})[0]
             check("MQTT: with the broker away, the data plane hands publishing to Python", wait_until(lambda: said_by(down()) == "python", 10) is not None)
@@ -2521,6 +2609,8 @@ def main() -> int:
             check("MQTT: when the broker is back, the data plane publishes again", back is not None)
             pub_same("after the broker came back, messages are the same again", "data plane", {"topic": "back", "payload": {"n": 1}}, want=one("back", 1, b'{"n": 1}'))
             check("MQTT: nothing sent while the broker was away turns up later", not any(m["topic"] == "while/away" for m in broker.published[seen:]))
+            check("MQTT: neither plane subscribes again by itself when the broker comes back", len(broker.subscriptions) == asked_before_it_left,
+                  f"{len(broker.subscriptions) - asked_before_it_left} more")
 
             # --- MQTT behind TLS ----------------------------------------------------------------------
             # As with the other backends behind TLS: a broker both planes trust, and one nobody vouches for.

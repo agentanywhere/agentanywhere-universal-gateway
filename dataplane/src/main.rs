@@ -230,7 +230,11 @@ fn main() {
         return proxy::judge_paths().unwrap_or_else(|e| fail(e));
     }
     if std::env::args().nth(1).as_deref() == Some("--judge-publishes") {
-        return pyjson::judge_stdin().unwrap_or_else(|e| fail(e));
+        return pyjson::judge_stdin(false).unwrap_or_else(|e| fail(e));
+    }
+    // `dataplane --judge-subscribes` answers what `POST /mqtt/subscribe` would subscribe to for each.
+    if std::env::args().nth(1).as_deref() == Some("--judge-subscribes") {
+        return pyjson::judge_stdin(true).unwrap_or_else(|e| fail(e));
     }
     let args = parse_args().unwrap_or_else(|e| fail(e));
     // A file bootstraps the snapshot; with a token it is replaced by the control plane's, and until

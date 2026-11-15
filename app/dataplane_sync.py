@@ -719,7 +719,8 @@ _MQTT_HOST = re.compile(r"[A-Za-z0-9.-]+")
 
 def _mqtt() -> Optional[Dict[str, Any]]:
     """The MQTT broker ``POST /mqtt/publish`` publishes to, while this gateway's own client is
-    connected to it: the data plane then keeps a connection of its own and publishes there too.
+    connected to it: the data plane then keeps a connection of its own, and publishes and
+    subscribes (``POST /mqtt/subscribe``) there too.
     Behind TLS (``mqtts://``), this gateway's client verifies the broker against the system's
     certificates and SSL_CERT_FILE; the data plane only against that file. Without one, the two
     would not trust alike, and the broker is left to this gateway."""

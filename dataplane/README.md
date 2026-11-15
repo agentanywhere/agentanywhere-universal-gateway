@@ -195,9 +195,22 @@ differently), a body over 1 MiB or in another encoding, and any request while th
 behind TLS (`mqtts://`) is this side's only with `SSL_CERT_FILE` set and `SSL_CERT_DIR` not, for the reason given for
 `wss://` backends: only then do both sides verify it against the same certificates. As with the Python gateway's client, the answer is given once the message is handed to the
 connection, not once the broker acknowledges it; messages above quality of service 0 are kept until it does and sent
-again after a reconnect. `/mqtt/subscribe` stays with the Python gateway.
-`python dataplane/conformance/publish.py` generates bodies and checks that whatever this side would publish, the Python
-gateway's own handler and client publish the same bytes.
+again after a reconnect.
+
+**MQTT subscribing.** `POST /mqtt/subscribe` makes the Python gateway's connection subscribe to a topic filter; what
+the broker then sends is written to that gateway's log (`mqtt_message_received`, at level info) and nothing else is done
+with it. Here it makes this side's connection subscribe instead, with the same packet: one filter, no option but the
+quality of service. It is answered here when the connection stands and the body is a JSON object in UTF-8 with a
+`topic` the Python gateway's client takes as a filter (`+` only as a whole level, `#` only as the last) and a `qos`
+written `0`, `1` or `2` (or none); everything else goes to the Python gateway, which subscribes or refuses. Each message
+the broker sends is acknowledged as that client acknowledges it, and written to this process's standard output as one
+line of JSON: `topic`, `payload` (the JSON the message spells, or its text under `raw`), `event`, `level`, `logger` and
+`@timestamp`. **So with the data plane in front, messages for a subscription made through it appear in the data plane's
+output, not in the Python gateway's log.** As there, a subscription ends with the connection: neither side subscribes
+again by itself when the broker comes back.
+
+`python dataplane/conformance/publish.py` generates bodies and checks that whatever this side would publish or
+subscribe to, the Python gateway's own handler and client publish or subscribe to the same.
 
 **Transformation rules.** A rule that changes headers, query parameters or the fields of a JSON body of a request,
 rewrites its path, or changes headers or the status of an answer, is applied here, as the Python
@@ -395,7 +408,8 @@ here is the reverse of everywhere else: **whatever this side cannot be sure of i
 | Any other WebSocket (refused by an IP rule or a policy, an escaped key, an unknown slug) | Python, through a tunnel |
 | gRPC calls (HTTP/2, `application/grpc`) | data plane only; refused when it cannot be sure |
 | `POST /mqtt/publish` (broker at `mqtt://`, or `mqtts://` with `SSL_CERT_FILE`), body certain to publish the same message | data plane, over its own connection to the broker |
-| Any other publish (a body this side is not sure of, `mqtts://` without `SSL_CERT_FILE`, the connection down), `/mqtt/subscribe` | Python |
+| `POST /mqtt/subscribe`, under the same conditions, a filter certain to be taken | data plane, on its own connection; the messages are written to its output |
+| Any other publish or subscribe (a body this side is not sure of, `mqtts://` without `SSL_CERT_FILE`, the connection down) | Python |
 | Any other request over HTTP/2 | as the same request over HTTP/1 |
 | `/agents/<slug>/...` to a registered agent, browsers included | data plane |
 | `/agents/<slug>/...` otherwise (unknown slugs, unusual requests) | Python |
@@ -430,6 +444,8 @@ here is the reverse of everywhere else: **whatever this side cannot be sure of i
 * **`wss://` backends and agents without `SSL_CERT_FILE` are relayed by the Python gateway**, not here.
 * **An agent's WebSocket message above 1 MiB passes here.** The Python gateway's relay closes the connection on one from the agent.
 
+* **A message from the broker above 16 MiB ends this side's MQTT connection**, and with it the subscriptions made
+  through it. The Python gateway's client takes a message of any size.
 * **`/ready` can be one sync interval behind** (500 ms by default), or as long as a sync that hangs takes to fail
   (five seconds), because it repeats the Python gateway's last answer instead of asking the database itself.
 * **`/metrics` is still the Python gateway's.** It is the registry for the whole gateway, including everything this
@@ -478,7 +494,7 @@ cargo test                              # unit tests
 python dataplane/conformance/run.py     # same scenarios against Python and the data plane, plus the live-link
                                         # scenarios (needs the build above)
 python dataplane/conformance/boundary.py  # the body checks against the Python functions, on generated bodies
-python dataplane/conformance/publish.py   # what would be published to MQTT, against the Python handler and client
+python dataplane/conformance/publish.py   # what would be published and subscribed to over MQTT, against the Python handler and client
 python dataplane/conformance/patterns.py  # which paths a transformation rule's pattern matches, against Python's matcher
 python dataplane/conformance/shapes.py    # what applied transformation rules make of a request and its answer, against Python's rule code
 python dataplane/conformance/preflight.py # what a preflight is answered, against the CORS middleware itself
