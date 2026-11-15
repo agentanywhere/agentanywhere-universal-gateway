@@ -890,6 +890,52 @@ async def test_the_snapshot_names_the_grpc_backend_when_it_is_a_plain_address(db
         assert await named() == want, target
 
 
+async def test_the_snapshot_says_how_the_json_bridge_under_grpc_is_served(db_session, monkeypatch):
+    """The data plane serves the bridge as this gateway would: it needs the server the handler calls,
+    and the two things about this installation that decide whether a call is made at all."""
+    import sys
+    import types
+
+    from app import main as gw
+    from app.protocols import GRPCHandler
+
+    async def said():
+        return (await dataplane_sync.build_snapshot(db_session))["grpc_bridge"]
+
+    def installed(reflection, stubs):
+        dataplane_sync._grpc_reflection.cache_clear()
+        dataplane_sync._greeter_stubs.cache_clear()
+        for name in ("grpc_reflection", "grpc_reflection.v1alpha", "grpc_reflection.v1alpha.reflection", "grpc_reflection.v1alpha.reflection_pb2"):
+            monkeypatch.setitem(sys.modules, name, types.ModuleType(name) if reflection else None)
+        if reflection:
+            sys.modules["grpc_reflection.v1alpha"].reflection_pb2 = sys.modules["grpc_reflection.v1alpha.reflection_pb2"]
+        for name in ("greeter_pb2", "greeter_pb2_grpc"):
+            if not stubs:
+                monkeypatch.setitem(sys.modules, name, None)
+            elif sys.modules.get(name, 0) is None:
+                monkeypatch.delitem(sys.modules, name)
+
+    monkeypatch.setattr(gw, "grpc_handler", None)
+    assert await said() is None
+    monkeypatch.setattr(gw, "grpc_handler", GRPCHandler("grpc.internal:9000"))
+    installed(False, True)
+    assert await said() == {"target": "http://grpc.internal:9000", "reflection": False, "stubs": True}
+    installed(True, False)
+    assert await said() == {"target": "http://grpc.internal:9000", "reflection": True, "stubs": False}
+    # Asked once: what is installed does not change while the gateway runs.
+    installed(True, True)
+    dataplane_sync._greeter_stubs.cache_clear()
+    assert (await said())["stubs"] is True
+    # The handler's channel takes a plain host:port; any other address is left to this gateway.
+    for target in ("http://grpc.internal:9000", "https://grpc.internal:443", "dns:///grpc.internal:9000", " grpc.internal:9000", "grpc.internal", ""):
+        monkeypatch.setattr(gw, "grpc_handler", GRPCHandler(target))
+        assert await said() is None, target
+    monkeypatch.setattr(gw, "grpc_handler", types.SimpleNamespace(call_unary=None))
+    assert await said() is None
+    dataplane_sync._grpc_reflection.cache_clear()
+    dataplane_sync._greeter_stubs.cache_clear()
+
+
 async def test_the_snapshot_names_the_mqtt_broker_while_this_gateway_is_connected_to_it(db_session, monkeypatch):
     from app import main as gw
     from app.protocols import MQTTHandler

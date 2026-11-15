@@ -124,6 +124,8 @@ pub struct Snapshot {
     pub grpc_url: Option<String>,
     /// The backend at that address, filled in when the snapshot is put to use.
     pub grpc: Option<Arc<Backend>>,
+    /// The JSON-to-gRPC bridge under `/grpc`, when this side may serve it as the Python gateway does.
+    pub bridge: Option<crate::bridge::Bridge>,
     /// The MQTT broker `POST /mqtt/publish` publishes to, while the Python gateway is connected
     /// to it and this side may publish there as well.
     pub mqtt: Option<Broker>,
@@ -753,6 +755,7 @@ struct SnapshotFile {
     ops: Option<Ops>,
     websocket: Option<String>,
     grpc: Option<String>,
+    grpc_bridge: Option<crate::bridge::Bridge>,
     mqtt: Option<Broker>,
     #[serde(default)]
     agents: HashMap<String, String>,
@@ -1138,6 +1141,10 @@ impl Snapshot {
             websocket: None,
             grpc_url: file.grpc.filter(|u| u.starts_with("http://") || u.starts_with("https://")),
             grpc: None,
+            bridge: file.grpc_bridge.and_then(|mut b| {
+                b.uri = b.target.strip_prefix("http://").and_then(|_| b.target.parse().ok())?;
+                Some(b)
+            }),
             mqtt: file.mqtt.filter(|b| !b.host.is_empty() && b.port != 0),
             agent_urls: file.agents,
             agents: HashMap::new(),

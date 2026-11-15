@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import fnmatch
+import functools
 import hashlib
 import ipaddress
 import json
@@ -699,6 +700,55 @@ def _agent_failure() -> Optional[Dict[str, Any]]:
     return {"message_json": _dumps(gw.INTERNAL_ERROR_MESSAGE), "page": parts}
 
 
+@functools.lru_cache(maxsize=1)
+def _greeter_stubs() -> bool:
+    """Whether the bridge under ``/grpc`` finds the sample service's generated code, looked for
+    exactly as the bridge looks for it. Asked once: what is installed does not change while running."""
+    import os
+    import sys
+
+    from app.protocols import grpc_handler
+
+    for proto_path in (os.path.join(os.path.dirname(grpc_handler.__file__), "../../samples/backends/grpc"),
+                       "/app/samples/backends/grpc", "samples/backends/grpc"):
+        if os.path.exists(proto_path):
+            sys.path.insert(0, proto_path)
+            try:
+                import greeter_pb2  # noqa: F401
+                import greeter_pb2_grpc  # noqa: F401
+                return True
+            except ImportError:
+                continue
+    return False
+
+
+@functools.lru_cache(maxsize=1)
+def _grpc_reflection() -> bool:
+    """Whether the reflection package the bridge asks for before any unary call can be loaded."""
+    try:
+        import grpc_reflection.v1alpha.reflection  # noqa: F401
+        from grpc_reflection.v1alpha import reflection_pb2  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _grpc_bridge() -> Optional[Dict[str, Any]]:
+    """How this gateway serves JSON posted under ``/grpc``, for the data plane to serve it the same
+    way: the server its handler calls (only a plain ``host:port``, which is all its channel takes),
+    whether the reflection package is installed (without it no unary call is made) and whether the
+    sample service's generated code is. ``None``: the data plane leaves the bridge to this gateway."""
+    from app import main as gw
+
+    target = getattr(gw.grpc_handler, "backend_url", None)
+    if not isinstance(target, str) or not _GRPC_TARGET.fullmatch(target):
+        return None
+    try:
+        return {"target": f"http://{target}", "reflection": _grpc_reflection(), "stubs": _greeter_stubs()}
+    except Exception:
+        return None
+
+
 _GRPC_TARGET = re.compile(r"(?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\]):[0-9]{1,5}")
 
 
@@ -1118,6 +1168,7 @@ async def build_snapshot(db: AsyncSession) -> Dict[str, Any]:
         "ops": _ops(settings),
         "websocket": _websocket(settings),
         "grpc": _grpc(settings),
+        "grpc_bridge": _grpc_bridge(),
         "mqtt": _mqtt(),
         "agents": _agents(),
         "agent_failure": _agent_failure(),

@@ -28,6 +28,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::accesslog::{self, AccessLog};
+use crate::bridge;
 use crate::boundary::Verdict;
 use crate::breaker::{self, Breaker};
 use crate::govern::{self, IpRule, Policy, Scope, Subject};
@@ -42,7 +43,7 @@ use crate::sync::Link;
 /// A body is either streamed from the other side or held here whole; neither is boxed. Responses
 /// are streamed from upstream or made here; requests are streamed from the client, or read whole
 /// when the gateway looks inside them.
-pub type Body = Either<Incoming, Full<Bytes>>;
+pub type Body = Either<Incoming, Either<Full<Bytes>, crate::bridge::Lines>>;
 
 /// The protocols served natively. Each has its own backend; which one a path belongs to is
 /// decided as the Python gateway's router decides it.
@@ -59,6 +60,8 @@ pub enum Protocol {
     Mqtt,
     /// Requests under `/graphql`, passed to the GraphQL server as they came.
     GraphQl,
+    /// JSON posted under `/grpc`, which the gateway turns into a gRPC call of its own.
+    Bridge,
 }
 
 /// The protocols whose backends come from the snapshot, in the order `Snapshot::routes` holds them.
@@ -74,7 +77,7 @@ impl Protocol {
             Protocol::A2a => "a2a",
             Protocol::AgUi => "ag_ui",
             Protocol::Acp => "acp",
-            Protocol::Grpc => "grpc",
+            Protocol::Grpc | Protocol::Bridge => "grpc",
             Protocol::Mqtt => "mqtt",
             Protocol::GraphQl => "graphql",
         }
@@ -398,8 +401,10 @@ fn classify(path: &str, own: Option<&[String]>) -> Option<Protocol> {
         Some(Protocol::AgUi)
     } else if under("/acp") {
         Some(Protocol::Acp)
-    } else if under("/mqtt") || path.starts_with("/ws") || path.starts_with("/websocket") || under("/grpc") {
+    } else if under("/mqtt") || path.starts_with("/ws") || path.starts_with("/websocket") {
         None
+    } else if under("/grpc") {
+        Some(Protocol::Bridge)
     } else if under("/graphql") {
         Some(Protocol::GraphQl)
     } else if let Some(rest) = path.strip_prefix("/api/") {
@@ -593,7 +598,7 @@ const PAGE_RETRY_AFTER: &str = "987654321";
 
 /// The bytes of a body made here, which is whole and ready. `None` for one streamed from upstream.
 fn made_here(body: Body) -> Option<Bytes> {
-    let Either::Right(body) = body else { return None };
+    let Either::Right(Either::Left(body)) = body else { return None };
     let mut body = std::pin::pin!(body);
     let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
     match body.as_mut().poll_frame(&mut cx) {
@@ -632,7 +637,7 @@ fn as_page(pages: &HashMap<String, String>, resp: Response<Body>) -> Response<Bo
 }
 
 fn full(bytes: impl Into<Bytes>) -> Body {
-    Either::Right(Full::new(bytes.into()))
+    Either::Right(Either::Left(Full::new(bytes.into())))
 }
 
 fn json(text: &str) -> String {
@@ -950,6 +955,11 @@ fn decide<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, now: u6
     if publishing && (method != "POST" || snap.mqtt.is_none()) {
         return PYTHON;
     }
+    // The bridge takes JSON by POST, and is served here only as the Python gateway said it serves it.
+    let bridging = protocol == Protocol::Bridge;
+    if bridging && (method != "POST" || snap.bridge.is_none()) {
+        return PYTHON;
+    }
     let pages = snap.error_pages.as_ref().filter(|_| html);
     let refuse = |wording: &'a Wording| Decision::Refuse(Unauthenticated { pages, wording, version, ip, method });
 
@@ -1000,7 +1010,7 @@ fn decide<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, now: u6
     }
     // A dynamic route comes before the protocol's own backend: the first that matches decides.
     // Publishing has a handler of its own in the Python gateway, which no route comes before.
-    let route = snap.dynamic_routes.iter().find(|r| !publishing && r.matches(path));
+    let route = snap.dynamic_routes.iter().find(|r| !publishing && !bridging && r.matches(path));
     let backend = match (route, protocol.route_index()) {
         (Some(route), _) => match route.backend.as_deref() {
             Some(backend) => Some(backend),
@@ -1023,7 +1033,7 @@ fn decide<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, now: u6
     let Some(mut shaping) = snap.shaping(method, asked, path) else { return PYTHON };
     if !shaping.is_empty() {
         // Publishing and gRPC have handlers of their own in the Python gateway.
-        if publishing || protocol == Protocol::Grpc {
+        if publishing || bridging || protocol == Protocol::Grpc {
             return PYTHON;
         }
         // An answer the Python gateway streams is passed on there with no rule applied.
@@ -2209,6 +2219,12 @@ fn backend_unavailable(t: &Trace) -> Response<Body> {
     )
 }
 
+/// The bridge's call to the gRPC server failed with this status.
+fn bridge_failed(code: u8, t: &Trace) -> Response<Body> {
+    let details = format!("{{\"grpc_code\":\"StatusCode.{}\",\"service\":\"gRPC\",\"method\":\"SayHello\"}}", bridge::code_name(code));
+    envelope(StatusCode::BAD_GATEWAY, "BACKEND_ERROR", "\"gRPC: gRPC backend call failed\"", &details, t, false)
+}
+
 /// The circuit breaker is open: the request was not sent.
 fn circuit_open(t: &Trace) -> Response<Body> {
     envelope(
@@ -2553,6 +2569,24 @@ pub async fn handle(w: Arc<Worker>, peer: SocketAddr, mut req: Request<Incoming>
         }
     }
 
+    // JSON for the bridge is read here whole, before anything is counted. Unless what the Python
+    // gateway would do for it is certain, the request is handed over as it came.
+    let mut bridged = None;
+    if refused.is_none() && n.protocol == Protocol::Bridge {
+        if let (Some(bridge), Some(len)) = (snap.bridge.as_ref(), req.body().size_hint().exact()) {
+            if len <= PUBLISH_BODY_MAX {
+                let (parts, body) = req.into_parts();
+                let Ok(read) = body.collect().await else { return Ok(body_unreadable()) };
+                let bytes = read.to_bytes();
+                bridged = bridge::plan(&bytes, bridge).map(|plan| (plan, bridge));
+                req = Request::from_parts(parts, full(bytes));
+            }
+        }
+        if bridged.is_none() {
+            return Ok(to_control(&w, peer, req).await);
+        }
+    }
+
     let (mut ticket, mut rejected, mut error_type) = (None, false, None);
     let (mut resp, error) = if let Some(r) = refused {
         rejected = true;
@@ -2584,6 +2618,32 @@ pub async fn handle(w: Arc<Worker>, peer: SocketAddr, mut req: Request<Incoming>
                     resp.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
                     st.mqtt.subscribe(wanted);
                     (resp, None)
+                } else if let Some((plan, bridge)) = bridged.take() {
+                    let said = |json: Vec<u8>| {
+                        let mut resp = Response::new(full(json));
+                        resp.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                        resp
+                    };
+                    let sent = |method: &str, name: &str, seconds: u64| bridge::call(&bridge.uri, method, name, seconds).map(|call| w.grpc.request(call.map(full)));
+                    match plan {
+                        bridge::Plan::Answer(json) => (said(json), None),
+                        bridge::Plan::Hello(name) => match sent("SayHello", &name, bridge::UNARY_SECONDS) {
+                            Some(sent) => match bridge::hello(sent).await {
+                                Ok(message) => (said(bridge::greeted(&message).into_bytes()), None),
+                                Err(code) => (bridge_failed(code, &t), Some("BACKEND_ERROR")),
+                            },
+                            None => (backend_unavailable(&t), Some("BACKEND_ERROR")),
+                        },
+                        bridge::Plan::Hellos(name) => match sent("SayManyHellos", &name, bridge::STREAM_SECONDS) {
+                            // Answered at once, as the Python gateway answers: the lines follow as the call yields them.
+                            Some(sent) => {
+                                let mut resp = Response::new(Either::Right(Either::Right(bridge::Lines::new(sent))));
+                                resp.headers_mut().insert(CONTENT_TYPE, bridge::ndjson());
+                                (resp, None)
+                            }
+                            None => (backend_unavailable(&t), Some("BACKEND_ERROR")),
+                        },
+                    }
                 } else if !backend.breaker.allow(&cb, Instant::now()) {
                     (circuit_open(&t), Some("SERVICE_UNAVAILABLE"))
                 } else {
@@ -2921,12 +2981,16 @@ mod tests {
             ("/graphql", Some(Protocol::GraphQl)),
             ("/api/graphql/batch", Some(Protocol::GraphQl)),
             ("/graphqlx", Some(Protocol::GraphQl)),
+            ("/grpc/x", Some(Protocol::Bridge)),
+            ("/api/grpc", Some(Protocol::Bridge)),
+            ("/grpcx", Some(Protocol::Bridge)),
+            ("/grpc/graphql", Some(Protocol::Bridge)),
         ] {
             assert_eq!(classify(path, None), protocol, "{path}");
         }
         for path in [
             "/admin/keys", "/oauth2/token", "/health", "/docs", "/", "/api", "/apix/y", "/rest/x", "/users",
-            "/mqtt/publish/", "/mqtt/subscribe/", "/mqtt/subscriptions", "/mqtt", "/api/mqtt/publish", "/api/mqtt/subscribe", "/api/mqtt/x", "/ws/x", "/websocket", "/wss", "/grpc/x", "/api/grpc", "/grpc/graphql", "/ws/graphql",
+            "/mqtt/publish/", "/mqtt/subscribe/", "/mqtt/subscriptions", "/mqtt", "/api/mqtt/publish", "/api/mqtt/subscribe", "/api/mqtt/x", "/ws/x", "/websocket", "/wss", "/ws/graphql",
             "/api/ws/x", "/api/agents/a", "/agents/a/mcp",
         ] {
             assert_eq!(classify(path, None), None, "{path}");
@@ -2942,7 +3006,7 @@ mod tests {
         // The control plane's own, by how they begin, and what it kept before.
         for path in [
             "/health", "/health/detailed", "/healthz", "/admin/keys", "/oauth2/token", "/metrics", "/.well-known/agent-card.json",
-            "/mqtt/topics", "/ws/x", "/wss", "/websocket", "/grpc/x", "/api/ws/x", "/api/agents/a",
+            "/mqtt/topics", "/ws/x", "/wss", "/websocket", "/api/ws/x", "/api/agents/a",
         ] {
             assert_eq!(classify(path, Some(&own)), None, "{path}");
         }
@@ -3428,7 +3492,7 @@ mod tests {
     }
 
     fn bytes_of(resp: Response<Body>) -> Bytes {
-        let Either::Right(body) = resp.into_body() else { panic!("made here") };
+        let Either::Right(Either::Left(body)) = resp.into_body() else { panic!("made here") };
         let mut body = std::pin::pin!(body);
         let waker = std::task::Waker::noop();
         let mut cx = std::task::Context::from_waker(waker);

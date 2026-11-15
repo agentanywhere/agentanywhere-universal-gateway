@@ -212,6 +212,29 @@ again by itself when the broker comes back.
 `python dataplane/conformance/publish.py` generates bodies and checks that whatever this side would publish or
 subscribe to, the Python gateway's own handler and client publish or subscribe to the same.
 
+**The JSON bridge under `/grpc`.** A `POST` to a path that begins with `/grpc` or `/api/grpc` carries JSON
+(`service`, `method`, `data`, `stream`) that the Python gateway turns into a gRPC call of its own to
+`GRPC_BACKEND_URL`. Its bridge knows one service, the sample `greeter.Greeter`, and what it does depends on its
+installation, which the snapshot says (`grpc_bridge`): whether the gRPC reflection package can be loaded (it is not
+among the gateway's requirements, and without it no single call is ever made) and whether the sample's generated code
+is found. This side does the same in each case:
+
+* `"stream": true` with `Greeter` and `SayManyHellos`: the call is made (60 seconds at most) and each answer is
+  written as a line of JSON (`application/x-ndjson`) when the server sends it. The answer starts at once with status
+  200; if the call fails, it breaks off after the lines already sent, as the Python gateway's does.
+* `Greeter` and `SayHello`, where the reflection package and the generated code are there: the call is made (30
+  seconds at most) and answered as `{"status":"success","message":...}`; a call that fails is a 502 naming the gRPC
+  status.
+* Anything else: `{"status":"unsupported",...}` with the data sent back, spelled as the Python gateway spells it.
+
+It is served here when `GRPC_BACKEND_URL` is a plain `host:port` and the body is a JSON object in UTF-8 of at most
+1 MiB whose `service` and `method` are strings (or absent), whose `stream` is written `true`, `false` or `null`, and
+whose `data`, where a call is made, is an object with a `name` that is a string (or absent). Every other request (any
+method but `POST`, a member named twice, a number too large to hold, a transformation rule that applies to the path)
+goes to the Python gateway, which answers in its own words. No dynamic route comes before the bridge, here or there.
+`python dataplane/conformance/bridge.py` generates bodies and checks, in each of the three installations, that
+whatever this side would do with one, the Python gateway's own handler does the same.
+
 **Transformation rules.** A rule that changes headers, query parameters or the fields of a JSON body of a request,
 rewrites its path, or changes headers or the status of an answer, is applied here, as the Python
 gateway applies it: for each rule that applies, in the order the rules were made, headers are renamed, then removed,
@@ -418,7 +441,8 @@ here is the reverse of everywhere else: **whatever this side cannot be sure of i
 | The same without `HTTP_BACKEND_URL` (Python sends them to the MCP backend) | Python |
 | A percent-escaped path, or one with `.` or `..` segments, on any of the above | data plane, read and written as Python does |
 | A path that decodes to a control character, `?`, `#` or bytes that are not UTF-8; an escaped path under `/agents/` | Python |
-| The JSON-to-gRPC bridge under `/grpc` | Python |
+| `POST` of JSON to the bridge under `/grpc`, read here exactly as Python reads it | data plane |
+| Anything else under `/grpc` that is not a gRPC call | Python |
 | A path that matches a dynamic route to an `http://` or `https://` backend | data plane, to the route's backend |
 | A path that matches a dynamic route to any other backend | Python |
 | A request a transformation rule applies to (by path pattern and method), when the rule changes headers, query parameters, the fields of the request's JSON body, the status or the headers of the answer, or rewrites the path by plain text or by an expression both engines read alike | data plane, which applies it |
@@ -442,6 +466,10 @@ here is the reverse of everywhere else: **whatever this side cannot be sure of i
 * **A WebSocket is checked when it opens, not while it is open.** A key revoked afterwards keeps its open connections,
   here and in the Python gateway alike. Connections are not counted, limited or written to the request log by either.
 * **`wss://` backends and agents without `SSL_CERT_FILE` are relayed by the Python gateway**, not here.
+* **The bridge under `/grpc` connects for each call when it must; the Python gateway's channel backs off.** After its
+  gRPC server has been down, the Python gateway keeps answering `UNAVAILABLE` until its channel tries again (up to two
+  minutes); this side reaches the server as soon as it is back. The server sees this side's calls under the user agent
+  `agentanywhere-dataplane`, and an answer the server compresses is a failure here (none is asked for).
 * **An agent's WebSocket message above 1 MiB passes here.** The Python gateway's relay closes the connection on one from the agent.
 
 * **A message from the broker above 16 MiB ends this side's MQTT connection**, and with it the subscriptions made
@@ -495,6 +523,7 @@ python dataplane/conformance/run.py     # same scenarios against Python and the 
                                         # scenarios (needs the build above)
 python dataplane/conformance/boundary.py  # the body checks against the Python functions, on generated bodies
 python dataplane/conformance/publish.py   # what would be published and subscribed to over MQTT, against the Python handler and client
+python dataplane/conformance/bridge.py    # what JSON posted to the bridge under /grpc asks for, against the Python handler
 python dataplane/conformance/patterns.py  # which paths a transformation rule's pattern matches, against Python's matcher
 python dataplane/conformance/shapes.py    # what applied transformation rules make of a request and its answer, against Python's rule code
 python dataplane/conformance/preflight.py # what a preflight is answered, against the CORS middleware itself

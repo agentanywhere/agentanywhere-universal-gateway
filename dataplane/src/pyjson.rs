@@ -28,6 +28,9 @@ const MAX_TOPIC: usize = 65_535;
 struct Reader<'a> {
     text: &'a [u8],
     at: usize,
+    /// Written out as the Python gateway's JSON answers are (nothing between members, characters
+    /// outside ASCII as themselves) and not as `json.dumps` writes by default.
+    compact: bool,
 }
 
 /// Where a string that is read goes.
@@ -131,6 +134,21 @@ impl Reader<'_> {
         }
     }
 
+    /// A string, written out with its quotes in this reader's spelling. In the compact one, half
+    /// a surrogate pair fails: Python could read it but not send it.
+    fn written(&mut self, out: &mut Vec<u8>) -> Option<()> {
+        if self.compact {
+            let mut text = String::new();
+            self.string(Sink::Text(&mut text))?;
+            out.extend_from_slice(quoted(&text).as_bytes());
+        } else {
+            out.push(b'"');
+            self.string(Sink::Dumped(out))?;
+            out.push(b'"');
+        }
+        Some(())
+    }
+
     /// A number, written out as Python writes the number it reads.
     fn number(&mut self, out: Option<&mut Vec<u8>>) -> Option<()> {
         let start = self.at;
@@ -195,14 +213,10 @@ impl Reader<'_> {
         if depth > MAX_DEPTH {
             return None;
         }
+        let (between, after_name): (&[u8], &[u8]) = if self.compact { (b",", b":") } else { (b", ", b": ") };
         match self.peek()? {
             b'"' => match out {
-                Some(out) => {
-                    out.push(b'"');
-                    self.string(Sink::Dumped(out))?;
-                    out.push(b'"');
-                    Some(())
-                }
+                Some(out) => self.written(out),
                 None => self.string(Sink::Nothing),
             },
             b'{' => {
@@ -215,7 +229,7 @@ impl Reader<'_> {
                 if self.take(b'}').is_none() {
                     loop {
                         let mut name = Vec::new();
-                        self.string(Sink::Dumped(&mut name))?;
+                        self.written(&mut name)?;
                         // Named twice, the member keeps its first place and its last value in
                         // Python: its to write.
                         if names.contains(&name) {
@@ -226,11 +240,10 @@ impl Reader<'_> {
                         self.blank();
                         if let Some(out) = out.as_deref_mut() {
                             if !names.is_empty() {
-                                out.extend_from_slice(b", ");
+                                out.extend_from_slice(between);
                             }
-                            out.push(b'"');
                             out.extend_from_slice(&name);
-                            out.extend_from_slice(b"\": ");
+                            out.extend_from_slice(after_name);
                         }
                         names.push(name);
                         self.value(out.as_deref_mut(), depth + 1)?;
@@ -257,7 +270,7 @@ impl Reader<'_> {
                     let mut first = true;
                     loop {
                         if let Some(out) = out.as_deref_mut().filter(|_| !first) {
-                            out.extend_from_slice(b", ");
+                            out.extend_from_slice(between);
                         }
                         first = false;
                         self.value(out.as_deref_mut(), depth + 1)?;
@@ -400,6 +413,14 @@ pub fn float_repr(value: f64) -> Option<String> {
     Some(format!("{sign}{}.{}", &digits[..whole], &digits[whole..]))
 }
 
+/// A string as `json.dumps` writes it: quoted, everything outside ASCII escaped.
+pub fn dumped(text: &str) -> String {
+    let mut out = vec![b'"'];
+    text.chars().for_each(|c| dump_char(&mut out, c as u32));
+    out.push(b'"');
+    String::from_utf8(out).unwrap_or_default()
+}
+
 /// A string as the Python gateway's JSON answers write it: quoted, with only what must be escaped.
 pub fn quoted(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 2);
@@ -451,7 +472,7 @@ pub fn path(dotted: &str) -> Path {
 /// 64 levels, `NaN`, a number too large to hold, a byte-order mark).
 pub fn parse(text: &[u8]) -> Option<Value> {
     std::str::from_utf8(text).ok()?;
-    let mut r = Reader { text, at: 0 };
+    let mut r = Reader { text, at: 0, compact: false };
     r.blank();
     let value = r.tree(0)?;
     r.blank();
@@ -576,13 +597,123 @@ pub fn subscribe(body: &[u8]) -> Option<Subscribe> {
     Some(Subscribe { topic, qos: qos.unwrap_or(1) })
 }
 
+/// A body posted to the JSON-to-gRPC bridge under `/grpc`, as the Python gateway reads it.
+#[derive(Debug, PartialEq)]
+pub struct Bridged {
+    pub service: String,
+    pub method: String,
+    /// Whether a stream of answers was asked for.
+    pub stream: bool,
+    /// `data` as the Python gateway's JSON answers write it.
+    pub data: Vec<u8>,
+    /// The `name` in `data`, which is all the bridge's one service reads of it.
+    pub name: Name,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum Name {
+    /// `data` is an object without one.
+    Absent,
+    Text(String),
+    /// Not a string, or `data` is not an object.
+    Other,
+}
+
+/// What a body posted to the bridge asks for. `None` for a body the Python gateway would not
+/// answer 200 to and for one this side is not sure of: a `service` or `method` that is not a
+/// string, a `stream` that is not written `true`, `false` or `null`, a member named twice.
+pub fn bridge(body: &[u8]) -> Option<Bridged> {
+    std::str::from_utf8(body).ok()?;
+    let mut r = Reader { text: body, at: 0, compact: true };
+    r.blank();
+    r.take(b'{')?;
+    r.blank();
+    let (mut service, mut method, mut stream, mut data) = (None, None, false, None);
+    let mut names: Vec<String> = Vec::new();
+    if r.take(b'}').is_none() {
+        loop {
+            let mut name = String::new();
+            r.string(Sink::Text(&mut name))?;
+            if names.contains(&name) {
+                return None;
+            }
+            r.blank();
+            r.take(b':')?;
+            r.blank();
+            match name.as_str() {
+                "service" | "method" => {
+                    let mut text = String::new();
+                    r.string(Sink::Text(&mut text))?;
+                    *(if name == "service" { &mut service } else { &mut method }) = Some(text);
+                }
+                "stream" => stream = ["true", "false", "null"].into_iter().find(|w| r.word(w).is_some())? == "true",
+                "data" => {
+                    let (from, mut out) = (r.at, Vec::new());
+                    r.value(Some(&mut out), 1)?;
+                    data = Some((out, name_in(&body[from..r.at])?));
+                }
+                _ => r.value(None, 1)?,
+            }
+            names.push(name);
+            r.blank();
+            if r.take(b',').is_none() {
+                r.take(b'}')?;
+                break;
+            }
+            r.blank();
+        }
+    }
+    r.blank();
+    if r.at != body.len() {
+        return None;
+    }
+    let (data, name) = data.unwrap_or_else(|| (b"{}".to_vec(), Name::Absent));
+    Some(Bridged { service: service.unwrap_or_else(|| "Greeter".into()), method: method.unwrap_or_else(|| "SayHello".into()), stream, data, name })
+}
+
+/// The `name` in a value already read once.
+fn name_in(data: &[u8]) -> Option<Name> {
+    let mut r = Reader { text: data, at: 0, compact: true };
+    if r.take(b'{').is_none() {
+        return Some(Name::Other);
+    }
+    r.blank();
+    let mut found = Name::Absent;
+    if r.take(b'}').is_none() {
+        loop {
+            let mut name = String::new();
+            r.string(Sink::Text(&mut name))?;
+            r.blank();
+            r.take(b':')?;
+            r.blank();
+            if name == "name" && r.peek()? == b'"' {
+                let mut text = String::new();
+                r.string(Sink::Text(&mut text))?;
+                found = Name::Text(text);
+            } else {
+                r.value(None, 1)?;
+                if name == "name" {
+                    found = Name::Other;
+                }
+            }
+            r.blank();
+            if r.take(b',').is_none() {
+                r.take(b'}')?;
+                break;
+            }
+            r.blank();
+        }
+    }
+    Some(found)
+}
+
 /// The members of a body posted to publish or to subscribe: its topic, its quality of service
 /// and, when asked for, its payload as `json.dumps` writes it. `None` for a body that is not a
 /// JSON object this side reads exactly as the Python gateway does.
 fn members(body: &[u8], with_payload: bool) -> Option<(Option<String>, Option<u8>, Option<Vec<u8>>)> {
     // UTF-8 without a byte-order mark; Python also reads UTF-16 and UTF-32.
     std::str::from_utf8(body).ok()?;
-    let mut r = Reader { text: body, at: 0 };
+    let mut r = Reader { text: body, at: 0, compact: false };
     r.blank();
     r.take(b'{')?;
     r.blank();

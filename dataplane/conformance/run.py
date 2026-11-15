@@ -411,8 +411,30 @@ def grpc_backend(tls=None):
         "Total": grpc.stream_unary_rpc_method_handler(lambda requests, context: str(sum(len(m) for m in requests)).encode()),
         "Chat": grpc.stream_stream_rpc_method_handler(chat),
     }
+    # The sample service the gateway's JSON bridge under `/grpc` knows. Nobody is greeted: a single
+    # call fails, and a stream breaks off after its first answer.
+    sys.path.insert(0, str(ROOT / "samples/backends/grpc"))
+    import greeter_pb2
+
+    def hello(request, context):
+        name = greeter_pb2.HelloRequest.FromString(request).name
+        if name == "nobody":
+            context.abort(grpc.StatusCode.NOT_FOUND, "no such person")
+        return greeter_pb2.HelloReply(message=f"Hello, {name}! \u2603").SerializeToString()
+
+    def hellos(request, context):
+        name = greeter_pb2.HelloRequest.FromString(request).name
+        for i in range(3):
+            if name == "nobody" and i == 1:
+                context.abort(grpc.StatusCode.UNAVAILABLE, "gone")
+            if name == "slowly" and i:
+                time.sleep(0.4)
+            yield greeter_pb2.HelloReply(message=f"Hello {name} #{i} \u00e9").SerializeToString()
+
+    greeter = {"SayHello": grpc.unary_unary_rpc_method_handler(hello), "SayManyHellos": grpc.unary_stream_rpc_method_handler(hellos)}
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=16), options=GRPC_SIZES)
-    server.add_generic_rpc_handlers((grpc.method_handlers_generic_handler("conf.Echo", handlers),))
+    server.add_generic_rpc_handlers((grpc.method_handlers_generic_handler("conf.Echo", handlers),
+                                     grpc.method_handlers_generic_handler("greeter.Greeter", greeter)))
     if tls:
         pair = (Path(tls[1]).read_bytes(), Path(tls[0]).read_bytes())
         port = server.add_secure_port("127.0.0.1:0", grpc.ssl_server_credentials([pair]))
@@ -2252,8 +2274,108 @@ def main() -> int:
                   any(l.get("api_key_id") == keys["rs"]["id"] for l in logs) and len(limited) >= 1, f"{len(logs)} rows, {len(limited)} limited")
 
             # The backend goes away: the caller is told so, in gRPC's terms.
+            # --- the JSON bridge under /grpc ----------------------------------------------------------
+            # JSON in, a gRPC call of the gateway's own, JSON out. What the Python gateway does depends on
+            # whether the gRPC reflection package is installed: without it (as here) no single call is ever
+            # made, only streams. A second gateway and data plane, further down, run with the package.
+            print()
+
+            def bridge(base, key, body=None, path="/grpc/call", content=None, method="POST"):
+                """One request to the bridge: the answer, the bytes read, when each piece came, and whether it broke off."""
+                got, times, broke = b"", [], False
+                more = {"content": content} if content is not None else {} if body is None else {"json": body}
+                with httpx.stream(method, base + path, headers={"X-API-Key": key}, timeout=20, **more) as r:
+                    try:
+                        for piece in r.iter_bytes():
+                            got += piece
+                            times.append(time.time())
+                    except httpx.TransportError:
+                        broke = True
+                return r, got, times, broke
+
+            def bridge_same(name, by, pair, bases, want=None, **kw):
+                (a, got_a, _, broke_a), (b, got_b, times, broke_b) = bridge(bases[0], pair["py"], **kw), bridge(bases[1], pair["rs"], **kw)
+                seen = lambda r, got: got if r.status_code == 200 else (list(json.loads(got)), mask(json.loads(got)))
+                bad = []
+                if (a.status_code, a.headers.get("content-type"), broke_a) != (b.status_code, b.headers.get("content-type"), broke_b):
+                    bad.append(f"python [{a.status_code}] {a.headers.get('content-type')} broke={broke_a} vs data plane [{b.status_code}] {b.headers.get('content-type')} broke={broke_b}")
+                elif seen(a, got_a) != seen(b, got_b):
+                    bad.append(f"python {got_a[:300]!r} vs data plane {got_b[:300]!r}")
+                bad += [f"header {h} on one side only" for h in PROMISED if (h in a.headers) != (h in b.headers)]
+                if said_by(b) != by:
+                    bad.append(f"answered by the {said_by(b)}")
+                if want is not None and not want(b, got_b, times, broke_b):
+                    bad.append(f"not what was expected: [{b.status_code}] {got_b[:200]!r} broke={broke_b}")
+                gaps.update(set(map(str.lower, a.headers)) ^ set(map(str.lower, b.headers)))
+                check(f"bridge: {name}", not bad, "; ".join(bad) or f"[{b.status_code}] by the {said_by(b)}: {got_b[:90]!r}")
+
+            bare = ({"py": keys["py"]["key"], "rs": keys["rs"]["key"]}, (py, rs))
+            many = {"stream": True, "service": "Greeter", "method": "SayManyHellos"}
+            lines = lambda name: "".join(json.dumps({"status": "stream_chunk", "message": f"Hello {name} #{i} \u00e9"}) + "\n" for i in range(3)).encode()
+            bridge_same("without the reflection package no call is made, and the data is sent back", "data plane", *bare,
+                        body={"service": "Greeter", "method": "SayHello", "data": {"name": "Ada", "n": [1, 2.50, None], "text": "caf\u00e9 \"q\""}},
+                        want=lambda r, got, *_: got == ('{"status":"unsupported","message":"gRPC reflection is unavailable; Greeter.SayHello could not be bridged to the backend.",'
+                                                        '"service":"Greeter","method":"SayHello","request_data":{"name":"Ada","n":[1,2.5,null],"text":"caf\u00e9 \\"q\\""}}').encode())
+            bridge_same("an empty object asks for the sample call", "data plane", *bare, body={})
+            bridge_same("any other service is answered the same way, under /api as well", "data plane", *bare, path="/api/grpc/x",
+                        body={"service": "orders.Orders", "method": "Get", "data": [1, "two"]})
+            bridge_same("a path that only begins with /grpc is the bridge's too", "data plane", *bare, path="/grpcx", body={"service": "S", "method": "M"})
+            bridge_same("a stream is passed on line by line", "data plane", *bare, body={**many, "data": {"name": "Ada"}},
+                        want=lambda r, got, times, broke: got == lines("Ada") and r.headers["content-type"] == "application/x-ndjson" and not broke)
+            bridge_same("a stream without a name greets the world", "data plane", *bare, body=many, want=lambda r, got, *_: got == lines("World"))
+            bridge_same("each line is sent when the server sends it, not at the end", "data plane", *bare, body={**many, "data": {"name": "slowly"}},
+                        want=lambda r, got, times, broke: got == lines("slowly") and times[-1] - times[0] > 0.5)
+            bridge_same("a stream that fails breaks off after what it had sent", "data plane", *bare, body={**many, "data": {"name": "nobody"}},
+                        want=lambda r, got, times, broke: broke and got == lines("nobody").split(b"\n")[0] + b"\n")
+            bridge_same("a stream asked for without `stream` is a single call", "data plane", *bare, body={"service": "Greeter", "method": "SayManyHellos"})
+            bridge_same("data that is not an object, in a stream: Python's own failure", "python", *bare, body={**many, "data": [1]})
+            bridge_same("a body that is not an object: Python's 500", "python", *bare, body=[1], want=lambda r, *_: r.status_code == 500)
+            bridge_same("a body that is not JSON: Python's 500", "python", *bare, content=b"nope", want=lambda r, *_: r.status_code == 500)
+            bridge_same("a service that is not text: Python's own answer", "python", *bare, body={"service": None})
+            bridge_same("a member named twice: Python's own answer", "python", *bare, content=b'{"service":"A","service":"B"}')
+            bridge_same("GET: Python's own answer", "python", *bare, method="GET")
+            r = httpx.post(f"{rs}/grpc/call", json={}, timeout=10)
+            check("bridge: without a key it is refused like any request", r.status_code == 401 and said_by(r) == "data plane", f"[{r.status_code}]")
+
+            # With the reflection package (stood in for by an empty one: the bridge only loads it).
+            fake = Path(tmp) / "reflection" / "grpc_reflection" / "v1alpha"
+            fake.mkdir(parents=True)
+            for made in (fake.parent / "__init__.py", fake / "__init__.py", fake / "reflection.py", fake / "reflection_pb2.py"):
+                made.write_text("")
+            g, d = free_port(), free_port()
+            own = {**env, "DATABASE_URL": f"sqlite+aiosqlite:///{tmp}/bridge.db", "PYTHONPATH": os.pathsep.join(filter(None, [str(fake.parent.parent), env.get("PYTHONPATH")]))}
+            bridge_gateway = subprocess.Popen([sys.executable, "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", str(g),
+                                               "--log-level", "warning"], cwd=ROOT, env=own, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            procs.append(bridge_gateway)
+            wait_healthy(f"http://127.0.0.1:{g}/health", bridge_gateway)
+
+            def bridge_key(name):
+                r = httpx.post(f"http://127.0.0.1:{g}/admin/api-keys", headers=adm, timeout=10, params={"name": name, "rate_limit_per_minute": 1000, "rate_limit_per_hour": 10000})
+                r.raise_for_status()
+                return r.json()["key"]
+
+            calling = ({side: bridge_key(f"bridge-{side}") for side in ("py", "rs")}, (f"http://127.0.0.1:{g}", f"http://127.0.0.1:{d}"))
+            procs.append(subprocess.Popen([str(BIN), "--listen", f"127.0.0.1:{d}", "--control-token", "conformance-token",
+                                           "--sync-interval-ms", "200", "--max-staleness-ms", "2000", "--report-interval-ms", "300",
+                                           "--backend", f"http://127.0.0.1:{bport}", "--control", f"http://127.0.0.1:{g}"], env=own))
+            check("bridge: the data plane starts serving it", wait_until(lambda: said_by(bridge(calling[1][1], calling[0]["rs"], body={"service": "S"})[0]) == "data plane", 10) is not None)
+            bridge_same("with the reflection package the sample call is made", "data plane", *calling, body={"data": {"name": "Ada"}},
+                        want=lambda r, got, *_: got == '{"status":"success","message":"Hello, Ada! \u2603","service":"Greeter","method":"SayHello"}'.encode())
+            bridge_same("named in full, without a name", "data plane", *calling, body={"service": "Greeter", "method": "SayHello"},
+                        want=lambda r, got, *_: json.loads(got)["message"] == "Hello, World! \u2603")
+            bridge_same("a name outside ASCII, and an empty one", "data plane", *calling, body={"data": {"name": "caf\u00e9 \U0001f600"}})
+            bridge_same("an empty name", "data plane", *calling, body={"data": {"name": ""}}, want=lambda r, got, *_: json.loads(got)["message"] == "Hello, ! \u2603")
+            bridge_same("a call the server fails is an error", "data plane", *calling, body={"data": {"name": "nobody"}}, want=lambda r, *_: r.status_code >= 500)
+            bridge_same("any other service has no stub", "data plane", *calling, body={"service": "S", "method": "M", "data": {"x": 1}},
+                        want=lambda r, got, *_: json.loads(got)["message"] == "No gRPC stub available to bridge S.M; request was not forwarded to the backend.")
+            bridge_same("a name that is not text: Python's own answer", "python", *calling, body={"data": {"name": 5}})
+            bridge_same("a stream, here too", "data plane", *calling, body={**many, "data": {"name": "Ada"}}, want=lambda r, got, *_: got == lines("Ada"))
+
             grpc_server.terminate()
             grpc_server.wait(timeout=10)
+            bridge_same("with the server down a call is an error", "data plane", *calling, body={"data": {"name": "Ada"}}, want=lambda r, *_: r.status_code >= 500)
+            bridge_same("and a stream breaks off before its first line", "data plane", *bare, body={**many, "data": {"name": "Ada"}},
+                        want=lambda r, got, times, broke: r.status_code == 200 and broke and got == b"")
             b = grpc_call(through, "unary", "Say", b"hello", rs_key)
             check("gRPC: with the backend down the call is UNAVAILABLE", (b["code"], b["details"]) == ("UNAVAILABLE", "the backend is unavailable"),
                   f"{b['code']}: {b['details']}")
