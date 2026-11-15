@@ -53,6 +53,8 @@ See [docs/known-limitations.md](docs/known-limitations.md) for the full list.
 
 ### Fixed
 
+- A backend that sets more than one cookie has each `Set-Cookie` line passed on as its own line. They were
+  joined into one line by commas, which a browser does not read as cookies.
 - Database migrations: the Alembic migrations `001` and `002` were replaced by
   one baseline, `0001`, that creates the full current schema. It is safe to
   run on a database the gateway already created at startup, works on SQLite

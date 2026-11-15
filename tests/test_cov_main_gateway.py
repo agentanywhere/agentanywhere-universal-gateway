@@ -574,3 +574,51 @@ def test_db_failure_then_auth_crash_is_internal_error(monkeypatch):
             assert "kaboom" not in r.text
     finally:
         app.dependency_overrides.clear()
+
+
+# ---------------------------------------------------------------- cookies a backend sets
+TWO_COOKIES = [("set-cookie", "session=alice; Path=/; Expires=Wed, 21 Oct 2026 07:28:00 GMT"), ("set-cookie", "csrf=1")]
+
+
+@pytest.fixture
+def no_rules():
+    from app.transformers import transformation_manager as manager
+    kept = dict(manager.rules_by_id), dict(manager.rules_by_path)
+    manager.rules_by_id.clear()
+    manager.rules_by_path.clear()
+    yield manager
+    manager.rules_by_id.clear()
+    manager.rules_by_path.clear()
+    manager.rules_by_id.update(kept[0])
+    manager.rules_by_path.update(kept[1])
+
+
+def test_each_cookie_a_backend_sets_reaches_the_caller_as_its_own_line(gwdb, monkeypatch, key, no_rules):
+    backend(monkeypatch, httpx.Response(200, json={"ok": True}, headers=TWO_COOKIES + [("x-agent", "echo")]))
+    r = gwdb.get("/mcp/t", headers={"X-API-Key": key})
+    assert r.status_code == 200 and r.json() == {"ok": True}
+    assert r.headers.get_list("set-cookie") == [value for _, value in TWO_COOKIES]
+    assert r.headers["x-agent"] == "echo"
+
+
+def test_one_cookie_and_none_are_left_as_they_came(gwdb, monkeypatch, key, no_rules):
+    backend(monkeypatch, httpx.Response(200, json={}, headers=TWO_COOKIES[:1]))
+    assert gwdb.get("/mcp/t", headers={"X-API-Key": key}).headers.get_list("set-cookie") == [TWO_COOKIES[0][1]]
+    backend(monkeypatch, httpx.Response(200, json={}))
+    assert gwdb.get("/mcp/t", headers={"X-API-Key": key}).headers.get_list("set-cookie") == []
+
+
+@pytest.mark.parametrize("config,given", [
+    # A rule that leaves the cookies alone leaves each on its line.
+    ({"headers_set": {"X-Powered": "gateway"}, "body_set": {"seen": True}}, [value for _, value in TWO_COOKIES]),
+    # One that changes them has the last word.
+    ({"headers_set": {"set-cookie": "mine=1"}}, ["mine=1"]),
+    ({"headers_remove": ["Set-Cookie"]}, []),
+    ({"headers_rename": {"Set-Cookie": "X-Was-Cookie"}}, []),
+])
+def test_a_rule_for_answers_and_the_cookies_a_backend_sets(gwdb, monkeypatch, key, no_rules, config, given):
+    no_rules.register_from_dict({"name": "r", "path_pattern": "*", "response_config": config})
+    backend(monkeypatch, httpx.Response(200, json={"ok": True}, headers=TWO_COOKIES))
+    r = gwdb.get("/mcp/t", headers={"X-API-Key": key})
+    assert r.status_code == 200
+    assert r.headers.get_list("set-cookie") == given
