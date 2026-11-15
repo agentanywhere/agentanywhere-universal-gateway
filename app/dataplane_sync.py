@@ -320,12 +320,93 @@ def _body_actions(cfg: Any) -> Optional[Dict[str, Any]]:
 # `^` in front or not, replaced by plain text.
 _REWRITE_FROM = re.compile(r"\^?(?:[A-Za-z0-9/_~]|\\[.\-])+")
 _REWRITE_TO = re.compile(r"[A-Za-z0-9/_.~-]*")
+# In a replacement: a group by its number, in either of the spellings `re.sub` reads as one.
+_REWRITE_GROUP = re.compile(r"\\([1-9])(?![0-9])|\\g<(0|[1-9][0-9]?)>")
+
+
+def _rewrite_parts(replacement: str, groups: int) -> Optional[List[Any]]:
+    """A replacement as ``re.sub`` reads it: plain text, and groups of the match by number.
+    ``None`` for any other (another escape, a group the expression does not have)."""
+    parts: List[Any] = []
+    at = 0
+    for found in list(_REWRITE_GROUP.finditer(replacement)) + [None]:
+        text = replacement[at:found.start() if found else len(replacement)]
+        if not _REWRITE_TO.fullmatch(text):
+            return None
+        if text:
+            parts.append(text)
+        if found:
+            group = int(found.group(1) or found.group(2))
+            if group > groups:
+                return None
+            parts.append(group)
+            at = found.end()
+    return parts
+
+
+def _engines_differ(pattern: str) -> bool:
+    """Whether an expression of the shared kind is one whose matches the two engines can still
+    find differently, though both take it:
+
+    * it repeats a group that can match nothing, as ``(a*)+`` does. ``re`` stops repeating at a
+      turn that matches nothing, so where such a match ends, and what its groups held, can
+      differ;
+    * it has alternatives that each hold a repetition or a group, as ``a*(aa)|a*a`` does. The
+      data plane's engine takes what alternatives begin with alike out in front of them
+      (``a*(?:(aa)|a)``), and where that can match in more than one way, the alternative that
+      wins is no longer the first that could.
+
+    Which alternatives begin alike is the other engine's to say, so every set of alternatives
+    that could is counted."""
+    # For each group open, and the expression itself: where it starts, and for each of its
+    # alternatives so far, whether it holds a repetition or a group.
+    frames: List[List[Any]] = [[0, [False]]]
+    i, n = 0, len(pattern)
+    while i < n:
+        c = pattern[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "[":
+            i += 1
+            while i < n and pattern[i] != "]":
+                i += 2 if pattern[i] == "\\" else 1
+        elif c == "(":
+            frames[-1][1][-1] = True
+            if pattern.startswith("?:", i + 1):
+                i += 2
+            frames.append([i + 1, [False]])
+        elif c == "|":
+            frames[-1][1].append(False)
+        elif c in "*+?{":
+            frames[-1][1][-1] = True
+        elif c == ")" and len(frames) > 1:
+            start, alternatives = frames.pop()
+            if len(alternatives) > 1 and all(alternatives):
+                return True
+            if pattern[i + 1:i + 2] in ("*", "+", "{"):
+                try:
+                    if re.fullmatch(pattern[start:i], "") is not None:
+                        return True
+                except re.error:
+                    return True
+        i += 1
+    return len(frames) != 1 or (len(frames[0][1]) > 1 and all(frames[0][1]))
 
 
 def _path_actions(cfg: Any) -> Optional[Dict[str, Any]]:
-    """A rule's rewrite of the path the backend is asked for (``_apply_path_rewrite``), when it
-    replaces plain text by plain text: ``{"path": {"from", "to", "start"}}``. Nothing for a rule
-    that rewrites nothing; ``None`` for any other expression."""
+    """A rule's rewrite of the path the backend is asked for (``_apply_path_rewrite``):
+
+    * plain text replaced by plain text, wherever it stands or at the start of the path only:
+      ``{"path": {"from", "to", "start"}}``;
+    * an expression that means the same to both engines and cannot match nothing, replaced by
+      plain text and groups of the match: ``{"path": {"regex", "parts"}}``, each part text or a
+      group's number. ``$`` alone, which adds to the end of the path, is described this way too.
+      Not one whose matches the engines can find differently (``_engines_differ``).
+
+    Nothing for a rule that rewrites nothing, which includes one whose expression does not
+    compile; ``None`` for any other. An expression that can match nothing is replaced in more
+    places by ``re.sub`` than by the data plane's engine."""
     rewrite = cfg.path_rewrite
     if not rewrite:
         return {}
@@ -334,10 +415,28 @@ def _path_actions(cfg: Any) -> Optional[Dict[str, Any]]:
     pattern, replacement = rewrite.get("pattern"), rewrite.get("replacement", "")
     if not pattern:
         return {}
-    if not (type(pattern) is str and _REWRITE_FROM.fullmatch(pattern) and type(replacement) is str and _REWRITE_TO.fullmatch(replacement)):
+    if type(pattern) is not str or type(replacement) is not str:
         return None
-    start = pattern.startswith("^")
-    return {"path": {"from": pattern[start:].replace("\\", ""), "to": replacement, "start": start}}
+    try:
+        compiled = re.compile(pattern)
+    except re.error:
+        return {}
+    except Exception:  # noqa: BLE001 - whatever else compiling raises is raised per request here
+        return None
+    plain = bool(_REWRITE_TO.fullmatch(replacement))
+    if plain and (pattern == "^" or _REWRITE_FROM.fullmatch(pattern)):
+        start = pattern.startswith("^")
+        return {"path": {"from": pattern[start:].replace("\\", ""), "to": replacement, "start": start}}
+    if not (pattern.isascii() and _SHARED_REGEX.fullmatch(pattern)):
+        return None
+    if pattern != "$" and compiled.fullmatch("") is not None:
+        return None
+    parts = _rewrite_parts(replacement, compiled.groups)
+    if parts is None:
+        return None
+    if _engines_differ(pattern):
+        return None
+    return {"path": {"regex": pattern, "parts": parts}}
 
 
 def _rule_actions(rule: Any) -> Optional[Dict[str, Any]]:

@@ -1151,14 +1151,45 @@ def test_the_snapshot_says_what_a_rule_does_when_the_data_plane_can_do_the_same(
                  {"body_set": {"a": 10 ** 400}}, {"body_set": {"a": "\ud800"}}, {"body_set": {"a": {"\udc00": 1}}}, {"body_set": {"\ud800": 1}},
                  {"body_remove": [1]}, {"body_remove": ["\ud800"]}, {"body_rename": {"a": 1}}, {"body_set": ["a"]}, {"body_set": {"a": b"bytes"}}):
         assert actions(request_config=kept) is None, kept
-    # A path rewrite that replaces plain text is told; one that is an expression is not.
+    # A path rewrite that replaces plain text is told as that...
     assert actions(request_config={"path_rewrite": {"pattern": "^/a", "replacement": "/b"}})["request"]["path"] == {"from": "/a", "to": "/b", "start": True}
     assert actions(request_config={"path_rewrite": {"pattern": r"/x\.y/a\-b"}})["request"]["path"] == {"from": "/x.y/a-b", "to": "", "start": False}
     for nothing_to_do in ({}, {"replacement": "/b"}, {"pattern": ""}):
         assert "path" not in actions(request_config={"headers_set": {"X-A": "1"}, "path_rewrite": nothing_to_do})["request"]
-    for kept in ({"pattern": "^/a$"}, {"pattern": "/a.b"}, {"pattern": "/(a)", "replacement": r"/\1"}, {"pattern": "/a+"}, {"pattern": "^"}, {"pattern": "/a|/b"},
-                 {"pattern": "/a", "replacement": r"\g<0>"}, {"pattern": "/a", "replacement": "/a b"}, {"pattern": "/a", "replacement": "/b?q=1"},
-                 {"pattern": "/caf\u00e9"}, {"pattern": 5}, {"pattern": "/a", "replacement": 5}, "text"):
+    assert actions(request_config={"path_rewrite": {"pattern": "^", "replacement": "/base"}})["request"]["path"] == {"from": "", "to": "/base", "start": True}
+    # ...and one by an expression both engines read alike, with the groups it puts back.
+    for rewrite, told in (
+        ({"pattern": "^/a$"}, {"regex": "^/a$", "parts": []}),
+        ({"pattern": "/a.b", "replacement": "/c"}, {"regex": "/a.b", "parts": ["/c"]}),
+        ({"pattern": r"^/users/(\d+)/(\w+)", "replacement": r"/\2/by-user/\g<1>"}, {"regex": r"^/users/(\d+)/(\w+)", "parts": ["/", 2, "/by-user/", 1]}),
+        ({"pattern": "/a", "replacement": r"\g<0>\g<0>"}, {"regex": "/a", "parts": [0, 0]}),
+        ({"pattern": "/a|/b", "replacement": "/c"}, {"regex": "/a|/b", "parts": ["/c"]}),
+        ({"pattern": r"/(posts|notes)/(\d+|new)", "replacement": r"/\2"}, {"regex": r"/(posts|notes)/(\d+|new)", "parts": ["/", 2]}),
+        ({"pattern": "/a+|/b", "replacement": "/c"}, {"regex": "/a+|/b", "parts": ["/c"]}),
+        ({"pattern": "$", "replacement": ".json"}, {"regex": "$", "parts": [".json"]}),
+        ({"pattern": "(a+)+b", "replacement": r"\g<0>\1"}, {"regex": "(a+)+b", "parts": [0, 1]}),
+        ({"pattern": "(a*)?b", "replacement": r"\1"}, {"regex": "(a*)?b", "parts": [1]}),
+        ({"pattern": "((a*)b)+c", "replacement": r"\2"}, {"regex": "((a*)b)+c", "parts": [2]}),
+    ):
+        assert actions(request_config={"path_rewrite": rewrite})["request"]["path"] == told, rewrite
+    # An expression that does not compile rewrites nothing there, so nothing is told of it.
+    for broken in ("(a", "a{3,1}", "[b-a]", "*a"):
+        assert "path" not in actions(request_config={"headers_set": {"X-A": "1"}, "path_rewrite": {"pattern": broken, "replacement": "\\9"}})["request"]
+    for kept in (
+        # What can match nothing is replaced in more places by `re.sub`.
+        {"pattern": "a*"}, {"pattern": "(?:/a)*"}, {"pattern": "/?$"}, {"pattern": "^/a|"}, {"pattern": "^$"}, {"pattern": "^", "replacement": r"\g<0>"},
+        # What only Python's engine reads, or reads its own way.
+        {"pattern": "/(?=a)"}, {"pattern": r"\ba"}, {"pattern": "(?i)/a"}, {"pattern": "(?P<n>/a)"}, {"pattern": r"(/a)\1"}, {"pattern": "/a++"}, {"pattern": "/a$b"},
+        # A group that can match nothing, repeated: `re` stops at such a turn.
+        {"pattern": "(a*)+b", "replacement": r"\1"}, {"pattern": "(?:(a?))*b"}, {"pattern": "(/a|){2}b", "replacement": "x"}, {"pattern": "(?:/{0,2}?[a-c]?)+?c"},
+        # Alternatives that each hold a repetition or a group: the engine here takes what they begin with out in front.
+        {"pattern": "a*(aa)|a*a"}, {"pattern": "/(?:[ab]*x|[ab]*y)"}, {"pattern": "/a+b|/a+c"}, {"pattern": "/(a)|/(b)"}, {"pattern": "/(?:(?:a|b)c|(?:a|b)d)"},
+        # A replacement with a group the expression does not have, or any other escape.
+        {"pattern": "/(a)", "replacement": r"\2"}, {"pattern": "/a", "replacement": r"\1"}, {"pattern": "/(a)", "replacement": r"\10"},
+        {"pattern": "/(a)", "replacement": r"\g<01>"}, {"pattern": "/(a)", "replacement": r"\n"}, {"pattern": "/(a)", "replacement": "\\\\"},
+        {"pattern": "/a", "replacement": "/a b"}, {"pattern": "/a", "replacement": "/b?q=1"},
+        {"pattern": "/caf\u00e9"}, {"pattern": 5}, {"pattern": "/a", "replacement": 5}, "text",
+    ):
         assert actions(request_config={"path_rewrite": kept}) is None, kept
     for code in ("condition", "transform_request", "transform_response"):
         assert dataplane_sync._rule_actions(TransformationRule(name="r", **{code: lambda *a: None})) is None

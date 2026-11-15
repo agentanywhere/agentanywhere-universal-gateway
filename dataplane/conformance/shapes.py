@@ -18,6 +18,11 @@ Python gateway. So the property that must hold is:
 A body the data plane is not certain how Python would read or write, it hands over with its request
 (it says `ask`), and so do no harm; the script fails if it does that for ordinary bodies.
 
+A path rewritten by a regular expression gets a second, larger run of its own: expressions put
+together at random from what the two engines share, each rewritten path compared with `re.sub`.
+The two engines do not always find the same match for an expression both take, so which expressions
+the data plane is told of (`app.dataplane_sync._path_actions`) is what this run checks.
+
 This script generates rules as the admin API takes them and exchanges to apply them to. The Python
 side is the gateway's own: its rule classes, the dictionaries it reads headers and a query into, its
 HTTP client writing the request and its web framework writing the answer. The other side is
@@ -28,6 +33,7 @@ Headers are compared as a receiver reads them: for each name, whatever its case,
 """
 import json
 import random
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -39,8 +45,8 @@ import httpx  # noqa: E402
 from starlette.datastructures import QueryParams  # noqa: E402
 from starlette.responses import Response  # noqa: E402
 
-from app.dataplane_sync import _rule_actions  # noqa: E402
-from app.transformers import RequestTransformer, ResponseTransformer, TransformationRule  # noqa: E402
+from app.dataplane_sync import _path_actions, _rule_actions  # noqa: E402
+from app.transformers import RequestTransformer, ResponseTransformer, TransformConfig, TransformationRule, _apply_path_rewrite  # noqa: E402
 
 BIN = ROOT / "dataplane/target/release/dataplane"
 NAMES = ["x-a", "X-A", "X-a", "x-b", "X-B", "x-c", "X-C", "x-trace-me", "X-Trace-Me", "authorization", "Authorization",
@@ -114,14 +120,41 @@ def header_actions(rng, names=NAMES):
     }
 
 
-SEGMENTS = ["a", "b", "ab", "v1", "v2", "x.y", "a-b", "", "users", "é", "a b", ".", ".."]
+SEGMENTS = ["a", "b", "ab", "v1", "v2", "x.y", "a-b", "", "users", "é", "a b", ".", "..", "aab", "abab", "abcd", "42", "v10", "a_b", "bcd"]
 FROM = ["/a", "a", "^/a", "^/a/", "/", "^/", "b/a", "x\\.y", "a\\-b", "^/v1", "v1", "/users/", "^/ab/a", "//", "ab"]
 ODD_FROM = ["^/a$", "/(a)", "a+", ".", "a|b", "[ab]", "^", "(?i)a", "a$", "\\d", 5, "é", "a b"]
 TO = ["", "/", "/b", "b", "/v2", "v2", "/a/a", "x.y", "a-b", "~", "/users", "ab"]
 ODD_TO = ["\\1", "\\g<0>", "a b", "é", "?q=1", "#f", "%20", 7]
+# Expressions, and replacements that put groups of the match back.
+EXPRESSIONS = ["/(a|b)", "^/(v[0-9]+)/", "a+", "[ab]+", "(a)(b)?", "/([^/]+)/([^/]+)", "\\d+", "\\w+$", "^/users/(.*)$", "(?:a|ab)(b?)", "/(a*)b",
+               "$", "a{2,}", "(a|ab)(c|bcd)?", "[^/]$", "/.", "(a+?)(a*)", "^/(?:a|b)/", "x\\.(y)", ".+?/", "(/a)+", "((a)|b)+", "(a*)+b",
+               "(a|b)*c", "/(?:(a)|(b))", "a{1,2}?b", "[a-c]{2}", "(b|ab|a)+?d", "^/a|/b$", "(.)(.)$", "/(\\w)(\\w*)", "(a?)+b", "((a*)b)*c", "a.c",
+               "(?:(a)|b)+", "(a*)?b", "(?:(a*))+b", "(a|b){2}", "(a?){2}b", "(a)|(b)", "(a*)(a*)", "(a+)(a+)?", "/(a|ab)(b?)/"]
+ODD_EXPRESSIONS = ["a*", "/?$", "^/a|", "(a|)", "(?=a)", "\\bab", "(?P<n>a)", "a{3,1}", "(a", "[b-a]", "\\_a", "a++", "(a)\\1", "^$", "a(?#c)"]
+WITH_GROUPS = ["\\1", "/\\1", "\\g<0>", "\\g<1>x", "\\2\\1", "/\\g<2>/\\1", "\\g<0>-\\g<0>", "<\\1>", "\\3", "\\10", "\\g<1", "\\n", "\\\\"]
+ATOMS = ["a", "b", "c", "/", ".", "\\d", "\\w", "[ab]", "[^/]", "[a-c]", "v", "1"]
+
+
+def an_expression(rng, depth=0):
+    """An expression put together at random from what the two engines share."""
+    def piece():
+        if depth < 2 and rng.random() < 0.3:
+            inner = an_expression(rng, depth + 1)
+            one = rng.choice(["(", "(", "(?:"]) + inner + ")"
+        else:
+            one = rng.choice(ATOMS)
+        return one + rng.choice([""] * 6 + ["*", "+", "?", "+?", "*?", "{2}", "{1,2}", "{0,2}?"])
+    branches = ["".join(piece() for _ in range(rng.randint(1, 3))) for _ in range(rng.choice([1, 1, 1, 2]))]
+    return "|".join(branches)
 
 
 def a_rewrite(rng):
+    if rng.random() < 0.5:
+        made = rng.choice(["", "", "^"]) + an_expression(rng) + rng.choice(["", "", "", "$"])
+        rewrite = {"pattern": rng.choice([pick(rng, EXPRESSIONS, ODD_EXPRESSIONS, 0.1), made])}
+        if rng.random() < 0.9:
+            rewrite["replacement"] = rng.choice([pick(rng, TO, ODD_TO, 0.05), rng.choice(WITH_GROUPS), rng.choice(TO) + rng.choice(WITH_GROUPS)])
+        return rewrite
     rewrite = {"pattern": pick(rng, FROM, ODD_FROM, 0.08)}
     if rng.random() < 0.9:
         rewrite["replacement"] = pick(rng, TO, ODD_TO, 0.08)
@@ -222,10 +255,70 @@ def python_says(rules, case):
     }
 
 
+FRONTS = ["a", "[ab]", "/", "\\w", "a*", "[ab]+", "(?:a|b)", "a?", "/a", "[^/]", "b{2}", ".", "a{1,2}"]
+BACK = ["", "\\1", "\\2", "\\g<0>", "\\g<1>", "\\3", "-\\1-"]
+PLAIN = ["a", "b", "ab", "aab", "abab", "abcd", "42", "v1", "v10", "a_b", "bcd", "x.y", "a-b", "", "users", "c", "1", "aa", "bb", "cab", "a1b2"]
+
+
+def too_slow(*_):
+    raise TimeoutError
+
+
+def rewrites(count, seed):
+    """Paths rewritten by expressions put together at random, each compared with `re.sub`. Only
+    expressions the data plane is told of take part; half of them or so match the path."""
+    rng = random.Random(seed)
+    cases = []
+    while len(cases) < count:
+        pattern = rng.choice(["", "", "^"]) + an_expression(rng) + rng.choice(["", "", "", "$"])
+        if rng.random() < 0.2:
+            pattern = rng.choice(EXPRESSIONS)
+        elif rng.random() < 0.35:
+            # Alternatives that begin alike, bare or in a group.
+            front = rng.choice(FRONTS)
+            several = "|".join(front + an_expression(rng, 1) for _ in range(rng.randint(2, 3)))
+            pattern = rng.choice(["{}", "({})", "(?:{})", "/(?:{})", "({})c", "x?(?:{})"]).format(several)
+        cfg = TransformConfig(path_rewrite={"pattern": pattern, "replacement": rng.choice(["", "/", "x", "/b"]) + rng.choice(BACK) + rng.choice(["", "", "\\1", "~"])})
+        told = _path_actions(cfg)
+        if told and "regex" in told.get("path", {}):
+            cases.append((cfg, told, "/" + "/".join(rng.choice(PLAIN) for _ in range(rng.randint(0, 6)))))
+    lines = [json.dumps({"headers": [], "query": "", "body": None, "path": path, "answer": [], "status": 200, "request": [told], "response": []})
+             for _, told, path in cases]
+    out = subprocess.run([str(BIN), "--judge-shapes"], input="\n".join(lines) + "\n", capture_output=True, text=True)
+    if out.returncode != 0:
+        sys.exit(f"dataplane --judge-shapes failed: {out.stderr.strip()}")
+    answers = [json.loads(line) for line in out.stdout.splitlines()]
+    assert len(answers) == len(cases), (len(answers), len(cases))
+    wrong, moved, slow, refused = [], 0, 0, 0
+    for (cfg, _, path), got in zip(cases, answers):
+        if got == "unready":
+            refused += 1
+            continue
+        signal.setitimer(signal.ITIMER_REAL, 1.0)
+        try:
+            want = _apply_path_rewrite(path, cfg)
+        except TimeoutError:
+            slow += 1
+            continue
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+        moved += want != path
+        if got["path"] != want:
+            wrong.append((cfg.path_rewrite, path, want, got["path"]))
+    for rewrite, path, want, got in wrong[:8]:
+        print(f"DIFFERENT for {json.dumps(rewrite)} on {path}\n  python {want}\n  plane  {got}")
+    print(f"{count} paths under a rewrite by expression ({moved} of them rewritten): {len(wrong)} different; "
+          f"{refused} expressions the engine here does not take, {slow} not compared, Python's engine taking too long")
+    if moved < count // 5:
+        print("too few expressions match their path")
+    return not wrong and moved >= count // 5 and slow <= count // 100 and refused <= count // 100
+
+
 def main():
     count = int(sys.argv[1]) if len(sys.argv) > 1 else 40000
     seed = int(sys.argv[2]) if len(sys.argv) > 2 else 1
     rng = random.Random(seed)
+    signal.signal(signal.SIGALRM, too_slow)
     cases, lines, kept = [], [], 0
     while len(cases) < count:
         described = [a_rule(rng, n) for n in range(rng.choice([1, 1, 2, 3]))]
@@ -243,14 +336,28 @@ def main():
         sys.exit(f"dataplane --judge-shapes failed: {out.stderr.strip()}")
     answers = [json.loads(line) for line in out.stdout.splitlines()]
     assert len(answers) == len(cases), (len(answers), len(cases))
-    wrong, changed, asked, rewritten, moved = [], 0, 0, 0, 0
-    for (described, rules, case), got in zip(cases, answers):
+    wrong, changed, asked, rewritten, moved, expressed, left, slow = [], 0, 0, 0, 0, 0, 0, 0
+    for (described, rules, case), got, line in zip(cases, answers, lines):
+        by_expression = any("regex" in (a.get("path") or {}) for a in json.loads(line)["request"])
+        if got == "ask" and by_expression and not case["path"].isascii():
+            # Beyond ASCII the two engines' classes differ: such a path is rewritten by Python.
+            left += 1
+            continue
         if got in ("ask", "unready"):
             # Handed over with its request, or the rule kept with Python once its value is read.
             asked += 1
             continue
         got["headers"], got["answer"] = as_read(got["headers"]), as_read(got["answer"])
-        want = python_says(rules, case)
+        # An expression put together at random can keep Python's engine trying for longer than
+        # anyone would wait; the engine here takes time in proportion to the path. Not compared.
+        signal.setitimer(signal.ITIMER_REAL, 2.0)
+        try:
+            want = python_says(rules, case)
+        except TimeoutError:
+            slow += 1
+            continue
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
         if got != want:
             wrong.append((described, case, want, got))
         untouched = {"headers": as_read(case["headers"]), "query": case["query"] or None, "body": case["body"], "path": case["path"],
@@ -258,21 +365,25 @@ def main():
         changed += want != untouched
         rewritten += want["body"] != case["body"]
         moved += want["path"] != case["path"]
+        expressed += by_expression and want["path"] != case["path"]
     for described, case, want, got in wrong[:8]:
         differ = [part for part in want if want[part] != got.get(part)]
         print(f"DIFFERENT in {differ}\n  rules  {json.dumps(described)}\n  case   {json.dumps(case)}")
         for part in differ:
             print(f"  python {part}: {want[part]}\n  plane  {part}: {got.get(part)}")
     print(f"{count} exchanges under rules the data plane is told the actions of ({changed} of them changed by the rules, "
-          f"{rewritten} with a body written anew, {moved} with a path rewritten): {len(wrong)} different; {asked} handed over for their body; "
+          f"{rewritten} with a body written anew, {moved} with a path rewritten, {expressed} of those by expression): {len(wrong)} different; "
+          f"{asked} handed over for their body, {left} for a path beyond ASCII; {slow} not compared, Python's engine taking too long; "
           f"{kept} sets of rules kept with Python")
     if kept > 2 * count:
         print("too many ordinary rules are being kept with Python")
     if asked > count // 20 or rewritten < count // 20:
         print("too few ordinary bodies are being written here")
-    if moved < count // 20:
+    if moved < count // 20 or expressed < count // 100:
         print("too few ordinary rewrites are being done here")
-    sys.exit(1 if wrong or kept > 2 * count or changed < count // 2 or asked > count // 20 or rewritten < count // 20 or moved < count // 20 else 0)
+    few = slow > count // 100 or asked > count // 20 or rewritten < count // 20 or moved < count // 20 or expressed < count // 100
+    alike = rewrites(5 * count, seed)
+    sys.exit(1 if wrong or kept > 2 * count or changed < count // 2 or few or not alike else 0)
 
 
 if __name__ == "__main__":

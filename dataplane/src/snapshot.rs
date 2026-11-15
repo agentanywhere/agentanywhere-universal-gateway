@@ -195,18 +195,72 @@ pub struct Actions {
     path: Option<PathRewrite>,
 }
 
-/// A path rewrite that needs no expression: plain text replaced by plain text, either wherever
-/// it stands in the path or at its start only.
-#[derive(Deserialize, Debug, PartialEq)]
+/// A path rewrite. Without an expression: plain text (`from`) replaced by plain text (`to`),
+/// either wherever it stands in the path or at its start only. With one (`regex`): each match
+/// replaced by `parts`, text and the groups of the match, in order.
+#[derive(Deserialize, Debug)]
 pub struct PathRewrite {
+    #[serde(default)]
     from: String,
+    #[serde(default)]
     to: String,
     #[serde(default)]
     start: bool,
+    regex: Option<String>,
+    #[serde(default)]
+    parts: Vec<Piece>,
+    /// The expression, ready to apply.
+    #[serde(skip)]
+    expression: Option<regex::Regex>,
+}
+
+/// What a match is replaced by: text as it stands, or what a group of the match held (nothing,
+/// for a group that took no part in it).
+#[derive(Deserialize, Debug, PartialEq)]
+#[serde(untagged)]
+enum Piece {
+    Text(String),
+    Group(usize),
+}
+
+impl PartialEq for PathRewrite {
+    fn eq(&self, other: &Self) -> bool {
+        (&self.from, &self.to, self.start, &self.regex, &self.parts) == (&other.from, &other.to, other.start, &other.regex, &other.parts)
+    }
 }
 
 impl PathRewrite {
+    /// Make the rewrite ready to apply. `None` for one this side would not do as Python does:
+    /// an expression its engine does not take, a group the expression does not have, or nothing
+    /// to look for.
+    fn ready(&mut self) -> Option<()> {
+        let Some(pattern) = &self.regex else { return (self.start || !self.from.is_empty()).then_some(()) };
+        let expression = regex::Regex::new(pattern).ok()?;
+        if self.parts.iter().any(|piece| matches!(piece, Piece::Group(n) if *n >= expression.captures_len())) {
+            return None;
+        }
+        self.expression = Some(expression);
+        Some(())
+    }
+
     fn apply(&self, path: &str) -> String {
+        if let Some(expression) = &self.expression {
+            // `re.sub`: matches from the left that do not overlap, each replaced in turn.
+            let (mut out, mut from) = (String::with_capacity(path.len() + 16), 0);
+            for found in expression.captures_iter(path) {
+                let Some(whole) = found.get(0) else { continue };
+                out.push_str(&path[from..whole.start()]);
+                for piece in &self.parts {
+                    match piece {
+                        Piece::Text(text) => out.push_str(text),
+                        Piece::Group(n) => out.push_str(found.get(*n).map_or("", |group| group.as_str())),
+                    }
+                }
+                from = whole.end();
+            }
+            out.push_str(&path[from..]);
+            return out;
+        }
         match self.start {
             true => match path.strip_prefix(self.from.as_str()) {
                 Some(rest) => format!("{}{rest}", self.to),
@@ -241,12 +295,16 @@ impl Actions {
         self.path.is_some()
     }
 
+    /// Whether the path is rewritten by an expression, which the two sides read alike on ASCII.
+    fn reads_path(&self) -> bool {
+        self.path.as_ref().is_some_and(|p| p.regex.is_some())
+    }
+
     /// Make the changes to a body ready to apply. `None` if this side cannot be certain of how
     /// Python writes a value the rule sets.
     pub fn ready(&mut self) -> Option<()> {
-        // Nothing replaces nothing: such a rule is not described this way.
-        if self.path.as_ref().is_some_and(|p| p.from.is_empty()) {
-            return None;
+        if let Some(rewrite) = &mut self.path {
+            rewrite.ready()?;
         }
         self.body.clear();
         self.body.extend(self.body_rename.iter().map(|(old, new)| BodyStep::Rename(pyjson::path(old), pyjson::path(new))));
@@ -362,13 +420,18 @@ impl Shaping<'_> {
     }
 
     /// The path the backend is asked for once each rule in turn has rewritten it
-    /// (`_apply_path_rewrite`), when any does.
-    pub fn rewritten(&self, asked: &str) -> Option<String> {
+    /// (`_apply_path_rewrite`), when any does. `Err` for a path this side might not rewrite as
+    /// the Python gateway does: one beyond ASCII under an expression, where the two engines'
+    /// classes differ.
+    pub fn rewritten(&self, asked: &str) -> Result<Option<String>, ()> {
+        if !asked.is_ascii() && self.request.iter().any(|a| a.reads_path()) {
+            return Err(());
+        }
         let mut path: Option<String> = None;
         for rewrite in self.request.iter().filter_map(|a| a.path.as_ref()) {
             path = Some(rewrite.apply(path.as_deref().unwrap_or(asked)));
         }
-        path
+        Ok(path)
     }
 }
 
@@ -468,6 +531,12 @@ impl TransformRule {
             Matcher::Contains(self.contains.take()?)
         });
         Some(self)
+    }
+
+    /// Whether this side reads `path` as the rule's pattern reads it there. Beyond ASCII, the
+    /// two engines' classes (`\w`, `\d`) take different characters.
+    fn certain(&self, path: &str) -> bool {
+        path.is_ascii() || !matches!(self.matcher, Some(Matcher::Regex(_)))
     }
 
     fn applies(&self, method: &str, path: &str) -> bool {
@@ -890,7 +959,7 @@ impl Snapshot {
             return false;
         }
         let answered = path.strip_prefix('/').unwrap_or(path);
-        rules.iter().any(|r| r.applies(method, asked) || r.applies(method, answered))
+        rules.iter().any(|r| !(r.certain(asked) && r.certain(answered)) || r.applies(method, asked) || r.applies(method, answered))
     }
 
     /// What the rules do to a request and to its answer, matched as `transformed` matches them.
@@ -903,6 +972,9 @@ impl Snapshot {
         }
         let answered = path.strip_prefix('/').unwrap_or(path);
         for rule in rules {
+            if !(rule.certain(asked) && rule.certain(answered)) {
+                return None;
+            }
             let (before, after) = (rule.applies(method, asked), rule.applies(method, answered));
             if (before || after) && !rule.native {
                 return None;
@@ -1118,7 +1190,7 @@ mod tests {
         )
         .unwrap();
         let shaping = snap.shaping("POST", "/old/draft/1/old/draft", "/old/draft/1/old/draft").unwrap();
-        assert_eq!(shaping.rewritten("/old/draft/1/old/draft").as_deref(), Some("/new/1/old"));
+        assert_eq!(shaping.rewritten("/old/draft/1/old/draft").unwrap().as_deref(), Some("/new/1/old"));
         let mut body = pyjson::parse(br#"{"user": "ana", "secret": 1, "keep": null}"#).unwrap();
         shaping.request.iter().for_each(|a| a.change_body(&mut body));
         let mut out = Vec::new();
@@ -1126,12 +1198,57 @@ mod tests {
         assert_eq!(String::from_utf8(out).unwrap(), r#"{"keep": null, "meta": {"user": {"seen": true}, "source": "gateway"}, "n": 1.5}"#);
         // A path only the first rule covers is rewritten by it alone.
         let shaping = snap.shaping("GET", "/other/old/", "/other/old/").unwrap();
-        assert_eq!(shaping.rewritten("/other/old/").as_deref(), Some("/other/old/"));
+        assert_eq!(shaping.rewritten("/other/old/").unwrap().as_deref(), Some("/other/old/"));
         // A value this side cannot be certain of, a body rule for an answer and a rewrite of
         // nothing each leave the rule to the Python gateway.
         for path in ["/odd/1", "/answer/1", "/nothing/1"] {
             assert!(snap.shaping("POST", path, path).is_none(), "{path}");
         }
+    }
+
+    #[test]
+    fn a_path_is_rewritten_by_expression_as_python_substitutes() {
+        let snap = Snapshot::from_json(
+            r#"{"keys":[],"transform_rules":[
+                {"glob":"/users/*","native":true,"response":null,"request":{"path":{"regex":"^/users/([0-9]+)/(posts|notes)","parts":["/", 2, "/by-user/", 1]}}},
+                {"glob":"/users/*","native":true,"response":null,"request":{"path":{"regex":"/by-(user|team)","parts":["/", 0, "-", 1]}}},
+                {"glob":"/twice/*","native":true,"response":null,"request":{"path":{"regex":"a(b)?","parts":["<", 1, ">"]}}},
+                {"glob":"/end/*","native":true,"response":null,"request":{"path":{"regex":"$","parts":[".json"]}}},
+                {"glob":"/front/*","native":true,"response":null,"request":{"path":{"from":"","to":"/base","start":true}}},
+                {"glob":"/gone/*","native":true,"response":null,"request":{"path":{"regex":"/v[0-9]+","parts":[]}}},
+                {"glob":"/group/*","native":true,"response":null,"request":{"path":{"regex":"/(a)","parts":[2]}}},
+                {"glob":"/engine/*","native":true,"response":null,"request":{"path":{"regex":"/(?=a)","parts":[]}}}]}"#,
+        )
+        .unwrap();
+        let rewritten = |path: &str| snap.shaping("GET", path, path).map(|s| s.rewritten(path));
+        // Each rule works on what the last left; a group is put back by its number, 0 the match.
+        assert_eq!(rewritten("/users/42/posts/7"), Some(Ok(Some("/posts//by-user-user/42/7".to_owned()))));
+        assert_eq!(rewritten("/users/x/posts"), Some(Ok(Some("/users/x/posts".to_owned()))));
+        // Every match from the left is replaced; a group that took no part leaves nothing.
+        assert_eq!(rewritten("/twice/ab/a"), Some(Ok(Some("/twice/<b>/<>".to_owned()))));
+        assert_eq!(rewritten("/end/x"), Some(Ok(Some("/end/x.json".to_owned()))));
+        assert_eq!(rewritten("/front/x"), Some(Ok(Some("/base/front/x".to_owned()))));
+        assert_eq!(rewritten("/gone/v2/x/v10"), Some(Ok(Some("/gone/x".to_owned()))));
+        // Beyond ASCII the two engines' classes differ: the Python gateway rewrites that path.
+        assert_eq!(rewritten("/gone/caf\u{e9}"), Some(Err(())));
+        assert_eq!(rewritten("/front/caf\u{e9}"), Some(Ok(Some("/base/front/caf\u{e9}".to_owned()))));
+        // A group the expression does not have, and an expression this engine does not take.
+        assert_eq!(rewritten("/group/a"), None);
+        assert_eq!(rewritten("/engine/a"), None);
+    }
+
+    #[test]
+    fn a_pattern_that_is_an_expression_is_pythons_to_match_beyond_ascii() {
+        let snap = Snapshot::from_json(
+            r#"{"keys":[],"transform_rules":[{"regex":"/w/\\w+$","native":true,"response":null,"request":{"set":[["x-a","1"]]}},
+                {"glob":"/g/*","native":true,"response":null,"request":{"set":[["x-a","1"]]}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(snap.shaping("GET", "/w/abc", "/w/abc").map(|s| s.request.len()), Some(1));
+        assert_eq!(snap.shaping("GET", "/other", "/other").map(|s| s.request.len()), Some(0));
+        assert!(snap.shaping("GET", "/w/\u{b2}", "/w/\u{b2}").is_none());
+        assert!(snap.transformed("GET", "/other/\u{b2}", "/other/\u{b2}"));
+        assert!(!snap.transformed("GET", "/other", "/other"));
     }
 
     #[test]

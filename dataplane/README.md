@@ -191,7 +191,7 @@ again after a reconnect. `/mqtt/subscribe` stays with the Python gateway.
 gateway's own handler and client publish the same bytes.
 
 **Transformation rules.** A rule that changes headers, query parameters or the fields of a JSON body of a request,
-replaces plain text in its path, or changes headers or the status of an answer, is applied here, as the Python
+rewrites its path, or changes headers or the status of an answer, is applied here, as the Python
 gateway applies it: for each rule that applies, in the order the rules were made, headers are renamed, then removed,
 then set, query parameters are removed, then set, fields of the body are renamed, then removed, then set, and the
 path is rewritten; an answer's status is mapped by each rule in turn. The quirks are the Python gateway's and are kept: a header is found for renaming or
@@ -236,11 +236,31 @@ body: one that opens as an object and then is not JSON, is nested more than 64 l
 too large to hold or one of the few whose digits the two sides might choose differently; one over 1 MiB; one sent
 without a `Content-Length`. A rule that sets a value which is not plain JSON is the Python gateway's to apply.
 
-A path rewrite is done here when it needs no expression: its pattern is plain text (letters, digits, `/`, `_`, `~`,
-an escaped `.` or `-`), with `^` in front to replace it at the start of the path only and otherwise wherever it
-stands, and its replacement is plain text too. It is applied to the path the backend is asked for, each rule to what
-the last left, while the rules themselves were chosen by the path before any rewrite, as in the Python gateway. A
-request whose rewritten path no longer starts with `/` is handed over.
+A path rewrite is done here in two forms. Without an expression: its pattern is plain text (letters, digits, `/`,
+`_`, `~`, an escaped `.` or `-`), with `^` in front to replace it at the start of the path only and otherwise wherever
+it stands, and its replacement is plain text too. By expression: a regular expression of the kind the two engines read
+alike (the same kind a rule's path pattern may be), each match from the left replaced by plain text and by groups of
+the match, written `\1` to `\9` or `\g<n>`. Either is applied to the path the backend is asked for, each rule to
+what the last left, while the rules themselves were chosen by the path before any rewrite, as in the Python gateway.
+A request whose rewritten path no longer starts with `/` is handed over.
+
+Some expressions stay with the Python gateway, which rewrites every path their rule applies to:
+
+* one that can match nothing (`a*`, `/?$`), which Python's `re.sub` replaces in more places than the engine here
+  does; `^` and `$` alone, which add to the front and the end of the path, are done here;
+* one that repeats a group which can match nothing (`(a*)+b`): Python's engine stops repeating at a turn that
+  matches nothing, so the two can disagree on where the match ends and on what its groups held;
+* one with alternatives that each hold a repetition or a group (`a*(aa)|a*a`): the engine here takes what
+  alternatives begin with alike out in front of them, and where that can match in more than one way, the alternative
+  that wins is no longer the first that could;
+* one with anything only Python's engine reads (a look-around, a back-reference, a named group, a flag), and a
+  replacement with any other escape or a group the expression does not have.
+
+An expression reads a path beyond ASCII differently in the two engines (`\w` and `\d` take different characters),
+so such a path is the Python gateway's to rewrite, and to match where a rule's own path pattern is an expression.
+An expression that does not compile rewrites nothing on either side.
+`python dataplane/conformance/shapes.py` puts expressions together at random and checks each rewritten path against
+`re.sub`.
 
 **API versions.** The version a request resolves to is echoed to the caller as `X-API-Version`: the one its
 `Accept-Version` or `X-API-Version` header names (a leading `v` ignored), else the default. The backend is told the
@@ -360,8 +380,8 @@ here is the reverse of everywhere else: **whatever this side cannot be sure of i
 | The JSON-to-gRPC bridge under `/grpc` | Python |
 | A path that matches a dynamic route to an `http://` or `https://` backend | data plane, to the route's backend |
 | A path that matches a dynamic route to any other backend | Python |
-| A request a transformation rule applies to (by path pattern and method), when the rule changes headers, query parameters, the fields of the request's JSON body or the status, or replaces plain text in the path | data plane, which applies it |
-| The same, when the rule changes an answer's body or a header the gateway has its own say in, rewrites the path by expression, fills in a template, or the request is one the two sides would read differently | Python, which applies it |
+| A request a transformation rule applies to (by path pattern and method), when the rule changes headers, query parameters, the fields of the request's JSON body or the status, or rewrites the path by plain text or by an expression both engines read alike | data plane, which applies it |
+| The same, when the rule changes an answer's body or a header the gateway has its own say in, rewrites the path by an expression of Python's own, fills in a template, or the request is one the two sides would read differently | Python, which applies it |
 | Any transformation rule whose regular expression the two engines could read differently | Python, for every path |
 | Request-altering plugins (when any exist) | Python, for every path |
 | The health path, `/ready` and `/live`, on a plain `GET` | data plane |

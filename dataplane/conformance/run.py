@@ -1769,11 +1769,34 @@ def main() -> int:
             remove_rules(made)
             assert rules_reached("/api/routed/old/1", "data plane", False), "removing the rules never reached the data plane"
 
+            # A rewrite by an expression both engines read alike, with the groups it puts back.
+            made = [post("/admin/transformations", r) for r in (
+                {"name": "turn a user's things around", "path_pattern": "/api/routed/users/*", "request_config": {
+                    "headers_set": {"X-Shaped": "yes"}, "path_rewrite": {"pattern": "/users/(\\d+)/(posts|notes)", "replacement": "/\\2/by-user/\\g<1>"}}},
+                {"name": "and say what the things are, each time", "path_pattern": "/api/routed/users/*", "request_config": {
+                    "path_rewrite": {"pattern": "/(?:posts|notes)(/by-user)?", "replacement": "/items\\1"}}},
+                {"name": "end with what kind it is", "path_pattern": "/api/routed/users/*", "methods": ["POST"], "request_config": {
+                    "path_rewrite": {"pattern": "$", "replacement": ".json"}}})]
+            assert rules_reached("/api/routed/users/1", "data plane", True), "the rules never reached the data plane"
+            exchange_same("a path is rewritten by expression, its groups put back in another order", "GET", "/api/routed/users/42/posts/7?q=tea",
+                          asked="/api/routed/items/by-user/42/7", query="q=tea", sees={"x-shaped": "yes"})
+            exchange_same("every match is replaced, and a group that took no part leaves nothing", "GET", "/api/routed/users/x/notes/posts",
+                          asked="/api/routed/users/x/items/items")
+            exchange_same("a path the expression does not match is asked for as it came", "GET", "/api/routed/users/42/drafts", asked="/api/routed/users/42/drafts")
+            exchange_same("an expression that adds to the end of the path", "POST", "/api/routed/users/42/notes", content=b'{"a": 1}', arrives=b'{"a": 1}',
+                          asked="/api/routed/items/by-user/42.json")
+            exchange_same("an escaped path is rewritten as it reads", "GET", "/api/routed/users/4%32/p%6Fsts", asked="/api/routed/items/by-user/42")
+            exchange_same("a path beyond ASCII under an expression is Python's to rewrite", "GET", "/api/routed/users/42/posts/caf%C3%A9", by="python",
+                          asked="/api/routed/items/by-user/42/caf%C3%A9")
+            remove_rules(made)
+            assert rules_reached("/api/routed/users/1", "data plane", False), "removing the rules never reached the data plane"
+
             # Rules this side is not told the actions of: they change an answer's body or the
             # path by expression, fill in a template, or change a header that the gateway or an HTTP library on
             # the way has a say in.
             for what, config in (("changes an answer's body", {"request_config": {"headers_set": {"X-Shaped": "yes"}}, "response_config": {"body_set": {"seen": True}}}),
-                                 ("rewrites the path by expression", {"request_config": {"headers_set": {"X-Shaped": "yes"}, "path_rewrite": {"pattern": "/kept/(\\d+)", "replacement": "/kept/\\1"}}}),
+                                 ("rewrites the path by an expression only Python's engine reads", {"request_config": {"headers_set": {"X-Shaped": "yes"}, "path_rewrite": {"pattern": "/kept/(?=\\d)", "replacement": "/kept/n"}}}),
+                                 ("rewrites the path by an expression that can match nothing", {"request_config": {"headers_set": {"X-Shaped": "yes"}, "path_rewrite": {"pattern": "(?:/x)*", "replacement": ""}}}),
                                  ("fills in a template", {"request_config": {"headers_set": {"X-Shaped": "yes"}}, "response_config": {"template": "{{ body | tojson }}"}}),
                                  ("sets the client's name", {"request_config": {"headers_set": {"X-Shaped": "yes", "User-Agent": "gateway"}}}),
                                  ("sets the kind of content of an answer", {"request_config": {"headers_set": {"X-Shaped": "yes"}},

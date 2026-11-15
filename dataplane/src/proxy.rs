@@ -1040,7 +1040,7 @@ fn decide<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, now: u6
         }
     }
     // A path rules rewrite is still a path.
-    let mut rewritten = shaping.rewritten(asked);
+    let Ok(mut rewritten) = shaping.rewritten(asked) else { return PYTHON };
     if rewritten.as_deref().is_some_and(|to| !to.starts_with('/')) {
         return PYTHON;
     }
@@ -1235,11 +1235,19 @@ pub fn judge_shapes() -> Result<(), String> {
         *resp.status_mut() = StatusCode::from_u16(case.status).map_err(|e| e.to_string())?;
         *resp.headers_mut() = map(&case.answer)?;
         shape_answer(&mut resp, &after);
+        let path = match case.path.as_deref().map(|asked| Shaping { request: before.clone(), response: Vec::new() }.rewritten(asked).map(|to| to.unwrap_or_else(|| asked.to_owned()))) {
+            Some(Err(())) => {
+                writeln!(out, "\"ask\"").map_err(|e| e.to_string())?;
+                continue;
+            }
+            Some(Ok(path)) => Some(path),
+            None => None,
+        };
         let said = serde_json::json!({
             "headers": lines(req.headers()),
             "query": req.uri().query(),
             "body": body.map(|b| b.iter().map(|byte| format!("{byte:02x}")).collect::<String>()),
-            "path": case.path.as_deref().map(|asked| Shaping { request: before.clone(), response: Vec::new() }.rewritten(asked).unwrap_or_else(|| asked.to_owned())),
+            "path": path,
             "answer": lines(resp.headers()),
             "status": resp.status().as_u16(),
         });
