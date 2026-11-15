@@ -1226,6 +1226,42 @@ def main() -> int:
             ws_same("an agent that cannot be reached", "/agents/gone/chat", want=lambda r: "refused" in r)
             ws_same("an agent whose certificate is not trusted", "/agents/stranger/chat", want=lambda r: "refused" in r)
             ws_same("an agent nobody registered", "/agents/nobody/chat", want=lambda r: "refused" in r)
+            # A handshake goes through the IP rules and the policies as a GET for its path does.
+            def ws_refused(path, headers):
+                return lambda: "refused" in ws_talk(rs, path, keys["rs"]["key"], (), headers)
+
+            rule = post("/admin/governance/ip-rules", {"cidr": "198.51.100.0/24", "action": "deny", "scope": "global"})
+            assert wait_until(native_status(403, far)), "the IP rule never reached the data plane"
+            ws_same("under an IP rule, an address it does not block is relayed here", "/ws/chat", ["hello"], with_key, by="data plane",
+                    want=lambda r: r.get("answers") == ["hello"])
+            ws_same("an address the rule blocks is refused", "/ws/chat", headers={**with_key, **far}, want=lambda r: "refused" in r)
+            ws_same("and so with the key in the query", "/ws/chat?api_key={key}", headers=far, want=lambda r: "refused" in r)
+            ws_same("an agent's socket is under no rule of the gateway's", "/agents/talker/chat", ["hello"], far, by="data plane",
+                    want=lambda r: r.get("answers") == ["hello"])
+            httpx.delete(f"{py}/admin/governance/ip-rules/{rule['id']}", headers=adm, timeout=10).raise_for_status()
+            assert wait_until(native_status(200, far)), "the IP rule never left the data plane"
+            ws_same("with the rule gone the address is let in again", "/ws/chat", ["hello"], {**with_key, **far}, by="data plane")
+
+            allow = post("/admin/governance/ip-rules", {"cidr": "198.51.100.0/24", "action": "allow", "scope": "global"})
+            assert wait_until(native_status(403)), "the allow-list never reached the data plane"
+            ws_same("an address outside an allow-list is refused", "/ws/chat", headers=with_key, want=lambda r: "refused" in r)
+            ws_same("an address inside it is relayed here", "/ws/chat", ["hello"], {**with_key, **far}, by="data plane", want=lambda r: r.get("answers") == ["hello"])
+            httpx.delete(f"{py}/admin/governance/ip-rules/{allow['id']}", headers=adm, timeout=10).raise_for_status()
+            assert wait_until(native_status(200)), "the allow-list never left the data plane"
+
+            made = [post("/admin/governance/policies", {"name": name, "priority": 10, "action": {"type": "deny", "reason": "no"}, "conditions": conditions})
+                    for name, conditions in (("conf-ws-private", {"path": "/ws/private/*"}), ("conf-ws-gets", {"path": "/ws/gets/*", "methods": ["GET"]}),
+                                             ("conf-ws-posts", {"path": "/ws/posts/*", "methods": ["POST"]}), ("conf-ws-far", {"path": "/ws/near/*", "cidrs": ["198.51.100.0/24"]}))]
+            assert wait_until(ws_refused("/ws/near/x", {**{"X-API-Key": keys["rs"]["key"]}, **far})), "the policies never reached the data plane"
+            ws_same("a policy on the path refuses the handshake", "/ws/private/room", headers=with_key, want=lambda r: "refused" in r)
+            ws_same("a handshake is a GET to a policy", "/ws/gets/room", headers=with_key, want=lambda r: "refused" in r)
+            ws_same("so a policy on another method lets it in", "/ws/posts/room", ["hello"], with_key, by="data plane", want=lambda r: r.get("answers") == ["hello"])
+            ws_same("a policy on an address refuses that address", "/ws/near/room", headers={**with_key, **far}, want=lambda r: "refused" in r)
+            ws_same("and lets another in", "/ws/near/room", ["hello"], with_key, by="data plane", want=lambda r: r.get("answers") == ["hello"])
+            ws_same("a path under no policy is relayed here", "/ws/chat", ["hello"], with_key, by="data plane")
+            for policy in made:
+                httpx.delete(f"{py}/admin/governance/policies/{policy['id']}", headers=adm, timeout=10).raise_for_status()
+            assert wait_until(lambda: not ws_refused("/ws/private/room", {"X-API-Key": keys["rs"]["key"]})()), "the policies never left the data plane"
             r = httpx.get(f"{rs}/api/users", headers={"X-API-Key": keys["rs"]["key"]}, timeout=10)
             check("ordinary requests are unaffected afterwards", r.status_code == 200 and said_by(r) == "data plane")
 
@@ -1647,6 +1683,8 @@ def main() -> int:
                 {"name": "mark orders", "path_pattern": "/api/routed/orders/*", "methods": ["GET"], "request_config": {"headers_set": {"X-Shaped": "yes"}}},
                 {"name": "mark an agent's intake", "path_pattern": "/intake/*", "request_config": {"headers_set": {"X-Shaped": "yes"}}})]
             assert rules_reached("/api/routed/orders/1", "data plane", True), "the rules never reached the data plane"
+            # The two rules are made one after the other, and a sync may fall between them.
+            assert rules_reached("/agents/echo/intake/7", "python", True), "the second rule never reached the data plane"
             rule_same("a request a rule applies to is changed here", "GET", "/api/routed/orders/1", "data plane", True)
             rule_same("another method on the same path is served here, unchanged", "POST", "/api/routed/orders/1", "data plane", False)
             rule_same("a path the rule does not cover is served here, unchanged", "GET", "/api/routed/other/1", "data plane", False)

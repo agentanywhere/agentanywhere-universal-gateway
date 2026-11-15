@@ -129,10 +129,11 @@ def _backends(settings) -> Dict[str, Optional[str]]:
     }
 
 
-def _websocket(settings, governed: bool) -> Optional[str]:
+def _websocket(settings) -> Optional[str]:
     """The WebSocket server ``/ws/...`` connections are relayed to, when the data plane may relay
-    them itself: a plain ``ws://`` address, the key read from the stock header, and no IP rule or
-    policy to evaluate (this gateway evaluates those for a handshake in a way of its own)."""
+    them itself: a ``ws://`` or ``wss://`` address, with the key read from the stock header or the
+    query. A handshake goes through the key's allowed paths, the IP rules and the policies as a
+    ``GET`` for its path does (``AuthMiddleware.authenticate``), and the data plane judges it so."""
     from app import main as gw
 
     url = getattr(gw.websocket_handler, "backend_url", None)
@@ -142,7 +143,7 @@ def _websocket(settings, governed: bool) -> Optional[str]:
     # SSL_CERT_FILE; the data plane only against that file. Without one, the two would not trust alike.
     if url.startswith("wss://") and (not os.environ.get("SSL_CERT_FILE") or os.environ.get("SSL_CERT_DIR")):
         return None
-    if governed or settings.api_key_header != "X-API-Key":
+    if settings.api_key_header != "X-API-Key":
         return None
     return url
 
@@ -1114,7 +1115,7 @@ async def build_snapshot(db: AsyncSession) -> Dict[str, Any]:
         "key_header": settings.api_key_header,
         "refusals": _refusals(auth_plugins),
         "ops": _ops(settings),
-        "websocket": _websocket(settings, bool(rules) or bool(policy_rows)),
+        "websocket": _websocket(settings),
         "grpc": _grpc(settings),
         "mqtt": _mqtt(),
         "agents": _agents(),

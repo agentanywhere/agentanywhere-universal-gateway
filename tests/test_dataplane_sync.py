@@ -870,12 +870,11 @@ async def test_the_snapshot_names_the_websocket_backend_only_when_the_data_plane
     monkeypatch.setenv("SSL_CERT_DIR", "/etc/ssl/certs")
     assert await named() is None
     monkeypatch.setattr(gw, "websocket_handler", SimpleNamespace(backend_url="ws://b:7000/base"))
-    # A key read from another header, or any rule or policy to evaluate: this gateway relays.
+    # A key read from another header: this gateway relays.
     monkeypatch.setattr(get_settings(), "api_key_header", "X-Gateway-Key")
     assert await named() is None
     monkeypatch.setattr(get_settings(), "api_key_header", "X-API-Key")
-    assert dataplane_sync._websocket(get_settings(), governed=True) is None
-    assert dataplane_sync._websocket(get_settings(), governed=False) == "ws://b:7000/base"
+    assert dataplane_sync._websocket(get_settings()) == "ws://b:7000/base"
 
 
 async def test_the_snapshot_names_the_grpc_backend_when_it_is_a_plain_address(db_session, monkeypatch):

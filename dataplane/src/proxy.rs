@@ -1764,7 +1764,8 @@ fn query_for_backend(query: &str) -> String {
 /// Whether a request is a WebSocket handshake for `/ws/...` that is certain to be let in: the
 /// key, in the query's `api_key` or else in its header, is known, working and allowed this path.
 /// Anything else is the Python gateway's to judge; it relays or refuses in its own way.
-fn relay<'a, B>(snap: &'a Snapshot, req: &Request<B>, now: u64) -> Option<Relay<'a>> {
+fn relay<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, at: Duration) -> Option<Relay<'a>> {
+    let now = at.as_secs();
     let backend = snap.websocket.as_deref()?;
     let (uri, headers) = (req.uri(), req.headers());
     let path = uri.path();
@@ -1787,6 +1788,26 @@ fn relay<'a, B>(snap: &'a Snapshot, req: &Request<B>, now: u64) -> Option<Relay<
     let expired = entry.expires_at.is_some_and(|e| e <= now as i64);
     if !entry.is_active || !entry.native_ok || expired || entry.scope.as_ref().is_some_and(|s| !s.allows(path)) {
         return None;
+    }
+    // The IP rules and the policies, as for any other request with this key: a handshake is a
+    // `GET` for its path. One they refuse is the Python gateway's to refuse.
+    if !snap.ip_rules.is_empty() || !snap.policies.is_empty() {
+        let ip = govern::client_ip(peer, headers, &snap.trusted_proxies)?;
+        let tenant = entry.tenant.as_ref().map(|t| &*t.id);
+        let key_id = entry.token.is_none().then_some(&*entry.id);
+        if snap.ip_rules.blocking(ip, tenant, key_id).is_some() {
+            return None;
+        }
+        let subject = Subject {
+            path,
+            method: "GET",
+            tenant: tenant.unwrap_or(""),
+            ip,
+            micros_of_day: (at.as_secs() % 86_400) * 1_000_000 + u64::from(at.subsec_micros()),
+        };
+        if govern::refusing(&snap.policies, &subject).is_some() {
+            return None;
+        }
     }
     let prefix = &backend.upstream.prefix;
     let query = query_for_backend(query);
@@ -2388,7 +2409,7 @@ pub async fn handle(w: Arc<Worker>, peer: SocketAddr, mut req: Request<Incoming>
     // Fail closed: if the snapshot is not known to be current, the Python gateway decides.
     let trusted = st.sync.as_ref().map(|s| s.fresh()).unwrap_or(true);
     if trusted && req.headers().contains_key(UPGRADE) {
-        if let Some(r) = relay(&snap, &req, now).or_else(|| agent_relay(&snap, &req)) {
+        if let Some(r) = relay(&snap, peer, &req, at).or_else(|| agent_relay(&snap, &req)) {
             if let Some(entry) = r.entry.filter(|e| e.last_used.load(Ordering::Relaxed) != now) {
                 entry.last_used.store(now, Ordering::Relaxed);
             }
@@ -3746,7 +3767,7 @@ mod tests {
     #[test]
     fn a_websocket_handshake_with_a_working_key_is_relayed_here() {
         let snap = governed(WS, "");
-        let target = |uri: &str, headers: &[(&str, &str)]| relay(&snap, &handshake(uri, headers), 100).map(|r| r.target);
+        let target = |uri: &str, headers: &[(&str, &str)]| relay(&snap, peer(), &handshake(uri, headers), Duration::from_secs(100)).map(|r| r.target);
         let key = [("x-api-key", KEY)];
         assert_eq!(target("/ws/chat", &key).as_deref(), Some("/base/chat"));
         assert_eq!(target("/ws/rooms/7?room=blue&x=1", &key).as_deref(), Some("/base/rooms/7?room=blue&x=1"));
@@ -3782,10 +3803,49 @@ mod tests {
         assert!(target(&format!("/ws/chat?api_key={KEY}&api_key=sk-nope"), &key).is_none());
         let twice = Request::builder().uri("/ws/chat").header("upgrade", "websocket").header("sec-websocket-version", "13")
             .header("sec-websocket-key", "a2V5").header("x-api-key", KEY).header("x-api-key", "sk-other").body(()).unwrap();
-        assert!(relay(&snap, &twice, 100).is_none());
+        assert!(relay(&snap, peer(), &twice, Duration::from_secs(100)).is_none());
         let post = Request::builder().method("POST").uri("/ws/chat").header("upgrade", "websocket").header("sec-websocket-version", "13")
             .header("sec-websocket-key", "a2V5").header("x-api-key", KEY).body(()).unwrap();
-        assert!(relay(&snap, &post, 100).is_none());
+        assert!(relay(&snap, peer(), &post, Duration::from_secs(100)).is_none());
+    }
+
+    #[test]
+    fn a_websocket_is_under_the_ip_rules_and_the_policies_as_a_get_for_its_path() {
+        let req = handshake("/ws/chat", &[("x-api-key", KEY)]);
+        let let_in = |extra: &str, req: &Request<()>, at: u64| relay(&governed(&format!("{WS}{extra}"), ""), peer(), req, Duration::from_secs(at)).is_some();
+        let rule = |scope: &str, id: &str, allow: bool, net: &str| format!(r#","ip_rules":[{{"scope":"{scope}","scope_id":{id},"allow":{allow},"net":"{net}","details_json":"{{}}"}}]"#);
+        // The caller's address is the peer's; a rule that blocks it leaves the handshake to Python.
+        assert!(let_in(&rule("global", "null", false, "192.0.2.0/24"), &req, 100));
+        assert!(!let_in(&rule("global", "null", false, "203.0.113.0/24"), &req, 100));
+        assert!(!let_in(&rule("global", "null", true, "192.0.2.0/24"), &req, 100), "an allow list the caller is not on");
+        assert!(!let_in(&rule("api_key", "\"k1\"", false, "203.0.113.0/24"), &req, 100));
+        assert!(let_in(&rule("api_key", "\"k9\"", false, "203.0.113.0/24"), &req, 100), "another key's rule");
+        let policy = |path: &str, methods: &str, time: &str, deny: bool| {
+            format!(r#","policies":[{{"path":{path},"methods":[{methods}],"tenants":[],"cidrs":null,"time":{time},"deny":{deny},"message_json":"\"no\"","details_json":"{{}}"}}]"#)
+        };
+        assert!(!let_in(&policy("\"/ws/*\"", "", "null", true), &req, 100));
+        assert!(let_in(&policy("\"/api/*\"", "", "null", true), &req, 100), "a policy for other paths");
+        assert!(!let_in(&policy("null", "\"GET\"", "null", true), &req, 100), "a handshake is a GET");
+        assert!(let_in(&policy("null", "\"POST\"", "null", true), &req, 100));
+        assert!(let_in(&policy("\"/ws/*\"", "", "null", false), &req, 100), "a policy that allows");
+        // A daily window, in UTC: 01:00 to 02:00.
+        assert!(!let_in(&policy("null", "", "[60,120]", true), &req, 3_700));
+        assert!(let_in(&policy("null", "", "[60,120]", true), &req, 100));
+        // With rules in force, an address this side cannot be sure of is Python's to read.
+        let proxied = r#","trusted_proxies":["203.0.113.7/32"]"#;
+        let blocked = rule("global", "null", false, "198.51.100.0/24");
+        let via = |forwarded: &[&str]| {
+            let mut b = Request::builder().uri("/ws/chat").header("upgrade", "websocket").header("sec-websocket-version", "13")
+                .header("sec-websocket-key", "a2V5").header("x-api-key", KEY);
+            for f in forwarded {
+                b = b.header("x-forwarded-for", *f);
+            }
+            b.body(()).unwrap()
+        };
+        assert!(let_in(&format!("{proxied}{blocked}"), &via(&["192.0.2.9"]), 100));
+        assert!(!let_in(&format!("{proxied}{blocked}"), &via(&["198.51.100.7"]), 100), "the forwarded address is the caller's");
+        assert!(!let_in(&format!("{proxied}{blocked}"), &via(&["192.0.2.9", "192.0.2.10"]), 100), "given twice");
+        assert!(let_in(proxied, &via(&["192.0.2.9", "192.0.2.10"]), 100), "no rule in force: the address is not needed");
     }
 
     #[test]
@@ -3817,18 +3877,18 @@ mod tests {
     fn a_websocket_is_relayed_here_only_with_a_backend_and_a_key_that_may() {
         let req = handshake("/ws/chat", &[("x-api-key", KEY)]);
         // No WebSocket backend this side can reach.
-        assert!(relay(&governed("", ""), &req, 100).is_none());
+        assert!(relay(&governed("", ""), peer(), &req, Duration::from_secs(100)).is_none());
         // Behind TLS only where this side verifies against a file of certificates it was given.
-        assert!(relay(&governed(r#","websocket":"wss://secure.example/base""#, ""), &req, 100).is_none());
-        assert!(relay(&governed(r#","websocket":"http://127.0.0.1:7000""#, ""), &req, 100).is_none());
+        assert!(relay(&governed(r#","websocket":"wss://secure.example/base""#, ""), peer(), &req, Duration::from_secs(100)).is_none());
+        assert!(relay(&governed(r#","websocket":"http://127.0.0.1:7000""#, ""), peer(), &req, Duration::from_secs(100)).is_none());
         // A key that is off, not reproducible here, expired, or not allowed this path.
         for key_extra in [r#","is_active":false"#, r#","native_ok":false"#, r#","expires_at":100"#, r#","expires_at":99"#] {
-            assert!(relay(&governed(WS, key_extra), &req, 100).is_none(), "{key_extra}");
+            assert!(relay(&governed(WS, key_extra), peer(), &req, Duration::from_secs(100)).is_none(), "{key_extra}");
         }
-        assert!(relay(&governed(WS, r#","expires_at":101"#), &req, 100).is_some());
+        assert!(relay(&governed(WS, r#","expires_at":101"#), peer(), &req, Duration::from_secs(100)).is_some());
         let scoped = governed(WS, r#","allowed_paths":{"rules":[["under","/ws/chat"]],"patterns_json":"[\"/ws/chat\"]"}"#);
-        assert!(relay(&scoped, &req, 100).is_some());
-        assert!(relay(&scoped, &handshake("/ws/other", &[("x-api-key", KEY)]), 100).is_none());
+        assert!(relay(&scoped, peer(), &req, Duration::from_secs(100)).is_some());
+        assert!(relay(&scoped, peer(), &handshake("/ws/other", &[("x-api-key", KEY)]), Duration::from_secs(100)).is_none());
     }
 
     #[test]
