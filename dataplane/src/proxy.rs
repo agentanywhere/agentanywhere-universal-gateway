@@ -181,11 +181,28 @@ impl Upstream {
 pub struct Backend {
     pub upstream: Upstream,
     pub breaker: Breaker,
+    /// Nothing is ever sent here: the address is in a scheme the Python gateway's HTTP client
+    /// refuses, and every request fails as it fails there.
+    pub never_sent: bool,
 }
 
 impl Backend {
     pub fn parse(text: &str) -> Result<Arc<Backend>, String> {
-        Ok(Arc::new(Backend { upstream: Upstream::parse(text)?, breaker: Breaker::new() }))
+        Ok(Arc::new(Backend { upstream: Upstream::parse(text)?, breaker: Breaker::new(), never_sent: false }))
+    }
+
+    /// The backend of a dynamic route, under the address the route gives. The Python gateway's
+    /// HTTP client speaks HTTP to a `ws://` address and HTTP over TLS to a `wss://` one, so this
+    /// side does. An address `never_sent` is only a name for the breaker that counts its failures.
+    fn of_route(text: &str, never_sent: bool) -> Result<Arc<Backend>, String> {
+        let spoken = match text.split_once("://") {
+            _ if never_sent => "http://never.invalid".to_owned(),
+            Some(("ws", rest)) => format!("http://{rest}"),
+            Some(("wss", rest)) => format!("https://{rest}"),
+            _ => text.to_owned(),
+        };
+        let upstream = Upstream { text: text.to_owned(), ..Upstream::parse(&spoken)? };
+        Ok(Arc::new(Backend { upstream, breaker: Breaker::new(), never_sent }))
     }
 }
 
@@ -213,6 +230,19 @@ impl Backends {
         Some(made)
     }
 
+    /// The backend of a dynamic route. Kept by the address the route gives, as the Python gateway
+    /// keeps its breakers: `ws://host` and `http://host` are two backends with a breaker each.
+    fn of_route(&self, url: &str, never_sent: bool) -> Option<Arc<Backend>> {
+        let key = url.trim_end_matches('/');
+        let mut known = self.0.lock().unwrap();
+        if let Some(found) = known.get(key).filter(|b| b.never_sent == never_sent) {
+            return Some(found.clone());
+        }
+        let made = Backend::of_route(key, never_sent).ok()?;
+        known.insert(key.to_owned(), made.clone());
+        Some(made)
+    }
+
     /// Give each protocol in the snapshot its backend.
     pub fn resolve(&self, snap: &mut Snapshot) {
         for (route, url) in snap.routes.iter_mut().zip(&snap.protocol_urls) {
@@ -228,7 +258,7 @@ impl Backends {
         snap.grpc = snap.grpc_url.as_deref().and_then(|u| self.at(u));
         for route in snap.dynamic_routes.iter_mut() {
             // A route with a backend this side cannot reach is kept, without one: what it matches is Python's.
-            route.backend = route.backend_url.as_deref().filter(|_| route.timeout().is_some()).and_then(|u| self.at(u));
+            route.backend = route.backend_url.as_deref().filter(|_| route.timeout().is_some()).and_then(|u| self.of_route(u, route.never_sent));
         }
         snap.agents = snap.agent_urls.iter().filter_map(|(slug, url)| Some((slug.clone(), self.at(url)?))).collect();
     }
@@ -2667,6 +2697,8 @@ pub async fn handle(w: Arc<Worker>, peer: SocketAddr, mut req: Request<Incoming>
                         shape_request(&mut req, &n.shaping.request, rewritten);
                     }
                     let answer = match grpc {
+                        // Refused by the Python gateway's HTTP client before it connects anywhere.
+                        _ if backend.never_sent => Err(Unanswered::Unsupported),
                         true => forward_grpc(&w, &backend.upstream, peer, req, &t, &snap.key_header, key_in_authorization).await,
                         false => forward(&w, &backend.upstream, peer, req, Some(native), Some(limit)).await,
                     };
@@ -2791,6 +2823,8 @@ enum Unanswered {
     TimedOut,
     /// Connected, then failed before a response arrived.
     Broken,
+    /// Never sent: the backend's address is in a scheme the Python gateway's HTTP client does not speak.
+    Unsupported,
 }
 
 impl Unanswered {
@@ -2800,6 +2834,7 @@ impl Unanswered {
             Unanswered::Refused => "ConnectError",
             Unanswered::TimedOut => "ReadTimeout",
             Unanswered::Broken => "RemoteProtocolError",
+            Unanswered::Unsupported => "UnsupportedProtocol",
         }
     }
 }
@@ -4153,6 +4188,34 @@ mod tests {
         // A protocol's path that is routed needs no backend of the protocol's own.
         assert_eq!(routed("/acp/routed/runs"), to("http://10.0.1.5:9000", "acp", None, 30));
         assert_eq!(routed("/acp/runs"), None);
+    }
+
+    #[test]
+    fn a_route_to_a_backend_that_is_not_http_goes_where_the_python_gateways_client_takes_it() {
+        let snap = governed(
+            r#","dynamic_routes":[
+            {"path":"/api/sockets/","wildcard":true,"backend":"ws://10.0.2.1:9000/base","protocol":"http","timeout_seconds":30,"rewrite":null},
+            {"path":"/api/plain/","wildcard":true,"backend":"http://10.0.2.1:9000/base","protocol":"http","timeout_seconds":30,"rewrite":null},
+            {"path":"/api/broker/","wildcard":true,"backend":"mqtt://10.0.2.2:1883","protocol":"http","timeout_seconds":30,"rewrite":null,"never_sent":true},
+            {"path":"/api/bare/","wildcard":true,"backend":"localhost:50051","protocol":"grpc","timeout_seconds":30,"rewrite":null,"never_sent":true},
+            {"path":"/api/unsaid/","wildcard":true,"backend":"mqtt://10.0.2.2:1883","protocol":"http","timeout_seconds":30,"rewrite":null}]"#,
+            "",
+        );
+        let routed = |uri: &str| {
+            let req = Request::builder().uri(uri).header("x-api-key", KEY).body(()).unwrap();
+            route(&snap, peer(), &req, 100).and_then(|n| n.backend).map(|b| (b.upstream.text.clone(), format!("{}://{}{}", b.upstream.scheme, b.upstream.authority, b.upstream.prefix), b.never_sent))
+        };
+        // A WebSocket address is spoken to in HTTP, under its own name and so with a breaker of its own.
+        assert_eq!(routed("/api/sockets/a"), Some(("ws://10.0.2.1:9000/base".into(), "http://10.0.2.1:9000/base".into(), false)));
+        assert_eq!(routed("/api/plain/a"), Some(("http://10.0.2.1:9000/base".into(), "http://10.0.2.1:9000/base".into(), false)));
+        let backend = |uri: &str| route(&snap, peer(), &Request::builder().uri(uri).header("x-api-key", KEY).body(()).unwrap(), 100).and_then(|n| n.backend).unwrap();
+        assert!(!std::ptr::eq(&backend("/api/sockets/a").breaker, &backend("/api/plain/a").breaker));
+        // Any other scheme, or none: nothing is sent, as the snapshot says.
+        assert_eq!(routed("/api/broker/a").map(|(text, _, never)| (text, never)), Some(("mqtt://10.0.2.2:1883".into(), true)));
+        assert_eq!(routed("/api/bare/a").map(|(text, _, never)| (text, never)), Some(("localhost:50051".into(), true)));
+        // Unless it says so, such a route is the Python gateway's.
+        assert_eq!(routed("/api/unsaid/a"), None);
+        assert_eq!(Unanswered::Unsupported.name(), "UnsupportedProtocol");
     }
 
     const AGENTS: &str = r#","agents":{"hiring":"http://10.0.0.10:8001","based":"http://10.0.0.11:8001/base","secure":"https://10.0.0.12"},"agent_failure":{"message_json":"\"Try again later.\"","page":["<p>Request <code>","</code></p>"]}"#;

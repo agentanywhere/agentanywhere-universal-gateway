@@ -1051,9 +1051,9 @@ async def test_the_snapshot_lists_the_dynamic_routes_in_force_in_matching_order(
         ("/api/exact", False), ("/api/orders/", True), ("/api/secure/", True), ("/api/odd/", True), ("/api/", True)]
     by_path = {r["path"]: r for r in routes}
     assert by_path["/api/"] == {"path": "/api/", "wildcard": True, "backend": "http://b1:9000", "protocol": "http",
-                                "timeout_seconds": 30, "rewrite": None}
+                                "timeout_seconds": 30, "rewrite": None, "never_sent": False}
     assert by_path["/api/orders/"] == {"path": "/api/orders/", "wildcard": True, "backend": "http://b2:9000", "protocol": "mcp",
-                                       "timeout_seconds": 5, "rewrite": "/v/orders"}
+                                       "timeout_seconds": 5, "rewrite": "/v/orders", "never_sent": False}
     # A route the data plane cannot follow is listed, so that it leaves what it matches alone.
     assert by_path["/api/secure/"]["backend"] == "https://b4:9000" and by_path["/api/odd/"]["backend"] is None
     # Routes no longer keep every path with this gateway: the data plane follows them.
@@ -1061,6 +1061,75 @@ async def test_the_snapshot_lists_the_dynamic_routes_in_force_in_matching_order(
     monkeypatch.setattr(get_settings(), "dynamic_routes_enabled", False)
     assert await listed() == []
     assert (await dataplane_sync.build_snapshot(db_session))["fallthrough_prefixes"] != ["/"]
+
+
+async def test_a_route_to_a_backend_that_is_not_http_is_described_as_this_gateways_client_treats_it(db_session, monkeypatch):
+    """The gateway's HTTP client speaks HTTP to a `ws://` or `wss://` address and refuses any other
+    scheme (or none) before it connects anywhere. The snapshot says which is which, and what it says
+    is checked here against the client itself."""
+    from types import SimpleNamespace
+
+    import httpx
+
+    from app import main as gw, route_registry
+    from app.models import ProtocolType, RouteConfig
+
+    # address -> (the backend the data plane is given, whether no request is ever sent)
+    backends = {
+        "http://127.0.0.1:9": ("http://127.0.0.1:9", False),
+        "ws://127.0.0.1:9": ("ws://127.0.0.1:9", False),
+        "wss://127.0.0.1:9/base": ("wss://127.0.0.1:9/base", False),
+        "mqtt://127.0.0.1:1883": ("mqtt://127.0.0.1:1883", True),
+        "MQTT://broker.internal:1883/base": ("MQTT://broker.internal:1883/base", True),
+        "grpc://10.0.0.1:50051": ("grpc://10.0.0.1:50051", True),
+        "redis://cache": ("redis://cache", True),
+        "localhost:50051": ("localhost:50051", True),
+        "127.0.0.1:50051/base": ("127.0.0.1:50051/base", True),
+        "broker": ("broker", True),
+        "h:99999": ("h:99999", True),
+        # Addresses this code is not sure of stay with this gateway.
+        "amqp://user:pw@h/x": (None, False),
+        "mqtt://h:1883/a b": (None, False),
+        "[::1]:50051": (None, False),
+        "unix:/tmp/s": (None, False),
+        "HTTP://h:1": (None, False),
+        "WS://127.0.0.1:9": (None, False),
+        "ftp://h/x?y=1": (None, False),
+    }
+
+    def row(path, backend):
+        return SimpleNamespace(path=path, backend_url=backend, is_active=True, protocol="http", timeout=1, rate_limit=None,
+                               requires_auth=True, headers=None, rewrite_path=None)
+
+    monkeypatch.setattr(route_registry, "_ROUTES", route_registry._snapshot_from_rows([row(f"/api/r{i}/*", b) for i, b in enumerate(backends)]))
+    told = {r["path"]: r for r in (await dataplane_sync.build_snapshot(db_session))["dynamic_routes"]}
+    monkeypatch.setattr(gw.router, "client", httpx.AsyncClient())
+    try:
+        for i, (backend, (given, never_sent)) in enumerate(backends.items()):
+            route = told[f"/api/r{i}/"]
+            assert (route["backend"], route["never_sent"]) == (given, never_sent), backend
+            try:
+                await gw.router.route_request("GET", "/api/x", {"accept": "*/*"}, {"a": "1"}, None,
+                                              route_config=RouteConfig(path="/api/x", backend_url=backend, protocol=ProtocolType.HTTP, timeout=1))
+                outcome = "answered"
+            except httpx.UnsupportedProtocol:
+                outcome = "never sent"
+            except httpx.TransportError:
+                outcome = "sent"
+            except Exception as e:  # noqa: BLE001
+                outcome = type(e).__name__
+            if never_sent:
+                assert outcome == "never sent", (backend, outcome)
+            elif given is not None:
+                # Spoken to (in vain: nothing listens there).
+                assert outcome == "sent", (backend, outcome)
+    finally:
+        await gw.router.client.aclose()
+    # With another HTTP client, nothing is said of what this one does.
+    monkeypatch.setattr(get_settings(), "upstream_client", "other", raising=False)
+    told = {r["path"]: r for r in (await dataplane_sync.build_snapshot(db_session))["dynamic_routes"]}
+    assert [(told[f"/api/r{i}/"]["backend"], told[f"/api/r{i}/"]["never_sent"]) for i in range(4)] == [
+        ("http://127.0.0.1:9", False), (None, False), (None, False), (None, False)]
 
 
 async def test_the_snapshot_says_how_a_request_from_another_origin_is_answered(db_session, monkeypatch):

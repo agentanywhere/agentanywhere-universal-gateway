@@ -370,8 +370,18 @@ not the Mozilla set, so only with the file do both sides trust what this side tr
 order the Python gateway tries them: exact paths, then wildcards from the longest prefix down. A request whose path
 matches one goes to that route's backend with the route's protocol name and timeout, and to its rewritten path if it
 has one; otherwise the caller's path, unchanged (a protocol's prefix such as `/acp` is not taken off a routed path).
-Keys, limits, rules and policies apply as for any other path. A route whose backend is not a plain `http://` or `https://`
-address leaves what it matches to the Python gateway. A route takes effect here one sync interval after it does there.
+Keys, limits, rules and policies apply as for any other path. A route takes effect here one sync interval after it does there.
+
+A route's backend need not be named as HTTP, and this side goes where the Python gateway's HTTP client goes. That
+client speaks plain HTTP to a `ws://` address and HTTP over TLS to a `wss://` one, exactly as to `http://` and
+`https://`, so a route to one is followed here the same way (under its own name: `ws://host` and `http://host` each
+have a circuit breaker). Any other scheme (`mqtt://broker:1883`, `grpc://...`), or none (`localhost:50051`), the
+client refuses before it connects anywhere: every request such a route matches is a 502 (`BACKEND_ERROR`, the same
+body as for a backend that cannot be reached), counted against that backend's circuit breaker, which opens after as
+many failures as any other and then answers 503. This side does the same, and sends nothing. A route whose address
+this side is not sure the client reads that way (one with a user name, a space or a query, an IPv6 address without a
+scheme, a scheme written in capitals that the client would speak), or whose rewrite or timeout it cannot follow,
+leaves what it matches to the Python gateway; so does every such route when the gateway runs with another HTTP client.
 
 **The agent edge.** A request for `/agents/<slug>/...` is forwarded here when the agent is registered with a plain
 `http://` or `https://` upstream and the request would reach it exactly as the Python gateway sends it. As there, no gateway key is
@@ -443,8 +453,9 @@ here is the reverse of everywhere else: **whatever this side cannot be sure of i
 | A path that decodes to a control character, `?`, `#` or bytes that are not UTF-8; an escaped path under `/agents/` | Python |
 | `POST` of JSON to the bridge under `/grpc`, read here exactly as Python reads it | data plane |
 | Anything else under `/grpc` that is not a gRPC call | Python |
-| A path that matches a dynamic route to an `http://` or `https://` backend | data plane, to the route's backend |
-| A path that matches a dynamic route to any other backend | Python |
+| A path that matches a dynamic route to an `http://`, `https://`, `ws://` or `wss://` backend | data plane, to the route's backend |
+| A path that matches a dynamic route to a backend in another scheme, or in none | data plane: a 502, nothing is sent |
+| A path that matches a dynamic route with an address, rewrite or timeout this side is not sure of | Python |
 | A request a transformation rule applies to (by path pattern and method), when the rule changes headers, query parameters, the fields of the request's JSON body, the status or the headers of the answer, or rewrites the path by plain text or by an expression both engines read alike | data plane, which applies it |
 | An answer whose body a rule changes, when it is short, not compressed and a JSON object this side reads as Python does | data plane, which applies the rule |
 | Any other answer whose body a rule changes | data plane, with the answer shaped by Python (`/internal/dataplane/shape-answer`) |

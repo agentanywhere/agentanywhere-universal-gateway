@@ -647,6 +647,28 @@ def _preflight(origins, credentials, methods, headers) -> Optional[Dict[str, Any
 
 
 _ROUTE_REWRITE = re.compile(r"/[A-Za-z0-9._~/-]*")
+# A route's backend named as a WebSocket address. This gateway's HTTP client (httpx) speaks plain
+# HTTP to `ws://` and HTTP over TLS to `wss://`, exactly as to `http://` and `https://`.
+_ROUTE_WEBSOCKET = re.compile(r"wss?://(?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])(?::[0-9]{1,5})?(?:/[A-Za-z0-9._~/-]*)?")
+# A backend in some other scheme (`mqtt://broker:1883`) or in none (`localhost:50051`).
+_ROUTE_OTHER = re.compile(r"(?:[A-Za-z][A-Za-z0-9+.-]*://)?[A-Za-z0-9.-]+(?::[0-9]{1,5})?(?:/[A-Za-z0-9._~/-]*)?")
+
+
+def _never_sent(settings, backend: str) -> bool:
+    """Whether a route's backend is one this gateway's HTTP client refuses before it connects
+    anywhere: an address in a scheme it does not speak, or in none. Every request such a route
+    matches fails the same way (a 502, counted against the backend's circuit breaker), which the
+    data plane can do as well. Said only of the client this was observed of (httpx) and of
+    addresses it reads without complaint."""
+    if getattr(settings, "upstream_client", "httpx") != "httpx" or not _ROUTE_OTHER.fullmatch(backend):
+        return False
+    try:
+        import httpx
+
+        scheme = httpx.URL(f"{backend}/x").scheme
+    except Exception:  # noqa: BLE001 - an address the client cannot read fails some other way
+        return False
+    return scheme not in ("http", "https", "ws", "wss")
 
 
 def _dynamic_routes(settings) -> list:
@@ -664,8 +686,10 @@ def _dynamic_routes(settings) -> list:
         backend = (cfg.backend_url or "").rstrip("/")
         rewrite = cfg.rewrite_path or None
         timeout = cfg.timeout
+        never_sent = _never_sent(settings, backend)
+        as_http = _ROUTE_WEBSOCKET.fullmatch(backend) is not None and getattr(settings, "upstream_client", "httpx") == "httpx"
         follows = (
-            _AGENT_UPSTREAM.fullmatch(backend) is not None
+            (_AGENT_UPSTREAM.fullmatch(backend) is not None or as_http or never_sent)
             and (rewrite is None or _ROUTE_REWRITE.fullmatch(rewrite) is not None)
             and isinstance(timeout, int) and not isinstance(timeout, bool) and 0 < timeout <= 86_400
             and cfg.protocol.value.isascii()
@@ -677,6 +701,8 @@ def _dynamic_routes(settings) -> list:
             "protocol": cfg.protocol.value,
             "timeout_seconds": timeout if follows else None,
             "rewrite": rewrite if follows else None,
+            # A backend no request is ever sent to: each one fails as this gateway's client fails it.
+            "never_sent": bool(follows and never_sent),
         })
     return out
 

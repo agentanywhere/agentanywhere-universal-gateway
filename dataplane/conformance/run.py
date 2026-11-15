@@ -1524,6 +1524,12 @@ def main() -> int:
                           {"path": "/api/routed/stranger/*", "backend_url": strange_agent},
                           {"path": "/api/routed/dead/*", "backend_url": "http://127.0.0.1:7"},  # its own address: a breaker of its own
                           {"path": "/api/routed/down/*", "backend_url": "http://127.0.0.1:11"},
+                          # Backends that are not named as HTTP. The Python gateway's HTTP client speaks HTTP to a
+                          # WebSocket address, and refuses every other scheme, or none, before it connects anywhere.
+                          {"path": "/api/routed/ws/*", "backend_url": "ws" + agent[4:]},
+                          {"path": "/api/routed/wss/*", "backend_url": "wss" + secure_agent[5:]},
+                          {"path": "/api/routed/broker/*", "backend_url": "mqtt://127.0.0.1:1883"},
+                          {"path": "/api/routed/bare/*", "backend_url": "localhost:50051", "protocol": "grpc"},
                           {"path": "/acp/routed/*", "backend_url": agent, "protocol": "acp"}):
                 post("/admin/routes", {"protocol": "http", "timeout": 30, **route})
 
@@ -1569,6 +1575,18 @@ def main() -> int:
                               want=lambda r: r.status_code == 502)
             check("dynamic routes: and the refusal is the same on both planes, to the details",
                   a.json().get("details") == b.json().get("details") and list(a.json()) == list(b.json()), str(b.json().get("details"))[:120])
+            route_same("a route to a ws:// address is spoken to in HTTP", "GET", "/api/routed/ws/a?n=1", want=lambda r: r.json()["path"] == "/api/routed/ws/a")
+            route_same("a route to a ws:// address, with a body", "POST", "/api/routed/ws/items", content=b'{"a": 1}', want=lambda r: r.json()["body_bytes"] == 8)
+            route_same("a route to a wss:// address is spoken to in HTTP over TLS", "GET", "/api/routed/wss/a", want=lambda r: r.json()["path"] == "/api/routed/wss/a")
+            for name, path in (("a route to a backend in another scheme", "/api/routed/broker/a"), ("a route to a backend named without a scheme", "/api/routed/bare/a")):
+                a, b = route_same(f"{name} is a 502: nothing is sent", "GET", path, sees=False, want=lambda r: r.status_code == 502)
+                check(f"dynamic routes: {name}: the same refusal on both planes, to the details",
+                      a.json().get("details") == b.json().get("details") and list(a.json()) == list(b.json()), str(b.json().get("details"))[:120])
+                # Each failure counts against the backend's breaker, which then opens, on both planes after as many.
+                seen = [(httpx.get(py + path, headers={"X-API-Key": keys["py"]["key"]}, timeout=10).status_code,
+                         httpx.get(rs + path, headers={"X-API-Key": keys["rs"]["key"]}, timeout=10).status_code) for _ in range(7)]
+                check(f"dynamic routes: {name}: its breaker opens after as many failures on both planes",
+                      all(x == y for x, y in seen) and seen[0][1] == 502 and seen[-1][1] == 503, str(seen))
             route_same("a key's allowed paths still apply to a routed path", "GET", "/api/routed/a", pair=scoped, sees=False, want=lambda r: r.status_code == 403)
             a = httpx.get(f"{py}/api/routed/a", timeout=10)
             b = httpx.get(f"{rs}/api/routed/a", timeout=10)

@@ -680,6 +680,10 @@ pub struct DynamicRoute {
     timeout_seconds: Option<u64>,
     /// The path the backend is asked for, in place of the caller's.
     pub rewrite: Option<String>,
+    /// The backend is in a scheme the Python gateway's HTTP client does not speak: no request
+    /// is sent, and each fails as a backend that cannot be reached does.
+    #[serde(default)]
+    pub never_sent: bool,
 }
 
 impl DynamicRoute {
