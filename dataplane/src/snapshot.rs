@@ -347,7 +347,7 @@ impl Actions {
 /// rules: a dictionary from name to value, in order, where names differ if their case does.
 pub type HeaderLines<V> = Vec<(String, V)>;
 
-fn put<V>(lines: &mut HeaderLines<V>, name: &str, value: V) {
+pub fn put<V>(lines: &mut HeaderLines<V>, name: &str, value: V) {
     match lines.iter_mut().find(|(n, _)| n == name) {
         Some(line) => line.1 = value,
         None => lines.push((name.to_owned(), value)),

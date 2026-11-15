@@ -1310,13 +1310,21 @@ def test_the_snapshot_says_what_a_rule_does_when_the_data_plane_can_do_the_same(
         assert actions(request_config={"path_rewrite": kept}) is None, kept
     for code in ("condition", "transform_request", "transform_response"):
         assert dataplane_sync._rule_actions(TransformationRule(name="r", **{code: lambda *a: None})) is None
-    # ...a header the gateway or an HTTP library on the way has its own say in, on that side...
-    for name in ("Host", "content-length", "User-Agent", "Accept-Encoding", "X-Forwarded-For", "x-request-id", "X-API-Version", "traceparent"):
+    # ...a header an HTTP library on the way has its own say in, or one the request is read by again
+    # after the rules (the version headers), on that side...
+    for name in ("Host", "content-length", "User-Agent", "Accept-Encoding", "Accept", "X-API-Version", "accept-version"):
         for kept in ({"headers_set": {name: "v"}}, {"headers_remove": [name]}, {"headers_rename": {name: "X-A"}}, {"headers_rename": {"X-A": name}}):
             assert actions(request_config=kept) is None, kept
-    for name in ("Content-Type", "content-length", "Set-Cookie", "Vary", "X-Request-ID", "Access-Control-Allow-Origin", "X-RateLimit-Limit", "x-tenant-id"):
+    for name in ("Content-Type", "content-length", "Set-Cookie", "Vary", "Access-Control-Allow-Origin", "X-RateLimit-Limit", "x-tenant-id", "X-Served-By"):
         assert actions(response_config={"headers_set": {name: "v"}}) is None, name
         assert actions(response_config={"headers_remove": [name]}) is None, name
+    # ...but not the headers this gateway itself writes after the rules, which the data plane writes as it does.
+    for name in ("X-Forwarded-For", "x-forwarded-for", "X-Protocol", "traceparent", "Traceparent", "x-request-id", "X-Request-ID"):
+        for told in ({"headers_set": {name: "v"}}, {"headers_remove": [name]}, {"headers_rename": {name: "X-A"}}, {"headers_rename": {"X-A": name}}):
+            assert actions(request_config=told) is not None, told
+    for name in ("X-Request-ID", "x-response-time", "traceparent", "X-API-Version"):
+        for told in ({"headers_set": {name: "v"}}, {"headers_remove": [name]}, {"headers_rename": {name: "X-A"}}, {"headers_rename": {"X-A": name}}):
+            assert actions(response_config=told) is not None, told
     assert actions(request_config={"headers_set": {"Content-Type": "text/plain", "Set-Cookie": "a=b"}}) is not None
     # ...a name or a value that is not plain, or that the two sides' libraries might write differently...
     for kept in ({"headers_set": {"bad name": "v"}}, {"headers_set": {"": "v"}}, {"headers_set": {"X-A": "Z\u00fcrich"}}, {"headers_set": {"X-A": "two\nlines"}},

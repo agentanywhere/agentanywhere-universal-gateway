@@ -35,7 +35,7 @@ use crate::govern::{self, IpRule, Policy, Scope, Subject};
 use crate::pyjson;
 use crate::report::{Event, Reporter, Row, Served};
 use crate::snapshot::{
-    change_headers, change_query, change_status, hash_key, Actions, AgentFailure, Digest32, DynamicRoute, HeaderLines, KeyEntry, Readiness, Shaping,
+    change_headers, put, change_query, change_status, hash_key, Actions, AgentFailure, Digest32, DynamicRoute, HeaderLines, KeyEntry, Readiness, Shaping,
     Snapshot, Wording,
 };
 use crate::sync::Link;
@@ -1146,9 +1146,15 @@ fn streamed(path: &str, method: &str, headers: &HeaderMap, query: Option<&str>) 
 /// them as one line per name while it does; a name the rules mention that an answer gives more
 /// than once is one line there, its values joined, and is here too. (A request that gives such
 /// a name twice is not changed here at all.)
-fn shape_headers(headers: &mut HeaderMap, rules: &[&Actions]) {
+///
+/// With `sent` (a request on its way to a backend), the headers the gateway itself writes are
+/// written here too, where each line's exact name is still known: the Python gateway writes them
+/// into the same dictionary the rules have just changed, under names of one exact spelling, so a
+/// line a rule left under that very spelling is taken over and one under any other stays beside
+/// it. Says whether that was done.
+fn shape_headers(headers: &mut HeaderMap, rules: &[&Actions], sent: Option<&Sent>) -> bool {
     if !rules.iter().any(|a| a.changes_headers()) {
-        return;
+        return false;
     }
     let mut lines: HeaderLines<HeaderValue> = Vec::with_capacity(headers.len());
     for name in headers.keys() {
@@ -1166,14 +1172,68 @@ fn shape_headers(headers: &mut HeaderMap, rules: &[&Actions]) {
         }
         lines.push((name.as_str().to_owned(), HeaderValue::from_bytes(&joined).unwrap_or_else(|_| first.clone())));
     }
+    // The request-id plugin adds its header before any rule is applied, when the caller sent none.
+    if let Some(id) = sent.filter(|s| s.inject_request_id && !lines.iter().any(|(n, _)| n.eq_ignore_ascii_case("x-request-id"))) {
+        if let Ok(v) = HeaderValue::from_str(&id.trace.request_id) {
+            lines.push(("X-Request-ID".to_owned(), v));
+        }
+    }
     for actions in rules {
         change_headers(&mut lines, actions, |text| HeaderValue::from_str(text).ok());
+    }
+    if let Some(sent) = sent {
+        if let Some(v) = sent.version.and_then(|v| HeaderValue::from_str(v).ok()) {
+            put(&mut lines, "X-API-Version", v);
+        }
+        lines.retain(|(name, _)| !name.to_ascii_lowercase().starts_with("x-gateway-"));
+        if !lines.iter().any(|(name, _)| name == "X-Forwarded-For") {
+            lines.push(("X-Forwarded-For".to_owned(), HeaderValue::from_static("")));
+        }
+        if let Ok(v) = HeaderValue::from_str(sent.protocol) {
+            put(&mut lines, "X-Protocol", v);
+        }
+        if let Ok(v) = HeaderValue::from_str(&sent.trace.traceparent) {
+            put(&mut lines, "traceparent", v);
+        }
     }
     headers.clear();
     for (name, value) in lines {
         if let Ok(name) = HeaderName::from_bytes(name.as_bytes()) {
             headers.append(name, value);
         }
+    }
+    sent.is_some()
+}
+
+/// A request whose headers already carry what the gateway itself writes (`shape_headers`).
+#[derive(Clone)]
+struct Stamped;
+
+/// The headers the gateway itself writes on a request to a backend, where no rule changed its
+/// headers: every name is then as the caller's server read it, in lower case and once. The
+/// Python gateway writes `X-API-Version`, `X-Forwarded-For` (empty) and `X-Protocol` under those
+/// spellings, which are other names to its dictionary than the caller's own `x-protocol` and the
+/// like: a caller's line of such a name goes on beside the gateway's, and before it. `traceparent`
+/// it writes in lower case, in place of the caller's.
+fn stamp_request(headers: &mut HeaderMap, sent: &Sent) {
+    let internal: Vec<HeaderName> = headers.keys().filter(|k| k.as_str().starts_with("x-gateway-")).cloned().collect();
+    for name in internal {
+        headers.remove(name);
+    }
+    if sent.inject_request_id && !headers.contains_key("x-request-id") {
+        if let Ok(v) = HeaderValue::from_str(&sent.trace.request_id) {
+            headers.insert("x-request-id", v);
+        }
+    }
+    if let Some(v) = sent.version.and_then(|v| HeaderValue::from_str(v).ok()) {
+        headers.append("x-api-version", v);
+    }
+    headers.append("x-forwarded-for", HeaderValue::from_static(""));
+    if let Ok(v) = HeaderValue::from_str(sent.protocol) {
+        headers.append("x-protocol", v);
+    }
+    if let Ok(v) = HeaderValue::from_str(&sent.trace.traceparent) {
+        headers.insert("traceparent", v);
     }
 }
 
@@ -1332,8 +1392,10 @@ async fn answer_with_body_rules(w: &Worker, resp: Response<Body>, rules: &[&Acti
 /// Apply the rules to a request before it is sent on: its headers, and its query. `rewritten`
 /// says the rules made a new body for it (already in place, with its length): the Python
 /// gateway's HTTP client then calls it JSON unless the headers say what it is.
-fn shape_request(req: &mut Request<Body>, rules: &[&Actions], rewritten: bool) {
-    shape_headers(req.headers_mut(), rules);
+fn shape_request(req: &mut Request<Body>, rules: &[&Actions], rewritten: bool, sent: Option<&Sent>) {
+    if shape_headers(req.headers_mut(), rules, sent) {
+        req.extensions_mut().insert(Stamped);
+    }
     if rewritten && !req.headers().contains_key(CONTENT_TYPE) {
         req.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     }
@@ -1355,7 +1417,7 @@ fn shape_request(req: &mut Request<Body>, rules: &[&Actions], rewritten: bool) {
 
 /// Apply the rules to a backend's answer: its headers, and its status.
 fn shape_answer(resp: &mut Response<Body>, rules: &[&Actions]) {
-    shape_headers(resp.headers_mut(), rules);
+    shape_headers(resp.headers_mut(), rules, None);
     let was = resp.status().as_u16();
     let becomes = change_status(was, rules);
     if becomes != was {
@@ -1389,6 +1451,10 @@ pub fn judge_shapes() -> Result<(), String> {
         #[serde(default)]
         answer_body: Option<String>,
         status: u16,
+        /// The protocol name the backend is told. With it, the headers the gateway itself writes
+        /// are written too (the trace as `<trace>`), as they are on the way to a backend.
+        #[serde(default)]
+        protocol: Option<String>,
     }
 
     fn unhex(text: &str) -> Result<Vec<u8>, String> {
@@ -1437,7 +1503,12 @@ pub fn judge_shapes() -> Result<(), String> {
                 }
             }
         }
-        shape_request(&mut req, &before, rewritten);
+        let trace = Trace { request_id: "<id>".to_owned(), traceparent: "<trace>".to_owned() };
+        let sent = case.protocol.as_deref().map(|protocol| Sent { trace: &trace, version: None, inject_request_id: false, protocol, path: None });
+        shape_request(&mut req, &before, rewritten, sent.as_ref());
+        if let Some(sent) = sent.as_ref().filter(|_| req.extensions().get::<Stamped>().is_none()) {
+            stamp_request(req.headers_mut(), sent);
+        }
         let mut resp = Response::new(full(Bytes::new()));
         *resp.status_mut() = StatusCode::from_u16(case.status).map_err(|e| e.to_string())?;
         *resp.headers_mut() = map(&case.answer)?;
@@ -2694,7 +2765,7 @@ pub async fn handle(w: Arc<Worker>, peer: SocketAddr, mut req: Request<Incoming>
                     };
                     let limit = n.route.and_then(DynamicRoute::timeout).unwrap_or(snap.upstream_timeout);
                     if !n.shaping.request.is_empty() {
-                        shape_request(&mut req, &n.shaping.request, rewritten);
+                        shape_request(&mut req, &n.shaping.request, rewritten, Some(&native));
                     }
                     let answer = match grpc {
                         // Refused by the Python gateway's HTTP client before it connects anywhere.
@@ -2901,6 +2972,7 @@ async fn forward(
     // this side's end of the connection is held ready for the tunnel.
     let asked_for = req.headers().get(UPGRADE).cloned();
     let client_end = asked_for.as_ref().map(|_| hyper::upgrade::on(&mut req));
+    let stamped = req.extensions().get::<Stamped>().is_some();
     let headers = req.headers_mut();
     for h in HOP_BY_HOP {
         headers.remove(h);
@@ -2912,26 +2984,9 @@ async fn forward(
     match native {
         Some(sent) => {
             headers.remove(HOST);
-            let internal: Vec<HeaderName> = headers.keys().filter(|k| k.as_str().starts_with("x-gateway-")).cloned().collect();
-            for name in internal {
-                headers.remove(name);
-            }
-            if let Ok(v) = HeaderValue::from_str(sent.protocol) {
-                headers.insert("x-protocol", v);
-            }
-            if let Some(v) = sent.version.and_then(|v| HeaderValue::from_str(v).ok()) {
-                headers.insert("x-api-version", v);
-            }
-            if !headers.contains_key("x-forwarded-for") {
-                headers.insert("x-forwarded-for", HeaderValue::from_static(""));
-            }
-            if let Ok(v) = HeaderValue::from_str(&sent.trace.traceparent) {
-                headers.insert("traceparent", v);
-            }
-            if sent.inject_request_id && !headers.contains_key("x-request-id") {
-                if let Ok(v) = HeaderValue::from_str(&sent.trace.request_id) {
-                    headers.insert("x-request-id", v);
-                }
+            // Written already, with the rules, where a request's headers were changed by them.
+            if !stamped {
+                stamp_request(headers, &sent);
             }
         }
         None => {
@@ -4060,7 +4115,7 @@ mod tests {
             Decision::Native(n) => {
                 let mut sent = Request::builder().uri(req.uri().clone()).body(full(Bytes::new())).unwrap();
                 *sent.headers_mut() = req.headers().clone();
-                shape_request(&mut sent, &n.shaping.request, false);
+                shape_request(&mut sent, &n.shaping.request, false, None);
                 let mut resp = Response::new(full(Bytes::new()));
                 for (name, value) in [("x-agent", "echo"), ("etag", "1"), ("etag", "2"), ("set-cookie", "a=1"), ("set-cookie", "b=2")] {
                     resp.headers_mut().append(name, HeaderValue::from_static(value));
@@ -4188,6 +4243,59 @@ mod tests {
         // A protocol's path that is routed needs no backend of the protocol's own.
         assert_eq!(routed("/acp/routed/runs"), to("http://10.0.1.5:9000", "acp", None, 30));
         assert_eq!(routed("/acp/runs"), None);
+    }
+
+    #[test]
+    fn the_gateways_own_request_headers_are_written_as_the_python_gateway_writes_them() {
+        let trace = Trace { request_id: "id-1".to_owned(), traceparent: "tp".to_owned() };
+        let sent = Sent { trace: &trace, version: Some("2"), inject_request_id: true, protocol: "http", path: None };
+        let read = |headers: &HeaderMap, name: &str| headers.get_all(name).iter().map(|v| v.to_str().unwrap().to_owned()).collect::<Vec<_>>();
+        let came = || {
+            let mut headers = HeaderMap::new();
+            for (name, value) in [("x-forwarded-for", "198.51.100.7"), ("x-protocol", "mine"), ("x-api-version", "2"), ("traceparent", "theirs"), ("x-gateway-note", "n")] {
+                headers.append(name, HeaderValue::from_static(value));
+            }
+            headers
+        };
+        // With no rule: the gateway's spellings are other names than the caller's, whose lines go
+        // on before them; `traceparent` is the caller's own spelling, and is replaced.
+        let mut headers = came();
+        stamp_request(&mut headers, &sent);
+        assert_eq!(read(&headers, "x-forwarded-for"), ["198.51.100.7", ""]);
+        assert_eq!(read(&headers, "x-protocol"), ["mine", "http"]);
+        assert_eq!(read(&headers, "x-api-version"), ["2", "2"]);
+        assert_eq!(read(&headers, "traceparent"), ["tp"]);
+        assert_eq!(read(&headers, "x-request-id"), ["id-1"]);
+        assert!(read(&headers, "x-gateway-note").is_empty());
+        let mut bare = HeaderMap::new();
+        stamp_request(&mut bare, &Sent { version: None, inject_request_id: false, ..Sent { trace: &trace, version: None, inject_request_id: false, protocol: "mcp", path: None } });
+        assert_eq!((read(&bare, "x-forwarded-for"), read(&bare, "x-protocol"), read(&bare, "traceparent")), (vec![String::new()], vec!["mcp".to_owned()], vec!["tp".to_owned()]));
+        assert!(read(&bare, "x-request-id").is_empty() && read(&bare, "x-api-version").is_empty());
+
+        // With rules: a line left under the gateway's own spelling is the one the gateway writes
+        // to (or, for X-Forwarded-For, leaves); one under any other spelling stays beside it.
+        let rule = |text: &str| serde_json::from_str::<Actions>(text).unwrap();
+        let named = rule(r#"{"rename":[["x-request-id","X-Caller-Request"]],"remove":[],"set":[["X-Forwarded-For","203.0.113.5"],["x-protocol","theirs"],["Traceparent","nope"]]}"#);
+        let mut headers = came();
+        assert!(shape_headers(&mut headers, &[&named], Some(&sent)));
+        assert_eq!(read(&headers, "x-forwarded-for"), ["198.51.100.7", "203.0.113.5"]);
+        assert_eq!(read(&headers, "x-protocol"), ["theirs", "http"]);
+        assert_eq!(read(&headers, "traceparent"), ["tp", "nope"]);
+        // The id the plugin added before the rules is the one renamed.
+        assert_eq!((read(&headers, "x-request-id"), read(&headers, "x-caller-request")), (vec![], vec!["id-1".to_owned()]));
+        assert!(read(&headers, "x-gateway-note").is_empty());
+        let exact = rule(r#"{"remove":["x-forwarded-for","traceparent","x-request-id"],"set":[["X-Protocol","theirs"],["X-Request-ID","mine"]]}"#);
+        let mut headers = came();
+        assert!(shape_headers(&mut headers, &[&exact], Some(&sent)));
+        assert_eq!((read(&headers, "x-forwarded-for"), read(&headers, "traceparent")), (vec![String::new()], vec!["tp".to_owned()]));
+        // The caller's own `x-protocol` stays; the rule's line is under the gateway's spelling and is written over.
+        assert_eq!(read(&headers, "x-protocol"), ["mine", "http"]);
+        assert_eq!(read(&headers, "x-request-id"), ["mine"]);
+        // An answer's headers, and rules that change no header, are not the gateway's to write here.
+        let mut headers = came();
+        assert!(!shape_headers(&mut headers, &[&named], None));
+        assert_eq!((read(&headers, "x-protocol"), read(&headers, "x-forwarded-for")), (vec!["theirs".to_owned()], vec!["198.51.100.7".to_owned(), "203.0.113.5".to_owned()]));
+        assert!(!shape_headers(&mut came(), &[&rule(r#"{"query_set":[["a","1"]]}"#)], Some(&sent)));
     }
 
     #[test]

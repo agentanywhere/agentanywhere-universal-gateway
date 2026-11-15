@@ -244,9 +244,10 @@ removing whatever its case, but is set under exactly the name the rule gives, so
 beside the caller's own `x-client`, not in its place. Any other rule is the Python gateway's to apply, and a request it
 applies to is handed over: a rule that fills in a template, sets a value in a body that is not plain JSON, or
 rewrites the path by a regular expression of Python's own; one that names a
-header the gateway or an HTTP library on the way has its own say in (`Host`, `Content-Length`, `User-Agent`, `Accept`,
-`X-Forwarded-For`, `X-Request-ID`, the version and trace headers; on an answer also `Content-Type`, `Set-Cookie`,
-`Vary` and the cross-origin, rate-limit and tenant headers); one with a header name or value that is not plain ASCII
+header an HTTP library on the way has its own say in, or that the request is read by again after the rules (`Host`,
+`Content-Length`, `User-Agent`, `Accept`, `Accept-Encoding`, `X-API-Version` and `Accept-Version` on a request; on an
+answer `Content-Type`, `Set-Cookie`, `Vary`, `Warning`, `Sunset`, `Deprecation` and the cross-origin, rate-limit and
+tenant headers); one with a header name or value that is not plain ASCII
 without a space at either end, or a query word of other than unreserved characters; one that maps a status to or from
 one without a body (below 200, 204, 205, 304). So are a request that gives a header the rules name more than once
 (the Python gateway's rules see one line of it), a request whose query is not plain `key=value` words when a rule
@@ -255,6 +256,19 @@ apply no rule; a rule that matches one keeps it with the Python gateway, as befo
 an agent's path. `python dataplane/conformance/shapes.py` generates rules as the admin API takes them and exchanges to
 apply them to, and checks that what the backend is sent and what the caller is given are what the Python gateway's
 own rule code, HTTP client and web framework make of them.
+
+A rule may name the headers the gateway itself writes. On a request those are `X-Forwarded-For`, `X-Protocol`,
+`traceparent` and (with the request-id plugin) `X-Request-ID`. The Python gateway writes them after the rules, into the
+same dictionary of headers the rules have just changed, where a name is its exact spelling. So a rule that sets
+`X-Forwarded-For` under that spelling has the last word on it (the gateway then adds no empty one), and one that sets
+`X-Protocol` or `traceparent` under the gateway's spelling is written over; a line under any other spelling
+(`x-protocol`, `Traceparent`, or the caller's own, which arrive in lower case) is sent beside the gateway's, before or
+after it as the dictionary has them. A rule that removes one of these finds the gateway writing its own all the same;
+one that renames `X-Request-ID` moves the id the plugin added. This side does the same, line for line. It also
+does so where no rule applies: a caller's own `x-forwarded-for`, `x-protocol` or `x-api-version` goes to the backend
+beside the gateway's line, as from the Python gateway (until now this side sent the backend one line of each). On an
+answer the gateway writes `X-Request-ID`, `X-Response-Time`, `traceparent` and, when the request resolved to a version,
+`X-API-Version` over whatever a rule left under those names, on both sides.
 
 A rule's pattern is matched, as there, against the path the backend is asked for (after a dynamic
 route's rewrite, a protocol's prefix or an agent's slug has been dealt with) and, for the answer, against the request's

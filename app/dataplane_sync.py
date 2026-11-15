@@ -229,17 +229,21 @@ _HEADER_NAME = re.compile(r"[A-Za-z0-9_-]+")
 _HEADER_VALUE = re.compile(r"(?:[\x21-\x7e](?:[\x20-\x7e]*[\x21-\x7e])?)?")
 # What a query is written with unchanged by every HTTP library on the way.
 _QUERY_WORD = re.compile(r"[A-Za-z0-9._~-]*")
-# Headers a rule's change to which is not the last word on them: the gateway, its HTTP client or
-# its server reads or writes them too, each side in its own way.
+# Headers a rule's change to which is not the last word on them: this gateway's HTTP client or
+# its server reads or writes them too, each side in its own way, or (the version headers) the
+# request is read by them again after the rules. The headers this gateway itself writes after
+# the rules are not among them: `X-Forwarded-For`, `X-Protocol`, `traceparent` and `X-Request-ID`
+# on a request, `X-Request-ID`, `X-Response-Time`, `traceparent` and `X-API-Version` on an answer.
+# The data plane writes those exactly as this gateway does, so a rule may name them.
 _REQUEST_HEADERS_KEPT = frozenset((
     "host", "content-length", "transfer-encoding", "connection", "keep-alive", "upgrade", "te", "trailer", "expect",
     "proxy-authenticate", "proxy-authorization", "proxy-connection", "accept", "accept-encoding", "user-agent",
-    "x-forwarded-for", "x-protocol", "traceparent", "x-request-id", "x-api-version", "accept-version",
+    "x-api-version", "accept-version",
 ))
 _RESPONSE_HEADERS_KEPT = frozenset((
     "content-type", "content-length", "content-encoding", "transfer-encoding", "connection", "keep-alive", "upgrade",
     "te", "trailer", "proxy-authenticate", "proxy-authorization", "set-cookie", "date", "server", "vary", "retry-after",
-    "x-request-id", "x-response-time", "x-api-version", "traceparent", "warning", "sunset", "deprecation",
+    "warning", "sunset", "deprecation",
     "x-served-by", "x-dataplane-auth", "x-content-type-options",
 ))
 _RESPONSE_PREFIXES_KEPT = ("access-control-", "x-ratelimit-", "x-tenant-", "x-anomaly-")

@@ -2029,8 +2029,89 @@ def main() -> int:
             remove_rules(made)
             assert rules_reached("/api/routed/users/1", "data plane", False), "removing the rules never reached the data plane"
 
+            # The headers the gateway itself writes. On a request it writes them into the dictionary
+            # the rules have just changed, each under one exact spelling: a line a rule (or the caller)
+            # left under another spelling goes on beside the gateway's. On an answer it writes its own
+            # over whatever a rule left. Both planes must send a backend, and give a caller, the same.
+            import re
+            a_trace = re.compile(r"00-[0-9a-f]{32}-[0-9a-f]{16}-0[01]")
+
+            def stamped_same(name, path, headers=(), sees=None, given=None, by="data plane"):
+                a, b = shaped(py, keys["py"]["key"], "GET", path, headers), shaped(rs, keys["rs"]["key"], "GET", path, headers)
+                watched = ("x-forwarded-for", "x-protocol", "traceparent", "x-request-id", "x-caller-request", "x-api-version", "x-gateway-note", "x-shaped")
+                told = ("x-request-id", "x-response-time", "traceparent", "x-api-version", "x-backend-request")
+
+                def own(r, header, value):
+                    """What is new with every request, named for what it is."""
+                    if value is not None and a_trace.fullmatch(value):
+                        return "<trace>"
+                    if value is not None and value == r.headers.get("x-request-id"):
+                        return "<id>"
+                    if header == "x-response-time" and value and value.replace(".", "").isdigit():
+                        return "<time>"
+                    return value
+
+                def seen(r):
+                    got = {}
+                    for header, value in r.json()["headers"]:
+                        if header.lower() in watched:
+                            got.setdefault(header.lower(), []).append(own(r, header.lower(), value))
+                    return got
+
+                def got_back(r):
+                    return {header: own(r, header, r.headers.get(header)) for header in told}
+
+                bad = []
+                if said_by(b) != by:
+                    bad.append(f"answered by the {said_by(b)}")
+                if not a.status_code == b.status_code == 200:
+                    bad.append(f"status {a.status_code} and {b.status_code}")
+                else:
+                    if seen(a) != seen(b):
+                        bad.append(f"the backend saw {seen(a)} from Python and {seen(b)} from the data plane")
+                    for header, want in (sees or {}).items():
+                        if seen(b).get(header) != want:
+                            bad.append(f"the backend saw {header}: {seen(b).get(header)!r}, not {want!r}")
+                    if got_back(a) != got_back(b):
+                        bad.append(f"the caller was given {got_back(a)} by Python and {got_back(b)} by the data plane")
+                    for header, want in (given or {}).items():
+                        if got_back(b).get(header) != want:
+                            bad.append(f"the caller was given {header}: {got_back(b).get(header)!r}, not {want!r}")
+                check(f"the gateway's own headers: {name}", not bad, "; ".join(bad) or f"the backend saw {seen(b)}; the caller was given {got_back(b)}")
+
+            calling = [("X-Forwarded-For", "198.51.100.7"), ("X-Protocol", "mine"), ("X-Gateway-Note", "n")]
+            stamped_same("with no rule, a caller's own lines go on beside the gateway's", "/api/routed/plainly/1", headers=calling,
+                         sees={"x-forwarded-for": ["198.51.100.7", ""], "x-protocol": ["mine", "http"], "traceparent": ["<trace>"], "x-gateway-note": None})
+            stamped_same("with no rule and nothing from the caller, the gateway's lines stand alone", "/api/routed/plainly/1",
+                         sees={"x-forwarded-for": [""], "x-protocol": ["http"], "traceparent": ["<trace>"]})
+            stamped_same("a caller's trace is taken up, not sent twice", "/api/routed/plainly/1",
+                         headers=[("traceparent", "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01")], sees={"traceparent": ["<trace>"]})
+            made = [post("/admin/transformations", r) for r in (
+                {"name": "name the gateway's own headers", "path_pattern": "/api/routed/stamped/*", "request_config": {
+                    "headers_rename": {"x-request-id": "X-Caller-Request"},
+                    "headers_set": {"X-Shaped": "yes", "X-Forwarded-For": "203.0.113.5", "x-protocol": "theirs", "Traceparent": "nope"}}},
+                {"name": "take the gateway's own headers away", "path_pattern": "/api/routed/unstamped/*", "request_config": {
+                    "headers_remove": ["X-Forwarded-For", "X-Protocol", "traceparent", "X-Request-ID"], "headers_set": {"X-Shaped": "yes", "X-Protocol": "theirs"}}},
+                {"name": "name the gateway's own headers on the answer", "path_pattern": "api/routed/stamped/*", "response_config": {
+                    "headers_rename": {"X-Agent": "X-Backend-Request"},
+                    "headers_set": {"X-Request-ID": "theirs", "X-Response-Time": "never", "Traceparent": "nope", "X-API-Version": "9"}}})]
+            assert rules_reached("/api/routed/stamped/1", "data plane", True), "the rules on the gateway's own headers never reached the data plane"
+            assert rules_reached("/api/routed/unstamped/1", "data plane", True), "the second rule on the gateway's own headers never reached the data plane"
+            stamped_same("a rule may set them: under the gateway's spelling its line is the one, under another it goes beside", "/api/routed/stamped/1",
+                         headers=calling, sees={"x-forwarded-for": ["198.51.100.7", "203.0.113.5"], "x-protocol": ["theirs", "http"],
+                                                "traceparent": ["nope", "<trace>"], "x-gateway-note": None, "x-shaped": ["yes"]},
+                         given={"x-request-id": "<id>", "x-response-time": "<time>", "traceparent": "<trace>", "x-backend-request": "echo"})
+            stamped_same("a rule may rename the request's id, which the backend is then not sent under its own name", "/api/routed/stamped/1",
+                         headers=[("X-Request-ID", "caller-chose-this")], sees={"x-request-id": None})
+            stamped_same("a rule may remove them: the gateway writes its own all the same", "/api/routed/unstamped/1", headers=calling,
+                         sees={"x-forwarded-for": [""], "x-protocol": ["http"], "traceparent": ["<trace>"], "x-shaped": ["yes"]})
+            stamped_same("on an answer the gateway's own are written over what a rule set", "/api/routed/stamped/2",
+                         given={"x-request-id": "<id>", "x-response-time": "<time>", "traceparent": "<trace>"})
+            remove_rules(made)
+            assert rules_reached("/api/routed/stamped/1", "data plane", False), "removing the rules never reached the data plane"
+
             # Rules this side is not told the actions of: they change an answer's body or the
-            # path by expression, fill in a template, or change a header that the gateway or an HTTP library on
+            # path by expression, fill in a template, or change a header that an HTTP library on
             # the way has a say in.
             for what, config in (("sets a value in an answer's body that is not plain JSON", {"request_config": {"headers_set": {"X-Shaped": "yes"}}, "response_config": {"body_set": {"seen": 10 ** 400}}}),
                                  ("rewrites the path by an expression only Python's engine reads", {"request_config": {"headers_set": {"X-Shaped": "yes"}, "path_rewrite": {"pattern": "/kept/(?=\\d)", "replacement": "/kept/n"}}}),

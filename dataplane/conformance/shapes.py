@@ -46,17 +46,21 @@ import httpx  # noqa: E402
 from starlette.datastructures import QueryParams  # noqa: E402
 from starlette.responses import Response  # noqa: E402
 
+from app import routing  # noqa: E402
 from app.dataplane_sync import _path_actions, _rule_actions  # noqa: E402
-from app.main import answer_from  # noqa: E402
+from app.main import answer_from, router  # noqa: E402
 from app.transformers import RequestTransformer, ResponseTransformer, TransformConfig, TransformationRule, _apply_path_rewrite, transformation_manager  # noqa: E402
 
 BIN = ROOT / "dataplane/target/release/dataplane"
 NAMES = ["x-a", "X-A", "X-a", "x-b", "X-B", "x-c", "X-C", "x-trace-me", "X-Trace-Me", "authorization", "Authorization",
          "cookie", "x-api-key", "X-Api-Key", "x_under", "X-Gateway-Internal", "x-gateway-internal", "etag", "ETag",
-         "cache-control", "Cache-Control", "x-d", "x-e"]
+         "cache-control", "Cache-Control", "x-d", "x-e",
+         # Headers the gateway itself writes after the rules, each under one exact spelling.
+         "x-forwarded-for", "X-Forwarded-For", "X-FORWARDED-FOR", "x-protocol", "X-Protocol", "X-PROTOCOL", "traceparent", "Traceparent",
+         "x-request-id", "X-Request-ID", "X-Request-Id", "x-response-time", "X-Response-Time"]
 # Names and values the two sides might treat differently: a rule with one stays with Python.
-KEPT = ["Host", "Content-Type", "User-Agent", "x-request-id", "Access-Control-Allow-Origin", "Set-Cookie", "Accept",
-        "X-Forwarded-For", "x-ratelimit-limit", "bad name", "café", ""]
+KEPT = ["Host", "Content-Type", "User-Agent", "Accept-Version", "Access-Control-Allow-Origin", "Set-Cookie", "Accept",
+        "X-API-Version", "x-ratelimit-limit", "bad name", "café", ""]
 VALUES = ["v1", "v2", "yes", "", "a b", "text/plain; q=0.5", "Bearer abc.def", "1", "x=y; z=1", "~!@#$%^&*()"]
 ODD_VALUES = [" lead", "trail ", "naïve", "two\nlines", "tab\there", 7, None]
 KEYS = ["a", "b", "c", "page", "q", "A", "sort"]
@@ -218,7 +222,9 @@ def an_exchange(rng):
         if rng.random() < 0.7:
             answer.append(["content-type", rng.choice(["application/json", "text/plain", "application/json; charset=utf-8"])])
     return {"headers": headers, "query": query, "body": body.hex() if body is not None else None, "path": path, "answer": answer,
-            "answer_body": given.hex() if given is not None else None, "status": status}
+            "answer_body": given.hex() if given is not None else None, "status": status,
+            # The protocol name the backend is told: the one the router gives a path with no prefix.
+            "protocol": router._get_backend_url(path)[1].value}
 
 
 def as_read(lines):
@@ -239,19 +245,21 @@ def python_says(rules, case):
     query = dict(QueryParams(case["query"]))
     came = bytes.fromhex(case["body"]) if case["body"] is not None else None
     method = "GET" if came is None else "POST"
-    headers, query, body, path = before.transform(method, case["path"], dict(case["headers"]), query, came)
-    # As `_prepare_upstream_parts` hands the body to the HTTP client.
-    content = json_payload = None
-    if isinstance(body, bytes):
-        content = body
-    elif isinstance(body, str) and body is not came:
-        content = body.encode("utf-8")
-    elif body is not None:
-        json_payload = body
-    if body is not came:
-        headers = {k: v for k, v in headers.items() if k.lower() != "content-length"}
+    # The router's own preparation of what goes upstream: the rules, then the headers the gateway
+    # itself writes. (No API version is configured here; which one a request resolves to is not
+    # the rules' business.)
+    routing.transformation_manager.transform_request = lambda **asked: before.transform(
+        asked["method"], asked["path"], asked["headers"], asked["query_params"], asked["body"])
+    routing.version_manager.resolve = lambda path, headers: (None, None)
+    url, headers, query, content, json_payload, backend, protocol, _ = router._prepare_upstream_parts(
+        method, case["path"], dict(case["headers"]), query, came)
+    assert protocol.value == case["protocol"], (protocol, case["path"])
+    path = url[len(backend.rstrip("/")):]
+    # The trace is the gateway's own, new for each request.
+    headers["traceparent"] = "<trace>"
     sent = httpx.Request(method, "http://backend:9000/x", headers=headers, params=query, content=content, json=json_payload)
     sent_headers = [(n, v) for n, v in sent.headers.raw if n.lower() != b"host"]
+    body = came if content is None and json_payload is None else sent.read()
 
     lines = [tuple(line) for line in case["answer"]]
     if case["answer_body"] is not None:
@@ -271,7 +279,7 @@ def python_says(rules, case):
     return {
         "headers": as_read(sent_headers),
         "query": sent.url.query.decode("ascii") or None,
-        "body": sent.read().hex() if came is not None else None,
+        "body": sent.read().hex() if came is not None else None,  # as the client writes it
         "path": path,
         "answer": answer,
         "given": body,
