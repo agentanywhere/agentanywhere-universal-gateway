@@ -320,6 +320,14 @@ async def test_the_stock_request_id_plugin_does_not_block_native_serving(db_sess
     assert snap["fallthrough_prefixes"] == [] and snap["inject_request_id"] is False
 
 
+async def test_the_snapshot_says_whether_versions_are_taken_off_the_path(db_session, monkeypatch):
+    from app.versioning import version_manager
+
+    assert (await dataplane_sync.build_snapshot(db_session))["api_versions"]["strip_prefix"] is False
+    monkeypatch.setattr(version_manager, "strip_prefix_on_proxy", True)
+    assert (await dataplane_sync.build_snapshot(db_session))["api_versions"]["strip_prefix"] is True
+
+
 async def test_a_deprecated_version_is_not_native(db_session):
     from app.versioning import VersionStatus, version_manager
 

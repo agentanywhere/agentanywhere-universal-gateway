@@ -84,6 +84,7 @@ def _versions() -> Dict[str, Any]:
 
     return {
         "default": version_manager.default_version,
+        "strip_prefix": bool(version_manager.strip_prefix_on_proxy),
         "versions": [
             {
                 "version": v.version,

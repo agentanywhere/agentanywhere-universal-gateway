@@ -69,6 +69,8 @@ pub struct ApiVersions {
     /// version -> true when it is active, has no deprecation date and no backend of its own.
     /// Anything else (deprecated, sunset, removed, own backend) is handled by the control plane.
     pub native_ok: HashMap<String, bool>,
+    /// A version a path names is taken off the path a backend is asked for.
+    pub strip_prefix: bool,
 }
 
 pub struct Snapshot {
@@ -792,6 +794,8 @@ struct VersionsRecord {
     default: Option<String>,
     #[serde(default)]
     versions: Vec<VersionRecord>,
+    #[serde(default)]
+    strip_prefix: bool,
 }
 
 #[derive(Deserialize)]
@@ -1035,11 +1039,13 @@ impl Snapshot {
         let api_versions = match file.api_versions {
             Some(v) => ApiVersions {
                 default: v.default,
+                strip_prefix: v.strip_prefix,
                 native_ok: v.versions.into_iter().map(|r| (r.version, r.native_ok)).collect(),
             },
             None => ApiVersions {
                 default: Some("1".into()),
                 native_ok: [("1".to_string(), true), ("2".to_string(), true)].into_iter().collect(),
+                strip_prefix: false,
             },
         };
         let key_header = file.key_header.as_deref().unwrap_or("x-api-key");

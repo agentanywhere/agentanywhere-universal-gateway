@@ -1308,7 +1308,39 @@ def main() -> int:
             agent_same("a query key given twice", "GET", "/agents/echo/a?x=1&x=2", by="python")
             agent_same("a query that Python rewrites", "GET", "/agents/echo/a?q=a+b&r=%7E", by="python")
             agent_same("a header given twice", "GET", "/agents/echo/a", [("Accept", "text/plain"), ("Accept", "application/json")], by="python")
-            agent_same("a path that names an API version", "GET", "/agents/echo/v1/a", by="python")
+
+            # A path that names an API version is that version's, whatever the headers hint, and
+            # the caller is still told the version its headers (or the default) give.
+            def told(r):
+                return [v for k, v in r.json()["headers"] if k.lower() == "x-api-version"]
+
+            agent_same("a path that names an API version tells the agent that version", "GET", "/agents/echo/v2/a",
+                       want=lambda r: r.json()["path"] == "/v2/a" and told(r) == ["2"] and r.headers["x-api-version"] == "1")
+            agent_same("whatever version the caller's header hints", "POST", "/agents/echo/v2/chat/completions", {"X-API-Version": "1"}, b'{"q": 1}',
+                       want=lambda r: sorted(told(r)) == ["1", "2"])
+            agent_same("a version with a fraction that the gateway does not know tells the agent nothing", "GET", "/agents/echo/v2.5/a",
+                       want=lambda r: told(r) == [])
+            agent_same("nor does the caller's hint then stand in for it", "GET", "/agents/echo/v9", {"Accept-Version": "2"},
+                       want=lambda r: told(r) == [] and r.headers["x-api-version"] == "2")
+            agent_same("a segment that only looks like a version is none", "GET", "/agents/echo/v2beta/a", want=lambda r: told(r) == ["1"])
+            agent_same("a digit of another script is Python's to read", "GET", "/agents/echo/v%D9%A2/a", by="python")
+            post("/admin/versions", {"version": "7", "status": "deprecated"})
+            assert wait_until(lambda: said_by(httpx.get(f"{rs}/agents/echo/v7/a", timeout=10)) == "python"), "the deprecated version never reached the data plane"
+            agent_same("a version that is deprecated is Python's to announce", "GET", "/agents/echo/v7/a", by="python")
+            httpx.delete(f"{py}/admin/versions/7", headers=adm, params={"hard": "true"}, timeout=10).raise_for_status()
+            assert wait_until(lambda: said_by(httpx.get(f"{rs}/agents/echo/v7/a", timeout=10)) == "data plane"), "removing the version never reached the data plane"
+
+            def strip(on):
+                httpx.put(f"{py}/admin/versions/config", headers=adm, json={"strip_prefix_on_proxy": on}, timeout=10).raise_for_status()
+                want = "/a" if on else "/v2/a"
+                assert wait_until(lambda: httpx.get(f"{rs}/agents/echo/v2/a", timeout=10).json()["path"] == want), "the version setting never reached the data plane"
+
+            strip(True)
+            agent_same("with versions taken off on the way, the agent is asked for the rest", "GET", "/agents/echo/v2/a/b?x=1",
+                       want=lambda r: r.json()["path"] == "/a/b" and r.json()["query"] == "x=1" and told(r) == ["2"])
+            agent_same("and for the root when nothing follows", "GET", "/agents/echo/v2", want=lambda r: r.json()["path"] == "/")
+            agent_same("a version the gateway does not know stays in the path", "GET", "/agents/echo/v9/a", want=lambda r: r.json()["path"] == "/v9/a")
+            strip(False)
             agent_same("a caller that names a protocol", "GET", "/agents/echo/a", {"X-Protocol": "mcp"}, by="python")
             agent_same("a request from a web page in another origin", "GET", "/agents/echo/a", {"Origin": "http://localhost:3001"})
             agent_same("a body too large to hold here", "POST", "/agents/echo/upload", {"Content-Type": "application/octet-stream"}, b"z" * 2_000_000, by="python")
@@ -1723,7 +1755,7 @@ def main() -> int:
                 {"name": "and drop a word, wherever it stands", "path_pattern": "/api/routed/old/*", "request_config": {
                     "path_rewrite": {"pattern": "/draft", "replacement": ""}}},
                 {"name": "name a version", "path_pattern": "/api/routed/versioned/*", "request_config": {
-                    "headers_set": {"X-Shaped": "yes"}, "path_rewrite": {"pattern": "^/api/routed/versioned", "replacement": "/v1"}}})]
+                    "headers_set": {"X-Shaped": "yes"}, "path_rewrite": {"pattern": "^/api/routed/versioned", "replacement": "/v2"}}})]
             assert rules_reached("/api/routed/old/1", "data plane", True), "the rules never reached the data plane"
             exchange_same("text at the start of a path is replaced", "GET", "/api/routed/old/1?q=tea", asked="/api/routed/new/1", query="q=tea", sees={"x-shaped": "yes"})
             exchange_same("the start is replaced once, and a later rule works on what is left", "GET", "/api/routed/old/draft/api/routed/old/draft/2",
@@ -1731,8 +1763,8 @@ def main() -> int:
             exchange_same("a body goes with the request to its new path", "POST", "/api/routed/old/draft/3", content=b'{"a":  1}', arrives=b'{"a":  1}',
                           asked="/api/routed/new/3")
             exchange_same("an escaped path is rewritten as it reads", "GET", "/api/routed/old/a%20b/%64raft/x", asked="/api/routed/new/a%20b/x")
-            exchange_same("a path rewritten to one that names a version is Python's to resolve", "GET", "/api/routed/versioned/users", by="python",
-                          sees={"x-shaped": "yes"})
+            exchange_same("a path rewritten to one that names a version is that version's", "GET", "/api/routed/versioned/users",
+                          asked="/v2/users", sees={"x-shaped": "yes", "x-api-version": "2"}, given={"x-api-version": "1"})
             exchange_same("a path the rules do not cover is asked for as it came", "GET", "/api/routed/other/old/draft", asked="/api/routed/other/old/draft")
             remove_rules(made)
             assert rules_reached("/api/routed/old/1", "data plane", False), "removing the rules never reached the data plane"

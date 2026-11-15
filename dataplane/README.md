@@ -240,8 +240,17 @@ A path rewrite is done here when it needs no expression: its pattern is plain te
 an escaped `.` or `-`), with `^` in front to replace it at the start of the path only and otherwise wherever it
 stands, and its replacement is plain text too. It is applied to the path the backend is asked for, each rule to what
 the last left, while the rules themselves were chosen by the path before any rewrite, as in the Python gateway. A
-request whose rewritten path no longer starts with `/`, or names an API version (`/v1/...`, which the Python gateway
-then resolves), is handed over.
+request whose rewritten path no longer starts with `/` is handed over.
+
+**API versions.** The version a request resolves to is echoed to the caller as `X-API-Version`: the one its
+`Accept-Version` or `X-API-Version` header names (a leading `v` ignored), else the default. The backend is told the
+same, unless the path it is asked for names a version itself (`/v2/...`, `/v2.1/...`): the path after a protocol's
+prefix is taken off, after `/agents/<slug>`, or as a dynamic route or a rule rewrote it. Then the path decides, as in
+the Python gateway: a version the gateway knows is the one the backend is told, whatever the headers hint, and one it
+does not know means the backend is told nothing. With `strip_prefix_on_proxy` set, a known version is taken off the
+path on the way (`/v2/runs` is asked for as `/runs`, `/v2` as `/`). A version that is deprecated, has a sunset date,
+is removed or has a backend of its own keeps its requests with the Python gateway, which announces or refuses it; so
+does a path whose first segment has a digit from another script, which Python's expression counts as a digit.
 
 An answer's body is the backend's, byte for byte, on both sides: the Python gateway reads and rewrites a body only
 for a rule that changes bodies, and such a rule is its own to apply. This side could not hand an answer over once the
@@ -291,7 +300,7 @@ its answer is streamed back as it comes. The Python gateway is handed the reques
 * the slug is not registered (the 404 is Python's);
 * the caller asks for a WebSocket;
 * the query is anything but `key=value` pairs of unreserved characters with no key twice (Python takes a query apart
-  and writes it again), a header is given twice (Python forwards the last), or the path after the slug names an API version;
+  and writes it again), a header is given twice (Python forwards the last), or the path after the slug names an API version that adds more than its number;
 * the body has no `Content-Length` or is over 1 MiB;
 * the agent cannot be reached. Nothing was sent, so Python tries, answers in its own way and counts the failure in
   its circuit breaker. This side keeps no breaker for agents.

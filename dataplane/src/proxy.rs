@@ -542,22 +542,47 @@ pub fn judge_paths() -> Result<(), String> {
 }
 
 /// `/v<digits>[.<digits>]` followed by `/` or nothing: a path that names its API version, which
-/// the Python gateway resolves differently from one that does not.
-fn names_a_version(path: &str) -> bool {
-    let Some(rest) = path.strip_prefix("/v") else { return false };
+/// the Python gateway resolves differently from one that does not. The version it names, and
+/// what follows it.
+fn version_named(path: &str) -> Option<(&str, &str)> {
+    let named = path.strip_prefix("/v")?;
     let digits = |s: &str| s.bytes().take_while(u8::is_ascii_digit).count();
-    let whole = digits(rest);
+    let whole = digits(named);
     if whole == 0 {
-        return false;
+        return None;
     }
-    let mut rest = &rest[whole..];
-    if let Some(fraction) = rest.strip_prefix('.') {
+    let mut len = whole;
+    if let Some(fraction) = named[whole..].strip_prefix('.') {
         let n = digits(fraction);
         if n > 0 {
-            rest = &fraction[n..];
+            len += 1 + n;
         }
     }
-    rest.is_empty() || rest.starts_with('/')
+    let (version, rest) = named.split_at(len);
+    (rest.is_empty() || rest.starts_with('/')).then_some((version, rest))
+}
+
+/// What a backend asked for `path` is told of the API version, and the path it is asked for
+/// instead when versions are taken off on the way (`VersionManager.resolve`, as the router uses
+/// it). A path that names a version is that version's: one the gateway does not know says
+/// nothing, whatever the headers hint. `resolved` is what the headers or the default give a
+/// path that names none. `None` when the Python gateway decides: the version adds more than its
+/// number, or the path's first segment has a digit of another script, which counts as one there.
+fn told_version<'a, 'p>(snap: &'a Snapshot, path: &'p str, resolved: Option<&'a str>) -> Option<(Option<&'a str>, Option<&'p str>)> {
+    if let Some(named) = path.strip_prefix("/v") {
+        if !named.split('/').next().unwrap_or("").is_ascii() {
+            return None;
+        }
+    }
+    let Some((version, rest)) = version_named(path) else { return Some((resolved, None)) };
+    match snap.api_versions.native_ok.get_key_value(version) {
+        None => Some((None, None)),
+        Some((_, false)) => None,
+        Some((known, true)) => {
+            let stripped = snap.api_versions.strip_prefix.then_some(if rest.is_empty() { "/" } else { rest });
+            Some((Some(known.as_str()), stripped))
+        }
+    }
 }
 
 /// The seconds of a countdown, as they stand in a page from the snapshot.
@@ -695,6 +720,8 @@ struct Native<'a> {
     /// The dynamic route the path matches, which then decides where the request goes and how.
     route: Option<&'a DynamicRoute>,
     version: Option<&'a str>,
+    /// The version the backend is told, which is the path's own when it names one.
+    told: Option<&'a str>,
     /// The client's address, as the Python gateway would resolve it.
     ip: IpAddr,
     method: &'static str,
@@ -702,7 +729,7 @@ struct Native<'a> {
     html: bool,
     /// What the transformation rules that apply do to the request and to its answer.
     shaping: Shaping<'a>,
-    /// The path the backend is asked for, when a rule rewrites it.
+    /// The path the backend is asked for, when a rule rewrites it or its version is taken off.
     rewritten: Option<String>,
 }
 
@@ -988,9 +1015,6 @@ fn decide<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, now: u6
         Some(route) => route.rewrite.as_deref().unwrap_or(path),
         None => upstream_path(path, protocol),
     };
-    if names_a_version(asked) {
-        return PYTHON;
-    }
     // The rules that apply are applied here when this side was told all they do, and when the
     // request is one they do the same to on both sides.
     let Some(shaping) = snap.shaping(method, asked, path) else { return PYTHON };
@@ -1015,18 +1039,22 @@ fn decide<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, now: u6
             return PYTHON;
         }
     }
-    // A path rules rewrite is still a path, and one that names no version: the Python gateway
-    // resolves a version from the path it ends up with.
-    let rewritten = shaping.rewritten(asked);
-    if rewritten.as_deref().is_some_and(|to| !to.starts_with('/') || names_a_version(to)) {
+    // A path rules rewrite is still a path.
+    let mut rewritten = shaping.rewritten(asked);
+    if rewritten.as_deref().is_some_and(|to| !to.starts_with('/')) {
         return PYTHON;
+    }
+    // The version is resolved from the path the request ends up with.
+    let Some((told, stripped)) = told_version(snap, rewritten.as_deref().unwrap_or(asked), version) else { return PYTHON };
+    if let Some(stripped) = stripped.map(str::to_owned) {
+        rewritten = Some(stripped);
     }
     let asked = rewritten.as_deref().unwrap_or(asked);
     // What the backend is asked for must be something this side's HTTP client will send.
     if !plain_path(asked) && sent_path(asked).parse::<hyper::http::uri::PathAndQuery>().is_err() {
         return PYTHON;
     }
-    Decision::Native(Native { protocol, backend, entry, route, version, ip, method, html, shaping, rewritten })
+    Decision::Native(Native { protocol, backend, entry, route, version, told, ip, method, html, shaping, rewritten })
 }
 
 /// Whether the Python gateway may pass the answer to a request on as a stream
@@ -1278,6 +1306,8 @@ struct AgentCall<'a> {
     /// What the agent is asked for: the path after `/agents/<slug>`, and the query.
     target: String,
     version: Option<&'a str>,
+    /// The version the agent is told, which is the path's own when it names one.
+    told: Option<&'a str>,
     ip: IpAddr,
     method: &'static str,
     /// How a failure is answered, and whether as a page: the caller is a browser.
@@ -1367,9 +1397,11 @@ fn agent_call<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, aft
         found => found.map(|(v, _)| v),
     };
     let upstream_path = format!("/{rest}");
-    if names_a_version(&upstream_path) || snap.transformed(method, &upstream_path, uri.path()) {
+    if snap.transformed(method, &upstream_path, uri.path()) {
         return None;
     }
+    let (told, stripped) = told_version(snap, &upstream_path, version)?;
+    let upstream_path = stripped.unwrap_or(&upstream_path);
     let ip = govern::client_ip(peer, headers, &snap.trusted_proxies)?;
     let prefix = &backend.upstream.prefix;
     let target = match uri.query() {
@@ -1377,7 +1409,7 @@ fn agent_call<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, aft
         Some(query) if query_survives(query) => format!("{prefix}{upstream_path}?{query}"),
         Some(_) => return None,
     };
-    Some(AgentCall { backend, target, version, ip, method, failure, html })
+    Some(AgentCall { backend, target, version, told, ip, method, failure, html })
 }
 
 /// The largest request body held here for an agent. It is held whole so that the request can
@@ -1446,7 +1478,7 @@ async fn serve_agent(
         headers.remove(name);
     }
     // Added beside whatever the caller sent under the same names, as the Python gateway adds them.
-    if let Some(v) = a.version.and_then(|v| HeaderValue::from_str(v).ok()) {
+    if let Some(v) = a.told.and_then(|v| HeaderValue::from_str(v).ok()) {
         headers.append("x-api-version", v);
     }
     headers.append("x-forwarded-for", HeaderValue::from_static(""));
@@ -1680,7 +1712,7 @@ fn admit_grpc<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, now
     if !entry.native_ok || snap.fallthrough_prefixes.iter().any(|p| path.starts_with(p.as_str())) || snap.transformed("POST", path, path) {
         return Err(GrpcRefusal::NOT_APPLICABLE);
     }
-    let native = Native { protocol: Protocol::Grpc, backend: Some(backend), entry, route: None, version: None, ip, method: "POST", shaping: Shaping::default(), rewritten: None, html: false };
+    let native = Native { protocol: Protocol::Grpc, backend: Some(backend), entry, route: None, version: None, told: None, ip, method: "POST", shaping: Shaping::default(), rewritten: None, html: false };
     Ok(GrpcCall { native, key_in_authorization })
 }
 
@@ -2269,7 +2301,7 @@ pub async fn handle(w: Arc<Worker>, peer: SocketAddr, mut req: Request<Incoming>
                     let wire = (!untouched && !grpc).then(|| sent_path(&format!("{}{asked}", backend.upstream.prefix)));
                     let native = Sent {
                         trace: &t,
-                        version: n.version,
+                        version: n.told,
                         inject_request_id: snap.inject_request_id,
                         protocol: n.route.map(|r| r.protocol.as_str()).unwrap_or(n.protocol.name()),
                         path: wire.as_deref(),
@@ -2724,12 +2756,40 @@ mod tests {
 
     #[test]
     fn a_version_in_the_path_is_recognised_as_python_recognises_it() {
-        for path in ["/v1", "/v1/", "/v2/runs", "/v10.5/x", "/v1./x"] {
-            assert_eq!(names_a_version(path), path != "/v1./x", "{path}");
+        for (path, named) in [("/v1", ("1", "")), ("/v1/", ("1", "/")), ("/v2/runs", ("2", "/runs")), ("/v10.5/x", ("10.5", "/x")), ("/v0.0", ("0.0", ""))] {
+            assert_eq!(version_named(path), Some(named), "{path}");
         }
-        for path in ["/", "/runs", "/v", "/vx/1", "/v1x", "/v1.2.3", "/version"] {
-            assert!(!names_a_version(path), "{path}");
+        for path in ["/", "/runs", "/v", "/vx/1", "/v1x", "/v1.2.3", "/version", "/v1./x", "/v.5/x", "v1/x", "/a/v1/x"] {
+            assert_eq!(version_named(path), None, "{path}");
         }
+    }
+
+    #[test]
+    fn a_backend_is_told_the_version_its_path_names() {
+        let snap = |strip: bool| {
+            Snapshot::from_json(&format!(
+                r#"{{"keys":[],"api_versions":{{"default":"1","strip_prefix":{strip},"versions":[
+                {{"version":"1"}},{{"version":"2"}},{{"version":"3","native_ok":false}}]}}}}"#
+            ))
+            .unwrap()
+        };
+        let (kept, taken_off) = (snap(false), snap(true));
+        // No version in the path: what the headers or the default gave.
+        assert_eq!(told_version(&kept, "/runs", Some("1")), Some((Some("1"), None)));
+        assert_eq!(told_version(&taken_off, "/version/2", None), Some((None, None)));
+        // One the gateway knows: that one, and the path without it where versions are taken off.
+        assert_eq!(told_version(&kept, "/v2/runs", Some("1")), Some((Some("2"), None)));
+        assert_eq!(told_version(&taken_off, "/v2/runs", Some("1")), Some((Some("2"), Some("/runs"))));
+        assert_eq!(told_version(&taken_off, "/v2", Some("1")), Some((Some("2"), Some("/"))));
+        assert_eq!(told_version(&taken_off, "/v2/", Some("1")), Some((Some("2"), Some("/"))));
+        // One it does not know: nothing is told, and the path stays.
+        assert_eq!(told_version(&taken_off, "/v9/runs", Some("1")), Some((None, None)));
+        assert_eq!(told_version(&kept, "/v2.0/runs", Some("1")), Some((None, None)));
+        // One that adds more than its number, or digits Python reads and this side does not.
+        assert_eq!(told_version(&kept, "/v3/runs", Some("1")), None);
+        assert_eq!(told_version(&kept, "/v\u{662}/runs", Some("1")), None);
+        assert_eq!(told_version(&kept, "/v1\u{662}", Some("1")), None);
+        assert_eq!(told_version(&kept, "/v1/\u{662}", Some("1")), Some((Some("1"), None)));
     }
 
     #[test]
@@ -2895,11 +2955,19 @@ mod tests {
     }
 
     #[test]
-    fn a_stripped_path_that_names_a_version_goes_to_python() {
-        let snap = governed(r#","backends":{"acp":"http://127.0.0.1:9201"}"#, "");
-        assert!(route(&snap, peer(), &request("GET", "/acp/runs"), 0).is_some());
-        assert!(route(&snap, peer(), &request("GET", "/acp/v2/runs"), 0).is_none());
-        assert!(route(&snap, peer(), &request("GET", "/api/acp/v1"), 0).is_none());
+    fn a_stripped_path_that_names_a_version_is_that_versions() {
+        let versions = r#","api_versions":{"default":"1","versions":[{"version":"1"},{"version":"2"},{"version":"3","native_ok":false}]}"#;
+        let snap = governed(&format!(r#","backends":{{"acp":"http://127.0.0.1:9201"}}{versions}"#), "");
+        let told = |uri: &str| route(&snap, peer(), &request("GET", uri), 0).map(|n| (n.version, n.told, n.rewritten));
+        assert_eq!(told("/acp/runs"), Some((Some("1"), Some("1"), None)));
+        assert_eq!(told("/acp/v2/runs"), Some((Some("1"), Some("2"), None)));
+        assert_eq!(told("/api/acp/v9"), Some((Some("1"), None, None)));
+        assert_eq!(told("/acp/v3/runs"), None, "a version that adds more than its number: Python's");
+        // The request's own path is not what the backend is asked for, and names no version.
+        assert_eq!(told("/api/v3/users"), Some((Some("1"), Some("1"), None)));
+        let taken_off = governed(&format!(r#","backends":{{"acp":"http://127.0.0.1:9201"}}{}"#, versions.replace(r#""default":"1""#, r#""default":"1","strip_prefix":true"#)), "");
+        let n = route(&taken_off, peer(), &request("GET", "/acp/v2/runs"), 0).unwrap();
+        assert_eq!((n.told, n.rewritten.as_deref()), (Some("2"), Some("/runs")));
     }
 
     #[test]
@@ -3566,9 +3634,11 @@ mod tests {
         assert_eq!(routed("/api/orders/7?x=1"), to("http://10.0.1.3:9000/base", "http", None, 30));
         assert_eq!(routed("/api/orders"), Some((None, None)));
         assert_eq!(routed("/api/users"), Some((None, None)));
-        // A route this side cannot follow, and one that leads to a path naming an API version.
+        // A route this side cannot follow.
         assert_eq!(routed("/api/secure/x"), None);
-        assert_eq!(routed("/api/versioned/x"), None);
+        // One that leads to a path naming an API version, which the backend is then told.
+        assert_eq!(routed("/api/versioned/x"), to("http://10.0.1.4:9000", "http", Some("/v2/x"), 30));
+        assert_eq!(route(&snap, peer(), &request("GET", "/api/versioned/x"), 0).map(|n| (n.version, n.told)), Some((Some("1"), Some("2"))));
         // A protocol's path that is routed needs no backend of the protocol's own.
         assert_eq!(routed("/acp/routed/runs"), to("http://10.0.1.5:9000", "acp", None, 30));
         assert_eq!(routed("/acp/runs"), None);
@@ -3606,9 +3676,16 @@ mod tests {
     fn an_agent_request_python_would_send_differently_is_left_to_python() {
         let snap = governed(AGENTS, "");
         for uri in ["/agents/hiring/a?x=1&x=2", "/agents/hiring/a?q=a+b", "/agents/hiring/a?q=%7E", "/agents/hiring/a?flag", "/agents/hiring/a?=1",
-                    "/agents/hiring/a?a=1&&b=2", "/agents/hiring/v1/a", "/agents/hiring/v2"] {
+                    "/agents/hiring/a?a=1&&b=2", "/agents/hiring/v\u{662}/a"] {
             assert!(to_agent(&snap, &request("GET", uri)).is_none(), "{uri}");
         }
+        // A path that names a version tells the agent that one, or none if it is not known.
+        let told = |uri: &str| match decide(&snap, peer(), &request("GET", uri), 100, |_| false) {
+            Decision::Agent(a) => Some((a.version, a.told, a.target)),
+            _ => None,
+        };
+        assert_eq!(told("/agents/hiring/v2/a"), Some((Some("1"), Some("2"), "/v2/a".to_owned())));
+        assert_eq!(told("/agents/hiring/v9"), Some((Some("1"), None, "/v9".to_owned())));
         assert!(to_agent(&snap, &request("OPTIONS", "/agents/hiring/a")).is_none());
         for (name, value) in [("origin", "http://localhost:3001"), ("upgrade", "websocket"), ("x-protocol", "mcp"),
                               ("te", "trailers"), ("trailer", "x"), ("proxy-authorization", "Basic eA==")] {
