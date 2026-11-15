@@ -444,6 +444,7 @@ def main() -> int:
         authority, trusted, untrusted = certificates(tmp)
         secure_agent, strange_agent = agent_backend(trusted), agent_backend(untrusted)
         sockets = websocket_backend()
+        secure_sockets = websocket_backend(trusted)
         # Chosen last: a port found free is free only until the next server here is given one.
         bport, gport, dport = free_port(), free_port(), free_port()
         # Both planes are told to trust the same authority, the way an operator tells them.
@@ -452,7 +453,9 @@ def main() -> int:
                "REDIS_ENABLED": "false", "LOG_LEVEL": "WARNING", "STARTUP_BANNER": "false", "DEBUG": "false",
                "TRUSTED_PROXIES": "127.0.0.1", "DATAPLANE_TOKEN": "conformance-token",
                "AGENT_ROUTES_JSON": json.dumps({"echo": agent, "based": f"{agent}/base", "gone": "http://127.0.0.1:9",
-                                                "secure": secure_agent, "stranger": strange_agent}),
+                                                "secure": secure_agent, "stranger": strange_agent,
+                                                # Agents that speak WebSocket, named as agents are: by `http://` and `https://`.
+                                                "talker": "http" + sockets[2:], "sealed": "https" + secure_sockets[3:]}),
                "WEBSOCKET_BACKEND_URL": sockets, "GRPC_BACKEND_URL": f"127.0.0.1:{grpc_port}",
                "MCP_BACKEND_URL": agents, "A2A_BACKEND_URL": agents, "AG_UI_BACKEND_URL": agents, "ACP_BACKEND_URL": agents,
                "GRAPHQL_BACKEND_URL": f"{agents}/graphql",  # named by its endpoint: `/graphql` is not sent twice
@@ -1175,10 +1178,10 @@ def main() -> int:
             ws_same("text comes back as text, JSON included", "/ws/chat", ["hello", '{"a": 1}', "again"], with_key, by="data plane",
                     want=lambda r: r.get("answers") == ["hello", '{"a": 1}', "again"])
             ws_same("bytes come back as bytes", "/ws/chat", [b"\x00\x01\xff"], with_key, by="data plane", want=lambda r: r.get("answers") == [b"\x00\x01\xff"])
-            ws_same("the key may be given in the query", "/ws/chat?api_key={key}", ["hello"], by="python", want=lambda r: r.get("answers") == ["hello"])
+            ws_same("the key may be given in the query", "/ws/chat?api_key={key}", ["hello"], by="data plane", want=lambda r: r.get("answers") == ["hello"])
             ws_same("the backend sees the path and the query", "/ws/rooms/7?room=blue&n=1", ["where"], with_key, by="data plane",
                     want=lambda r: r.get("answers") == ["/base/rooms/7?room=blue&n=1"])
-            ws_same("the backend sees the path and the query, without the gateway's key", "/ws/rooms/7?room=blue&api_key={key}", ["where"], by="python",
+            ws_same("the backend sees the path and the query, without the gateway's key", "/ws/rooms/7?room=blue&api_key={key}", ["where"], by="data plane",
                     want=lambda r: r.get("answers") == ["/base/rooms/7?room=blue"])
             ws_same("the backend sees Authorization and Cookie, never the gateway's key", "/ws/chat", ["who"],
                     {**with_key, "Authorization": "Bearer t", "Cookie": "s=1"}, by="data plane", want=lambda r: r.get("answers") == ['["Bearer t", "s=1", null]'])
@@ -1186,6 +1189,17 @@ def main() -> int:
                     want=lambda r: r.get("subprotocol") == "chat.v2")
             ws_same("the backend's close code and reason reach the client", "/ws/chat", ["hello", "close:4001"], with_key, by="data plane",
                     want=lambda r: r.get("closed") == [4001, "bye"])
+            ws_same("a key in the query stands before the one in the header", "/ws/chat?api_key={key}", ["hello"], {"X-API-Key": "sk-nope"}, by="data plane",
+                    want=lambda r: r.get("answers") == ["hello"])
+            ws_same("so a wrong key in the query is refused whatever the header says", "/ws/chat?api_key=sk-nope", headers=with_key, want=lambda r: "refused" in r)
+            ws_same("of two keys in the query the last counts", "/ws/rooms/7?api_key=sk-nope&room=blue&api_key={key}", ["where"], by="data plane",
+                    want=lambda r: r.get("answers") == ["/base/rooms/7?room=blue"])
+            ws_same("an empty key in the query leaves the header's", "/ws/rooms/7?api_key=&room=blue", ["where"], with_key, by="data plane",
+                    want=lambda r: r.get("answers") == ["/base/rooms/7?room=blue"])
+            ws_same("empty parts of the query are not sent on", "/ws/rooms/7?&room=blue&&n=1&", ["where"], with_key, by="data plane",
+                    want=lambda r: r.get("answers") == ["/base/rooms/7?room=blue&n=1"])
+            ws_same("an escaped key in the query is Python's to read", "/ws/chat?api_key={key}%20", want=lambda r: "refused" in r)
+            ws_same("a key under an escaped name is Python's to read", "/ws/chat?api%5Fkey={key}", ["hello"], by="python", want=lambda r: r.get("answers") == ["hello"])
             ws_same("without a key the handshake is refused", "/ws/chat", want=lambda r: "refused" in r)
             ws_same("with a wrong key the handshake is refused", "/ws/chat", headers={"X-API-Key": "sk-nope"}, want=lambda r: "refused" in r)
             ws_same("a handshake the backend refuses is refused", "/ws/refuse", headers=with_key, want=lambda r: "refused" in r)
@@ -1193,6 +1207,24 @@ def main() -> int:
             ws_same("a key not allowed this path is refused", "/ws/chat", headers=with_key, pair=scoped, want=lambda r: "refused" in r)
             big = "x" * 2_000_000
             ws_same("a large message comes back whole", "/ws/chat", [big], with_key, by="data plane", want=lambda r: r.get("answers") == [big])
+            # An agent's socket needs no gateway key: the agent lets its own callers in.
+            ws_same("an agent's socket is relayed without a gateway key", "/agents/talker/chat", ["hello", b"\x00\xff"], by="data plane",
+                    want=lambda r: r.get("answers") == ["hello", b"\x00\xff"])
+            ws_same("the agent sees the rest of the path and the query as they came", "/agents/talker/rooms/7?room=blue&api_key=theirs&&n=1", ["where"], by="data plane",
+                    want=lambda r: r.get("answers") == ["/base/rooms/7?room=blue&api_key=theirs&&n=1"])
+            ws_same("the agent's root", "/agents/talker", ["where"], by="data plane", want=lambda r: r.get("answers") == ["/base/"])
+            ws_same("the agent sees Authorization and Cookie", "/agents/talker/chat", ["who"],
+                    {"X-API-Key": "sk-anything", "Authorization": "Bearer t", "Cookie": "s=1"}, by="data plane",
+                    want=lambda r: r.get("answers") == ['["Bearer t", "s=1", null]'])
+            ws_same("the subprotocol is the one the agent chose", "/agents/talker/chat", ["hello"], subprotocols=["chat.v1", "chat.v2"], by="data plane",
+                    want=lambda r: r.get("subprotocol") == "chat.v2")
+            ws_same("the agent's close code reaches the client", "/agents/talker/chat", ["hello", "close:4001"], by="data plane")
+            ws_same("an agent behind TLS", "/agents/sealed/chat", ["hello"], by="data plane", want=lambda r: r.get("answers") == ["hello"])
+            ws_same("an agent that refuses the handshake", "/agents/talker/refuse", want=lambda r: "refused" in r)
+            ws_same("an agent that does not speak WebSocket", "/agents/echo/chat", want=lambda r: "refused" in r)
+            ws_same("an agent that cannot be reached", "/agents/gone/chat", want=lambda r: "refused" in r)
+            ws_same("an agent whose certificate is not trusted", "/agents/stranger/chat", want=lambda r: "refused" in r)
+            ws_same("an agent nobody registered", "/agents/nobody/chat", want=lambda r: "refused" in r)
             r = httpx.get(f"{rs}/api/users", headers={"X-API-Key": keys["rs"]["key"]}, timeout=10)
             check("ordinary requests are unaffected afterwards", r.status_code == 200 and said_by(r) == "data plane")
 

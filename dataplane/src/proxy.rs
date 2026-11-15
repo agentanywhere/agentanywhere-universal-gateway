@@ -1711,42 +1711,112 @@ async fn serve_agent(
 /// A WebSocket handshake this side relays itself.
 struct Relay<'a> {
     backend: &'a Backend,
-    entry: &'a KeyEntry,
-    /// What the backend is asked for: the path after `/ws`, and the query.
+    /// The key that let it in. A handshake for an agent needs none.
+    entry: Option<&'a KeyEntry>,
+    /// What the backend is asked for: the path after `/ws` or `/agents/<slug>`, and the query.
     target: String,
 }
 
-/// Whether a request is a WebSocket handshake for `/ws/...` that is certain to be let in: the
-/// key is in its header, known, working and allowed this path. Anything else, a key in the query
-/// included, is the Python gateway's to judge; it relays or refuses in its own way.
-fn relay<'a, B>(snap: &'a Snapshot, req: &Request<B>, now: u64) -> Option<Relay<'a>> {
-    let backend = snap.websocket.as_deref()?;
+/// Whether a request is a WebSocket handshake this side reads as the Python gateway's server
+/// does: a plain `GET` for a path with nothing escaped in it, each handshake header given once.
+fn is_handshake<B>(req: &Request<B>) -> bool {
     let (uri, headers) = (req.uri(), req.headers());
     let path = uri.path();
-    let rest = path.strip_prefix("/ws/")?;
     if req.method() != Method::GET || uri.authority().is_some() || !path.is_ascii() || path.contains('%') {
-        return None;
+        return false;
     }
     let one = |name: &str| {
         let mut all = headers.get_all(name).iter();
         all.next().filter(|_| all.next().is_none())
     };
-    let handshake = one("upgrade").is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"))
+    one("upgrade").is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"))
         && one("sec-websocket-version").is_some_and(|v| v == "13")
-        && one("sec-websocket-key").is_some();
-    let query = uri.query().unwrap_or("");
-    if !handshake || query.contains("api_key") {
+        && one("sec-websocket-key").is_some()
+}
+
+/// The gateway key a handshake's query gives in `api_key`, as the Python gateway reads it: the
+/// last one given, and none when that one is empty. `Err` when this side is not certain what
+/// the Python gateway would read: a name or the key itself is escaped.
+fn key_in_query(query: &str) -> Result<Option<&str>, ()> {
+    let mut found = None;
+    for part in query.split('&').filter(|p| !p.is_empty()) {
+        let (name, value) = part.split_once('=').unwrap_or((part, ""));
+        if name.contains('%') {
+            return Err(());
+        }
+        if name == "api_key" {
+            found = Some(value);
+        }
+    }
+    match found {
+        Some(key) if key.contains(['%', '+']) || !key.is_ascii() => Err(()),
+        found => Ok(found.filter(|k| !k.is_empty())),
+    }
+}
+
+/// The query a `/ws/...` backend is sent: the caller's, without the gateway's own `api_key` and
+/// without empty parts, as the Python gateway writes it.
+fn query_for_backend(query: &str) -> String {
+    let kept: Vec<&str> = query.split('&').filter(|p| !p.is_empty() && p.split('=').next() != Some("api_key")).collect();
+    kept.join("&")
+}
+
+/// Whether a request is a WebSocket handshake for `/ws/...` that is certain to be let in: the
+/// key, in the query's `api_key` or else in its header, is known, working and allowed this path.
+/// Anything else is the Python gateway's to judge; it relays or refuses in its own way.
+fn relay<'a, B>(snap: &'a Snapshot, req: &Request<B>, now: u64) -> Option<Relay<'a>> {
+    let backend = snap.websocket.as_deref()?;
+    let (uri, headers) = (req.uri(), req.headers());
+    let path = uri.path();
+    let rest = path.strip_prefix("/ws/")?;
+    if !is_handshake(req) {
         return None;
     }
-    let key = one("x-api-key").map(|v| v.as_bytes()).filter(|k| !k.is_empty() && k.is_ascii())?;
+    let query = uri.query().unwrap_or("");
+    if !query.is_ascii() {
+        return None;
+    }
+    let key = match key_in_query(query).ok()? {
+        Some(key) => key.as_bytes(),
+        None => {
+            let mut all = headers.get_all("x-api-key").iter();
+            all.next().filter(|_| all.next().is_none()).map(|v| v.as_bytes()).filter(|k| !k.is_empty() && k.is_ascii())?
+        }
+    };
     let entry = snap.keys.get(&hash_key(key))?;
     let expired = entry.expires_at.is_some_and(|e| e <= now as i64);
     if !entry.is_active || !entry.native_ok || expired || entry.scope.as_ref().is_some_and(|s| !s.allows(path)) {
         return None;
     }
     let prefix = &backend.upstream.prefix;
+    let query = query_for_backend(query);
     let target = if query.is_empty() { format!("{prefix}/{rest}") } else { format!("{prefix}/{rest}?{query}") };
-    Some(Relay { backend, entry, target })
+    Some(Relay { backend, entry: Some(entry), target })
+}
+
+/// Whether a request is a WebSocket handshake for `/agents/<slug>/...` to an agent this side can
+/// reach. As for any other request to an agent, no gateway key is asked for: the agent lets its
+/// own callers in. It is asked for the rest of the path and the query as they came. An unknown
+/// slug is the Python gateway's to refuse.
+fn agent_relay<'a, B>(snap: &'a Snapshot, req: &Request<B>) -> Option<Relay<'a>> {
+    let uri = req.uri();
+    let after = uri.path().strip_prefix("/agents/")?;
+    if !is_handshake(req) {
+        return None;
+    }
+    let (slug, rest) = after.split_once('/').unwrap_or((after, ""));
+    let backend = snap.agents.get(slug)?;
+    // Behind TLS, only where this side trusts what the Python gateway's WebSocket client trusts.
+    if backend.upstream.tls && !tls_for_websockets() {
+        return None;
+    }
+    let prefix = &backend.upstream.prefix;
+    let target = match uri.query() {
+        None | Some("") => format!("{prefix}/{rest}"),
+        Some(query) if query.is_ascii() => format!("{prefix}/{rest}?{query}"),
+        Some(_) => return None,
+    };
+    Some(Relay { backend, entry: None, target })
 }
 
 /// What of the caller's handshake the backend is sent, as the Python gateway's relay sends it:
@@ -2318,9 +2388,9 @@ pub async fn handle(w: Arc<Worker>, peer: SocketAddr, mut req: Request<Incoming>
     // Fail closed: if the snapshot is not known to be current, the Python gateway decides.
     let trusted = st.sync.as_ref().map(|s| s.fresh()).unwrap_or(true);
     if trusted && req.headers().contains_key(UPGRADE) {
-        if let Some(r) = relay(&snap, &req, now) {
-            if r.entry.last_used.load(Ordering::Relaxed) != now {
-                r.entry.last_used.store(now, Ordering::Relaxed);
+        if let Some(r) = relay(&snap, &req, now).or_else(|| agent_relay(&snap, &req)) {
+            if let Some(entry) = r.entry.filter(|e| e.last_used.load(Ordering::Relaxed) != now) {
+                entry.last_used.store(now, Ordering::Relaxed);
             }
             match relay_websocket(&w, &r, req).await {
                 Ok(resp) => return Ok(resp),
@@ -3686,8 +3756,10 @@ mod tests {
         for (why, uri, headers) in [
             ("no key", "/ws/chat", vec![]),
             ("unknown key", "/ws/chat", vec![("x-api-key", "sk-nope")]),
-            ("key in the query", "/ws/chat?api_key=sk-test", vec![]),
-            ("key in both", "/ws/chat?api_key=sk-test", key.to_vec()),
+            ("an unknown key in the query", "/ws/chat?api_key=sk-nope", key.to_vec()),
+            ("an escaped key in the query", "/ws/chat?api_key=sk%2Dtest", key.to_vec()),
+            ("a key with a plus in the query", "/ws/chat?api_key=sk+test", key.to_vec()),
+            ("an escaped name in the query", "/ws/chat?api%5Fkey=sk-test", key.to_vec()),
             ("key as a Bearer token", "/ws/chat", vec![("authorization", "Bearer sk-test")]),
             ("not under /ws/", "/ws", key.to_vec()),
             ("not under /ws/", "/wsx/chat", key.to_vec()),
@@ -3699,12 +3771,46 @@ mod tests {
         ] {
             assert!(target(uri, &headers).is_none(), "{why}");
         }
+        // The key may be in the query, where the last one given stands before the header's;
+        // the backend is sent the query without it and without empty parts.
+        assert_eq!(target(&format!("/ws/chat?api_key={KEY}"), &[]).as_deref(), Some("/base/chat"));
+        assert_eq!(target(&format!("/ws/chat?api_key={KEY}"), &[("x-api-key", "sk-nope")]).as_deref(), Some("/base/chat"));
+        assert_eq!(target(&format!("/ws/chat?api_key=sk-nope&a=1&&api_key={KEY}&b"), &[]).as_deref(), Some("/base/chat?a=1&b"));
+        assert_eq!(target("/ws/chat?api_key=&a=1&", &key).as_deref(), Some("/base/chat?a=1"));
+        assert_eq!(target("/ws/chat?api_key", &key).as_deref(), Some("/base/chat"));
+        assert_eq!(target("/ws/chat?api_keys=x&xapi_key=y", &key).as_deref(), Some("/base/chat?api_keys=x&xapi_key=y"));
+        assert!(target(&format!("/ws/chat?api_key={KEY}&api_key=sk-nope"), &key).is_none());
         let twice = Request::builder().uri("/ws/chat").header("upgrade", "websocket").header("sec-websocket-version", "13")
             .header("sec-websocket-key", "a2V5").header("x-api-key", KEY).header("x-api-key", "sk-other").body(()).unwrap();
         assert!(relay(&snap, &twice, 100).is_none());
         let post = Request::builder().method("POST").uri("/ws/chat").header("upgrade", "websocket").header("sec-websocket-version", "13")
             .header("sec-websocket-key", "a2V5").header("x-api-key", KEY).body(()).unwrap();
         assert!(relay(&snap, &post, 100).is_none());
+    }
+
+    #[test]
+    fn an_agents_websocket_is_relayed_here_without_a_key() {
+        let snap = governed(AGENTS, "");
+        let target = |uri: &str, headers: &[(&str, &str)]| agent_relay(&snap, &handshake(uri, headers)).map(|r| (r.backend.upstream.authority.to_string(), r.target, r.entry.is_some()));
+        let to = |authority: &str, target: &str| Some((authority.to_owned(), target.to_owned(), false));
+        assert_eq!(target("/agents/hiring/ws/chat", &[]), to("10.0.0.10:8001", "/ws/chat"));
+        assert_eq!(target("/agents/hiring", &[]), to("10.0.0.10:8001", "/"));
+        assert_eq!(target("/agents/hiring/", &[("x-api-key", "sk-nope")]), to("10.0.0.10:8001", "/"));
+        assert_eq!(target("/agents/hiring/a?", &[]), to("10.0.0.10:8001", "/a"));
+        // The query goes as it came: the agent may well read a key of its own there.
+        assert_eq!(target("/agents/based/a?token=t&api_key=x&&q=a+b%20c", &[]), to("10.0.0.11:8001", "/base/a?token=t&api_key=x&&q=a+b%20c"));
+        for (why, uri, headers) in [
+            ("an unknown slug", "/agents/nobody/a", vec![]),
+            ("no slug", "/agents/", vec![]),
+            ("behind TLS, without a file of certificates", "/agents/secure/a", vec![]),
+            ("an escaped path", "/agents/hiring/a%20b", vec![]),
+            ("not under /agents/", "/api/agents/hiring/a", vec![]),
+            ("not a WebSocket", "/agents/hiring/a", vec![("upgrade", "h2c")]),
+            ("another version", "/agents/hiring/a", vec![("sec-websocket-version", "8")]),
+        ] {
+            assert!(target(uri, &headers).is_none(), "{why}");
+        }
+        assert!(agent_relay(&governed("", ""), &handshake("/agents/hiring/a", &[])).is_none());
     }
 
     #[test]
