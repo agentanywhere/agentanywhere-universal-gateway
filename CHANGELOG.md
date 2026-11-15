@@ -53,6 +53,10 @@ See [docs/known-limitations.md](docs/known-limitations.md) for the full list.
 
 ### Fixed
 
+- Proxy: a query that gives a key more than once (`?tag=a&tag=b`) now reaches
+  the backend with every value. Only the last value was sent on before. A
+  transformation rule or plugin that sets, changes or removes such a key
+  still decides what is sent for it.
 - Database migrations: the Alembic migrations `001` and `002` were replaced by
   one baseline, `0001`, that creates the full current schema. It is safe to
   run on a database the gateway already created at startup, works on SQLite

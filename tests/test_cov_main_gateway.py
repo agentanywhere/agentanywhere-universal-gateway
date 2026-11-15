@@ -574,3 +574,62 @@ def test_db_failure_then_auth_crash_is_internal_error(monkeypatch):
             assert "kaboom" not in r.text
     finally:
         app.dependency_overrides.clear()
+
+
+# ------------------------------------------------- repeated query keys
+@pytest.fixture
+def sent(monkeypatch):
+    """The real router with a fake backend; yields the query of each request sent."""
+    from app.transformers import transformation_manager
+
+    queries = []
+
+    def answer(request):
+        queries.append(request.url.query.decode())
+        return httpx.Response(200, json={"ok": True})
+
+    monkeypatch.setattr(
+        main.router, "client", httpx.AsyncClient(transport=httpx.MockTransport(answer))
+    )
+    monkeypatch.setattr(transformation_manager, "rules_by_id", {})
+    return queries
+
+
+def test_a_repeated_query_key_reaches_the_backend_whole(gwdb, sent, H):
+    assert gwdb.get("/mcp/t?tag=a&tag=b&one=1&tag=c", headers=H).status_code == 200
+    assert sent == ["tag=a&tag=b&tag=c&one=1"]
+
+
+def test_a_query_without_repeats_is_sent_as_before(gwdb, sent, H):
+    gwdb.get("/mcp/t?one=1&blank=&two=a%20b", headers=H)
+    assert sent == ["one=1&blank=&two=a%20b"]
+
+
+def test_a_repeated_key_given_the_same_value_twice_keeps_both(gwdb, sent, H):
+    gwdb.get("/mcp/t?tag=a&tag=a", headers=H)
+    assert sent == ["tag=a&tag=a"]
+
+
+def test_a_rule_that_sets_or_removes_a_repeated_key_wins(gwdb, sent, H):
+    from app.transformers import TransformationRule, transformation_manager
+
+    rule = TransformationRule.from_dict({
+        "name": "query", "path_pattern": "**",
+        "request_config": {"query_set": {"tag": "z"}, "query_remove": ["drop"]},
+    })
+    transformation_manager.rules_by_id[rule.id] = rule
+    gwdb.get("/mcp/t?tag=a&tag=b&drop=1&drop=2&keep=x&keep=y", headers=H)
+    assert sent == ["tag=z&keep=x&keep=y"]
+
+
+def test_repeated_query_lists_only_keys_given_more_than_once():
+    from starlette.datastructures import QueryParams
+    from app.routing import _with_repeats, repeated_query
+
+    repeated = repeated_query(QueryParams("a=1&b=2&a=3"))
+    assert repeated == {"a": ["1", "3"]}
+    assert _with_repeats({"a": "3", "b": "2"}, repeated) == {"a": ["1", "3"], "b": "2"}
+    assert _with_repeats({"a": "9", "b": "2"}, repeated) == {"a": "9", "b": "2"}
+    assert _with_repeats({"b": "2"}, repeated) == {"b": "2"}
+    assert _with_repeats({"b": "2"}, None) == {"b": "2"}
+    assert repeated_query({"a": "1"}) == {}

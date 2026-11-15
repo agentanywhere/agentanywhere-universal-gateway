@@ -1,5 +1,5 @@
 """Request routing logic."""
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, List, Tuple
 from urllib.parse import urlparse
 from app.config import get_settings
 from app.models import ProtocolType, RouteConfig
@@ -11,6 +11,39 @@ import time
 import asyncio
 
 settings = get_settings()
+
+
+
+def repeated_query(query) -> Dict[str, List[str]]:
+    """The values of every query key the caller gave more than once.
+
+    The proxy path carries the query as a plain dict, which holds one value a
+    key, so ``?tag=a&tag=b`` used to reach the backend as ``?tag=b``. The
+    values are kept here, beside the dict, and put back before sending.
+    """
+    pairs = getattr(query, "multi_items", None)
+    if pairs is None:  # a plain mapping holds one value a key already
+        return {}
+    seen: Dict[str, List[str]] = {}
+    for key, value in pairs():
+        seen.setdefault(key, []).append(value)
+    return {key: values for key, values in seen.items() if len(values) > 1}
+
+
+def _with_repeats(
+    query: Dict[str, Any], repeated: Optional[Dict[str, List[str]]]
+) -> Dict[str, Any]:
+    """Put back the repeated values of each key nothing changed on the way.
+
+    A key a rule or plugin set, changed or removed keeps what that left.
+    """
+    if not repeated:
+        return query
+    out = dict(query)
+    for key, values in repeated.items():
+        if key in out and out[key] == values[-1]:
+            out[key] = list(values)
+    return out
 
 
 class Router:
@@ -203,6 +236,7 @@ class Router:
         query_params: Dict[str, Any],
         body: Optional[Any] = None,
         route_config: Optional[RouteConfig] = None,
+        repeated: Optional[Dict[str, List[str]]] = None,
     ) -> Tuple[str, Dict[str, str], Dict[str, Any], Optional[bytes], Optional[Any], str, ProtocolType, int]:
         if route_config:
             backend_url = route_config.backend_url
@@ -227,6 +261,7 @@ class Router:
                 body=body,
             )
         )
+        transformed_query_params = _with_repeats(transformed_query_params, repeated)
 
         api_version, version_target_path = version_manager.resolve(
             target_path, transformed_headers
@@ -287,12 +322,13 @@ class Router:
         headers: Dict[str, str],
         query_params: Dict[str, Any],
         body: Optional[Any] = None,
-        route_config: Optional[RouteConfig] = None
+        route_config: Optional[RouteConfig] = None,
+        repeated: Optional[Dict[str, List[str]]] = None,
     ) -> httpx.Response:
         """Route request to appropriate backend."""
         url, filtered_headers, transformed_query_params, content, json_payload, backend_url, protocol, timeout = (
             self._prepare_upstream_parts(
-                method, path, headers, query_params, body, route_config
+                method, path, headers, query_params, body, route_config, repeated
             )
         )
         if not self._check_circuit_breaker(backend_url):
@@ -338,11 +374,12 @@ class Router:
         query_params: Dict[str, Any],
         body: Optional[Any] = None,
         route_config: Optional[RouteConfig] = None,
+        repeated: Optional[Dict[str, List[str]]] = None,
     ) -> httpx.Response:
         """Open a streaming HTTP response; caller must ``await resp.aclose()`` when done."""
         url, filtered_headers, transformed_query_params, content, json_payload, backend_url, protocol, _timeout = (
             self._prepare_upstream_parts(
-                method, path, headers, query_params, body, route_config
+                method, path, headers, query_params, body, route_config, repeated
             )
         )
         if not self._check_circuit_breaker(backend_url):
