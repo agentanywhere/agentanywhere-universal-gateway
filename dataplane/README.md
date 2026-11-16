@@ -337,9 +337,16 @@ same, unless the path it is asked for names a version itself (`/v2/...`, `/v2.1/
 prefix is taken off, after `/agents/<slug>`, or as a dynamic route or a rule rewrote it. Then the path decides, as in
 the Python gateway: a version the gateway knows is the one the backend is told, whatever the headers hint, and one it
 does not know means the backend is told nothing. With `strip_prefix_on_proxy` set, a known version is taken off the
-path on the way (`/v2/runs` is asked for as `/runs`, `/v2` as `/`). A version that is deprecated, has a sunset date,
-is removed or has a backend of its own keeps its requests with the Python gateway, which announces or refuses it; so
-does a path whose first segment has a digit from another script, which Python's expression counts as a digit.
+path on the way (`/v2/runs` is asked for as `/runs`, `/v2` as `/`).
+
+A version on its way out is announced here as the Python gateway announces it. The backend is told with the version:
+`Warning` when the version is deprecated, `Sunset` when it has a date to go, each beside whatever the caller sent
+under that name. The caller is told on every answer under the version, the gateway's own refusals included: those
+two and `Deprecation: true`, over whatever the backend said. The snapshot carries the texts, so they are the Python
+gateway's own. A version that is removed, is within a minute of its sunset or past it, has a sunset date with a UTC
+offset (which only the Python gateway compares), or has a backend of its own, keeps its requests with the Python
+gateway, which refuses or routes them; so does a path whose first segment has a digit from another script, which
+Python's expression counts as a digit.
 
 An answer's body is read only for a rule that changes its fields; without one it is the backend's, byte for byte.
 Such a rule is applied here to an answer that states a length of 1 MiB or less, is not compressed and is UTF-8. As
@@ -417,7 +424,7 @@ its answer is streamed back as it comes. The Python gateway is handed the reques
 * the slug is not registered (the 404 is Python's);
 * the caller asks for a WebSocket;
 * the query has an escape that is not text, a header about the connection is given twice (see "Given more than once"
-  below), or the path after the slug names an API version that adds more than its number;
+  below), or the path after the slug names an API version that is removed or has a backend of its own;
 * the body has no `Content-Length` or is over 1 MiB;
 * the agent cannot be reached. Nothing was sent, so Python tries, answers in its own way and counts the failure in
   its circuit breaker. This side keeps no breaker for agents.

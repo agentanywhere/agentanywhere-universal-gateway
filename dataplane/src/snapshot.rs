@@ -63,14 +63,36 @@ pub struct KeyEntry {
     pub hour: Arc<Window>,
 }
 
-/// API versions as the data plane needs them: which are served as plain pass-through.
+/// What the gateway announces with a version that is on its way out: to the backend it tells
+/// the version, and to the caller on every answer.
+#[derive(Debug, PartialEq)]
+pub struct Notices {
+    /// `Warning`: the version is deprecated.
+    pub warning: Option<HeaderValue>,
+    /// `Sunset`: when it goes.
+    pub sunset: Option<HeaderValue>,
+    /// `Deprecation: true`, to the caller alone.
+    pub deprecation: bool,
+}
+
+/// API versions as the data plane needs them: which are served here, and what is announced.
 pub struct ApiVersions {
     pub default: Option<String>,
-    /// version -> true when it is active, has no deprecation date and no backend of its own.
-    /// Anything else (deprecated, sunset, removed, own backend) is handled by the control plane.
+    /// version -> true when a request under it may be served here: it is not removed, not
+    /// within a minute of its sunset, and has no backend of its own. Any other is handled by
+    /// the control plane.
     pub native_ok: HashMap<String, bool>,
+    /// What is announced with the versions that announce something.
+    pub notices: HashMap<String, Notices>,
     /// A version a path names is taken off the path a backend is asked for.
     pub strip_prefix: bool,
+}
+
+impl ApiVersions {
+    /// What is announced with a version, when anything is.
+    pub fn announced(&self, version: Option<&str>) -> Option<&Notices> {
+        self.notices.get(version?)
+    }
 }
 
 pub struct Snapshot {
@@ -974,6 +996,18 @@ struct VersionRecord {
     version: String,
     #[serde(default = "yes")]
     native_ok: bool,
+    #[serde(default)]
+    notices: Option<NoticesRecord>,
+}
+
+#[derive(Deserialize)]
+struct NoticesRecord {
+    #[serde(default)]
+    warning: Option<String>,
+    #[serde(default)]
+    sunset: Option<String>,
+    #[serde(default)]
+    deprecation: bool,
 }
 
 #[derive(Deserialize)]
@@ -1211,14 +1245,29 @@ impl Snapshot {
         }
         // Without an `api_versions` section, the gateway's shipped defaults apply: versions 1 (default) and 2.
         let api_versions = match file.api_versions {
-            Some(v) => ApiVersions {
-                default: v.default,
-                strip_prefix: v.strip_prefix,
-                native_ok: v.versions.into_iter().map(|r| (r.version, r.native_ok)).collect(),
-            },
+            Some(v) => {
+                let (mut native_ok, mut notices) = (HashMap::new(), HashMap::new());
+                for record in v.versions {
+                    // A notice this side cannot write as a header leaves the version to the control plane.
+                    let read = |text: Option<String>| text.map(|t| HeaderValue::from_str(&t)).transpose();
+                    let told = match record.notices {
+                        None => Some(None),
+                        Some(n) => match (read(n.warning), read(n.sunset)) {
+                            (Ok(warning), Ok(sunset)) => Some(Some(Notices { warning, sunset, deprecation: n.deprecation })),
+                            _ => None,
+                        },
+                    };
+                    native_ok.insert(record.version.clone(), record.native_ok && told.is_some());
+                    if let Some(Some(told)) = told.filter(|_| record.native_ok) {
+                        notices.insert(record.version, told);
+                    }
+                }
+                ApiVersions { default: v.default, strip_prefix: v.strip_prefix, native_ok, notices }
+            }
             None => ApiVersions {
                 default: Some("1".into()),
                 native_ok: [("1".to_string(), true), ("2".to_string(), true)].into_iter().collect(),
+                notices: HashMap::new(),
                 strip_prefix: false,
             },
         };

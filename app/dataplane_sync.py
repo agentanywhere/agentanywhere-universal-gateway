@@ -80,22 +80,43 @@ def _epoch(value: Optional[datetime]) -> Optional[int]:
     return int(value.timestamp())
 
 
+# A version with a sunset is the data plane's until this long before it: by then every data
+# plane has been told, and from then on the Python gateway alone says when the version is gone.
+SUNSET_MARGIN_SECONDS = 60
+
+
+def _version(v) -> Dict[str, Any]:
+    """One API version as the data plane is told of it: whether a request under it may be served
+    there, and what the gateway then announces with it (to the backend and to the caller)."""
+    from datetime import timedelta
+
+    from app.time_utils import utcnow
+    from app.versioning import VersionStatus
+
+    # A version that is gone is refused, and one with a backend of its own is routed, by the
+    # Python gateway.
+    native = v.status != VersionStatus.REMOVED and not v.backend_url
+    if native and v.status == VersionStatus.SUNSET and v.sunset_date is not None:
+        try:
+            native = utcnow() + timedelta(seconds=SUNSET_MARGIN_SECONDS) < v.sunset_date
+        except TypeError:  # a date with an offset: the Python gateway's to compare
+            native = False
+    warning, sunset = v.get_warning_header(), v.get_sunset_header()
+    if any(text is not None and not _HEADER_VALUE.fullmatch(text) for text in (warning, sunset)):
+        native = False
+    told: Dict[str, Any] = {"version": v.version, "native_ok": native}
+    if native and (warning or sunset or v.deprecated_date is not None):
+        told["notices"] = {"warning": warning, "sunset": sunset, "deprecation": v.deprecated_date is not None}
+    return told
+
+
 def _versions() -> Dict[str, Any]:
-    from app.versioning import VersionStatus, version_manager
+    from app.versioning import version_manager
 
     return {
         "default": version_manager.default_version,
         "strip_prefix": bool(version_manager.strip_prefix_on_proxy),
-        "versions": [
-            {
-                "version": v.version,
-                "native_ok": v.status == VersionStatus.ACTIVE
-                and not v.backend_url
-                and v.deprecated_date is None
-                and v.sunset_date is None,
-            }
-            for v in version_manager.versions.values()
-        ],
+        "versions": [_version(v) for v in version_manager.versions.values()],
     }
 
 

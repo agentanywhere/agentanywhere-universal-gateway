@@ -35,7 +35,7 @@ use crate::govern::{self, IpRule, Policy, Scope, Subject};
 use crate::pyjson;
 use crate::report::{Event, Reporter, Row, Served};
 use crate::snapshot::{
-    change_headers, put, change_query, change_status, read_query, write_query, hash_key, Actions, AgentFailure, Digest32, DynamicRoute, HeaderLines, KeyEntry, Readiness, Shaping,
+    change_headers, put, change_query, change_status, read_query, write_query, Notices, hash_key, Actions, AgentFailure, Digest32, DynamicRoute, HeaderLines, KeyEntry, Readiness, Shaping,
     Snapshot, Wording,
 };
 use crate::sync::Link;
@@ -964,8 +964,8 @@ fn decide<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, now: u6
     } else {
         return PYTHON;
     };
-    // The version is echoed on every answer, refusals included; one that adds more than its
-    // number (a deprecation, a sunset) is the Python gateway's to announce.
+    // The version is echoed on every answer, refusals included, with what it announces if it is
+    // on its way out. One that is gone, or has a backend of its own, is the Python gateway's.
     let version = match resolve_version(snap, req.headers()) {
         Some((_, false)) => return PYTHON,
         found => found.map(|(v, _)| v),
@@ -1186,6 +1186,12 @@ fn shape_headers(headers: &mut HeaderMap, rules: &[&Actions], sent: Option<&Sent
         if let Some(v) = sent.version.and_then(|v| HeaderValue::from_str(v).ok()) {
             put(&mut lines, "X-API-Version", v);
         }
+        // What a version on its way out announces is written like the version itself.
+        for (name, value) in sent.notices.iter().flat_map(|n| [("Warning", &n.warning), ("Sunset", &n.sunset)]) {
+            if let Some(value) = value {
+                put(&mut lines, name, value.clone());
+            }
+        }
         lines.retain(|(name, _)| !name.to_ascii_lowercase().starts_with("x-gateway-"));
         if !lines.iter().any(|(name, _)| name == "X-Forwarded-For") {
             lines.push(("X-Forwarded-For".to_owned(), HeaderValue::from_static("")));
@@ -1234,12 +1240,23 @@ fn stamp_request(headers: &mut HeaderMap, sent: &Sent) {
     if let Some(v) = sent.version.and_then(|v| HeaderValue::from_str(v).ok()) {
         headers.append("x-api-version", v);
     }
+    announce_upstream(headers, sent.notices);
     headers.append("x-forwarded-for", HeaderValue::from_static(""));
     if let Ok(v) = HeaderValue::from_str(sent.protocol) {
         headers.append("x-protocol", v);
     }
     if let Ok(v) = HeaderValue::from_str(&sent.trace.traceparent) {
         headers.insert("traceparent", v);
+    }
+}
+
+/// Tell a backend what the version it is told announces (`Warning`, `Sunset`), beside whatever
+/// the caller sent under the same names, as the Python gateway does.
+fn announce_upstream(headers: &mut HeaderMap, notices: Option<&Notices>) {
+    for (name, value) in notices.iter().flat_map(|n| [("warning", &n.warning), ("sunset", &n.sunset)]) {
+        if let Some(value) = value {
+            headers.append(name, value.clone());
+        }
     }
 }
 
@@ -1467,6 +1484,9 @@ pub fn judge_shapes() -> Result<(), String> {
         /// are written too (the trace as `<trace>`), as they are on the way to a backend.
         #[serde(default)]
         protocol: Option<String>,
+        /// The version the backend is told, and what it announces: `[version, warning, sunset]`.
+        #[serde(default)]
+        version: Option<(String, Option<String>, Option<String>)>,
     }
 
     fn unhex(text: &str) -> Result<Vec<u8>, String> {
@@ -1521,7 +1541,13 @@ pub fn judge_shapes() -> Result<(), String> {
             }
         }
         let trace = Trace { request_id: "<id>".to_owned(), traceparent: "<trace>".to_owned() };
-        let sent = case.protocol.as_deref().map(|protocol| Sent { trace: &trace, version: None, inject_request_id: false, protocol, path: None });
+        let read = |text: &Option<String>| text.as_deref().map(HeaderValue::from_str).transpose().map_err(|e| e.to_string());
+        let notices = match &case.version {
+            Some((_, warning, sunset)) => Some(Notices { warning: read(warning)?, sunset: read(sunset)?, deprecation: true }),
+            None => None,
+        };
+        let version = case.version.as_ref().map(|(version, _, _)| version.as_str());
+        let sent = case.protocol.as_deref().map(|protocol| Sent { trace: &trace, version, notices: notices.as_ref(), inject_request_id: false, protocol, path: None });
         shape_request(&mut req, &before, rewritten, sent.as_ref());
         if let Some(sent) = sent.as_ref().filter(|_| req.extensions().get::<Stamped>().is_none()) {
             stamp_request(req.headers_mut(), sent);
@@ -1626,6 +1652,8 @@ struct AgentCall<'a> {
     version: Option<&'a str>,
     /// The version the agent is told, which is the path's own when it names one.
     told: Option<&'a str>,
+    /// What the version the agent is told announces.
+    announced: Option<&'a Notices>,
     ip: IpAddr,
     method: &'static str,
     /// How a failure is answered, and whether as a page: the caller is a browser.
@@ -1732,7 +1760,7 @@ fn agent_call<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, aft
         },
         None => format!("{prefix}{upstream_path}"),
     };
-    Some(AgentCall { backend, target, version, told, ip, method, failure, html })
+    Some(AgentCall { backend, target, version, told, announced: snap.api_versions.announced(told), ip, method, failure, html })
 }
 
 /// The largest request body held here for an agent. It is held whole so that the request can
@@ -1804,6 +1832,7 @@ async fn serve_agent(
     if let Some(v) = a.told.and_then(|v| HeaderValue::from_str(v).ok()) {
         headers.append("x-api-version", v);
     }
+    announce_upstream(&mut headers, a.announced);
     headers.append("x-forwarded-for", HeaderValue::from_static(""));
     headers.insert("x-protocol", HeaderValue::from_static("http"));
     if let Ok(v) = HeaderValue::from_str(&t.traceparent) {
@@ -1835,7 +1864,7 @@ async fn serve_agent(
     resp = finish(w, resp, &answered, &original, &t, started, at);
     if failed {
         // The Python gateway's answer to this failure carries none of its usual headers.
-        for h in ["x-request-id", "x-response-time", "traceparent", "x-api-version"] {
+        for h in ["x-request-id", "x-response-time", "traceparent", "x-api-version", "warning", "sunset", "deprecation"] {
             resp.headers_mut().remove(h);
         }
     }
@@ -2380,7 +2409,7 @@ fn body_unreadable() -> Response<Body> {
 }
 
 /// The headers every answer made or passed on here carries.
-fn stamp(resp: &mut Response<Body>, t: &Trace, seconds: f64, version: Option<&str>) {
+fn stamp(resp: &mut Response<Body>, t: &Trace, seconds: f64, version: Option<&str>, announced: Option<&Notices>) {
     let h = resp.headers_mut();
     // Tells operators (and the conformance suite) which plane answered.
     h.insert("x-served-by", HeaderValue::from_static("dataplane"));
@@ -2389,6 +2418,18 @@ fn stamp(resp: &mut Response<Body>, t: &Trace, seconds: f64, version: Option<&st
     }
     if let Some(v) = version.and_then(|v| HeaderValue::from_str(v).ok()) {
         h.insert("x-api-version", v);
+    }
+    // A version on its way out says so on every answer, over whatever the backend said.
+    if let Some(notices) = announced {
+        if let Some(v) = &notices.warning {
+            h.insert("warning", v.clone());
+        }
+        if let Some(v) = &notices.sunset {
+            h.insert("sunset", v.clone());
+        }
+        if notices.deprecation {
+            h.insert("deprecation", HeaderValue::from_static("true"));
+        }
     }
     if let Ok(v) = HeaderValue::from_str(&t.request_id) {
         h.insert("x-request-id", v);
@@ -2418,7 +2459,8 @@ fn finish<B>(w: &Worker, mut resp: Response<Body>, a: &Answered, req: &Request<B
     let status = resp.status().as_u16();
     let seconds = started.elapsed().as_secs_f64();
     let bytes_out = resp.body().size_hint().exact().unwrap_or(0);
-    stamp(&mut resp, t, seconds, a.version);
+    let (_, snap) = w.snapshot();
+    stamp(&mut resp, t, seconds, a.version, snap.api_versions.announced(a.version));
     let user_agent = req.headers().get(USER_AGENT).and_then(|v| v.to_str().ok());
     if let Some(reporter) = &st.reporter {
         let served = Served {
@@ -2781,6 +2823,7 @@ pub async fn handle(w: Arc<Worker>, peer: SocketAddr, mut req: Request<Incoming>
                     let native = Sent {
                         trace: &t,
                         version: n.told,
+                        notices: snap.api_versions.announced(n.told),
                         inject_request_id: snap.inject_request_id,
                         protocol: n.route.map(|r| r.protocol.as_str()).unwrap_or(n.protocol.name()),
                         path: wire.as_deref(),
@@ -2842,7 +2885,7 @@ pub async fn handle(w: Arc<Worker>, peer: SocketAddr, mut req: Request<Incoming>
         .and_then(|v| v.parse().ok())
         .or_else(|| resp.body().size_hint().exact())
         .unwrap_or(0);
-    stamp(&mut resp, &t, seconds, n.version);
+    stamp(&mut resp, &t, seconds, n.version, snap.api_versions.announced(n.version));
     if let Some(v) = tenant.and_then(|tn| tn.header.clone()) {
         resp.headers_mut().insert("x-tenant-id", v);
     }
@@ -2937,6 +2980,8 @@ impl Unanswered {
 struct Sent<'a> {
     trace: &'a Trace,
     version: Option<&'a str>,
+    /// What that version announces, when it is on its way out.
+    notices: Option<&'a Notices>,
     inject_request_id: bool,
     /// The protocol name the backend is told.
     protocol: &'a str,
@@ -3398,6 +3443,59 @@ mod tests {
     fn snap() -> Snapshot {
         Snapshot::from_json(r#"{"keys":[],"api_versions":{"default":"1","versions":[
             {"version":"1"},{"version":"2"},{"version":"3","native_ok":false}]}}"#).unwrap()
+    }
+
+    #[test]
+    fn what_a_version_announces_is_written_to_the_backend_and_on_the_answer() {
+        let snap = Snapshot::from_json(r#"{"keys":[],"api_versions":{"default":"1","versions":[
+            {"version":"1"},
+            {"version":"7","notices":{"warning":"299 - \"API version 7 is deprecated\"","sunset":"Fri, 02 Jan 2099 03:04:05 -0000","deprecation":true}},
+            {"version":"8","notices":{"warning":null,"sunset":null,"deprecation":true}},
+            {"version":"9","notices":{"warning":"not\nwritable","sunset":null,"deprecation":true}},
+            {"version":"6","native_ok":false,"notices":{"warning":"w","sunset":null,"deprecation":false}}]}}"#).unwrap();
+        let versions = &snap.api_versions;
+        assert_eq!(versions.native_ok.get("7"), Some(&true));
+        // A notice that cannot be a header, or a version that is not this side's: nothing is announced here.
+        assert_eq!((versions.native_ok.get("9"), versions.announced(Some("9"))), (Some(&false), None));
+        assert_eq!((versions.native_ok.get("6"), versions.announced(Some("6"))), (Some(&false), None));
+        assert!(versions.announced(Some("1")).is_none() && versions.announced(None).is_none());
+        let read = |headers: &HeaderMap, name: &str| headers.get_all(name).iter().map(|v| v.to_str().unwrap().to_owned()).collect::<Vec<_>>();
+        let trace = Trace { request_id: "id".to_owned(), traceparent: "tp".to_owned() };
+        let came = || {
+            let mut headers = HeaderMap::new();
+            headers.insert("warning", HeaderValue::from_static("mine"));
+            headers
+        };
+        // To the backend, with no rule: beside the caller's own line, and after it.
+        let sent = Sent { trace: &trace, version: Some("7"), notices: versions.announced(Some("7")), inject_request_id: false, protocol: "http", path: None };
+        let mut headers = came();
+        stamp_request(&mut headers, &sent);
+        assert_eq!(read(&headers, "warning"), ["mine", "299 - \"API version 7 is deprecated\""]);
+        assert_eq!(read(&headers, "sunset"), ["Fri, 02 Jan 2099 03:04:05 -0000"]);
+        assert!(read(&headers, "deprecation").is_empty());
+        // With a rule: a line the rule left under the gateway's own spelling is taken over.
+        let rule: Actions = serde_json::from_str(r#"{"set":[["Warning","the rule's"],["sunset","the rule's"]]}"#).unwrap();
+        let mut headers = came();
+        assert!(shape_headers(&mut headers, &[&rule], Some(&sent), &[]));
+        assert_eq!(read(&headers, "warning"), ["mine", "299 - \"API version 7 is deprecated\""]);
+        assert_eq!(read(&headers, "sunset"), ["the rule's", "Fri, 02 Jan 2099 03:04:05 -0000"]);
+        // A deprecation date alone tells the backend nothing.
+        let quiet = Sent { version: Some("8"), notices: versions.announced(Some("8")), ..Sent { trace: &trace, version: None, notices: None, inject_request_id: false, protocol: "http", path: None } };
+        let mut headers = HeaderMap::new();
+        stamp_request(&mut headers, &quiet);
+        assert!(read(&headers, "warning").is_empty() && read(&headers, "sunset").is_empty());
+        // On the answer: over whatever the backend said.
+        let mut resp = Response::new(full(Bytes::new()));
+        resp.headers_mut().append("warning", HeaderValue::from_static("the backend's"));
+        resp.headers_mut().append("warning", HeaderValue::from_static("and another"));
+        stamp(&mut resp, &trace, 0.001, Some("7"), versions.announced(Some("7")));
+        assert_eq!(read(resp.headers(), "warning"), ["299 - \"API version 7 is deprecated\""]);
+        assert_eq!(read(resp.headers(), "sunset"), ["Fri, 02 Jan 2099 03:04:05 -0000"]);
+        assert_eq!(read(resp.headers(), "deprecation"), ["true"]);
+        let mut resp = Response::new(full(Bytes::new()));
+        resp.headers_mut().append("warning", HeaderValue::from_static("the backend's"));
+        stamp(&mut resp, &trace, 0.001, Some("8"), versions.announced(Some("8")));
+        assert_eq!((read(resp.headers(), "warning"), read(resp.headers(), "deprecation")), (vec!["the backend's".to_owned()], vec!["true".to_owned()]));
     }
 
     #[test]
@@ -4310,7 +4408,7 @@ mod tests {
     #[test]
     fn the_gateways_own_request_headers_are_written_as_the_python_gateway_writes_them() {
         let trace = Trace { request_id: "id-1".to_owned(), traceparent: "tp".to_owned() };
-        let sent = Sent { trace: &trace, version: Some("2"), inject_request_id: true, protocol: "http", path: None };
+        let sent = Sent { trace: &trace, version: Some("2"), notices: None, inject_request_id: true, protocol: "http", path: None };
         let read = |headers: &HeaderMap, name: &str| headers.get_all(name).iter().map(|v| v.to_str().unwrap().to_owned()).collect::<Vec<_>>();
         let came = || {
             let mut headers = HeaderMap::new();
@@ -4330,7 +4428,7 @@ mod tests {
         assert_eq!(read(&headers, "x-request-id"), ["id-1"]);
         assert!(read(&headers, "x-gateway-note").is_empty());
         let mut bare = HeaderMap::new();
-        stamp_request(&mut bare, &Sent { version: None, inject_request_id: false, ..Sent { trace: &trace, version: None, inject_request_id: false, protocol: "mcp", path: None } });
+        stamp_request(&mut bare, &Sent { version: None, inject_request_id: false, ..Sent { trace: &trace, version: None, notices: None, inject_request_id: false, protocol: "mcp", path: None } });
         assert_eq!((read(&bare, "x-forwarded-for"), read(&bare, "x-protocol"), read(&bare, "traceparent")), (vec![String::new()], vec!["mcp".to_owned()], vec!["tp".to_owned()]));
         assert!(read(&bare, "x-request-id").is_empty() && read(&bare, "x-api-version").is_empty());
 
@@ -4471,7 +4569,7 @@ mod tests {
         // named at all: every line. The gateway's own trace: its one line.
         let rule: Actions = serde_json::from_str(r#"{"rename":[["X-Old","X-New"]],"set":[["x-set","z"],["x-same","a"]],"remove":["X-Gone"]}"#).unwrap();
         let trace = Trace { request_id: "id".to_owned(), traceparent: "tp".to_owned() };
-        let sent = Sent { trace: &trace, version: None, inject_request_id: false, protocol: "http", path: None };
+        let sent = Sent { trace: &trace, version: None, notices: None, inject_request_id: false, protocol: "http", path: None };
         assert!(shape_headers(&mut headers, &[&rule], Some(&sent), &repeated));
         assert_eq!(read(&headers), "traceparent=tp x-forwarded-for= x-new=1 x-other=o x-protocol=http x-same=a,b x-set=z x-tag=a,b");
         // With every path left to Python (a transformation rule exists, say), so is this one.
@@ -4612,7 +4710,7 @@ mod tests {
     fn a_grpc_refusal_is_one_a_grpc_client_reads() {
         let t = trace_for(&HeaderMap::new());
         let mut made = rate_limited("minute", 3, 60, None, &t);
-        stamp(&mut made, &t, 0.001, None);
+        stamp(&mut made, &t, 0.001, None, None);
         let resp = GrpcRefusal::for_error("RATE_LIMIT_EXCEEDED").onto(made);
         assert_eq!(resp.status(), StatusCode::OK);
         let h = resp.headers();

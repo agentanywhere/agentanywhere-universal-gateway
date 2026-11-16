@@ -1458,8 +1458,12 @@ def main() -> int:
             agent_same("a segment that only looks like a version is none", "GET", "/agents/echo/v2beta/a", want=lambda r: told(r) == ["1"])
             agent_same("a digit of another script is Python's to read", "GET", "/agents/echo/v%D9%A2/a", by="python")
             post("/admin/versions", {"version": "7", "status": "deprecated"})
-            assert wait_until(lambda: said_by(httpx.get(f"{rs}/agents/echo/v7/a", timeout=10)) == "python"), "the deprecated version never reached the data plane"
-            agent_same("a version that is deprecated is Python's to announce", "GET", "/agents/echo/v7/a", by="python")
+            assert wait_until(lambda: told(httpx.get(f"{rs}/agents/echo/v7/a", timeout=10)) == ["7"]), "the deprecated version never reached the data plane"
+            agent_same("a version that is deprecated is announced to the agent with its warning", "GET", "/agents/echo/v7/a",
+                       want=lambda r: told(r) == ["7"] and [v for k, v in r.json()["headers"] if k.lower() == "warning"] == ['299 - "API version 7 is deprecated"'])
+            httpx.delete(f"{py}/admin/versions/7", headers=adm, timeout=10).raise_for_status()
+            assert wait_until(lambda: said_by(httpx.get(f"{rs}/agents/echo/v7/a", timeout=10)) == "python"), "the removed version never reached the data plane"
+            agent_same("a version that is removed is Python's to refuse", "GET", "/agents/echo/v7/a", by="python", sees=False)
             httpx.delete(f"{py}/admin/versions/7", headers=adm, params={"hard": "true"}, timeout=10).raise_for_status()
             assert wait_until(lambda: said_by(httpx.get(f"{rs}/agents/echo/v7/a", timeout=10)) == "data plane"), "removing the version never reached the data plane"
 
@@ -2177,6 +2181,85 @@ def main() -> int:
             repeated_same("an agent is sent every line of a header given twice", "/agents/echo/twice", headers=twice, key=False,
                           sees={"x-tag": ["a", "b"], "x-other": ["o"]})
             repeated_same("and every value of a parameter, its query written again", "/agents/echo/twice?a=1&b=c+d&a=3&flag", key=False, query="a=1&a=3&b=c%20d&flag=")
+
+            # A version on its way out. The gateway tells the backend so with the version (`Warning`,
+            # `Sunset`), and tells the caller on every answer (those and `Deprecation`), over
+            # whatever the backend said. Once it is gone, or about to go, the Python gateway answers.
+            def announced_same(name, path, headers=(), sees=None, given=None, by="data plane", status=200, key=True):
+                send = lambda base, k: httpx.get(base + path, headers=[*([("X-API-Key", keys[k]["key"])] if key else []), *headers], timeout=15)
+                a, b = send(py, "py"), send(rs, "rs")
+                names = ("x-api-version", "warning", "sunset", "deprecation")
+
+                def seen(r):
+                    got = {}
+                    for header, value in r.json()["headers"]:
+                        if header.lower() in names:
+                            got.setdefault(header.lower(), []).append(value)
+                    return got
+
+                def got_back(r):
+                    return {header: r.headers.get_list(header) for header in names if header in r.headers}
+
+                bad = []
+                if said_by(b) != by:
+                    bad.append(f"answered by the {said_by(b)}")
+                if not a.status_code == b.status_code == status:
+                    bad.append(f"status {a.status_code} and {b.status_code}")
+                else:
+                    if status == 200 and seen(a) != seen(b):
+                        bad.append(f"the backend saw {seen(a)} from Python and {seen(b)} from the data plane")
+                    for header, want in (sees or {}).items():
+                        if seen(b).get(header) != want:
+                            bad.append(f"the backend saw {header}: {seen(b).get(header)!r}, not {want!r}")
+                    if got_back(a) != got_back(b):
+                        bad.append(f"the caller was given {got_back(a)} by Python and {got_back(b)} by the data plane")
+                    for header, want in (given or {}).items():
+                        if got_back(b).get(header) != want:
+                            bad.append(f"the caller was given {header}: {got_back(b).get(header)!r}, not {want!r}")
+                check(f"a version on its way out: {name}", not bad, "; ".join(bad) or f"the caller was given {got_back(b)}")
+
+            def announced(version, **want):
+                """Wait until the data plane itself answers under the version with what it announces."""
+                def there():
+                    r = httpx.get(f"{rs}/api/routed/plainly/1", headers={"X-API-Key": keys["rs"]["key"], "X-API-Version": version}, timeout=10)
+                    return said_by(r) == "data plane" and all(r.headers.get(header) == value for header, value in want.items())
+                return wait_until(there)
+
+            warns = '299 - "API version 7 is deprecated"'
+            hint = [("X-API-Version", "7")]
+            post("/admin/versions", {"version": "7"})
+            post("/admin/versions/7/deprecate", None)
+            assert announced("7", warning=warns, deprecation="true"), "the deprecated version never reached the data plane"
+            announced_same("a deprecated version is announced to the backend and to the caller", "/api/routed/plainly/1", headers=hint,
+                           sees={"x-api-version": ["7", "7"], "warning": [warns], "sunset": None},
+                           given={"x-api-version": ["7"], "warning": [warns], "deprecation": ["true"], "sunset": None})
+            announced_same("a caller's own warning goes on beside the gateway's", "/api/routed/plainly/1", headers=[*hint, ("Warning", "mine")],
+                           sees={"warning": ["mine", warns]})
+            announced_same("an answer made by the gateway itself is told the same", "/api/users", headers=hint, key=False, status=401,
+                           given={"x-api-version": ["7"], "warning": [warns], "deprecation": ["true"]})
+            announced_same("another version's requests are told nothing", "/api/routed/plainly/1", headers=[("X-API-Version", "2")],
+                           sees={"x-api-version": ["2", "2"], "warning": None}, given={"x-api-version": ["2"], "warning": None, "deprecation": None})
+            made = [post("/admin/transformations", {"name": "name what a version announces", "path_pattern": "/api/routed/announced/*", "request_config": {
+                "headers_set": {"X-Shaped": "yes", "Warning": "the rule's", "sunset": "the rule's"}}})]
+            assert rules_reached("/api/routed/announced/1", "data plane", True), "the rule on a version's notices never reached the data plane"
+            announced_same("a rule's line under the gateway's own spelling is taken over, under another it goes beside", "/api/routed/announced/1", headers=hint,
+                           sees={"warning": [warns], "sunset": ["the rule's"]})
+            remove_rules(made)
+            assert rules_reached("/api/routed/announced/1", "data plane", False), "removing the rule on a version's notices never reached the data plane"
+            r = httpx.post(f"{py}/admin/versions/7/deprecate", headers=adm, json="2099-01-02T03:04:05", timeout=10)
+            r.raise_for_status()
+            goes = "Fri, 02 Jan 2099 03:04:05 -0000"
+            assert announced("7", sunset=goes), "the sunset never reached the data plane"
+            announced_same("a version with a sunset says when, to both", "/api/routed/plainly/1", headers=hint,
+                           sees={"warning": [warns + ', date="2099-01-02T03:04:05"'], "sunset": [goes]},
+                           given={"warning": [warns + ', date="2099-01-02T03:04:05"'], "sunset": [goes], "deprecation": ["true"]})
+            post("/admin/versions", {"version": "6", "status": "sunset", "sunset_date": "2020-01-02T03:04:05"})
+            assert wait_until(lambda: said_by(httpx.get(f"{rs}/api/routed/plainly/1", headers={"X-API-Key": keys["rs"]["key"], "X-API-Version": "6"}, timeout=10)) == "python"), \
+                "the version past its sunset never reached the data plane"
+            announced_same("a version past its sunset is the Python gateway's to refuse", "/api/routed/plainly/1", headers=[("X-API-Version", "6")], by="python", status=410)
+            for version in ("6", "7"):
+                httpx.delete(f"{py}/admin/versions/{version}", headers=adm, params={"hard": "true"}, timeout=10).raise_for_status()
+            assert announced("7", **{"x-api-version": "1"}), "removing the versions never reached the data plane"
 
             # Rules this side is not told the actions of: they change an answer's body or the
             # path by expression, fill in a template, or change a header that an HTTP library on

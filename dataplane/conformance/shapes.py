@@ -32,6 +32,8 @@ difference, and if ordinary rules are not being described to the data plane at a
 Headers are compared as a receiver reads them: for each name, whatever its case, the values in order.
 """
 import asyncio
+from datetime import datetime
+from types import SimpleNamespace
 import json
 import random
 from urllib.parse import unquote_to_bytes
@@ -51,6 +53,7 @@ from app import routing  # noqa: E402
 from app.routing import repeated_headers, repeated_query  # noqa: E402
 from app.dataplane_sync import _path_actions, _rule_actions  # noqa: E402
 from app.main import answer_from, router  # noqa: E402
+from app.versioning import APIVersion, VersionStatus  # noqa: E402
 from app.transformers import RequestTransformer, ResponseTransformer, TransformConfig, TransformationRule, _apply_path_rewrite, transformation_manager  # noqa: E402
 
 BIN = ROOT / "dataplane/target/release/dataplane"
@@ -68,6 +71,8 @@ ODD_VALUES = [" lead", "trail ", "naïve", "two\nlines", "tab\there", 7, None]
 KEYS = ["a", "b", "c", "page", "q", "A", "sort"]
 WORDS = ["1", "two", "", "x-y_z.~", "A1", "10"]
 ODD_WORDS = ["a b", "a&b", "café", "50%", 3]
+# What the gateway tells a backend with a version on its way out, each under one exact spelling.
+ANNOUNCED = ["warning", "Warning", "WARNING", "sunset", "Sunset"]
 # What a caller may write in a query that is not a plain word: escapes (whole, cut short, not
 # text once read), `+`, and the characters a URL keeps for itself.
 ODD_PARTS = ["a+b", "+", "%20", "%7E", "%7e", "%zz", "%", "%4", "%2541", "%25", "%C3%A9", "caf%c3%a9", "a/b", "x;y",
@@ -181,7 +186,7 @@ def a_rule(rng, n):
     rule = {"name": f"rule {n}", "path_pattern": "*"}
     if rng.random() < 0.8:
         rule["request_config"] = {
-            **header_actions(rng, NAMES + ["content-type", "Content-Type"]),
+            **header_actions(rng, NAMES + ANNOUNCED + ["content-type", "Content-Type"]),
             **(body_actions(rng) if rng.random() < 0.5 else {}),
             "query_remove": some(rng, lambda: rng.choice(KEYS)),
             "query_set": dict(some(rng, lambda: (rng.choice(KEYS), pick(rng, WORDS, ODD_WORDS)))),
@@ -207,7 +212,7 @@ def an_exchange(rng):
     its server reads them, and some are given more than once; so may an answer's be. Half the
     requests carry a body, with its length and, usually, what it is. A query is plain pairs or
     anything a caller may write."""
-    names = sorted({n.lower() for n in rng.sample(NAMES, rng.randint(0, 8))})
+    names = sorted({n.lower() for n in rng.sample(NAMES + ANNOUNCED + ["x-api-version"], rng.randint(0, 8))})
     rng.shuffle(names)
     headers = [[n, rng.choice(VALUES)] for n in names]
     if names and rng.random() < 0.3:
@@ -239,7 +244,18 @@ def an_exchange(rng):
     return {"headers": headers, "query": query, "body": body.hex() if body is not None else None, "path": path, "answer": answer,
             "answer_body": given.hex() if given is not None else None, "status": status,
             # The protocol name the backend is told: the one the router gives a path with no prefix.
-            "protocol": router._get_backend_url(path)[1].value}
+            "protocol": router._get_backend_url(path)[1].value,
+            "version": a_version(rng)}
+
+
+def a_version(rng):
+    """The version a backend is told, half the time: `[version, warning, sunset]`, with what the
+    gateway's own class says a version of that standing announces."""
+    if rng.random() < 0.5:
+        return None
+    version = APIVersion(rng.choice(["1", "2", "7"]), status=rng.choice(list(VersionStatus)[:3]),
+                         sunset_date=rng.choice([None, datetime(2099, 1, 2, 3, 4, 5)]))
+    return [version.version, version.get_warning_header(), version.get_sunset_header()]
 
 
 def as_read(lines):
@@ -264,11 +280,13 @@ def python_says(rules, case):
     came = bytes.fromhex(case["body"]) if case["body"] is not None else None
     method = "GET" if came is None else "POST"
     # The router's own preparation of what goes upstream: the rules, then the headers the gateway
-    # itself writes. (No API version is configured here; which one a request resolves to is not
-    # the rules' business.)
+    # itself writes. (Which version a request resolves to is not the rules' business: the case
+    # says which the backend is told, and what that version announces.)
     routing.transformation_manager.transform_request = lambda **asked: before.transform(
         asked["method"], asked["path"], asked["headers"], asked["query_params"], asked["body"])
-    routing.version_manager.resolve = lambda path, headers: (None, None)
+    told = case["version"] and SimpleNamespace(version=case["version"][0], backend_url=None,
+                                               get_warning_header=lambda: case["version"][1], get_sunset_header=lambda: case["version"][2])
+    routing.version_manager.resolve = lambda path, headers: (told, path)
     url, headers, query, content, json_payload, backend, protocol, _ = router._prepare_upstream_parts(
         method, case["path"], held, query, came, None, repeated_query(asked), repeated_headers(came_with))
     assert protocol.value == case["protocol"], (protocol, case["path"])

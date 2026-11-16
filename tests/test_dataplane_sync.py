@@ -328,14 +328,46 @@ async def test_the_snapshot_says_whether_versions_are_taken_off_the_path(db_sess
     assert (await dataplane_sync.build_snapshot(db_session))["api_versions"]["strip_prefix"] is True
 
 
-async def test_a_deprecated_version_is_not_native(db_session):
+async def test_the_snapshot_says_what_a_version_announces(db_session):
+    """A version on its way out is still the data plane's to serve, with what the gateway
+    announces for it. One that is gone, about to go, routed elsewhere, or dated in a way only
+    this side compares, is not."""
+    from datetime import datetime, timedelta, timezone
+
+    from app.time_utils import utcnow
     from app.versioning import VersionStatus, version_manager
 
+    async def told():
+        versions = (await dataplane_sync.build_snapshot(db_session))["api_versions"]["versions"]
+        return {v["version"]: v for v in versions}["9"]
+
     version_manager.register_version("9")
+    v = version_manager.versions["9"]
     try:
-        assert {v["version"]: v["native_ok"] for v in (await dataplane_sync.build_snapshot(db_session))["api_versions"]["versions"]}["9"]
-        version_manager.versions["9"].status = VersionStatus.DEPRECATED
-        assert not {v["version"]: v["native_ok"] for v in (await dataplane_sync.build_snapshot(db_session))["api_versions"]["versions"]}["9"]
+        assert await told() == {"version": "9", "native_ok": True}
+        v.status, v.deprecated_date = VersionStatus.DEPRECATED, utcnow()
+        assert await told() == {"version": "9", "native_ok": True, "notices": {
+            "warning": '299 - "API version 9 is deprecated"', "sunset": None, "deprecation": True}}
+        # With a sunset far enough off, the date is announced too.
+        v.status, v.sunset_date = VersionStatus.SUNSET, datetime(2099, 1, 2, 3, 4, 5)
+        assert await told() == {"version": "9", "native_ok": True, "notices": {
+            "warning": '299 - "API version 9 is deprecated", date="2099-01-02T03:04:05"',
+            "sunset": "Fri, 02 Jan 2099 03:04:05 -0000", "deprecation": True}}
+        # A deprecation date alone is announced to the caller alone.
+        v.status, v.sunset_date = VersionStatus.ACTIVE, None
+        assert (await told())["notices"] == {"warning": None, "sunset": None, "deprecation": True}
+        # Within a minute of the sunset, and after it, the version is this side's.
+        v.status, v.sunset_date = VersionStatus.SUNSET, utcnow() + timedelta(seconds=dataplane_sync.SUNSET_MARGIN_SECONDS - 5)
+        assert await told() == {"version": "9", "native_ok": False}
+        v.sunset_date = utcnow() - timedelta(days=1)
+        assert await told() == {"version": "9", "native_ok": False}
+        # A date with an offset is compared here alone.
+        v.sunset_date = datetime(2099, 1, 2, tzinfo=timezone.utc)
+        assert await told() == {"version": "9", "native_ok": False}
+        v.sunset_date, v.status = None, VersionStatus.REMOVED
+        assert await told() == {"version": "9", "native_ok": False}
+        v.status, v.backend_url = VersionStatus.DEPRECATED, "http://127.0.0.1:9"
+        assert await told() == {"version": "9", "native_ok": False}
     finally:
         version_manager.versions.pop("9", None)
 
