@@ -53,6 +53,10 @@ See [docs/known-limitations.md](docs/known-limitations.md) for the full list.
 
 ### Fixed
 
+- API versions: a sunset date given with a UTC offset (`2027-01-01T00:00:00+00:00`,
+  or one ending in `Z`) now works. Comparing it with the current time raised
+  an error, so the admin call that set the date failed and so did every
+  request under that version.
 - Database migrations: the Alembic migrations `001` and `002` were replaced by
   one baseline, `0001`, that creates the full current schema. It is safe to
   run on a database the gateway already created at startup, works on SQLite
