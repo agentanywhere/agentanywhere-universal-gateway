@@ -39,7 +39,7 @@ from app.middleware.auth import INVALID_KEY_MESSAGE, MISSING_KEY_MESSAGE, missin
 # Response header that tells the data plane a 401 was about the credential itself. Set only when
 # DATAPLANE_TOKEN is configured; the data plane removes it before answering the client.
 DATAPLANE_AUTH_HEADER = "X-Dataplane-Auth"
-from app.routing import Router
+from app.routing import Router, repeated_headers, repeated_query
 from app.logging_config import (
     setup_logging,
     bind_request_context,
@@ -2226,6 +2226,8 @@ async def _proxy_agent_route(request: Request, agent_route, request_id: str) -> 
         query_params=dict(request.query_params),
         body=body,
         route_config=route_config,
+        repeated=repeated_query(request.query_params),
+        repeated_lines=repeated_headers(request.headers, held=-1),
     )
     # Every header line as the agent sent it: an agent that sets two cookies sends two
     # ``Set-Cookie`` lines, and joined into one they are no longer two cookies.
@@ -2650,6 +2652,8 @@ async def gateway_proxy(request: Request, path: str):
                 query_params=query_params,
                 body=body,
                 route_config=dynamic_route,
+                repeated=repeated_query(request.query_params),
+                repeated_lines=repeated_headers(request.headers),
             )
             resp_headers = {
                 k: v
@@ -2680,6 +2684,8 @@ async def gateway_proxy(request: Request, path: str):
             query_params=query_params,
             body=body,
             route_config=dynamic_route,
+            repeated=repeated_query(request.query_params),
+            repeated_lines=repeated_headers(request.headers),
         )
         
         return await answer_from(response, request.method, path, dict(request.headers), request_id, request)
