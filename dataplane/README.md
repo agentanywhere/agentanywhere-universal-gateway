@@ -249,13 +249,24 @@ header an HTTP library on the way has its own say in, or that the request is rea
 answer `Content-Type`, `Set-Cookie`, `Vary`, `Warning`, `Sunset`, `Deprecation` and the cross-origin, rate-limit and
 tenant headers); one with a header name or value that is not plain ASCII
 without a space at either end, or a query word of other than unreserved characters; one that maps a status to or from
-one without a body (below 200, 204, 205, 304). So are a request that gives a header the rules name more than once
-(the Python gateway's rules see one line of it), a request whose query is not plain `key=value` words when a rule
-changes the query. gRPC and `POST /mqtt/publish` have handlers of their own there, which
+one without a body (below 200, 204, 205, 304). gRPC and `POST /mqtt/publish` have handlers of their own there, which
 apply no rule; a rule that matches one keeps it with the Python gateway, as before, and so does a rule that matches
 an agent's path. `python dataplane/conformance/shapes.py` generates rules as the admin API takes them and exchanges to
 apply them to, and checks that what the backend is sent and what the caller is given are what the Python gateway's
 own rule code, HTTP client and web framework make of them.
+
+**Given more than once.** A header a caller gives on more than one line reaches the backend with every line, and a
+query parameter given more than once with every value: from the Python gateway (which used to send one of each) and
+from here. The rules read one value of each, as they always did: a header's first line, a parameter's last value. A
+header or parameter a rule sets, renames or removes is sent as the rule left it; any other goes on whole. The values
+of one parameter are sent together, where the parameter first appeared (`?tag=a&one=1&tag=b` is sent as
+`tag=a&tag=b&one=1`). `Host`, `Content-Length` and the hop-by-hop headers are sent on one line by the Python gateway;
+a request that gives one of those twice is handed to it.
+
+The query is read and written again on the way, as the Python gateway's HTTP client writes it: `?flag` becomes
+`?flag=`, `+` becomes `%20`, an escape that need not be one is taken off (`%7E` becomes `~`), and a `?` with nothing
+after it is dropped. A query of plain `key=value` words is sent as it came. One with an escape that is not UTF-8 text
+is the Python gateway's to read, and so is the request.
 
 A rule may name the headers the gateway itself writes. On a request those are `X-Forwarded-For`, `X-Protocol`,
 `traceparent` and (with the request-id plugin) `X-Request-ID`. The Python gateway writes them after the rules, into the
@@ -405,8 +416,8 @@ its answer is streamed back as it comes. The Python gateway is handed the reques
 
 * the slug is not registered (the 404 is Python's);
 * the caller asks for a WebSocket;
-* the query is anything but `key=value` pairs of unreserved characters with no key twice (Python takes a query apart
-  and writes it again), a header is given twice (Python forwards the last), or the path after the slug names an API version that adds more than its number;
+* the query has an escape that is not text, a header about the connection is given twice (see "Given more than once"
+  below), or the path after the slug names an API version that adds more than its number;
 * the body has no `Content-Length` or is over 1 MiB;
 * the agent cannot be reached. Nothing was sent, so Python tries, answers in its own way and counts the failure in
   its circuit breaker. This side keeps no breaker for agents.
@@ -534,10 +545,6 @@ here is the reverse of everywhere else: **whatever this side cannot be sure of i
   p95 and p99 were worse than the earlier work-stealing build at low concurrency; with pinned cores on Linux they were
   equal or better. No comparison against other gateways has been run yet.
 * **An answer to `HEAD` keeps the length the backend stated.** The Python gateway states a length of 0.
-* **A query that gives a name twice reaches the backend whole here.** The Python gateway reads a query into a
-  dictionary and sends on the last value of each name only; so a backend sees `?tag=a&tag=b` from this side and
-  `?tag=b` from that one. Where a rule changes the query, or the request is for an agent, such a request is the
-  Python gateway's.
 * The `Server` response header differs (uvicorn on one side), and native answers add `X-Served-By`.
 
 ## Tests

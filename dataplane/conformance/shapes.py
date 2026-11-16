@@ -34,6 +34,7 @@ Headers are compared as a receiver reads them: for each name, whatever its case,
 import asyncio
 import json
 import random
+from urllib.parse import unquote_to_bytes
 import signal
 import subprocess
 import sys
@@ -43,10 +44,11 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 import httpx  # noqa: E402
-from starlette.datastructures import QueryParams  # noqa: E402
+from starlette.datastructures import Headers, QueryParams  # noqa: E402
 from starlette.responses import Response  # noqa: E402
 
 from app import routing  # noqa: E402
+from app.routing import repeated_headers, repeated_query  # noqa: E402
 from app.dataplane_sync import _path_actions, _rule_actions  # noqa: E402
 from app.main import answer_from, router  # noqa: E402
 from app.transformers import RequestTransformer, ResponseTransformer, TransformConfig, TransformationRule, _apply_path_rewrite, transformation_manager  # noqa: E402
@@ -66,6 +68,12 @@ ODD_VALUES = [" lead", "trail ", "naïve", "two\nlines", "tab\there", 7, None]
 KEYS = ["a", "b", "c", "page", "q", "A", "sort"]
 WORDS = ["1", "two", "", "x-y_z.~", "A1", "10"]
 ODD_WORDS = ["a b", "a&b", "café", "50%", 3]
+# What a caller may write in a query that is not a plain word: escapes (whole, cut short, not
+# text once read), `+`, and the characters a URL keeps for itself.
+ODD_PARTS = ["a+b", "+", "%20", "%7E", "%7e", "%zz", "%", "%4", "%2541", "%25", "%C3%A9", "caf%c3%a9", "a/b", "x;y",
+             "a:b@c", "k=v", "=", "~", "a*b", "(1)", "!$'", "a,b", "?", "%00", "%26", "%3D", "a%20b", "%41"]
+# Escapes that are not text once read: the Python gateway reads those alone.
+NOT_TEXT = ["%ff", "%E2%82", "%80"]
 STATUSES = [200, 201, 202, 301, 400, 401, 404, 409, 500, 502, 503]
 ODD_STATUSES = [204, 304, 99, 700, 0, "502"]
 
@@ -195,13 +203,16 @@ def a_rule(rng, n):
 
 
 def an_exchange(rng):
-    """A request and an answer as they reach the rules. A request's names are in lower case and
-    given once (the data plane hands over a request that gives a name the rules mention twice);
-    an answer may give a name more than once. Half the requests carry a body, with its length
-    and, usually, what it is."""
+    """A request and an answer as they reach the rules. A request's names are in lower case, as
+    its server reads them, and some are given more than once; so may an answer's be. Half the
+    requests carry a body, with its length and, usually, what it is. A query is plain pairs or
+    anything a caller may write."""
     names = sorted({n.lower() for n in rng.sample(NAMES, rng.randint(0, 8))})
     rng.shuffle(names)
     headers = [[n, rng.choice(VALUES)] for n in names]
+    if names and rng.random() < 0.3:
+        for _ in range(rng.randint(1, 3)):
+            headers.insert(rng.randint(0, len(headers)), [rng.choice(names), rng.choice(VALUES)])
     body = a_body(rng) if rng.random() < 0.5 else None
     if body is not None:
         headers.append(["content-length", str(len(body))])
@@ -210,6 +221,10 @@ def an_exchange(rng):
         rng.shuffle(headers)
     keys = rng.sample(KEYS, rng.randint(0, 4))
     query = "&".join(f"{k}={rng.choice(WORDS)}" for k in keys)
+    if rng.random() < 0.4:
+        part = lambda plain: rng.choice(plain) if rng.random() < 0.6 else "".join(rng.choice(NOT_TEXT if rng.random() < 0.02 else ODD_PARTS + plain) for _ in range(rng.randint(1, 3)))
+        pieces = [rng.choice([f"{part(KEYS)}={part(WORDS)}"] * 6 + [part(KEYS), ""]) for _ in range(rng.randint(0, 6))]
+        query = "&".join(pieces)
     answer = []
     for n in rng.sample(NAMES, rng.randint(0, 8)):
         answer += [[n, rng.choice(VALUES)] for _ in range(rng.choice([1, 1, 1, 2, 3]))]
@@ -242,7 +257,10 @@ def python_says(rules, case):
     proxy handler's answer), with its own classes at each step."""
     before = RequestTransformer()
     before.rules = rules
-    query = dict(QueryParams(case["query"]))
+    # A request's headers and query as the proxy handler holds them: a dictionary of each, and
+    # beside it what was given more than once.
+    asked, came_with = QueryParams(case["query"]), Headers(raw=[(name.encode("latin-1"), value.encode("latin-1")) for name, value in case["headers"]])
+    query, held = dict(asked), dict(came_with)
     came = bytes.fromhex(case["body"]) if case["body"] is not None else None
     method = "GET" if came is None else "POST"
     # The router's own preparation of what goes upstream: the rules, then the headers the gateway
@@ -252,11 +270,11 @@ def python_says(rules, case):
         asked["method"], asked["path"], asked["headers"], asked["query_params"], asked["body"])
     routing.version_manager.resolve = lambda path, headers: (None, None)
     url, headers, query, content, json_payload, backend, protocol, _ = router._prepare_upstream_parts(
-        method, case["path"], dict(case["headers"]), query, came)
+        method, case["path"], held, query, came, None, repeated_query(asked), repeated_headers(came_with))
     assert protocol.value == case["protocol"], (protocol, case["path"])
     path = url[len(backend.rstrip("/")):]
     # The trace is the gateway's own, new for each request.
-    headers["traceparent"] = "<trace>"
+    headers = [(name, "<trace>" if name == "traceparent" else value) for name, value in (headers.items() if isinstance(headers, dict) else headers)]
     sent = httpx.Request(method, "http://backend:9000/x", headers=headers, params=query, content=content, json=json_payload)
     sent_headers = [(n, v) for n, v in sent.headers.raw if n.lower() != b"host"]
     body = came if content is None and json_payload is None else sent.read()
@@ -369,7 +387,19 @@ def main():
     answers = [json.loads(line) for line in out.stdout.splitlines()]
     assert len(answers) == len(cases), (len(answers), len(cases))
     wrong, changed, asked, rewritten, moved, expressed, left, slow, unsure, answered = [], 0, 0, 0, 0, 0, 0, 0, 0, 0
+    unread, twice, requeried = 0, 0, 0
     for (described, rules, case), got, line in zip(cases, answers, lines):
+        # A query whose escapes are not text is the only one this side leaves to Python to read.
+        try:
+            unquote_to_bytes(case["query"].replace("+", " ")).decode("utf-8")
+            readable = True
+        except UnicodeDecodeError:
+            readable = False
+        if not readable:
+            unread += 1
+            if got not in ("ask", "unready"):
+                wrong.append((described, case, {"query": "left to Python"}, got if isinstance(got, dict) else {"query": got}))
+            continue
         by_expression = any("regex" in (a.get("path") or {}) for a in json.loads(line)["request"])
         if got == "ask" and by_expression and not case["path"].isascii():
             # Beyond ASCII the two engines' classes differ: such a path is rewritten by Python.
@@ -396,6 +426,8 @@ def main():
             signal.setitimer(signal.ITIMER_REAL, 0)
         if got != want:
             wrong.append((described, case, want, got))
+        twice += len({name for name, _ in case["headers"]}) < len(case["headers"])
+        requeried += (want["query"] or "") != case["query"]
         untouched = {"headers": as_read(case["headers"]), "query": case["query"] or None, "body": case["body"], "path": case["path"],
                      "answer": as_read(case["answer"]), "given": case["answer_body"], "status": case["status"]}
         answered += want["given"] != case["answer_body"]
@@ -412,14 +444,17 @@ def main():
           f"{rewritten} with a body written anew, {moved} with a path rewritten, {expressed} of those by expression): {len(wrong)} different; "
           f"{answered} with an answer's body written anew; "
           f"{asked} handed over for their body, {left} for a path beyond ASCII, {unsure} answers left for Python to shape; {slow} not compared, Python's engine taking too long; "
-          f"{kept} sets of rules kept with Python")
+          f"{kept} sets of rules kept with Python; "
+          f"{twice} requests gave a header more than once, {requeried} queries were written anew, {unread} queries left for Python to read")
+    if twice < count // 20 or requeried < count // 20 or unread > count // 5:
+        print("too few requests with a header given twice or a query written anew are being compared")
     if kept > 2 * count:
         print("too many ordinary rules are being kept with Python")
     if asked > count // 20 or rewritten < count // 20:
         print("too few ordinary bodies are being written here")
-    if moved < count // 20 or expressed < count // 100:
+    if moved < (count - unread) // 20 or expressed < (count - unread) // 100:
         print("too few ordinary rewrites are being done here")
-    few = answered < count // 20 or unsure > count // 10 or slow > count // 100 or asked > count // 20 or rewritten < count // 20 or moved < count // 20 or expressed < count // 100
+    few = twice < count // 20 or requeried < count // 20 or unread > count // 5 or answered < count // 20 or unsure > count // 10 or slow > count // 100 or asked > count // 20 or rewritten < count // 20 or moved < (count - unread) // 20 or expressed < (count - unread) // 100
     alike = rewrites(5 * count, seed)
     sys.exit(1 if wrong or kept > 2 * count or changed < count // 2 or few or not alike else 0)
 

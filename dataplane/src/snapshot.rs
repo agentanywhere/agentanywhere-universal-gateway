@@ -387,21 +387,116 @@ pub fn change_headers<V>(lines: &mut HeaderLines<V>, actions: &Actions, value: i
     }
 }
 
-/// Apply rules' query changes to a query of plain `key=value` pairs, as `_apply_query_ops` does
-/// to the dictionary the Python gateway reads a query into: removals, then values set, each
-/// rule in turn. `None` when no parameter is left.
-pub fn change_query(query: &str, rules: &[&Actions]) -> Option<String> {
-    let mut pairs: Vec<(&str, &str)> = query.split('&').filter_map(|pair| pair.split_once('=')).collect();
+/// A query as the Python gateway holds it on its way to a backend: a dictionary of one value to
+/// a name, which its rules read and change, and beside it every value of each name given more
+/// than once, put back before sending where no rule changed that name (`repeated_query`).
+#[derive(Debug, Default, PartialEq)]
+pub struct Query {
+    /// One value to a name: the last given, in the place of the first.
+    held: Vec<(String, String)>,
+    /// The names given more than once, each with its values in the order given.
+    repeated: Vec<(String, Vec<String>)>,
+}
+
+/// Read a query as the Python gateway reads it (`request.query_params`, which is `parse_qsl`
+/// keeping blank values): the pieces between `&`, each a name and, after its first `=`, a
+/// value; `+` a space and `%xx` the byte it names, an escape that is not one left as written.
+/// `None` for a query this side is not certain to read the same: one beyond ASCII, or whose
+/// escapes are not UTF-8.
+pub fn read_query(query: &str) -> Option<Query> {
+    if !query.is_ascii() {
+        return None;
+    }
+    fn unquoted(text: &str) -> Option<String> {
+        let hex = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
+        let bytes = text.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            match (bytes[i], bytes.get(i + 1).copied().and_then(hex), bytes.get(i + 2).copied().and_then(hex)) {
+                (b'%', Some(high), Some(low)) => {
+                    out.push(high << 4 | low);
+                    i += 3;
+                }
+                (b'+', _, _) => {
+                    out.push(b' ');
+                    i += 1;
+                }
+                (other, _, _) => {
+                    out.push(other);
+                    i += 1;
+                }
+            }
+        }
+        String::from_utf8(out).ok()
+    }
+    let mut all: Vec<(String, Vec<String>)> = Vec::new();
+    for piece in query.split('&').filter(|piece| !piece.is_empty()) {
+        let (name, value) = piece.split_once('=').unwrap_or((piece, ""));
+        let (name, value) = (unquoted(name)?, unquoted(value)?);
+        match all.iter_mut().find(|(n, _)| *n == name) {
+            Some((_, values)) => values.push(value),
+            None => all.push((name, vec![value])),
+        }
+    }
+    let held = all.iter().map(|(name, values)| (name.clone(), values.last().cloned().unwrap_or_default())).collect();
+    all.retain(|(_, values)| values.len() > 1);
+    Some(Query { held, repeated: all })
+}
+
+/// Apply rules' query changes to a query as read, as `_apply_query_ops` does to the dictionary
+/// the Python gateway reads a query into: removals, then values set, each rule in turn.
+pub fn change_query(query: &mut Query, rules: &[&Actions]) {
+    let pairs = &mut query.held;
     for actions in rules {
         pairs.retain(|(key, _)| !actions.query_remove.iter().any(|r| r == key));
         for (key, value) in &actions.query_set {
             match pairs.iter_mut().find(|(k, _)| k == key) {
-                Some(pair) => pair.1 = value,
-                None => pairs.push((key, value)),
+                Some(pair) => pair.1.clone_from(value),
+                None => pairs.push((key.clone(), value.clone())),
             }
         }
     }
-    (!pairs.is_empty()).then(|| pairs.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("&"))
+}
+
+/// A query as the Python gateway's HTTP client writes the dictionary (`urlencode` in httpx):
+/// `name=value` joined by `&`, a name given more than once with every value where the
+/// dictionary still holds its last (`_with_repeats`). A name or a value of letters, digits,
+/// `-._~` and whole `%xx` escapes is written as it is; in any other, every byte that is not
+/// one of those letters is escaped, `%` too. `None` when no parameter is left: the backend is
+/// then asked with no `?`.
+pub fn write_query(query: &Query) -> Option<String> {
+    fn quoted(text: &str, out: &mut String) {
+        let plain = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~');
+        let bytes = text.as_bytes();
+        let escape = |i: usize| bytes.get(i + 1).is_some_and(u8::is_ascii_hexdigit) && bytes.get(i + 2).is_some_and(u8::is_ascii_hexdigit);
+        if bytes.iter().enumerate().all(|(i, b)| plain(*b) || (*b == b'%' && escape(i))) {
+            out.push_str(text);
+            return;
+        }
+        for b in bytes {
+            match plain(*b) {
+                true => out.push(*b as char),
+                false => out.push_str(&format!("%{b:02X}")),
+            }
+        }
+    }
+    let mut out = String::new();
+    let mut pair = |name: &str, value: &str| {
+        if !out.is_empty() {
+            out.push('&');
+        }
+        quoted(name, &mut out);
+        out.push('=');
+        quoted(value, &mut out);
+    };
+    for (name, value) in &query.held {
+        match query.repeated.iter().find(|(n, values)| n == name && values.last() == Some(value)) {
+            Some((_, values)) => values.iter().for_each(|each| pair(name, each)),
+            None => pair(name, value),
+        }
+    }
+    (!query.held.is_empty()).then_some(out)
 }
 
 /// The status an answer leaves with: each rule in turn maps the one it finds.
@@ -1187,6 +1282,29 @@ impl Snapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_query_is_read_and_written_as_the_python_gateway_does() {
+        let written = |query: &str| read_query(query).map(|read| write_query(&read).unwrap_or_default());
+        for (came, sent) in [
+            ("a=1&b=2&a=3", "a=1&a=3&b=2"), ("flag&b=2", "flag=&b=2"), ("q=a%20b&r=c+d&s=%2F", "q=a%20b&r=c%20d&s=%2F"), ("", ""), ("&&", ""),
+            ("a=1&&b", "a=1&b="), ("=x", "=x"), ("a=%zz", "a=%25zz"), ("a=b=c", "a=b%3Dc"), ("a;b=1", "a%3Bb=1"), ("caf%C3%A9=1", "caf%C3%A9=1"),
+            ("a=%2541", "a=%41"), ("a=%2541+", "a=%2541%20"), ("a=%", "a=%25"), ("a=%4", "a=%254"), ("%61=%7e", "a=~"), ("a=x&A=y", "a=x&A=y"),
+            ("a=1&a", "a=1&a="), ("a=%E2%82%AC", "a=%E2%82%AC"), ("k=a/b?c:d@e", "k=a%2Fb%3Fc%3Ad%40e"), ("a=%00", "a=%00"),
+            ("tag=a&one=1&tag=b&tag=a", "tag=a&tag=b&tag=a&one=1"), ("a=1&%61=2", "a=1&a=2"),
+        ] {
+            assert_eq!(written(came).as_deref(), Some(sent), "{came}");
+        }
+        for came in ["a=%ff", "a=%C3", "caf\u{e9}=1", "%80=1"] {
+            assert_eq!(written(came), None, "{came}");
+        }
+        // Rules read and change one value to a name. A name given more than once goes on with
+        // every value unless a rule changed it; set to the value it held, it was not changed.
+        let rule: Actions = serde_json::from_str(r#"{"query_remove":["a b","gone"],"query_set":[["page","1"],["new","x"],["same","2"]]}"#).unwrap();
+        let mut read = read_query("gone=1&page=7&a+b=2&q=tea&gone=2&page=8&keep=x&keep=y&same=1&same=2").unwrap();
+        change_query(&mut read, &[&rule]);
+        assert_eq!(write_query(&read).as_deref(), Some("page=1&q=tea&keep=x&keep=y&same=1&same=2&new=x"));
+    }
 
     #[test]
     fn rules_for_a_body_and_a_path_are_read_and_applied_in_order() {

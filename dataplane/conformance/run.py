@@ -1434,10 +1434,13 @@ def main() -> int:
                   [l for _, l in lines_a] == [l for _, l in lines_b] and len(lines_b) == 3 and lines_b[-1][0] - lines_b[0][0] > 0.5
                   and said_by(b) == "data plane", f"{lines_b[-1][0] - lines_b[0][0]:.2f}s between first and last, by {said_by(b)}")
 
-            # What this side cannot be sure of sending as Python sends it is Python's to send.
-            agent_same("a query key given twice", "GET", "/agents/echo/a?x=1&x=2", by="python")
-            agent_same("a query that Python rewrites", "GET", "/agents/echo/a?q=a+b&r=%7E", by="python")
-            agent_same("a header given twice", "GET", "/agents/echo/a", [("Accept", "text/plain"), ("Accept", "application/json")], by="python")
+            # A query is written again on the way as Python writes it, and what is given more
+            # than once goes on whole. What this side cannot be sure of reading as Python reads
+            # it is Python's to send.
+            agent_same("a query key given twice", "GET", "/agents/echo/a?x=1&x=2")
+            agent_same("a query that Python rewrites", "GET", "/agents/echo/a?q=a+b&r=%7E")
+            agent_same("a header given twice", "GET", "/agents/echo/a", [("Accept", "text/plain"), ("Accept", "application/json")])
+            agent_same("a query whose escapes are not text", "GET", "/agents/echo/a?q=%ff", by="python")
 
             # A path that names an API version is that version's, whatever the headers hint, and
             # the caller is still told the version its headers (or the default) give.
@@ -1849,12 +1852,12 @@ def main() -> int:
             check("transformation rules: the answer's body is the backend's own bytes on both sides",
                   a.content.startswith(b'{"method": "GET", "path": "/api/routed/shaped/1"') and b.content.startswith(b'{"method": "GET", "path": "/api/routed/shaped/1"'),
                   f"{a.content[:60]!r} and {b.content[:60]!r}")
-            exchange_same("a request that gives a header the rules name twice is Python's", "GET", "/api/routed/shaped/1", by="python", status=201,
-                          headers=[("X-Old", "first"), ("X-Old", "second")], sees={"x-shaped": "yes"})
+            exchange_same("of a header given twice that the rules name, they read the first line", "GET", "/api/routed/shaped/1", status=201,
+                          headers=[("X-Old", "first"), ("X-Old", "second")], sees={"x-shaped": "yes", "x-new": "first", "x-old": None})
             exchange_same("and one that gives another header twice is changed here", "GET", "/api/routed/shaped/1", status=201,
                           headers=[("X-Keep", "first"), ("X-Old", "o")], sees={"x-new": "o", "x-shaped": "yes"})
-            exchange_same("a query that is not plain words is Python's to take apart", "GET", "/api/routed/shaped/1?q=a%20b&debug=1", by="python", status=201,
-                          sees={"x-shaped": "yes"})
+            exchange_same("a query that is not plain words is read, changed and written again", "GET", "/api/routed/shaped/1?q=a+b&debug=1", status=201,
+                          sees={"x-shaped": "yes"}, query="q=a%20b&source=gw&page=1")
             exchange_same("an answer that is streamed has no rule applied to it, with the request still changed", "GET", "/api/routed/shaped/message:stream/1",
                           sees={"x-shaped": "yes"}, given={"x-powered": None})
             remove_rules(made)
@@ -2109,6 +2112,71 @@ def main() -> int:
                          given={"x-request-id": "<id>", "x-response-time": "<time>", "traceparent": "<trace>"})
             remove_rules(made)
             assert rules_reached("/api/routed/stamped/1", "data plane", False), "removing the rules never reached the data plane"
+
+            # A header or a query parameter a caller gives more than once reaches the backend whole:
+            # every line of the header, every value of the parameter. The rules read one value of
+            # each (a header's first line, a parameter's last value) and, where one changes it,
+            # what the rule left is what is sent. A query is read and written again on the way.
+            def repeated_same(name, path, headers=(), sees=None, query=None, by="data plane", key=True):
+                send = lambda base, k: httpx.get(base + path, headers=[*([("X-API-Key", keys[k]["key"])] if key else []), *headers], timeout=15)
+                a, b = send(py, "py"), send(rs, "rs")
+                watched = ("x-tag", "x-other", "x-label", "cookie", "accept-language")
+
+                def seen(r):
+                    got = {}
+                    for header, value in r.json()["headers"]:
+                        if header.lower() in watched:
+                            got.setdefault(header.lower(), []).append(value)
+                    return got
+
+                bad = []
+                if said_by(b) != by:
+                    bad.append(f"answered by the {said_by(b)}")
+                if not a.status_code == b.status_code == 200:
+                    bad.append(f"status {a.status_code} and {b.status_code}")
+                else:
+                    if seen(a) != seen(b):
+                        bad.append(f"the backend saw {seen(a)} from Python and {seen(b)} from the data plane")
+                    for header, want in (sees or {}).items():
+                        if seen(b).get(header) != want:
+                            bad.append(f"the backend saw {header}: {seen(b).get(header)!r}, not {want!r}")
+                    if a.json()["query"] != b.json()["query"]:
+                        bad.append(f"the backend saw the query {a.json()['query']!r} from Python and {b.json()['query']!r} from the data plane")
+                    if query is not None and b.json()["query"] != query:
+                        bad.append(f"the backend saw the query {b.json()['query']!r}, not {query!r}")
+                check(f"given more than once: {name}", not bad, "; ".join(bad) or f"the backend saw {seen(b)} and the query {b.json()['query']!r}")
+
+            twice = [("X-Tag", "a"), ("X-Other", "o"), ("X-Tag", "b")]
+            repeated_same("a header given on two lines reaches the backend with both", "/api/routed/plainly/1", headers=twice, sees={"x-tag": ["a", "b"], "x-other": ["o"]})
+            repeated_same("and one given on three, in any spelling, with all three", "/api/routed/plainly/1",
+                          headers=[("x-tag", "1"), ("X-TAG", "2"), ("X-Tag", "3")], sees={"x-tag": ["1", "2", "3"]})
+            repeated_same("two lines of cookies are two lines of cookies", "/api/routed/plainly/1",
+                          headers=[("Cookie", "a=1"), ("Cookie", "b=2"), ("Accept-Language", "en"), ("Accept-Language", "hi")],
+                          sees={"cookie": ["a=1", "b=2"], "accept-language": ["en", "hi"]})
+            repeated_same("a header given once with two values is one line still", "/api/routed/plainly/1", headers=[("X-Tag", "a, b")], sees={"x-tag": ["a, b"]})
+            repeated_same("a header about the connection given twice is the Python gateway's to send on", "/api/routed/plainly/1",
+                          headers=[("TE", "trailers"), ("TE", "gzip")], by="python")
+            repeated_same("a parameter given twice reaches the backend with both values, together", "/api/routed/plainly/1?a=1&b=2&a=3", query="a=1&a=3&b=2")
+            repeated_same("a parameter without a value is written with an empty one", "/api/routed/plainly/1?flag&b=2", query="flag=&b=2")
+            repeated_same("an escaped parameter is written with the escapes the Python gateway's client uses", "/api/routed/plainly/1?q=a%20b&r=c+d&s=%2F&t=%7e",
+                          query="q=a%20b&r=c%20d&s=%2F&t=~")
+            repeated_same("an empty query", "/api/routed/plainly/1?", query="")
+            repeated_same("a query whose escapes are not text is the Python gateway's to read", "/api/routed/plainly/1?q=%ff", by="python")
+            made = [post("/admin/transformations", {"name": "name what is given twice", "path_pattern": "/api/routed/repeated/*", "request_config": {
+                "headers_rename": {"X-Tag": "X-Label"}, "headers_set": {"X-Shaped": "yes"}, "query_set": {"page": "1"}, "query_remove": ["debug"]}})]
+            assert rules_reached("/api/routed/repeated/1", "data plane", True), "the rule on a header given twice never reached the data plane"
+            repeated_same("a rule that names a header given twice reads its first line, and what it leaves is sent", "/api/routed/repeated/1", headers=twice,
+                          sees={"x-label": ["a"], "x-tag": None, "x-other": ["o"]})
+            repeated_same("and a header it does not name goes on with every line", "/api/routed/repeated/1",
+                          headers=[("X-Other", "1"), ("X-Other", "2")], sees={"x-other": ["1", "2"]})
+            repeated_same("a rule that sets or removes a parameter given twice decides what is sent for it", "/api/routed/repeated/1?page=7&tag=a&debug=1&page=8&tag=b&debug=2",
+                          query="page=1&tag=a&tag=b")
+            repeated_same("a parameter a rule sets to the value it held is as it came", "/api/routed/repeated/1?page=7&page=1", query="page=7&page=1")
+            remove_rules(made)
+            assert rules_reached("/api/routed/repeated/1", "data plane", False), "removing the rule on a header given twice never reached the data plane"
+            repeated_same("an agent is sent every line of a header given twice", "/agents/echo/twice", headers=twice, key=False,
+                          sees={"x-tag": ["a", "b"], "x-other": ["o"]})
+            repeated_same("and every value of a parameter, its query written again", "/agents/echo/twice?a=1&b=c+d&a=3&flag", key=False, query="a=1&a=3&b=c%20d&flag=")
 
             # Rules this side is not told the actions of: they change an answer's body or the
             # path by expression, fill in a template, or change a header that an HTTP library on

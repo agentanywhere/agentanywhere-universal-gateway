@@ -35,7 +35,7 @@ use crate::govern::{self, IpRule, Policy, Scope, Subject};
 use crate::pyjson;
 use crate::report::{Event, Reporter, Row, Served};
 use crate::snapshot::{
-    change_headers, put, change_query, change_status, hash_key, Actions, AgentFailure, Digest32, DynamicRoute, HeaderLines, KeyEntry, Readiness, Shaping,
+    change_headers, put, change_query, change_status, read_query, write_query, hash_key, Actions, AgentFailure, Digest32, DynamicRoute, HeaderLines, KeyEntry, Readiness, Shaping,
     Snapshot, Wording,
 };
 use crate::sync::Link;
@@ -1074,17 +1074,14 @@ fn decide<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, now: u6
                 None => return PYTHON,
             }
         }
-        // Of a header given twice, the Python gateway's rules see one line only.
-        let headers = req.headers();
-        let named = |name: &HeaderName| shaping.request.iter().any(|a| a.names(name.as_str()));
-        if headers.len() != headers.keys_len() && headers.keys().any(|name| named(name) && headers.get_all(name).iter().nth(1).is_some()) {
-            return PYTHON;
-        }
-        // A query is taken apart and written again there; only a plain one reads the same here.
-        let plain = matches!(uri.query(), None | Some("")) || uri.query().is_some_and(query_survives);
-        if !plain && shaping.request.iter().any(|a| a.changes_query()) {
-            return PYTHON;
-        }
+    }
+    // A query is taken apart and written again there, and is here: one this side is not certain
+    // to read the same is the Python gateway's. (Publishing, the bridge and gRPC send none on.)
+    // So is a request that gives twice a header the Python gateway sends on one line of.
+    if !(publishing || bridging || protocol == Protocol::Grpc)
+        && (framed_twice(req.headers()) || uri.query().is_some_and(|query| !query_survives(query) && read_query(query).is_none()))
+    {
+        return PYTHON;
     }
     // A path rules rewrite is still a path.
     let Ok(mut rewritten) = shaping.rewritten(asked) else { return PYTHON };
@@ -1144,15 +1141,19 @@ fn streamed(path: &str, method: &str, headers: &HeaderMap, query: Option<&str>) 
 
 /// Apply rules' header changes to a request's or an answer's headers. The Python gateway holds
 /// them as one line per name while it does; a name the rules mention that an answer gives more
-/// than once is one line there, its values joined, and is here too. (A request that gives such
-/// a name twice is not changed here at all.)
+/// than once is one line there, its values joined, and is here too.
+///
+/// A request comes here with one line to a name, the first, as the Python gateway's rules read
+/// it; `repeated` is every line of the names it gave more than once (`take_repeated`). They are
+/// put back at the end, in place of the one line, where that line is still as it came: a header
+/// a rule set, renamed or removed, or the gateway wrote itself, keeps what that left.
 ///
 /// With `sent` (a request on its way to a backend), the headers the gateway itself writes are
 /// written here too, where each line's exact name is still known: the Python gateway writes them
 /// into the same dictionary the rules have just changed, under names of one exact spelling, so a
 /// line a rule left under that very spelling is taken over and one under any other stays beside
 /// it. Says whether that was done.
-fn shape_headers(headers: &mut HeaderMap, rules: &[&Actions], sent: Option<&Sent>) -> bool {
+fn shape_headers(headers: &mut HeaderMap, rules: &[&Actions], sent: Option<&Sent>, repeated: &[(HeaderName, Vec<HeaderValue>)]) -> bool {
     if !rules.iter().any(|a| a.changes_headers()) {
         return false;
     }
@@ -1194,6 +1195,11 @@ fn shape_headers(headers: &mut HeaderMap, rules: &[&Actions], sent: Option<&Sent
         }
         if let Ok(v) = HeaderValue::from_str(&sent.trace.traceparent) {
             put(&mut lines, "traceparent", v);
+        }
+    }
+    for (name, values) in repeated {
+        if let Some(at) = lines.iter().position(|(line, value)| line == name.as_str() && value == &values[0]) {
+            lines.splice(at..=at, values.iter().map(|value| (name.as_str().to_owned(), value.clone())));
         }
     }
     headers.clear();
@@ -1393,15 +1399,21 @@ async fn answer_with_body_rules(w: &Worker, resp: Response<Body>, rules: &[&Acti
 /// says the rules made a new body for it (already in place, with its length): the Python
 /// gateway's HTTP client then calls it JSON unless the headers say what it is.
 fn shape_request(req: &mut Request<Body>, rules: &[&Actions], rewritten: bool, sent: Option<&Sent>) {
-    if shape_headers(req.headers_mut(), rules, sent) {
+    let repeated = if rules.iter().any(|a| a.changes_headers()) { take_repeated(req.headers_mut()) } else { Vec::new() };
+    if shape_headers(req.headers_mut(), rules, sent, &repeated) {
         req.extensions_mut().insert(Stamped);
     }
     if rewritten && !req.headers().contains_key(CONTENT_TYPE) {
         req.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     }
-    if rules.iter().any(|a| a.changes_query()) {
-        let uri = req.uri();
-        let target = match change_query(uri.query().unwrap_or(""), rules) {
+    // The query is read into a dictionary there, changed by the rules and written again. Written
+    // again it is the same query when it is plain pairs and no rule changes it.
+    let uri = req.uri();
+    let changing = rules.iter().any(|a| a.changes_query());
+    let as_it_came = !changing && uri.query().is_none_or(query_survives);
+    if let Some(mut query) = (!as_it_came).then(|| read_query(uri.query().unwrap_or(""))).flatten() {
+        change_query(&mut query, rules);
+        let target = match write_query(&query) {
             Some(query) => format!("{}?{query}", uri.path()),
             None => uri.path().to_owned(),
         };
@@ -1417,7 +1429,7 @@ fn shape_request(req: &mut Request<Body>, rules: &[&Actions], rewritten: bool, s
 
 /// Apply the rules to a backend's answer: its headers, and its status.
 fn shape_answer(resp: &mut Response<Body>, rules: &[&Actions]) {
-    shape_headers(resp.headers_mut(), rules, None);
+    shape_headers(resp.headers_mut(), rules, None, &[]);
     let was = resp.status().as_u16();
     let becomes = change_status(was, rules);
     if becomes != was {
@@ -1484,6 +1496,11 @@ pub fn judge_shapes() -> Result<(), String> {
             continue;
         }
         let (before, after): (Vec<&Actions>, Vec<&Actions>) = (case.request.iter().collect(), case.response.iter().collect());
+        // A query this side is not certain to read as the Python gateway does is that gateway's.
+        if read_query(&case.query).is_none() {
+            writeln!(out, "\"ask\"").map_err(|e| e.to_string())?;
+            continue;
+        }
         let target = if case.query.is_empty() { "/x".to_owned() } else { format!("/x?{}", case.query) };
         let mut req = Request::builder().uri(target).body(full(Bytes::new())).map_err(|e| e.to_string())?;
         *req.headers_mut() = map(&case.headers)?;
@@ -1650,8 +1667,9 @@ fn html_escaped(text: &str) -> String {
 /// the same way, and `x-protocol`, which the Python gateway sends twice when the caller sent one.
 const NOT_FORWARDED_ALIKE: [&str; 5] = ["te", "trailer", "proxy-authorization", "proxy-authenticate", "x-protocol"];
 
-/// Whether a query reaches the agent unchanged through the Python gateway, which takes it apart
-/// and writes it again: `key=value` pairs of unreserved characters, no key twice.
+/// Whether a query reaches a backend unchanged through the Python gateway, which takes it apart
+/// and writes it again (`read_query`, `write_query`): `key=value` pairs of unreserved characters,
+/// no key twice.
 fn query_survives(query: &str) -> bool {
     let plain = |s: &str| s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~'));
     let mut seen: Vec<&str> = Vec::new();
@@ -1685,8 +1703,8 @@ fn agent_call<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, aft
     if headers.contains_key(UPGRADE) || cross_origin(snap, headers).is_err() || NOT_FORWARDED_ALIKE.iter().any(|h| headers.contains_key(*h)) {
         return None;
     }
-    // Of a header sent twice, the Python gateway forwards the last one only.
-    if headers.len() != headers.keys_len() {
+    // A header given twice goes on with every line, but for those sent on one line of.
+    if framed_twice(headers) {
         return None;
     }
     let method = [("GET", Method::GET), ("POST", Method::POST), ("PUT", Method::PUT), ("DELETE", Method::DELETE), ("PATCH", Method::PATCH), ("HEAD", Method::HEAD)]
@@ -1705,10 +1723,14 @@ fn agent_call<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, aft
     let upstream_path = stripped.unwrap_or(&upstream_path);
     let ip = govern::client_ip(peer, headers, &snap.trusted_proxies)?;
     let prefix = &backend.upstream.prefix;
+    // The query is read into a dictionary and written again, as on the way to any backend.
     let target = match uri.query() {
-        None | Some("") => format!("{prefix}{upstream_path}"),
         Some(query) if query_survives(query) => format!("{prefix}{upstream_path}?{query}"),
-        Some(_) => return None,
+        Some(query) => match write_query(&read_query(query)?) {
+            Some(query) => format!("{prefix}{upstream_path}?{query}"),
+            None => format!("{prefix}{upstream_path}"),
+        },
+        None => format!("{prefix}{upstream_path}"),
     };
     Some(AgentCall { backend, target, version, told, ip, method, failure, html })
 }
@@ -2764,7 +2786,8 @@ pub async fn handle(w: Arc<Worker>, peer: SocketAddr, mut req: Request<Incoming>
                         path: wire.as_deref(),
                     };
                     let limit = n.route.and_then(DynamicRoute::timeout).unwrap_or(snap.upstream_timeout);
-                    if !n.shaping.request.is_empty() {
+                    // gRPC has a client of its own in the Python gateway, which sends every line on.
+                    if !grpc {
                         shape_request(&mut req, &n.shaping.request, rewritten, Some(&native));
                     }
                     let answer = match grpc {
@@ -3022,6 +3045,34 @@ async fn forward(
         Err(e) if e.is_connect() => Err(Unanswered::Refused),
         Err(_) => Err(Unanswered::Broken),
     }
+}
+
+/// Headers that describe the connection or the message's framing, not the request. Of one of
+/// these given more than once the Python gateway sends a backend one line; of any other, every
+/// line (`repeated_headers`).
+const ONE_LINE: [&str; 10] = ["host", "content-length", "connection", "keep-alive", "transfer-encoding", "upgrade", "te", "trailer", "proxy-authorization", "proxy-authenticate"];
+
+/// Whether a request gives more than once a header the Python gateway sends on one line of.
+fn framed_twice(headers: &HeaderMap) -> bool {
+    headers.len() != headers.keys_len() && ONE_LINE.iter().any(|name| headers.get_all(*name).iter().nth(1).is_some())
+}
+
+/// Take out of a request's headers every line but the first of each name given more than once,
+/// and say what they were. The Python gateway's rules read a request's headers from a dictionary
+/// of one value to a name, the first line's; the lines are kept beside it.
+fn take_repeated(headers: &mut HeaderMap) -> Vec<(HeaderName, Vec<HeaderValue>)> {
+    if headers.len() == headers.keys_len() {
+        return Vec::new();
+    }
+    let repeated: Vec<(HeaderName, Vec<HeaderValue>)> = headers
+        .keys()
+        .filter(|name| headers.get_all(*name).iter().nth(1).is_some())
+        .map(|name| (name.clone(), headers.get_all(name).iter().cloned().collect()))
+        .collect();
+    for (name, values) in &repeated {
+        headers.insert(name.clone(), values[0].clone());
+    }
+    repeated
 }
 
 /// The upstream agreed to change protocol: pass its answer on and, once the client has it, carry
@@ -4143,13 +4194,24 @@ mod tests {
         assert_eq!(shaped(&ask("GET", "/api/users?a=b%20c", &[])), "/api/users?a=b%20c 200 etag=|1, 2 set-cookie=|a=1, b=2 x-agent=|echo");
         assert_eq!(shaped(&ask("GET", "/api/nothing/1", &[])), "/api/nothing/1 200 etag=|1, 2 set-cookie=|a=1, b=2 x-agent=|echo");
         assert_eq!(shaped(&ask("GET", "/api/kept/1", &[])), "ask");
-        // A header the rules name given twice, and a query that is not plain words with a rule
-        // that changes queries: the Python gateway reads those its own way.
-        assert_eq!(shaped(&ask("GET", "/api/shaped/1", &[("x-old", "a"), ("x-old", "b")])), "ask");
-        assert_ne!(shaped(&ask("GET", "/api/shaped/1", &[("x-keep", "a"), ("x-keep", "b")])), "ask");
-        assert_eq!(shaped(&ask("GET", "/api/shaped/1?q=a%20b", &[])), "ask");
-        assert_eq!(shaped(&ask("GET", "/api/shaped/1?q=1&q=2", &[])), "ask");
-        assert_ne!(shaped(&ask("PUT", "/api/users?q=a%20b", &[])), "ask");
+        // Of a header given twice a rule reads the first line, and one no rule changed goes on
+        // with every line; a query is written again as the Python gateway writes it, a name
+        // given twice with every value unless a rule changed it.
+        let once = |req: &Request<()>| shaped(req).split(' ').filter(|part| part.starts_with('/') || part.starts_with("x-new") || part.starts_with("x-keep")).collect::<Vec<_>>().join(" ");
+        assert_eq!(once(&ask("GET", "/api/shaped/1", &[("x-old", "a"), ("x-old", "b")])), "/api/shaped/1?source=gw x-new=a|");
+        assert!(shaped(&ask("GET", "/api/shaped/1", &[("x-keep", "a"), ("x-keep", "b")])).contains(" x-keep=a, b| "));
+        assert!(shaped(&ask("GET", "/api/users", &[("x-keep", "a"), ("x-keep", "b")])).ends_with(" x-keep=a, b|"));
+        assert_eq!(shaped(&ask("GET", "/api/users", &[("te", "trailers"), ("te", "gzip")])), "ask");
+        assert_eq!(once(&ask("GET", "/api/shaped/1?q=a+b&debug=1", &[])), "/api/shaped/1?q=a%20b&source=gw");
+        assert_eq!(once(&ask("GET", "/api/shaped/1?q=1&q=2", &[])), "/api/shaped/1?q=1&q=2&source=gw");
+        // The rule sets `source`: set to another value it is the rule's, to the value held it is as it came.
+        assert_eq!(once(&ask("GET", "/api/shaped/1?page=1&page=2&source=gw&source=x", &[])), "/api/shaped/1?page=1&page=2&source=gw");
+        assert_eq!(once(&ask("GET", "/api/shaped/1?source=x&source=gw", &[])), "/api/shaped/1?source=x&source=gw");
+        assert_eq!(once(&ask("PUT", "/api/users?q=a+b&flag", &[])), "/api/users?q=a%20b&flag=");
+        assert_eq!(once(&ask("GET", "/api/users?", &[])), "/api/users");
+        // A query whose escapes are not text is read by the Python gateway alone.
+        assert_eq!(shaped(&ask("GET", "/api/users?q=%ff", &[])), "ask");
+        assert_eq!(shaped(&ask("GET", "/api/shaped/1?q=%ff", &[])), "ask");
         // An answer the Python gateway may stream is passed on there with no rule applied.
         assert!(shaped(&ask("GET", "/api/talk/1", &[])).contains("x-powered=|gateway"));
         let streamed = shaped(&ask("GET", "/api/talk/message:stream", &[]));
@@ -4277,7 +4339,7 @@ mod tests {
         let rule = |text: &str| serde_json::from_str::<Actions>(text).unwrap();
         let named = rule(r#"{"rename":[["x-request-id","X-Caller-Request"]],"remove":[],"set":[["X-Forwarded-For","203.0.113.5"],["x-protocol","theirs"],["Traceparent","nope"]]}"#);
         let mut headers = came();
-        assert!(shape_headers(&mut headers, &[&named], Some(&sent)));
+        assert!(shape_headers(&mut headers, &[&named], Some(&sent), &[]));
         assert_eq!(read(&headers, "x-forwarded-for"), ["198.51.100.7", "203.0.113.5"]);
         assert_eq!(read(&headers, "x-protocol"), ["theirs", "http"]);
         assert_eq!(read(&headers, "traceparent"), ["tp", "nope"]);
@@ -4286,16 +4348,16 @@ mod tests {
         assert!(read(&headers, "x-gateway-note").is_empty());
         let exact = rule(r#"{"remove":["x-forwarded-for","traceparent","x-request-id"],"set":[["X-Protocol","theirs"],["X-Request-ID","mine"]]}"#);
         let mut headers = came();
-        assert!(shape_headers(&mut headers, &[&exact], Some(&sent)));
+        assert!(shape_headers(&mut headers, &[&exact], Some(&sent), &[]));
         assert_eq!((read(&headers, "x-forwarded-for"), read(&headers, "traceparent")), (vec![String::new()], vec!["tp".to_owned()]));
         // The caller's own `x-protocol` stays; the rule's line is under the gateway's spelling and is written over.
         assert_eq!(read(&headers, "x-protocol"), ["mine", "http"]);
         assert_eq!(read(&headers, "x-request-id"), ["mine"]);
         // An answer's headers, and rules that change no header, are not the gateway's to write here.
         let mut headers = came();
-        assert!(!shape_headers(&mut headers, &[&named], None));
+        assert!(!shape_headers(&mut headers, &[&named], None, &[]));
         assert_eq!((read(&headers, "x-protocol"), read(&headers, "x-forwarded-for")), (vec!["theirs".to_owned()], vec!["198.51.100.7".to_owned(), "203.0.113.5".to_owned()]));
-        assert!(!shape_headers(&mut came(), &[&rule(r#"{"query_set":[["a","1"]]}"#)], Some(&sent)));
+        assert!(!shape_headers(&mut came(), &[&rule(r#"{"query_set":[["a","1"]]}"#)], Some(&sent), &[]));
     }
 
     #[test]
@@ -4357,9 +4419,12 @@ mod tests {
     #[test]
     fn an_agent_request_python_would_send_differently_is_left_to_python() {
         let snap = governed(AGENTS, "");
-        for uri in ["/agents/hiring/a?x=1&x=2", "/agents/hiring/a?q=a+b", "/agents/hiring/a?q=%7E", "/agents/hiring/a?flag", "/agents/hiring/a?=1",
-                    "/agents/hiring/a?a=1&&b=2", "/agents/hiring/v\u{662}/a"] {
+        for uri in ["/agents/hiring/a?q=%ff", "/agents/hiring/v\u{662}/a"] {
             assert!(to_agent(&snap, &request("GET", uri)).is_none(), "{uri}");
+        }
+        // A query is written again as the Python gateway writes the dictionary it read it into.
+        for (query, sent) in [("x=1&x=2", "?x=1&x=2"), ("q=a+b", "?q=a%20b"), ("q=%7E", "?q=~"), ("flag", "?flag="), ("=1", "?=1"), ("a=1&&b=2", "?a=1&b=2"), ("&", "")] {
+            assert_eq!(to_agent(&snap, &request("GET", &format!("/agents/hiring/a?{query}"))).as_deref(), Some(&*format!("10.0.0.10:8001/a{sent}")), "{query}");
         }
         // A path that names a version tells the agent that one, or none if it is not known.
         let told = |uri: &str| match decide(&snap, peer(), &request("GET", uri), 100, |_| false) {
@@ -4374,8 +4439,41 @@ mod tests {
             let req = Request::builder().uri("/agents/hiring/a").header(name, value).body(()).unwrap();
             assert!(to_agent(&snap, &req).is_none(), "{name}");
         }
+        // A header given twice is no reason, as the agent is sent every line; but for a header
+        // the Python gateway sends on one line of.
         let twice = Request::builder().uri("/agents/hiring/a").header("accept", "text/plain").header("accept", "application/json").body(()).unwrap();
-        assert!(to_agent(&snap, &twice).is_none());
+        assert!(to_agent(&snap, &twice).is_some());
+        let framed = Request::builder().uri("/agents/hiring/a").header("host", "a").header("host", "b").body(()).unwrap();
+        assert!(to_agent(&snap, &framed).is_none());
+    }
+
+    #[test]
+    fn a_header_given_twice_goes_on_whole_unless_a_rule_changed_it() {
+        let came = || {
+            let mut headers = HeaderMap::new();
+            for (name, value) in [("x-tag", "a"), ("x-other", "o"), ("x-tag", "b"), ("x-old", "1"), ("x-set", "s"), ("x-old", "2"), ("x-set", "t"),
+                                  ("x-same", "a"), ("x-same", "b"), ("x-gone", "1"), ("x-gone", "2"), ("traceparent", "t1"), ("traceparent", "t2")] {
+                headers.append(name, HeaderValue::from_static(value));
+            }
+            headers
+        };
+        let read = |headers: &HeaderMap| {
+            let mut names: Vec<&str> = headers.keys().map(|name| name.as_str()).collect();
+            names.sort_unstable();
+            names.iter().map(|name| format!("{name}={}", headers.get_all(*name).iter().map(|v| v.to_str().unwrap()).collect::<Vec<_>>().join(",")))
+                .collect::<Vec<_>>().join(" ")
+        };
+        let mut headers = came();
+        let repeated = take_repeated(&mut headers);
+        assert_eq!(read(&headers), "traceparent=t1 x-gone=1 x-old=1 x-other=o x-same=a x-set=s x-tag=a");
+        assert_eq!(repeated.len(), 6);
+        // Renamed, set, removed: what the rule left. Set to the first line's own value, or not
+        // named at all: every line. The gateway's own trace: its one line.
+        let rule: Actions = serde_json::from_str(r#"{"rename":[["X-Old","X-New"]],"set":[["x-set","z"],["x-same","a"]],"remove":["X-Gone"]}"#).unwrap();
+        let trace = Trace { request_id: "id".to_owned(), traceparent: "tp".to_owned() };
+        let sent = Sent { trace: &trace, version: None, inject_request_id: false, protocol: "http", path: None };
+        assert!(shape_headers(&mut headers, &[&rule], Some(&sent), &repeated));
+        assert_eq!(read(&headers), "traceparent=tp x-forwarded-for= x-new=1 x-other=o x-protocol=http x-same=a,b x-set=z x-tag=a,b");
         // With every path left to Python (a transformation rule exists, say), so is this one.
         assert!(to_agent(&governed(&format!(r#"{AGENTS},"fallthrough_prefixes":["/"]"#), ""), &request("GET", "/agents/hiring/a")).is_none());
     }
