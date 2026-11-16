@@ -1,5 +1,5 @@
 """Request routing logic."""
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List, Tuple, Union
 from urllib.parse import urlparse
 from app.config import get_settings
 from app.models import ProtocolType, RouteConfig
@@ -44,6 +44,60 @@ def _with_repeats(
         if key in out and out[key] == values[-1]:
             out[key] = list(values)
     return out
+
+
+# Headers that describe the connection or the message's framing, not the request. Of these the
+# backend is sent one line, as before, however many the caller gave.
+_ONE_LINE_HEADERS = frozenset({
+    "host", "content-length", "connection", "keep-alive", "transfer-encoding", "upgrade",
+    "te", "trailer", "proxy-authorization", "proxy-authenticate",
+})
+
+
+def repeated_headers(headers, held: int = 0) -> Dict[str, Tuple[str, List[str]]]:
+    """Every line of each header the caller gave more than once.
+
+    The proxy path carries a request's headers as a plain dict, which holds one
+    value a name, so of ``Accept-Language: en`` and ``Accept-Language: hi`` the
+    backend used to be sent one. The lines are kept here, beside the dict, and
+    put back before sending. ``held`` says which line's value the dict holds:
+    the first (``0``, ``dict(request.headers)``) or the last (``-1``, a dict
+    filled line by line).
+    """
+    pairs = getattr(headers, "items", None)
+    if pairs is None or isinstance(headers, dict):  # a plain dict holds one value a name already
+        return {}
+    seen: Dict[str, List[str]] = {}
+    for name, value in pairs():
+        seen.setdefault(name.lower(), []).append(value)
+    return {
+        name: (values[held], values)
+        for name, values in seen.items()
+        if len(values) > 1 and name not in _ONE_LINE_HEADERS
+    }
+
+
+def _with_repeated_lines(
+    headers: Dict[str, str], repeated: Optional[Dict[str, Tuple[str, List[str]]]]
+) -> Union[Dict[str, str], List[Tuple[str, str]]]:
+    """Put back every line of each header nothing changed on the way.
+
+    A header a rule or plugin set, changed or removed keeps what that left, and
+    so does one the gateway writes itself. With nothing to put back the dict is
+    returned as it is.
+    """
+    if not repeated:
+        return headers
+    lines: List[Tuple[str, str]] = []
+    put_back = False
+    for name, value in headers.items():
+        kept = repeated.get(name)
+        if kept is not None and kept[0] == value:
+            lines.extend((name, line) for line in kept[1])
+            put_back = True
+        else:
+            lines.append((name, value))
+    return lines if put_back else headers
 
 
 class Router:
@@ -237,7 +291,8 @@ class Router:
         body: Optional[Any] = None,
         route_config: Optional[RouteConfig] = None,
         repeated: Optional[Dict[str, List[str]]] = None,
-    ) -> Tuple[str, Dict[str, str], Dict[str, Any], Optional[bytes], Optional[Any], str, ProtocolType, int]:
+        repeated_lines: Optional[Dict[str, Tuple[str, List[str]]]] = None,
+    ) -> Tuple[str, Union[Dict[str, str], List[Tuple[str, str]]], Dict[str, Any], Optional[bytes], Optional[Any], str, ProtocolType, int]:
         if route_config:
             backend_url = route_config.backend_url
             protocol = route_config.protocol
@@ -313,7 +368,8 @@ class Router:
             else:
                 json_payload = transformed_body
 
-        return url, filtered_headers, transformed_query_params, content, json_payload, backend_url, protocol, timeout
+        sent_headers = _with_repeated_lines(filtered_headers, repeated_lines)
+        return url, sent_headers, transformed_query_params, content, json_payload, backend_url, protocol, timeout
 
     async def route_request(
         self,
@@ -324,11 +380,12 @@ class Router:
         body: Optional[Any] = None,
         route_config: Optional[RouteConfig] = None,
         repeated: Optional[Dict[str, List[str]]] = None,
+        repeated_lines: Optional[Dict[str, Tuple[str, List[str]]]] = None,
     ) -> httpx.Response:
         """Route request to appropriate backend."""
         url, filtered_headers, transformed_query_params, content, json_payload, backend_url, protocol, timeout = (
             self._prepare_upstream_parts(
-                method, path, headers, query_params, body, route_config, repeated
+                method, path, headers, query_params, body, route_config, repeated, repeated_lines
             )
         )
         if not self._check_circuit_breaker(backend_url):
@@ -375,11 +432,12 @@ class Router:
         body: Optional[Any] = None,
         route_config: Optional[RouteConfig] = None,
         repeated: Optional[Dict[str, List[str]]] = None,
+        repeated_lines: Optional[Dict[str, Tuple[str, List[str]]]] = None,
     ) -> httpx.Response:
         """Open a streaming HTTP response; caller must ``await resp.aclose()`` when done."""
         url, filtered_headers, transformed_query_params, content, json_payload, backend_url, protocol, _timeout = (
             self._prepare_upstream_parts(
-                method, path, headers, query_params, body, route_config, repeated
+                method, path, headers, query_params, body, route_config, repeated, repeated_lines
             )
         )
         if not self._check_circuit_breaker(backend_url):

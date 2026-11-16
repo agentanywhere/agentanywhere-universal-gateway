@@ -57,6 +57,12 @@ See [docs/known-limitations.md](docs/known-limitations.md) for the full list.
   the backend with every value. Only the last value was sent on before. A
   transformation rule or plugin that sets, changes or removes such a key
   still decides what is sent for it.
+- Proxy: a header a caller gives on more than one line (two `Accept-Language`
+  lines, say) now reaches the backend with every line. Only one was sent on
+  before: the first, or the last on the way to an agent. A transformation rule
+  or plugin still sees one value and, if it sets, changes or removes the
+  header, decides what is sent for it. `Host`, `Content-Length` and the
+  hop-by-hop headers are sent on one line, as before.
 - Database migrations: the Alembic migrations `001` and `002` were replaced by
   one baseline, `0001`, that creates the full current schema. It is safe to
   run on a database the gateway already created at startup, works on SQLite

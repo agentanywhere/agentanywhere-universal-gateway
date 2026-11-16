@@ -34,7 +34,7 @@ from app.exceptions import (
     NotFoundError, InternalServerError
 )
 from app.middleware import AuthMiddleware, RateLimiter
-from app.routing import Router, repeated_query
+from app.routing import Router, repeated_headers, repeated_query
 from app.logging_config import (
     setup_logging,
     bind_request_context,
@@ -2152,6 +2152,7 @@ async def _proxy_agent_route(request: Request, agent_route, request_id: str) -> 
         body=body,
         route_config=route_config,
         repeated=repeated_query(request.query_params),
+        repeated_lines=repeated_headers(request.headers, held=-1),
     )
     resp_headers = {
         k: v for k, v in upstream.headers.items()
@@ -2421,6 +2422,7 @@ async def gateway_proxy(request: Request, path: str):
                 body=body,
                 route_config=dynamic_route,
                 repeated=repeated_query(request.query_params),
+                repeated_lines=repeated_headers(request.headers),
             )
             resp_headers = {
                 k: v
@@ -2452,6 +2454,7 @@ async def gateway_proxy(request: Request, path: str):
             body=body,
             route_config=dynamic_route,
             repeated=repeated_query(request.query_params),
+            repeated_lines=repeated_headers(request.headers),
         )
         
         # Create response

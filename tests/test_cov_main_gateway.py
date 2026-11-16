@@ -633,3 +633,105 @@ def test_repeated_query_lists_only_keys_given_more_than_once():
     assert _with_repeats({"b": "2"}, repeated) == {"b": "2"}
     assert _with_repeats({"b": "2"}, None) == {"b": "2"}
     assert repeated_query({"a": "1"}) == {}
+
+
+# ------------------------------------------------- repeated header lines
+@pytest.fixture
+def lines(monkeypatch):
+    """The real router with a fake backend; yields the header lines of each request sent."""
+    from app.transformers import transformation_manager
+
+    seen = []
+
+    def answer(request):
+        seen.append([(name.decode().lower(), value.decode()) for name, value in request.headers.raw])
+        return httpx.Response(200, json={"ok": True})
+
+    monkeypatch.setattr(
+        main.router, "client", httpx.AsyncClient(transport=httpx.MockTransport(answer))
+    )
+    monkeypatch.setattr(transformation_manager, "rules_by_id", {})
+    return seen
+
+
+def _of(sent_lines, name):
+    return [value for line, value in sent_lines if line == name]
+
+
+def _get(client, path, headers):
+    """A GET with its header lines as given. (The test client itself joins the lines of a
+    repeated header into one before the app sees them.)"""
+    async def ask():
+        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as direct:
+            return await direct.get(path, headers=headers)
+
+    return client.portal.call(ask)
+
+
+def test_a_header_given_on_two_lines_reaches_the_backend_whole(gwdb, lines, H):
+    given = [*H.items(), ("X-Tag", "a"), ("X-Other", "o"), ("x-tag", "b"), ("X-TAG", "c")]
+    assert _get(gwdb, "/mcp/t", given).status_code == 200
+    assert _of(lines[0], "x-tag") == ["a", "b", "c"]
+    assert _of(lines[0], "x-other") == ["o"]
+
+
+def test_a_header_given_once_is_sent_as_before(gwdb, lines, H):
+    _get(gwdb, "/mcp/t", [*H.items(), ("X-Tag", "a, b")])
+    assert _of(lines[0], "x-tag") == ["a, b"]
+
+
+def test_the_same_value_on_two_lines_keeps_both(gwdb, lines, H):
+    _get(gwdb, "/mcp/t", [*H.items(), ("X-Tag", "a"), ("X-Tag", "a")])
+    assert _of(lines[0], "x-tag") == ["a", "a"]
+
+
+def test_a_rule_that_changes_a_repeated_header_wins(gwdb, lines, H):
+    from app.transformers import TransformationRule, transformation_manager
+
+    rule = TransformationRule.from_dict({
+        "name": "headers", "path_pattern": "**",
+        "request_config": {
+            "headers_set": {"x-set": "z"}, "headers_remove": ["X-Drop"],
+            "headers_rename": {"X-Old": "X-New"},
+        },
+    })
+    transformation_manager.rules_by_id[rule.id] = rule
+    given = [*H.items(), *[(name, value) for name in ("X-Set", "X-Drop", "X-Old", "X-Keep") for value in ("1", "2")]]
+    _get(gwdb, "/mcp/t", given)
+    assert _of(lines[0], "x-set") == ["z"]
+    assert _of(lines[0], "x-drop") == []
+    assert _of(lines[0], "x-old") == []
+    assert _of(lines[0], "x-new") == ["1"]  # a rule sees one value: the first line's
+    assert _of(lines[0], "x-keep") == ["1", "2"]
+
+
+def test_the_gateways_own_headers_are_written_once(gwdb, lines, H):
+    trace = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+    given = [*H.items(), ("traceparent", trace), ("traceparent", trace), ("X-Gateway-Note", "a"), ("X-Gateway-Note", "b")]
+    _get(gwdb, "/mcp/t", given)
+    assert len(_of(lines[0], "traceparent")) == 1
+    assert _of(lines[0], "x-gateway-note") == []
+
+
+def test_a_header_about_the_connection_stays_on_one_line(gwdb, lines, H):
+    _get(gwdb, "/mcp/t", [*H.items(), ("TE", "trailers"), ("TE", "gzip")])
+    assert _of(lines[0], "te") == ["trailers"]
+
+
+def test_repeated_headers_lists_only_names_given_more_than_once():
+    from starlette.datastructures import Headers
+    from app.routing import _with_repeated_lines, repeated_headers
+
+    came = Headers(raw=[(b"x-tag", b"a"), (b"x-other", b"o"), (b"x-tag", b"b"), (b"host", b"one"), (b"host", b"two")])
+    first, last = repeated_headers(came), repeated_headers(came, held=-1)
+    assert first == {"x-tag": ("a", ["a", "b"])}
+    assert last == {"x-tag": ("b", ["a", "b"])}
+    assert _with_repeated_lines({"x-tag": "a", "x-other": "o"}, first) == [("x-tag", "a"), ("x-tag", "b"), ("x-other", "o")]
+    assert _with_repeated_lines({"x-tag": "b"}, last) == [("x-tag", "a"), ("x-tag", "b")]
+    # Changed, renamed in another case, or gone: what is there is what is sent.
+    assert _with_repeated_lines({"x-tag": "z"}, first) == {"x-tag": "z"}
+    assert _with_repeated_lines({"X-Tag": "a"}, first) == {"X-Tag": "a"}
+    assert _with_repeated_lines({"x-other": "o"}, first) == {"x-other": "o"}
+    assert _with_repeated_lines({"x-other": "o"}, None) == {"x-other": "o"}
+    assert repeated_headers({"x-tag": "a"}) == {}
