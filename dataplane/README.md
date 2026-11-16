@@ -423,7 +423,9 @@ leaves what it matches to the Python gateway; so does every such route when the 
 `http://` or `https://` upstream and the request would reach it exactly as the Python gateway sends it. As there, no gateway key is
 asked for and no limit, IP rule or policy applies: the agent authenticates its own callers. The agent is sent the path
 after the slug, the caller's headers (`Host`, `Authorization` and `Cookie` included) and the gateway's additions, and
-its answer is streamed back as it comes. The Python gateway is handed the request when:
+its answer is streamed back as it comes. An escaped path is read decoded, slug included, and the agent is asked for it
+as the Python gateway's HTTP client writes a path, as on the way to any backend (so `%2F` reaches it as `/`). The
+Python gateway is handed the request when:
 
 * the slug is not registered (the 404 is Python's);
 * the caller asks for a WebSocket;
@@ -486,7 +488,7 @@ here is the reverse of everywhere else: **whatever this side cannot be sure of i
 | Any other path (`/users`, `/rest/...`, `/http/...`, `/`) with `HTTP_BACKEND_URL` set | data plane, to `--backend` |
 | The same without `HTTP_BACKEND_URL` (Python sends them to the MCP backend) | Python |
 | A percent-escaped path, or one with `.` or `..` segments, on any of the above | data plane, read and written as Python does |
-| A path that decodes to a control character, `?`, `#` or bytes that are not UTF-8; an escaped path under `/agents/` | Python |
+| A path that decodes to a control character, `?`, `#` or bytes that are not UTF-8 | Python |
 | `POST` of JSON to the bridge under `/grpc`, read here exactly as Python reads it | data plane |
 | Anything else under `/grpc` that is not a gRPC call | Python |
 | A path that matches a dynamic route to an `http://`, `https://`, `ws://` or `wss://` backend | data plane, to the route's backend |

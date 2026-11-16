@@ -1018,7 +1018,7 @@ def main() -> int:
                       "" if ok else f"[{b.status_code}] served-by={b.headers.get('x-served-by')} {b.text[:160]}")
             for name, path in [("an escaped ?", "/api/a%3Fb"), ("an escaped #", "/api/a%23b"), ("a control character", "/api/a%0Ab"),
                                ("bytes that are not UTF-8", "/api/%FF%FE"), ("one of the gateway's own paths, escaped", "/%61dmin/api-keys"),
-                               ("an agent, escaped", "/agents/echo/a%20b")]:
+                               ("an agent, escaped to a ?", "/agents/echo/a%3Fb")]:
                 a, b = both("GET", path, None)
                 check(f"Escaped path: {name}: left to Python, same status", b.headers.get("x-served-by") != "dataplane" and a.status_code == b.status_code,
                       f"[{a.status_code}/{b.status_code}] served-by={b.headers.get('x-served-by')}")
@@ -1441,6 +1441,13 @@ def main() -> int:
             agent_same("a query that Python rewrites", "GET", "/agents/echo/a?q=a+b&r=%7E")
             agent_same("a header given twice", "GET", "/agents/echo/a", [("Accept", "text/plain"), ("Accept", "application/json")])
             agent_same("a query whose escapes are not text", "GET", "/agents/echo/a?q=%ff", by="python")
+            # An escaped path is read decoded and written again, as on the way to any backend.
+            for what, path, asked in (("a space", "/agents/echo/a%20b", "/a%20b"), ("in the slug", "/agents/ech%6F/x", "/x"),
+                                      ("a slash", "/agents/echo/a%2Fb", "/a/b"), ("beyond ASCII", "/agents/echo/caf%C3%A9?q=1", "/caf%C3%A9"),
+                                      ("a percent sign", "/agents/echo/a%25b", "/a%25b"), ("an escape of an escape", "/agents/echo/a%2541", "/a%41"),
+                                      ("what need not be escaped", "/agents/echo/%7Ea", "/~a"), ("under a base path", "/agents/based/a%20b", "/base/a%20b")):
+                agent_same(f"an escaped path: {what}", "GET", path, want=lambda r, asked=asked: r.json()["path"] == asked)
+            agent_same("an escaped slug that is not registered", "GET", "/agents/nobod%79/a", by="python", sees=False)
 
             # A path that names an API version is that version's, whatever the headers hint, and
             # the caller is still told the version its headers (or the default) give.

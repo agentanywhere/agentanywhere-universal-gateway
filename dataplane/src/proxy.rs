@@ -1740,14 +1740,14 @@ fn query_survives(query: &str) -> bool {
 /// unknown slug, a browser, and anything unusual about the request are the Python gateway's.
 fn agent_call<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, after: &str) -> Option<AgentCall<'a>> {
     let (uri, headers) = (req.uri(), req.headers());
-    // An escaped path under the agent edge is forwarded by other code there: the Python gateway's.
-    if uri.path().contains('%') {
-        return None;
-    }
+    // `after` is the path as the Python gateway reads it, its escapes decoded: the slug, the
+    // rules and the version are all read from that, and the agent is asked for it written
+    // again as that gateway's HTTP client writes a path (`sent_path`).
     let (slug, rest) = after.split_once('/').unwrap_or((after, ""));
     let backend = snap.agents.get(slug)?;
     let failure = snap.agent_failure.as_ref()?;
-    if snap.fallthrough_prefixes.iter().any(|p| uri.path().starts_with(p.as_str())) {
+    let whole = format!("/agents/{after}");
+    if snap.fallthrough_prefixes.iter().any(|p| whole.starts_with(p.as_str())) {
         return None;
     }
     // A browser is forwarded for like anyone else; only a failure is answered differently.
@@ -1768,22 +1768,25 @@ fn agent_call<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, aft
         found => found.map(|(v, _)| v),
     };
     let upstream_path = format!("/{rest}");
-    if snap.transformed(method, &upstream_path, uri.path()) {
+    if snap.transformed(method, &upstream_path, &whole) {
         return None;
     }
     let (told, stripped) = told_version(snap, &upstream_path, version)?;
     let upstream_path = stripped.unwrap_or(&upstream_path);
     let ip = govern::client_ip(peer, headers, &snap.trusted_proxies)?;
-    let prefix = &backend.upstream.prefix;
+    let asked = format!("{}{upstream_path}", backend.upstream.prefix);
+    let asked = if plain_path(&asked) { asked } else { sent_path(&asked) };
     // The query is read into a dictionary and written again, as on the way to any backend.
     let target = match uri.query() {
-        Some(query) if query_survives(query) => format!("{prefix}{upstream_path}?{query}"),
+        Some(query) if query_survives(query) => format!("{asked}?{query}"),
         Some(query) => match write_query(&read_query(query)?) {
-            Some(query) => format!("{prefix}{upstream_path}?{query}"),
-            None => format!("{prefix}{upstream_path}"),
+            Some(query) => format!("{asked}?{query}"),
+            None => asked,
         },
-        None => format!("{prefix}{upstream_path}"),
+        None => asked,
     };
+    // What is asked for must be something this side's HTTP client will send.
+    target.parse::<hyper::http::uri::PathAndQuery>().ok()?;
     Some(AgentCall { backend, target, version, told, announced: snap.api_versions.announced(told), ip, method, failure, html })
 }
 
@@ -4570,7 +4573,18 @@ mod tests {
             assert!(to_agent(&snap, &request(method, "/agents/hiring/a")).is_some(), "{method}");
         }
         // An agent this side does not know or cannot reach, and no agent at all.
-        for uri in ["/agents/nobody/a", "/agents/secure/a", "/agents/", "/agents", "/agents/hiring%2Fa", "/api/agents/hiring/a"] {
+        for uri in ["/agents/nobody/a", "/agents/secure/a", "/agents/", "/agents", "/api/agents/hiring/a", "/agents/nobod%79/a"] {
+            assert!(sent(uri).is_none(), "{uri}");
+        }
+        // An escaped path is read decoded, slug and all, and the agent is asked for it as the
+        // Python gateway's HTTP client writes a path.
+        for (uri, asked) in [("/agents/hiring/a%20b", "/a%20b"), ("/agents/hirin%67/a", "/a"), ("/agents/hiring%2Fa", "/a"), ("/agents/hiring/a%2Fb", "/a/b"),
+                             ("/agents/hiring/caf%C3%A9", "/caf%C3%A9"), ("/agents/hiring/a%25b", "/a%25b"), ("/agents/hiring/a%2541", "/a%41"),
+                             ("/agents/hiring/%7Ea%22", "/~a%22"), ("/agents/hiring/a/%2E%2E/b", "/b"), ("/agents/based/x%2F..%2Fy?q=a+b", "/base/y?q=a%20b")] {
+            assert_eq!(sent(uri).as_deref(), Some(&*format!("10.0.0.1{}:8001{asked}", if uri.contains("based") { 1 } else { 0 })), "{uri}");
+        }
+        // One that decodes to what the two sides might not read alike is the Python gateway's.
+        for uri in ["/agents/hiring/a%3Fb", "/agents/hiring/a%0Ab", "/agents/hiring/%FF"] {
             assert!(sent(uri).is_none(), "{uri}");
         }
         assert!(to_agent(&governed("", ""), &request("GET", "/agents/hiring/a")).is_none());
