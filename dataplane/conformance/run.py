@@ -1704,11 +1704,27 @@ def main() -> int:
                 from_page(f"{whose}: a preflight for several headers", origin, "OPTIONS", "/graphql",
                           pre(**{"Access-Control-Request-Headers": "Content-Type , X-API-Key,authorization"}))
                 from_page(f"{whose}: a preflight for one of the gateway's own paths", origin, "OPTIONS", "/admin/api-keys", pre("GET"), by="python")
-                from_page(f"{whose}: OPTIONS that is not a preflight", origin, "OPTIONS", "/api/users", by="python")
+                from_page(f"{whose}: OPTIONS that is not a preflight", origin, "OPTIONS", "/api/users",
+                          wants=lambda h: h.get("access-control-allow-methods") == "GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD"
+                          and h.get("access-control-allow-headers") == "*" and h.get("access-control-allow-origin") == (origin if listed else "*"))
+                from_page(f"{whose}: OPTIONS with a cookie", origin, "OPTIONS", "/mcp", {"Cookie": "s=1"})
+                a, b = (httpx.options(f"{base}/api/users", timeout=10, headers={"Origin": origin, "X-Request-ID": "opt-1"}) for base in (py, rs))
+                compare(f"from a web page ({whose}: the whole answer to OPTIONS)", a, b)
+                check(f"from a web page ({whose}: that answer is empty, with nothing said of its kind)",
+                      a.content == b.content == b"" and "content-type" not in a.headers and "content-type" not in b.headers
+                      and a.headers.get("content-length") == b.headers.get("content-length"), f"{a.headers.get('content-length')} and {b.headers.get('content-length')}")
                 a, b = (httpx.options(f"{base}/api/users", timeout=10, headers={"Origin": origin, **pre(), "X-Request-ID": "pre-1"}) for base in (py, rs))
                 compare(f"from a web page ({whose}: the whole preflight answer)", a, b)
             a, b = (httpx.get(f"{base}/api/users", timeout=10, headers=[("Origin", "http://localhost:3001"), ("Origin", "http://elsewhere.example"),
                                                                          ("X-API-Key", k)]) for base, k in ((py, keys["py"]["key"]), (rs, keys["rs"]["key"])))
+            for name, headers in (("OPTIONS from no page at all", {}), ("OPTIONS that names a method but no origin", {"Access-Control-Request-Method": "POST"}),
+                                  ("OPTIONS with a key", {"X-API-Key": keys["rs"]["key"]})):
+                a, b = (httpx.options(f"{base}/api/routed/plainly/1", timeout=10, headers=headers) for base in (py, rs))
+                check(f"from a web page: {name}", said_by(b) == "data plane" and a.status_code == b.status_code == 200 and page_headers(a) == page_headers(b),
+                      f"[{a.status_code} and {b.status_code}] by the {said_by(b)}: {page_headers(a)} and {page_headers(b)}")
+            a, b = (httpx.options(f"{base}/api/users", timeout=10, headers=[("Origin", "http://localhost:3001"), ("Origin", "http://elsewhere.example")]) for base in (py, rs))
+            check("from a web page: OPTIONS with an origin given twice is Python's to answer",
+                  said_by(b) == "python" and a.status_code == b.status_code and page_headers(a) == page_headers(b), f"[{b.status_code}] {page_headers(b)}")
             check("from a web page: an origin given twice is Python's to answer",
                   said_by(b) == "python" and a.status_code == b.status_code and page_headers(a) == page_headers(b), f"[{b.status_code}] {page_headers(b)}")
 

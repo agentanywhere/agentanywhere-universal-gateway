@@ -790,6 +790,21 @@ struct Preflighted<'a> {
     ip: IpAddr,
 }
 
+/// An `OPTIONS` request that is not a preflight, which the Python gateway's proxy handler
+/// answers before anything else is looked at: 200, nothing in the body, and three headers that
+/// say any origin may ask anything.
+struct Unasked<'a> {
+    version: Option<&'a str>,
+    ip: IpAddr,
+}
+
+/// The headers of the answer to an `OPTIONS` request that is not a preflight.
+const OPTIONS_ANSWER: [(&str, &str); 3] = [
+    ("access-control-allow-origin", "*"),
+    ("access-control-allow-methods", "GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD"),
+    ("access-control-allow-headers", "*"),
+];
+
 /// Answer a preflight (an `OPTIONS` request with `Origin` and `Access-Control-Request-Method`)
 /// as Starlette's `CORSMiddleware.preflight_response` does: whether it is allowed, the headers
 /// and the text. `None` for anything else, or for one this side cannot be sure of reading the
@@ -876,6 +891,7 @@ enum Decision<'a> {
     Refuse(Unauthenticated<'a>),
     /// A preflight from a web page in another origin, answered here.
     Preflight(Preflighted<'a>),
+    Options(Unasked<'a>),
     /// The Python gateway answers, which is always right: it is the answer whenever this side
     /// cannot be sure of deciding the same. With a digest: the request carries one credential this
     /// side does not know, and if the Python gateway refuses it, that is worth remembering.
@@ -971,13 +987,21 @@ fn decide<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, now: u6
         found => found.map(|(v, _)| v),
     };
     let Some(ip) = govern::client_ip(peer, req.headers(), &snap.trusted_proxies) else { return PYTHON };
-    // A preflight carries no credential and is answered before any is looked for. Any other
-    // `OPTIONS` request is the Python gateway's.
+    // An `OPTIONS` request carries no credential and is answered before any is looked for. A
+    // preflight is one from another origin that names the method it asks about; the Python
+    // gateway's CORS middleware answers it. Any other reaches its proxy handler, which answers
+    // every one alike.
     if method == "OPTIONS" {
-        return match snap.cross_origin.as_ref().and_then(|rules| preflight(rules, req.headers())) {
-            Some((allowed, headers, body)) => Decision::Preflight(Preflighted { allowed, headers, body, version, ip }),
-            None => PYTHON,
-        };
+        let headers = req.headers();
+        if headers.contains_key(ORIGIN) && headers.contains_key("access-control-request-method") {
+            return match snap.cross_origin.as_ref().and_then(|rules| preflight(rules, headers)) {
+                Some((allowed, headers, body)) => Decision::Preflight(Preflighted { allowed, headers, body, version, ip }),
+                None => PYTHON,
+            };
+        }
+        // What a page in another origin is told goes onto the answer; where this side cannot
+        // say (an `Origin` given twice), the Python gateway answers.
+        return if cross_origin(snap, headers).is_ok() { Decision::Options(Unasked { version, ip }) } else { PYTHON };
     }
     // Publishing is a POST to a broker the Python gateway is connected to; anything else on that
     // path is its to answer.
@@ -2632,6 +2656,19 @@ pub async fn handle(w: Arc<Worker>, peer: SocketAddr, mut req: Request<Incoming>
             let a = Answered { method: "OPTIONS", ip: p.ip, version: p.version, rejected: false, error: None };
             return Ok(finish(&w, resp, &a, &req, &t, started, at));
         }
+        Decision::Options(o) => {
+            let t = trace_for(req.headers());
+            let mut resp = Response::new(full(Bytes::new()));
+            for (name, value) in OPTIONS_ANSWER {
+                resp.headers_mut().insert(name, HeaderValue::from_static(value));
+            }
+            // The CORS middleware writes what it grants this origin over the handler's own.
+            if let Some(granted) = &granted {
+                granted.onto(&mut resp);
+            }
+            let a = Answered { method: "OPTIONS", ip: o.ip, version: o.version, rejected: false, error: None };
+            return Ok(finish(&w, resp, &a, &req, &t, started, at));
+        }
         Decision::Ask(credential) => {
             let (resp, refused) = ask_control(&w, peer, req.map(Either::Left)).await;
             if let Some(digest) = credential.filter(|_| refused && resp.status() == StatusCode::UNAUTHORIZED) {
@@ -3651,6 +3688,31 @@ mod tests {
     }
 
     #[test]
+    fn an_options_request_that_is_no_preflight_is_answered_here_without_a_key() {
+        let snap = governed(r#","cross_origin":{"any_origin":false,"origins":["https://app.example"],"credentials":true}"#, "");
+        let asks = |headers: &[(&str, &str)]| {
+            let mut req = Request::builder().method("OPTIONS").uri("/api/users");
+            for (name, value) in headers {
+                req = req.header(*name, *value);
+            }
+            outcome(&snap, &req.body(()).unwrap(), 0, false)
+        };
+        // With or without a key, from a page or not: the proxy handler answers before it looks.
+        assert_eq!(asks(&[]), "options");
+        assert_eq!(asks(&[("x-api-key", "sk-nope")]), "options");
+        assert_eq!(asks(&[("origin", "https://app.example")]), "options");
+        assert_eq!(asks(&[("access-control-request-method", "POST")]), "options");
+        // A preflight is the CORS middleware's, and an origin given twice the Python gateway's.
+        assert!(!matches!(asks(&[("origin", "https://app.example"), ("access-control-request-method", "POST")]).as_str(), "options"));
+        assert_eq!(asks(&[("origin", "https://app.example"), ("origin", "https://other.example")]), "ask");
+        // The gateway's own paths, and agents, are not this answer's.
+        for uri in ["/admin/api-keys", "/agents/hiring/a", "/metrics"] {
+            let req = Request::builder().method("OPTIONS").uri(uri).body(()).unwrap();
+            assert_eq!(outcome(&snap, &req, 0, false), "ask", "{uri}");
+        }
+    }
+
+    #[test]
     fn what_this_side_cannot_be_sure_of_goes_to_python() {
         let snap = governed("", "");
         for (method, uri) in [
@@ -3660,7 +3722,6 @@ mod tests {
             ("GET", "/api/%C3%28"),
             ("GET", "/%61dmin/api-keys"),
             ("GET", "/api/caf\u{e9}"),
-            ("OPTIONS", "/api/users"),
             ("PROPFIND", "/api/users"),
             ("GET", "http://other.example/api/users"),
             ("GET", "/admin/api-keys"),
@@ -3785,6 +3846,7 @@ mod tests {
             Decision::Ask(Some(_)) => "learn".into(),
             Decision::Refuse(u) => u.wording.message_json.clone(),
             Decision::Preflight(p) => format!("preflight: {}", p.body),
+            Decision::Options(_) => "options".into(),
         }
     }
 
@@ -3918,7 +3980,7 @@ mod tests {
         // Without the wording (a plugin may authenticate some other way), the Python gateway answers.
         assert_eq!(outcome(&governed("", ""), &with_headers(&[]), 0, false), "ask");
         // What the Python gateway does not treat as a gateway request is not refused here either.
-        for (method, uri) in [("GET", "/health"), ("GET", "/admin/api-keys"), ("OPTIONS", "/api/users"), ("GET", "/agents/a"), ("GET", "/api/a%3Fb"), ("GET", "/api/a%0Ab"), ("GET", "/api/%FF")] {
+        for (method, uri) in [("GET", "/health"), ("GET", "/admin/api-keys"), ("OPTIONS", "/admin/api-keys"), ("GET", "/agents/a"), ("GET", "/api/a%3Fb"), ("GET", "/api/a%0Ab"), ("GET", "/api/%FF")] {
             let req = Request::builder().method(method).uri(uri).body(()).unwrap();
             assert_eq!(outcome(&snap, &req, 0, false), "ask", "{method} {uri}");
         }

@@ -127,7 +127,7 @@ with no backend of its own; the key is in the snapshot, active, unexpired and `n
 gateway checks the body, the body has a `Content-Length`, fits in memory (4 MiB, or the MCP limit if lower) and is
 certain to pass. On those same paths, a request with no credential, or with one the Python gateway has just refused,
 is answered here with the gateway's 401. Anything else, including credentials seen for the first time,
-an `OPTIONS` request that is not a preflight, `/metrics`, `/admin`, `/oauth2`
+`/metrics`, `/admin`, `/oauth2`
 and MQTT other than publishing, goes to the Python gateway untouched, so its answer is the answer.
 
 **HTTP/2.** A client that opens its connection with the HTTP/2 preface (no TLS; `curl --http2-prior-knowledge`, a
@@ -384,6 +384,10 @@ in the Python gateway, these go on answers from a backend (and the 502 or 503 st
 endpoints and agents; the gateway's own 401, 403 and 429 carry none. A preflight (an `OPTIONS` request with `Origin` and
 `Access-Control-Request-Method`) to a path this side serves is answered here, from the middleware's own set-up as the
 snapshot describes it; `conformance/preflight.py` compares the answers with the middleware's over generated set-ups.
+Any other `OPTIONS` request to such a path is answered here too, as the Python gateway's proxy handler answers every
+one before it looks for a key: 200, an empty body, and three headers that say any origin may ask anything
+(`Access-Control-Allow-Origin: *`, the seven methods, `Access-Control-Allow-Headers: *`), with what the middleware
+grants the caller's origin written over them.
 
 **Backends behind TLS.** An `https://` backend (a protocol's, a dynamic route's, an agent's, or `--backend`) is spoken
 to over TLS, HTTP/1.1, and its certificate is verified as the Python gateway's HTTP client verifies it: against the
@@ -497,7 +501,8 @@ here is the reverse of everywhere else: **whatever this side cannot be sure of i
 | The health path, `/ready` and `/live`, on a plain `GET` | data plane |
 | A request with an `Origin` header | data plane, with the gateway's cross-origin headers |
 | A preflight to a path served here | data plane |
-| Any other `OPTIONS` request, a preflight header given twice, an `Origin` given twice | Python |
+| Any other `OPTIONS` request to a path this side serves | here |
+| A preflight header given twice, an `Origin` given twice, `OPTIONS` to an agent or to one of the gateway's own paths | Python |
 | `/health/detailed`, `/metrics`, `/oauth2`, `/admin` and the console | Python |
 
 ## Known gaps (why this is not production-ready)
