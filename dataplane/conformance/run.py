@@ -1059,12 +1059,23 @@ def main() -> int:
                       same_details and b.headers.get("x-served-by") != "dataplane",
                       f"[{a.status_code}/{b.status_code}] served-by={b.headers.get('x-served-by')}")
 
-            # A body sent without a length cannot be read ahead: Python checks it, and the answer is the same.
-            chunks = lambda: iter([json.dumps(rpc("tools/list")).encode()])
-            a = httpx.post(f"{py}/mcp", headers={**J, "X-API-Key": keys["py"]["key"]}, content=chunks(), timeout=15)
-            b = httpx.post(f"{rs}/mcp", headers={**J, "X-API-Key": keys["rs"]["key"]}, content=chunks(), timeout=15)
-            compare("MCP body sent in chunks", a, b)
-            check("a body without a length is left to Python", b.status_code == 200 and b.headers.get("x-served-by") != "dataplane")
+            # A body sent without a length is read until it ends, and checked like any other. One
+            # that fails the check, or is too long to hold here, goes to Python whole.
+            def in_pieces(name, payload, by, status, pieces=3):
+                raw = json.dumps(payload).encode() if not isinstance(payload, bytes) else payload
+                step = max(1, len(raw) // pieces)
+                chunks = lambda: iter([raw[i:i + step] for i in range(0, len(raw), step)])
+                a = httpx.post(f"{py}/mcp", headers={**J, "X-API-Key": keys["py"]["key"]}, content=chunks(), timeout=30)
+                b = httpx.post(f"{rs}/mcp", headers={**J, "X-API-Key": keys["rs"]["key"]}, content=chunks(), timeout=30)
+                compare(f"MCP body sent in pieces: {name}", a, b)
+                check(f"MCP body sent in pieces: {name}: answered by the {by}", a.status_code == b.status_code and status in (None, b.status_code)
+                      and (b.headers.get("x-served-by") == "dataplane") == (by == "data plane"),
+                      f"[{a.status_code}/{b.status_code}] served-by={b.headers.get('x-served-by')}")
+
+            in_pieces("one that passes the check", rpc("tools/list"), "data plane", 200)
+            in_pieces("one that fails it is refused in Python's words", {"jsonrpc": "1.0", "method": "tools/list", "id": 1}, "python", 400)
+            in_pieces("one that is not JSON", b"{not json", "python", 400)
+            in_pieces("one too long to hold here reaches Python whole", {**rpc("tools/list"), "padding": "x" * (5 * 1024 * 1024)}, "python", None, pieces=40)
 
             # Event streams are passed through as they arrive.
             def stream(base, key, method, path, body):
@@ -1376,8 +1387,10 @@ def main() -> int:
                 return seen
 
             def agent_same(name, method, path, headers=None, content=None, by="data plane", sees=True, want=None):
-                a = httpx.request(method, py + path, headers=headers, content=content, timeout=15)
-                b = httpx.request(method, rs + path, headers=headers, content=content, timeout=15)
+                # A body given as a function is made anew for each side (one sent in pieces).
+                body = lambda: content() if callable(content) else content
+                a = httpx.request(method, py + path, headers=headers, content=body(), timeout=15)
+                b = httpx.request(method, rs + path, headers=headers, content=body(), timeout=15)
                 bad = []
                 if a.status_code != b.status_code:
                     bad.append(f"status {a.status_code} vs {b.status_code}")
@@ -1408,6 +1421,10 @@ def main() -> int:
                        want=lambda r: r.json()["path"] == "/a/b" and r.json()["query"] == "x=1&y=two")
             agent_same("a body", "POST", "/agents/echo/run", {"Content-Type": "application/json"}, b'{"a": 1}', want=lambda r: r.json()["body_bytes"] == 8)
             agent_same("a POST without a body", "POST", "/agents/echo/run")
+            agent_same("a body sent in pieces reaches the agent whole, with its length", "POST", "/agents/echo/run", {"Content-Type": "application/json"},
+                       lambda: iter([b'{"a":', b" 1", b"}"]), want=lambda r: r.json()["body_bytes"] == 8 and "transfer-encoding" not in [k.lower() for k, _ in r.json()["headers"]])
+            agent_same("one in pieces too long to hold here is Python's to forward", "POST", "/agents/echo/run", {"Content-Type": "text/plain"},
+                       lambda: iter([b"x" * 65536] * 20), by="python", want=lambda r: r.json()["body_bytes"] == 20 * 65536)
             for method in ("PUT", "PATCH", "DELETE"):
                 agent_same(f"{method} with a body", method, "/agents/echo/items/7", {"Content-Type": "text/plain"}, b"x" * 5000)
             agent_same("DELETE without a body", "DELETE", "/agents/echo/items/7")
@@ -1922,8 +1939,10 @@ def main() -> int:
                                ("that is nearly an object", b'{"a": 1,}')):
                 exchange_same(f"a body {name} is Python's to read", "POST", "/api/routed/bodies/1", by="python", headers=json_type, content=body,
                               sees={"x-shaped": "yes"})
-            exchange_same("a body of no stated length is Python's to read", "POST", "/api/routed/bodies/1", by="python", headers=json_type,
-                          pieces=[b'{"user":', b'"ana"}'], sees={"x-shaped": "yes"})
+            exchange_same("a body of no stated length is read whole and changed like any other", "POST", "/api/routed/bodies/1", headers=json_type,
+                          pieces=[b'{"user":', b'"ana"}'], sees={"x-shaped": "yes", "transfer-encoding": None})
+            exchange_same("one too long to hold here is Python's to change", "POST", "/api/routed/bodies/1", by="python", headers=json_type,
+                          pieces=[b'{"user":"ana","fill":"'] + [b"x" * 65536] * 20 + [b'"}'], sees={"x-shaped": "yes"})
             exchange_same("a path the rules do not cover keeps its body", "POST", "/api/routed/other/1", headers=json_type, content=came, arrives=came)
             remove_rules(made)
             assert rules_reached("/api/routed/bodies/1", "data plane", False), "removing the rules never reached the data plane"

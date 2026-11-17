@@ -43,7 +43,86 @@ use crate::sync::Link;
 /// A body is either streamed from the other side or held here whole; neither is boxed. Responses
 /// are streamed from upstream or made here; requests are streamed from the client, or read whole
 /// when the gateway looks inside them.
-pub type Body = Either<Incoming, Either<Full<Bytes>, crate::bridge::Lines>>;
+pub type Body = Either<Incoming, Either<Full<Bytes>, Either<crate::bridge::Lines, Resumed>>>;
+
+/// A request's body that was read part of the way here and is then handed on: what was read,
+/// then the rest as it comes. A body of no stated length is read to see whether it is short
+/// enough to look inside; one that is not goes to the Python gateway whole all the same.
+pub struct Resumed {
+    read: std::collections::VecDeque<Bytes>,
+    rest: Incoming,
+}
+
+impl hyper::body::Body for Resumed {
+    type Data = Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, hyper::Error>>> {
+        let this = self.get_mut();
+        match this.read.pop_front() {
+            Some(piece) => std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(piece)))),
+            None => std::pin::Pin::new(&mut this.rest).poll_frame(cx),
+        }
+    }
+}
+
+/// What came of reading a request's body to hold it here.
+enum Held {
+    /// The whole body, and the request it came with. Where the body came without its length,
+    /// the request now states it, as the Python gateway states it to a backend.
+    Whole(hyper::http::request::Parts, Bytes),
+    /// Longer than may be held here (or of no stated length and empty, which the Python
+    /// gateway's HTTP client frames in its own way): the request, whole, for the Python gateway.
+    Over(Request<Body>),
+    Unreadable,
+}
+
+/// Read a request's body whole if it is no longer than `max`. A body of no stated length is
+/// read until it ends or passes `max`; nothing read is lost either way.
+async fn hold(req: Request<Body>, max: u64) -> Held {
+    let stated = req.body().size_hint().exact();
+    if stated.is_some_and(|len| len > max) {
+        return Held::Over(req);
+    }
+    let (mut parts, body) = req.into_parts();
+    let mut incoming = match (stated, body) {
+        (None, Either::Left(incoming)) => incoming,
+        (None, other) => return Held::Over(Request::from_parts(parts, other)),
+        (Some(_), body) => {
+            return match body.collect().await {
+                Ok(read) => Held::Whole(parts, read.to_bytes()),
+                Err(_) => Held::Unreadable,
+            }
+        }
+    };
+    let (mut read, mut length) = (std::collections::VecDeque::new(), 0u64);
+    let ended = loop {
+        match incoming.frame().await {
+            None => break true,
+            Some(Err(_)) => return Held::Unreadable,
+            // What follows a body (trailers) is not passed on by the Python gateway either.
+            Some(Ok(frame)) => {
+                if let Ok(piece) = frame.into_data() {
+                    length += piece.len() as u64;
+                    read.push_back(piece);
+                    if length > max {
+                        break false;
+                    }
+                }
+            }
+        }
+    };
+    if !ended || length == 0 {
+        return Held::Over(Request::from_parts(parts, Either::Right(Either::Right(Either::Right(Resumed { read, rest: incoming })))));
+    }
+    let mut whole = Vec::with_capacity(length as usize);
+    for piece in read {
+        whole.extend_from_slice(&piece);
+    }
+    // The caller's `Transfer-Encoding` is taken off with the other hop-by-hop headers on the way.
+    parts.headers.insert(CONTENT_LENGTH, HeaderValue::from(whole.len()));
+    Held::Whole(parts, Bytes::from(whole))
+}
 
 /// The protocols served natively. Each has its own backend; which one a path belongs to is
 /// decided as the Python gateway's router decides it.
@@ -1831,17 +1910,17 @@ async fn serve_agent(
     at: Duration,
 ) -> Response<Body> {
     let has_body = matches!(a.method, "POST" | "PUT" | "PATCH" | "DELETE");
-    let fits = match req.body().size_hint().exact() {
-        Some(0) => true,
-        Some(len) => has_body && len <= AGENT_BODY_MAX,
-        None => false,
-    };
+    // The Python gateway reads a body for these methods only; any other request is forwarded
+    // without one, so one that brings a body all the same is its to forward.
+    let fits = has_body || req.body().size_hint().exact() == Some(0);
     let to = &a.backend.upstream;
     let uri = Uri::builder().scheme(to.scheme.clone()).authority(to.authority.clone()).path_and_query(a.target.as_str()).build();
     let (true, Ok(uri)) = (fits, uri) else { return to_control(w, peer, req.map(Either::Left)).await };
-    let (parts, body) = req.into_parts();
-    let Ok(read) = body.collect().await else { return body_unreadable() };
-    let bytes = read.to_bytes();
+    let (parts, bytes) = match hold(req.map(Either::Left), AGENT_BODY_MAX).await {
+        Held::Whole(parts, bytes) => (parts, bytes),
+        Held::Over(req) => return to_control(w, peer, req).await,
+        Held::Unreadable => return body_unreadable(),
+    };
     let t = trace_for(&parts.headers);
 
     let mut out = Request::new(full(bytes.clone()));
@@ -2700,21 +2779,18 @@ pub async fn handle(w: Arc<Worker>, peer: SocketAddr, mut req: Request<Incoming>
     // counted. A body that is certain to pass goes on; anything else is the Python gateway's to
     // answer, in its own words, so the request is handed over whole.
     let grpc = n.protocol == Protocol::Grpc;
-    if refused.is_none() && !grpc && snap.boundary.reads_body(n.method, path) {
-        match req.body().size_hint().exact() {
-            Some(0) => {}
-            Some(len) if len <= snap.boundary.max_body(n.method, path) => {
-                let (parts, body) = req.into_parts();
-                let Ok(read) = body.collect().await else { return Ok(body_unreadable()) };
-                let bytes = read.to_bytes();
+    if refused.is_none() && !grpc && snap.boundary.reads_body(n.method, path) && req.body().size_hint().exact() != Some(0) {
+        match hold(req, snap.boundary.max_body(n.method, path)).await {
+            Held::Whole(parts, bytes) => {
                 let verdict = snap.boundary.check(n.method, path, &bytes);
                 req = Request::from_parts(parts, full(bytes));
                 if verdict == Verdict::AskPython {
                     return Ok(to_control(&w, peer, req).await);
                 }
             }
-            // No length given, or too long to hold here.
-            _ => return Ok(to_control(&w, peer, req).await),
+            // Too long to hold here.
+            Held::Over(req) => return Ok(to_control(&w, peer, req).await),
+            Held::Unreadable => return Ok(body_unreadable()),
         }
     }
 
@@ -2729,24 +2805,19 @@ pub async fn handle(w: Arc<Worker>, peer: SocketAddr, mut req: Request<Incoming>
     // body is long or of no stated length, the request is handed over as it came. The Python
     // gateway reads a body for these methods only.
     let mut rewritten = false;
-    if refused.is_none() && matches!(n.method, "POST" | "PUT" | "PATCH") && n.shaping.request.iter().any(|a| a.changes_body()) {
-        match req.body().size_hint().exact() {
-            Some(0) => {}
-            Some(len) if len <= RULE_BODY_MAX => {
-                let (mut parts, body) = req.into_parts();
-                let Ok(read) = body.collect().await else { return Ok(body_unreadable()) };
-                let bytes = read.to_bytes();
-                match reshape(&bytes, &n.shaping.request) {
-                    Ok(None) => req = Request::from_parts(parts, full(bytes)),
-                    Ok(Some(body)) => {
-                        parts.headers.insert(CONTENT_LENGTH, HeaderValue::from(body.len()));
-                        rewritten = true;
-                        req = Request::from_parts(parts, full(body));
-                    }
-                    Err(()) => return Ok(to_control(&w, peer, Request::from_parts(parts, full(bytes))).await),
+    if refused.is_none() && matches!(n.method, "POST" | "PUT" | "PATCH") && n.shaping.request.iter().any(|a| a.changes_body()) && req.body().size_hint().exact() != Some(0) {
+        match hold(req, RULE_BODY_MAX).await {
+            Held::Whole(mut parts, bytes) => match reshape(&bytes, &n.shaping.request) {
+                Ok(None) => req = Request::from_parts(parts, full(bytes)),
+                Ok(Some(body)) => {
+                    parts.headers.insert(CONTENT_LENGTH, HeaderValue::from(body.len()));
+                    rewritten = true;
+                    req = Request::from_parts(parts, full(body));
                 }
-            }
-            _ => return Ok(to_control(&w, peer, req).await),
+                Err(()) => return Ok(to_control(&w, peer, Request::from_parts(parts, full(bytes))).await),
+            },
+            Held::Over(req) => return Ok(to_control(&w, peer, req).await),
+            Held::Unreadable => return Ok(body_unreadable()),
         }
     }
 
@@ -2756,18 +2827,19 @@ pub async fn handle(w: Arc<Worker>, peer: SocketAddr, mut req: Request<Incoming>
     let (mut publish, mut subscribe) = (None, None);
     if refused.is_none() && n.protocol == Protocol::Mqtt {
         let ready = snap.mqtt.as_ref().is_some_and(|broker| st.mqtt.serves(broker));
-        match req.body().size_hint().exact() {
-            Some(len) if ready && len <= PUBLISH_BODY_MAX => {
-                let (parts, body) = req.into_parts();
-                let Ok(read) = body.collect().await else { return Ok(body_unreadable()) };
-                let bytes = read.to_bytes();
+        if !ready {
+            return Ok(to_control(&w, peer, req).await);
+        }
+        match hold(req, PUBLISH_BODY_MAX).await {
+            Held::Whole(parts, bytes) => {
                 match path == SUBSCRIBE {
                     true => subscribe = pyjson::subscribe(&bytes),
                     false => publish = pyjson::publish(&bytes),
                 }
                 req = Request::from_parts(parts, full(bytes));
             }
-            _ => {}
+            Held::Over(req) => return Ok(to_control(&w, peer, req).await),
+            Held::Unreadable => return Ok(body_unreadable()),
         }
         if publish.is_none() && subscribe.is_none() {
             return Ok(to_control(&w, peer, req).await);
@@ -2778,14 +2850,14 @@ pub async fn handle(w: Arc<Worker>, peer: SocketAddr, mut req: Request<Incoming>
     // gateway would do for it is certain, the request is handed over as it came.
     let mut bridged = None;
     if refused.is_none() && n.protocol == Protocol::Bridge {
-        if let (Some(bridge), Some(len)) = (snap.bridge.as_ref(), req.body().size_hint().exact()) {
-            if len <= PUBLISH_BODY_MAX {
-                let (parts, body) = req.into_parts();
-                let Ok(read) = body.collect().await else { return Ok(body_unreadable()) };
-                let bytes = read.to_bytes();
+        let Some(bridge) = snap.bridge.as_ref() else { return Ok(to_control(&w, peer, req).await) };
+        match hold(req, PUBLISH_BODY_MAX).await {
+            Held::Whole(parts, bytes) => {
                 bridged = bridge::plan(&bytes, bridge).map(|plan| (plan, bridge));
                 req = Request::from_parts(parts, full(bytes));
             }
+            Held::Over(req) => return Ok(to_control(&w, peer, req).await),
+            Held::Unreadable => return Ok(body_unreadable()),
         }
         if bridged.is_none() {
             return Ok(to_control(&w, peer, req).await);
@@ -2842,7 +2914,7 @@ pub async fn handle(w: Arc<Worker>, peer: SocketAddr, mut req: Request<Incoming>
                         bridge::Plan::Hellos(name) => match sent("SayManyHellos", &name, bridge::STREAM_SECONDS) {
                             // Answered at once, as the Python gateway answers: the lines follow as the call yields them.
                             Some(sent) => {
-                                let mut resp = Response::new(Either::Right(Either::Right(bridge::Lines::new(sent))));
+                                let mut resp = Response::new(Either::Right(Either::Right(Either::Left(bridge::Lines::new(sent)))));
                                 resp.headers_mut().insert(CONTENT_TYPE, bridge::ndjson());
                                 (resp, None)
                             }

@@ -124,8 +124,9 @@ A request is served natively only when **all** of these hold: the link is fresh;
 MCP, A2A, AG-UI, ACP or GraphQL and that protocol has an `http://` or `https://` backend configured; no `fallthrough_prefixes` entry matches;
 `X-API-Version` or `Accept-Version` resolves to an active version
 with no backend of its own; the key is in the snapshot, active, unexpired and `native_ok`; and, where the
-gateway checks the body, the body has a `Content-Length`, fits in memory (4 MiB, or the MCP limit if lower) and is
-certain to pass. On those same paths, a request with no credential, or with one the Python gateway has just refused,
+gateway checks the body, the body fits in memory (4 MiB, or the MCP limit if lower) and is
+certain to pass. A body sent without a `Content-Length` is read until it ends or passes that size; one that passes it
+goes to the Python gateway whole, what was read first and then the rest. On those same paths, a request with no credential, or with one the Python gateway has just refused,
 is answered here with the gateway's 401. Anything else, including credentials seen for the first time,
 `/metrics`, `/admin`, `/oauth2`
 and MQTT other than publishing, goes to the Python gateway untouched, so its answer is the answer.
@@ -302,8 +303,8 @@ outside ASCII escaped, numbers as Python prints them, a member named twice kept 
 and, if the caller did not say what it is, as `application/json`. Any other body (a list, text, nothing) goes on as
 it came. A request is handed to the Python gateway whole when this side is not certain what Python would make of its
 body: one that opens as an object and then is not JSON, is nested more than 64 levels deep or holds `NaN`, a number
-too large to hold or one of the few whose digits the two sides might choose differently; one over 1 MiB; one sent
-without a `Content-Length`. A rule that sets a value which is not plain JSON is the Python gateway's to apply.
+too large to hold or one of the few whose digits the two sides might choose differently; one over 1 MiB, with a
+stated length or without. A rule that sets a value which is not plain JSON is the Python gateway's to apply.
 
 A path rewrite is done here in two forms. Without an expression: its pattern is plain text (letters, digits, `/`,
 `_`, `~`, an escaped `.` or `-`), with `^` in front to replace it at the start of the path only and otherwise wherever
@@ -431,7 +432,7 @@ Python gateway is handed the request when:
 * the caller asks for a WebSocket;
 * the query has an escape that is not text, a header about the connection is given twice (see "Given more than once"
   below), or the path after the slug names an API version that is removed or has a backend of its own;
-* the body has no `Content-Length` or is over 1 MiB;
+* the body is over 1 MiB, or came without a `Content-Length` and is empty;
 * the agent cannot be reached. Nothing was sent, so Python tries, answers in its own way and counts the failure in
   its circuit breaker. This side keeps no breaker for agents.
 
@@ -536,7 +537,7 @@ here is the reverse of everywhere else: **whatever this side cannot be sure of i
 * **Some MCP traffic is still judged by Python.** A string that contains one of four letters Python's
   case-insensitive matching treats as `i`, `s` or `k` (U+0130, U+0131, U+017F, U+212A), a method name that is not ASCII
   while a method list is configured, a `tools/call` whose arguments are not certain to fit the tool's JSON Schema, any MCP body when custom injection
-  patterns are configured, and any checked body sent without a `Content-Length`: all correct, none fast.
+  patterns are configured, and any checked body too long to hold here: all correct, none fast.
 * **The four protocols have not been benchmarked.** Reading and parsing a body to check it costs time the plain HTTP
   path does not spend; how much has not been measured.
 * **Runtime changes held only in a Python worker's memory are not visible to the snapshot:** transformation rules,
@@ -546,6 +547,10 @@ here is the reverse of everywhere else: **whatever this side cannot be sure of i
   shows every error but only a capped number of successes at high rates. Each key's `last_used_at` is kept current.
 * **Usage is reported at least once.** If the control plane applies a report and the acknowledgement is lost, that
   interval's tenant usage and counts are sent again and counted twice. The error is on the strict side for quotas.
+* **A body sent without a length, where nothing here looks inside it, is passed on as it comes.** The backend is
+  sent it in chunks, with `Transfer-Encoding: chunked`. The Python gateway holds every body whole and sends it with a
+  `Content-Length`. Where this side reads the body (a checked path, a rule that changes it, an agent, publishing, the
+  bridge), it sends the length too.
 * **AI anomaly scoring does not see native requests**, so they never carry `X-Anomaly-Detected` or `X-Anomaly-Score`.
 * **A rate-limit webhook stands for a batch, not one request.** A native 429 fires the same webhook and alert, but
   once per key and window in each report, with a `count` of the requests refused, where Python fires one per request.
