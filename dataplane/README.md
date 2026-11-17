@@ -122,8 +122,7 @@ Its format is the same as what the control plane serves; see `src/snapshot.rs`.
 A request is served natively only when **all** of these hold: the link is fresh; the path is `/api/...`, has no protocol's prefix and is not one the Python gateway answers itself
 (with `HTTP_BACKEND_URL` set there), or belongs to
 MCP, A2A, AG-UI, ACP or GraphQL and that protocol has an `http://` or `https://` backend configured; no `fallthrough_prefixes` entry matches;
-`X-API-Version` or `Accept-Version` resolves to an active version
-with no backend of its own; the key is in the snapshot, active, unexpired and `native_ok`; and, where the
+`X-API-Version` or `Accept-Version` resolves to a version this side was told it may serve; the key is in the snapshot, active, unexpired and `native_ok`; and, where the
 gateway checks the body, the body fits in memory (4 MiB, or the MCP limit if lower) and is
 certain to pass. A body sent without a `Content-Length` is read until it ends or passes that size; one that passes it
 goes to the Python gateway whole, what was read first and then the rest. On those same paths, a request with no credential, or with one the Python gateway has just refused,
@@ -344,10 +343,15 @@ A version on its way out is announced here as the Python gateway announces it. T
 `Warning` when the version is deprecated, `Sunset` when it has a date to go, each beside whatever the caller sent
 under that name. The caller is told on every answer under the version, the gateway's own refusals included: those
 two and `Deprecation: true`, over whatever the backend said. The snapshot carries the texts, so they are the Python
-gateway's own. A version that is removed, is within a minute of its sunset or past it, has a sunset date with a UTC
-offset (which only the Python gateway compares), or has a backend of its own, keeps its requests with the Python
-gateway, which refuses or routes them; so does a path whose first segment has a digit from another script, which
-Python's expression counts as a digit.
+gateway's own.
+
+A version that is gone (removed, or more than a minute past its sunset) is refused here as the Python gateway's
+proxy handler refuses it: a 410 in its words, once the key, the limits and the body have been checked and counted,
+and with no `X-API-Version` on any answer under it. A version with a backend of its own sends its requests there,
+unless a dynamic route decides; the backend is followed like a route's, with a circuit breaker of its own. Kept with
+the Python gateway: a version within a minute of its sunset on either side, one whose sunset date has a UTC offset
+(which only the Python gateway compares), one with a backend this side cannot reach, a gone version on the way to
+an agent, and a path whose first segment has a digit from another script, which Python's expression counts as a digit.
 
 An answer's body is read only for a rule that changes its fields; without one it is the backend's, byte for byte.
 Such a rule is applied here to an answer that states a length of 1 MiB or less, is not compressed and is UTF-8. As
@@ -431,7 +435,7 @@ Python gateway is handed the request when:
 * the slug is not registered (the 404 is Python's);
 * the caller asks for a WebSocket;
 * the query has an escape that is not text, a header about the connection is given twice (see "Given more than once"
-  below), or the path after the slug names an API version that is removed or has a backend of its own;
+  below), or the path after the slug names an API version that is gone;
 * the body is over 1 MiB, or came without a `Content-Length` and is empty;
 * the agent cannot be reached. Nothing was sent, so Python tries, answers in its own way and counts the failure in
   its circuit breaker. This side keeps no breaker for agents.

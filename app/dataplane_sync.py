@@ -85,38 +85,57 @@ def _epoch(value: Optional[datetime]) -> Optional[int]:
 SUNSET_MARGIN_SECONDS = 60
 
 
-def _version(v) -> Dict[str, Any]:
+def _version(v, settings=None) -> Dict[str, Any]:
     """One API version as the data plane is told of it: whether a request under it may be served
-    there, and what the gateway then announces with it (to the backend and to the caller)."""
+    there, what the gateway announces with it (to the backend and to the caller), what it says of
+    it once it is gone, and where its requests go when it has a backend of its own."""
     from datetime import timedelta
 
     from app.time_utils import utcnow
     from app.versioning import VersionStatus
 
-    # A version that is gone is refused, and one with a backend of its own is routed, by the
-    # Python gateway.
-    native = v.status != VersionStatus.REMOVED and not v.backend_url
-    if native and v.status == VersionStatus.SUNSET and v.sunset_date is not None:
+    told: Dict[str, Any] = {"version": v.version, "native_ok": True}
+    # A version that is gone is refused in the proxy handler's own words, which do not change.
+    # Around the moment of a sunset, this gateway alone says which side of it a request falls.
+    gone = "has been removed" if v.status == VersionStatus.REMOVED else None
+    if gone is None and v.status == VersionStatus.SUNSET and v.sunset_date is not None:
+        margin = timedelta(seconds=SUNSET_MARGIN_SECONDS)
         try:
-            native = utcnow() + timedelta(seconds=SUNSET_MARGIN_SECONDS) < v.sunset_date
+            if utcnow() - margin >= v.sunset_date:
+                gone = "is no longer available"
+            elif utcnow() + margin >= v.sunset_date:
+                told["native_ok"] = False
         except TypeError:  # a date with an offset: the Python gateway's to compare
-            native = False
+            told["native_ok"] = False
+    if gone is not None:
+        # What is said of it goes into JSON as it is, so only a plain version is said here.
+        if not _QUERY_WORD.fullmatch(v.version):
+            return {"version": v.version, "native_ok": False}
+        return {**told, "gone": f"API version {v.version} {gone}"}
     warning, sunset = v.get_warning_header(), v.get_sunset_header()
     if any(text is not None and not _HEADER_VALUE.fullmatch(text) for text in (warning, sunset)):
-        native = False
-    told: Dict[str, Any] = {"version": v.version, "native_ok": native}
-    if native and (warning or sunset or v.deprecated_date is not None):
+        told["native_ok"] = False
+    # A backend of its own is followed like a dynamic route's, where the data plane can reach it.
+    if v.backend_url and told["native_ok"]:
+        backend = v.backend_url.rstrip("/")
+        httpx_client = getattr(settings, "upstream_client", "httpx") == "httpx"
+        never_sent = _never_sent(settings, backend)
+        if _AGENT_UPSTREAM.fullmatch(backend) is not None or (httpx_client and _ROUTE_WEBSOCKET.fullmatch(backend) is not None) or never_sent:
+            told.update(backend=backend, never_sent=bool(never_sent))
+        else:
+            told["native_ok"] = False
+    if told["native_ok"] and (warning or sunset or v.deprecated_date is not None):
         told["notices"] = {"warning": warning, "sunset": sunset, "deprecation": v.deprecated_date is not None}
     return told
 
 
-def _versions() -> Dict[str, Any]:
+def _versions(settings=None) -> Dict[str, Any]:
     from app.versioning import version_manager
 
     return {
         "default": version_manager.default_version,
         "strip_prefix": bool(version_manager.strip_prefix_on_proxy),
-        "versions": [_version(v) for v in version_manager.versions.values()],
+        "versions": [_version(v, settings) for v in version_manager.versions.values()],
     }
 
 
@@ -1208,7 +1227,7 @@ async def build_snapshot(db: AsyncSession) -> Dict[str, Any]:
             "timeout_seconds": int(settings.circuit_breaker_timeout),
         },
         "upstream_timeout_seconds": float(settings.default_timeout),
-        "api_versions": _versions(),
+        "api_versions": _versions(settings),
         "backends": _backends(settings),
         "own_paths": None if all_paths_via_python else _own_paths(settings),
         "boundary": _boundary(settings),

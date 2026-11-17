@@ -340,6 +340,13 @@ impl Backends {
             route.backend = route.backend_url.as_deref().filter(|_| route.timeout().is_some()).and_then(|u| self.of_route(u, route.never_sent));
         }
         snap.agents = snap.agent_urls.iter().filter_map(|(slug, url)| Some((slug.clone(), self.at(url)?))).collect();
+        // A version with a backend this side cannot reach keeps its requests with Python.
+        for (version, (url, never_sent)) in snap.api_versions.backend_urls.clone() {
+            match self.of_route(&url, never_sent) {
+                Some(backend) => drop(snap.api_versions.backends.insert(version, backend)),
+                None => drop(snap.api_versions.native_ok.insert(version, false)),
+            }
+        }
     }
 }
 
@@ -1196,6 +1203,10 @@ fn decide<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, now: u6
     if let Some(stripped) = stripped.map(str::to_owned) {
         rewritten = Some(stripped);
     }
+    // A version with a backend of its own sends its requests there, unless a route decides
+    // (publishing, the bridge and gRPC have handlers of their own, which no version comes into).
+    let own = told.filter(|_| route.is_none() && !(publishing || bridging || protocol == Protocol::Grpc));
+    let backend = own.and_then(|v| snap.api_versions.backends.get(v)).map(|b| &**b).or(backend);
     let asked = rewritten.as_deref().unwrap_or(asked);
     // What the backend is asked for must be something this side's HTTP client will send.
     if !plain_path(asked) && sent_path(asked).parse::<hyper::http::uri::PathAndQuery>().is_err() {
@@ -1851,6 +1862,10 @@ fn agent_call<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, aft
         return None;
     }
     let (told, stripped) = told_version(snap, &upstream_path, version)?;
+    // A version that is gone is refused by other code on the way to an agent: the Python gateway's.
+    if told.is_some_and(|v| snap.api_versions.gone.contains_key(v)) {
+        return None;
+    }
     let upstream_path = stripped.unwrap_or(&upstream_path);
     let ip = govern::client_ip(peer, headers, &snap.trusted_proxies)?;
     let asked = format!("{}{upstream_path}", backend.upstream.prefix);
@@ -2495,6 +2510,22 @@ fn circuit_open(t: &Trace) -> Response<Body> {
     )
 }
 
+/// The gateway's answer to a request under a version that is gone: 410, in the proxy handler's
+/// own words.
+fn version_gone(version: &str, said: &str, t: &Trace, at: Duration) -> Response<Body> {
+    let body = format!(
+        "{{\"error\":\"API_VERSION_UNAVAILABLE\",\"message\":{},\"version\":{},\"request_id\":{},\"timestamp\":\"{}\"}}",
+        json(said),
+        json(version),
+        json(&t.request_id),
+        timestamp(at, false)
+    );
+    let mut resp = Response::new(full(body));
+    *resp.status_mut() = StatusCode::GONE;
+    resp.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    resp
+}
+
 /// The control plane itself could not be reached; there is no gateway behind us to shape the answer.
 fn control_unreachable() -> Response<Body> {
     let t = Trace { request_id: uuid::Uuid::new_v4().to_string(), traceparent: String::new() };
@@ -2566,7 +2597,8 @@ fn finish<B>(w: &Worker, mut resp: Response<Body>, a: &Answered, req: &Request<B
     let seconds = started.elapsed().as_secs_f64();
     let bytes_out = resp.body().size_hint().exact().unwrap_or(0);
     let (_, snap) = w.snapshot();
-    stamp(&mut resp, t, seconds, a.version, snap.api_versions.announced(a.version));
+    let shown = snap.api_versions.shown(a.version);
+    stamp(&mut resp, t, seconds, shown, snap.api_versions.announced(shown));
     let user_agent = req.headers().get(USER_AGENT).and_then(|v| v.to_str().ok());
     if let Some(reporter) = &st.reporter {
         let served = Served {
@@ -2921,6 +2953,10 @@ pub async fn handle(w: Arc<Worker>, peer: SocketAddr, mut req: Request<Incoming>
                             None => (backend_unavailable(&t), Some("BACKEND_ERROR")),
                         },
                     }
+                } else if let Some((version, said)) = n.told.and_then(|v| snap.api_versions.gone.get_key_value(v)) {
+                    // Refused where the Python gateway refuses it: when it comes to sending the
+                    // request on, with everything before that done and counted.
+                    (version_gone(version, said, &t, at), None)
                 } else if !backend.breaker.allow(&cb, Instant::now()) {
                     (circuit_open(&t), Some("SERVICE_UNAVAILABLE"))
                 } else {
@@ -2997,7 +3033,8 @@ pub async fn handle(w: Arc<Worker>, peer: SocketAddr, mut req: Request<Incoming>
         .and_then(|v| v.parse().ok())
         .or_else(|| resp.body().size_hint().exact())
         .unwrap_or(0);
-    stamp(&mut resp, &t, seconds, n.version, snap.api_versions.announced(n.version));
+    let shown = snap.api_versions.shown(n.version);
+    stamp(&mut resp, &t, seconds, shown, snap.api_versions.announced(shown));
     if let Some(v) = tenant.and_then(|tn| tn.header.clone()) {
         resp.headers_mut().insert("x-tenant-id", v);
     }
@@ -3608,6 +3645,39 @@ mod tests {
         resp.headers_mut().append("warning", HeaderValue::from_static("the backend's"));
         stamp(&mut resp, &trace, 0.001, Some("8"), versions.announced(Some("8")));
         assert_eq!((read(resp.headers(), "warning"), read(resp.headers(), "deprecation")), (vec!["the backend's".to_owned()], vec!["true".to_owned()]));
+    }
+
+    #[test]
+    fn a_version_that_is_gone_or_has_a_backend_of_its_own_is_served_here() {
+        let versions = r#","api_versions":{"default":"1","versions":[{"version":"1"},
+            {"version":"6","gone":"API version 6 has been removed"},
+            {"version":"5","backend":"http://10.9.9.9:8080/base","never_sent":false},
+            {"version":"4","backend":"mqtt://10.9.9.9:1883","never_sent":true},
+            {"version":"3","native_ok":false,"gone":"x","backend":"http://10.9.9.9"}]},
+            "dynamic_routes":[{"path":"/api/routed/","wildcard":true,"backend":"http://10.0.9.1:9000","protocol":"http","timeout_seconds":30,"rewrite":null}]"#;
+        let snap = governed(versions, "");
+        let under = |version: &str, uri: &str| {
+            let req = Request::builder().uri(uri).header("x-api-key", KEY).header("x-api-version", version).body(()).unwrap();
+            route(&snap, peer(), &req, 0).map(|n| (n.version, n.told, n.backend.map(|b| (b.upstream.authority.to_string(), b.never_sent))))
+        };
+        // Gone: still this side's to answer, told to nobody.
+        assert_eq!(under("6", "/api/users"), Some((Some("6"), Some("6"), None)));
+        assert_eq!(snap.api_versions.shown(Some("6")), None);
+        assert_eq!(snap.api_versions.shown(Some("1")), Some("1"));
+        let trace = Trace { request_id: "r\"1".to_owned(), traceparent: "tp".to_owned() };
+        let said = version_gone("6", &snap.api_versions.gone["6"], &trace, Duration::new(1_700_000_000, 0));
+        assert_eq!(said.status(), StatusCode::GONE);
+        assert_eq!(
+            made_here(said.into_body()).as_deref(),
+            Some(&br#"{"error":"API_VERSION_UNAVAILABLE","message":"API version 6 has been removed","version":"6","request_id":"r\"1","timestamp":"2023-11-14T22:13:20"}"#[..])
+        );
+        // A backend of its own, unless a route decides; one never sent to is still its backend.
+        assert_eq!(under("5", "/api/users"), Some((Some("5"), Some("5"), Some(("10.9.9.9:8080".to_owned(), false)))));
+        assert_eq!(under("5", "/api/routed/x").and_then(|n| n.2), Some(("10.0.9.1:9000".to_owned(), false)));
+        assert_eq!(under("4", "/api/users").and_then(|n| n.2).map(|b| b.1), Some(true));
+        assert_eq!(under("1", "/api/users").map(|n| n.2), Some(None));
+        // One the control plane keeps is still its own.
+        assert_eq!(under("3", "/api/users"), None);
     }
 
     #[test]

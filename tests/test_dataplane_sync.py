@@ -356,18 +356,34 @@ async def test_the_snapshot_says_what_a_version_announces(db_session):
         # A deprecation date alone is announced to the caller alone.
         v.status, v.sunset_date = VersionStatus.ACTIVE, None
         assert (await told())["notices"] == {"warning": None, "sunset": None, "deprecation": True}
-        # Within a minute of the sunset, and after it, the version is this side's.
-        v.status, v.sunset_date = VersionStatus.SUNSET, utcnow() + timedelta(seconds=dataplane_sync.SUNSET_MARGIN_SECONDS - 5)
-        assert await told() == {"version": "9", "native_ok": False}
+        # Within a minute of the sunset, either side of it, the version is this side's.
+        for seconds in (dataplane_sync.SUNSET_MARGIN_SECONDS - 5, 5 - dataplane_sync.SUNSET_MARGIN_SECONDS):
+            v.status, v.sunset_date = VersionStatus.SUNSET, utcnow() + timedelta(seconds=seconds)
+            assert await told() == {"version": "9", "native_ok": False}
+        # Well past it, and once removed, the version is gone, and the data plane says so in
+        # this gateway's words.
         v.sunset_date = utcnow() - timedelta(days=1)
-        assert await told() == {"version": "9", "native_ok": False}
+        assert await told() == {"version": "9", "native_ok": True, "gone": "API version 9 is no longer available"}
         # A date with an offset is compared here alone.
         v.sunset_date = datetime(2099, 1, 2, tzinfo=timezone.utc)
         assert await told() == {"version": "9", "native_ok": False}
         v.sunset_date, v.status = None, VersionStatus.REMOVED
+        assert await told() == {"version": "9", "native_ok": True, "gone": "API version 9 has been removed"}
+        # A backend of its own is followed where the data plane can reach it, like a route's.
+        v.status, v.backend_url = VersionStatus.DEPRECATED, "http://127.0.0.1:9/"
+        assert await told() == {"version": "9", "native_ok": True, "backend": "http://127.0.0.1:9", "never_sent": False, "notices": {
+            "warning": '299 - "API version 9 is deprecated"', "sunset": None, "deprecation": True}}
+        v.backend_url = "mqtt://127.0.0.1:1883"
+        assert (await told())["never_sent"] is True
+        v.backend_url = "http://user:secret@127.0.0.1:9"
         assert await told() == {"version": "9", "native_ok": False}
-        v.status, v.backend_url = VersionStatus.DEPRECATED, "http://127.0.0.1:9"
-        assert await told() == {"version": "9", "native_ok": False}
+        # A version whose name would not go into JSON as it is, once gone, is this side's to refuse.
+        version_manager.register_version('1"x', status=VersionStatus.REMOVED)
+        try:
+            versions = (await dataplane_sync.build_snapshot(db_session))["api_versions"]["versions"]
+            assert {entry["version"]: entry for entry in versions}['1"x'] == {"version": '1"x', "native_ok": False}
+        finally:
+            version_manager.versions.pop('1"x', None)
     finally:
         version_manager.versions.pop("9", None)
 

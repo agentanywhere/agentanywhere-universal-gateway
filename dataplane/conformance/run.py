@@ -2295,11 +2295,45 @@ def main() -> int:
             announced_same("a version with a sunset says when, to both", "/api/routed/plainly/1", headers=hint,
                            sees={"warning": [warns + ', date="2099-01-02T03:04:05"'], "sunset": [goes]},
                            given={"warning": [warns + ', date="2099-01-02T03:04:05"'], "sunset": [goes], "deprecation": ["true"]})
+            # A version that is gone is refused with a 410, in the proxy handler's words, and is
+            # not echoed to the caller. One with a backend of its own sends its requests there.
+            def under(version, path="/api/routed/plainly/1"):
+                return [httpx.get(base + path, headers={"X-API-Key": keys[k]["key"], "X-API-Version": version}, timeout=10) for base, k in ((py, "py"), (rs, "rs"))]
+
+            def gone_same(name, version, says):
+                a, b = under(version)
+                compare(f"a version that is gone: {name}", a, b)
+                check(f"a version that is gone: {name}: refused by the data plane in Python's words",
+                      said_by(b) == "data plane" and a.status_code == b.status_code == 410 and a.json()["message"] == b.json()["message"] == says
+                      and list(a.json()) == list(b.json()) and a.json()["version"] == b.json()["version"] == version
+                      and "x-api-version" not in a.headers and "x-api-version" not in b.headers and a.headers.get("content-type") == b.headers.get("content-type"),
+                      f"[{a.status_code}/{b.status_code}] by the {said_by(b)}: {b.text[:160]}")
+
             post("/admin/versions", {"version": "6", "status": "sunset", "sunset_date": "2020-01-02T03:04:05"})
-            assert wait_until(lambda: said_by(httpx.get(f"{rs}/api/routed/plainly/1", headers={"X-API-Key": keys["rs"]["key"], "X-API-Version": "6"}, timeout=10)) == "python"), \
-                "the version past its sunset never reached the data plane"
-            announced_same("a version past its sunset is the Python gateway's to refuse", "/api/routed/plainly/1", headers=[("X-API-Version", "6")], by="python", status=410)
-            for version in ("6", "7"):
+            assert wait_until(lambda: under("6")[1].status_code == 410 and said_by(under("6")[1]) == "data plane"), "the version past its sunset never reached the data plane"
+            gone_same("past its sunset", "6", "API version 6 is no longer available")
+            httpx.delete(f"{py}/admin/versions/7", headers=adm, timeout=10).raise_for_status()
+            assert wait_until(lambda: under("7")[1].status_code == 410 and said_by(under("7")[1]) == "data plane"), "the removed version never reached the data plane"
+            gone_same("removed", "7", "API version 7 has been removed")
+            a, b = (httpx.get(f"{base}/api/users", headers={"X-API-Version": "7"}, timeout=10) for base in (py, rs))
+            compare("a version that is gone: without a key the 401 comes first", a, b)
+            check("a version that is gone: and it names no version", a.status_code == b.status_code == 401 and "x-api-version" not in a.headers and "x-api-version" not in b.headers)
+            post("/admin/versions", {"version": "5", "backend_url": agent})
+            post("/admin/versions", {"version": "4", "backend_url": "http://127.0.0.1:9"})
+            assert wait_until(lambda: under("5", "/api/users")[1].json() != under("1", "/api/users")[1].json() and said_by(under("5", "/api/users")[1]) == "data plane"), \
+                "the version with a backend of its own never reached the data plane"
+            a, b = under("5", "/api/users?x=1")
+            check("a version with a backend of its own: its requests go there, from both",
+                  said_by(b) == "data plane" and a.status_code == b.status_code == 200 and a.json()["path"] == b.json()["path"] == "/api/users"
+                  and a.json()["query"] == b.json()["query"] == "x=1" and a.headers.get("x-api-version") == b.headers.get("x-api-version") == "5",
+                  f"[{a.status_code}/{b.status_code}] by the {said_by(b)}: {b.text[:120]}")
+            a, b = under("5")
+            check("a version with a backend of its own: a dynamic route still decides", said_by(b) == "data plane" and a.json()["path"] == b.json()["path"] == "/api/routed/plainly/1"
+                  and lines(a.json()["headers"]).get("x-api-version") == lines(b.json()["headers"]).get("x-api-version") == "5, 5")
+            a, b = under("4", "/api/users")
+            compare("a version with a backend of its own: one that cannot be reached", a, b)
+            check("a version with a backend of its own: that is a 502 from the data plane", said_by(b) == "data plane" and a.status_code == b.status_code == 502)
+            for version in ("4", "5", "6", "7"):
                 httpx.delete(f"{py}/admin/versions/{version}", headers=adm, params={"hard": "true"}, timeout=10).raise_for_status()
             assert announced("7", **{"x-api-version": "1"}), "removing the versions never reached the data plane"
 

@@ -84,6 +84,14 @@ pub struct ApiVersions {
     pub native_ok: HashMap<String, bool>,
     /// What is announced with the versions that announce something.
     pub notices: HashMap<String, Notices>,
+    /// The versions that are gone (removed, or past their sunset), each with what the gateway
+    /// says of it in its 410. Such a version is not echoed to the caller either.
+    pub gone: HashMap<String, String>,
+    /// The versions with a backend of their own, by its address and whether it is one no
+    /// request is ever sent to (`DynamicRoute::never_sent`).
+    pub backend_urls: HashMap<String, (String, bool)>,
+    /// Those backends, once resolved (`Backends::resolve`).
+    pub backends: HashMap<String, std::sync::Arc<Backend>>,
     /// A version a path names is taken off the path a backend is asked for.
     pub strip_prefix: bool,
 }
@@ -92,6 +100,11 @@ impl ApiVersions {
     /// What is announced with a version, when anything is.
     pub fn announced(&self, version: Option<&str>) -> Option<&Notices> {
         self.notices.get(version?)
+    }
+
+    /// The version as it is echoed to a caller: one that is gone is not.
+    pub fn shown<'v>(&self, version: Option<&'v str>) -> Option<&'v str> {
+        version.filter(|v| !self.gone.contains_key(*v))
     }
 }
 
@@ -998,6 +1011,13 @@ struct VersionRecord {
     native_ok: bool,
     #[serde(default)]
     notices: Option<NoticesRecord>,
+    /// What the gateway says of a version that is gone.
+    #[serde(default)]
+    gone: Option<String>,
+    #[serde(default)]
+    backend: Option<String>,
+    #[serde(default)]
+    never_sent: bool,
 }
 
 #[derive(Deserialize)]
@@ -1246,8 +1266,14 @@ impl Snapshot {
         // Without an `api_versions` section, the gateway's shipped defaults apply: versions 1 (default) and 2.
         let api_versions = match file.api_versions {
             Some(v) => {
-                let (mut native_ok, mut notices) = (HashMap::new(), HashMap::new());
+                let (mut native_ok, mut notices, mut gone, mut backend_urls) = (HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new());
                 for record in v.versions {
+                    if let Some(said) = record.gone.filter(|_| record.native_ok) {
+                        gone.insert(record.version.clone(), said);
+                    }
+                    if let Some(url) = record.backend.filter(|_| record.native_ok) {
+                        backend_urls.insert(record.version.clone(), (url, record.never_sent));
+                    }
                     // A notice this side cannot write as a header leaves the version to the control plane.
                     let read = |text: Option<String>| text.map(|t| HeaderValue::from_str(&t)).transpose();
                     let told = match record.notices {
@@ -1262,12 +1288,15 @@ impl Snapshot {
                         notices.insert(record.version, told);
                     }
                 }
-                ApiVersions { default: v.default, strip_prefix: v.strip_prefix, native_ok, notices }
+                ApiVersions { default: v.default, strip_prefix: v.strip_prefix, native_ok, notices, gone, backend_urls, backends: HashMap::new() }
             }
             None => ApiVersions {
                 default: Some("1".into()),
                 native_ok: [("1".to_string(), true), ("2".to_string(), true)].into_iter().collect(),
                 notices: HashMap::new(),
+                gone: HashMap::new(),
+                backend_urls: HashMap::new(),
+                backends: HashMap::new(),
                 strip_prefix: false,
             },
         };
