@@ -278,15 +278,13 @@ _QUERY_WORD = re.compile(r"[A-Za-z0-9._~-]*")
 _REQUEST_HEADERS_KEPT = frozenset((
     "host", "content-length", "transfer-encoding", "connection", "keep-alive", "upgrade", "te", "trailer", "expect",
     "proxy-authenticate", "proxy-authorization", "proxy-connection", "accept", "accept-encoding", "user-agent",
-    "x-api-version", "accept-version",
 ))
 _RESPONSE_HEADERS_KEPT = frozenset((
     "content-type", "content-length", "content-encoding", "transfer-encoding", "connection", "keep-alive", "upgrade",
-    "te", "trailer", "proxy-authenticate", "proxy-authorization", "set-cookie", "date", "server", "vary", "retry-after",
-    "warning", "sunset", "deprecation",
+    "te", "trailer", "proxy-authenticate", "proxy-authorization", "set-cookie", "date", "server", "vary",
     "x-served-by", "x-dataplane-auth", "x-content-type-options",
 ))
-_RESPONSE_PREFIXES_KEPT = ("access-control-", "x-ratelimit-", "x-tenant-", "x-anomaly-")
+_RESPONSE_PREFIXES_KEPT = ("x-ratelimit-", "x-tenant-", "x-anomaly-")
 # The statuses a rule may turn into one another here: those that carry a body, as every server
 # on the way writes them.
 _STATUS_MAPPED = frozenset(range(200, 600)) - {204, 205, 304}

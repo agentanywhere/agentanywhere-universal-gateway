@@ -245,9 +245,8 @@ beside the caller's own `x-client`, not in its place. Any other rule is the Pyth
 applies to is handed over: a rule that fills in a template, sets a value in a body that is not plain JSON, or
 rewrites the path by a regular expression of Python's own; one that names a
 header an HTTP library on the way has its own say in, or that the request is read by again after the rules (`Host`,
-`Content-Length`, `User-Agent`, `Accept`, `Accept-Encoding`, `X-API-Version` and `Accept-Version` on a request; on an
-answer `Content-Type`, `Set-Cookie`, `Vary`, `Warning`, `Sunset`, `Deprecation` and the cross-origin, rate-limit and
-tenant headers); one with a header name or value that is not plain ASCII
+`Content-Length`, `User-Agent`, `Accept`, `Accept-Encoding` and the hop-by-hop headers on a request; on an
+answer `Content-Type`, `Content-Length`, `Set-Cookie`, `Vary`, `Date`, `Server` and the rate-limit and tenant headers); one with a header name or value that is not plain ASCII
 without a space at either end, or a query word of other than unreserved characters; one that maps a status to or from
 one without a body (below 200, 204, 205, 304). gRPC and `POST /mqtt/publish` have handlers of their own there, which
 apply no rule; a rule that matches one keeps it with the Python gateway, as before, and so does a rule that matches
@@ -267,6 +266,13 @@ The query is read and written again on the way, as the Python gateway's HTTP cli
 `?flag=`, `+` becomes `%20`, an escape that need not be one is taken off (`%7E` becomes `~`), and a `?` with nothing
 after it is dropped. A query of plain `key=value` words is sent as it came. One with an escape that is not UTF-8 text
 is the Python gateway's to read, and so is the request.
+
+A rule may name `X-API-Version` and `Accept-Version` on a request. The Python gateway reads the version again from
+the headers the rules leave, and so does this side: the backend is told that version (and is sent to its backend, or
+refused, if the version says so), while the caller is still told the version its own headers named. On an answer a
+rule may name `Warning`, `Sunset`, `Deprecation`, `Retry-After` and the cross-origin headers: where the gateway
+writes one of those itself (a version on its way out, a page from a listed origin) its own line replaces the rule's,
+and where it does not the rule's stands.
 
 A rule may name the headers the gateway itself writes. On a request those are `X-Forwarded-For`, `X-Protocol`,
 `traceparent` and (with the request-id plugin) `X-Request-ID`. The Python gateway writes them after the rules, into the

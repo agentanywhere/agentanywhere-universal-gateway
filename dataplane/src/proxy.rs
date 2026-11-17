@@ -794,10 +794,20 @@ fn wall() -> Duration {
 /// start with `/v<N>`: the `Accept-Version` or `X-API-Version` header (a leading v is ignored),
 /// else the default. `None` when there is none; `Some((version, native_ok))` otherwise.
 fn resolve_version<'a>(snap: &'a Snapshot, headers: &HeaderMap) -> Option<(&'a str, bool)> {
-    let wanted = headers
-        .get("accept-version")
-        .or_else(|| headers.get("x-api-version"))
-        .and_then(|v| v.to_str().ok())
+    let said = |name: &str| headers.get(name).map(|v| v.to_str().unwrap_or(NOT_TEXT));
+    version_of(snap, said("accept-version"), said("x-api-version"))
+}
+
+/// What stands for a header value that is not text: it names no version.
+const NOT_TEXT: &str = "\u{1}";
+
+/// The version two header values name, as `VersionManager.get_version_from_headers` reads them:
+/// `Accept-Version` unless it is absent or empty, then `X-API-Version`; a leading `v` is
+/// ignored; a version the gateway does not know leaves the default.
+fn version_of<'a>(snap: &'a Snapshot, accept: Option<&str>, own: Option<&str>) -> Option<(&'a str, bool)> {
+    let wanted = accept
+        .filter(|v| !v.is_empty())
+        .or(own)
         .map(|v| v.trim().trim_start_matches(['v', 'V']))
         .filter(|v| !v.is_empty())
         .and_then(|v| snap.api_versions.native_ok.get_key_value(v));
@@ -1185,6 +1195,22 @@ fn decide<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, now: u6
             }
         }
     }
+    // The backend is told the version the headers name once the rules have changed them: the
+    // Python gateway reads it again from what they left, the last of a name in any case winning.
+    let told_by = if shaping.request.iter().any(|a| a.names("x-api-version") || a.names("accept-version")) {
+        let headers = req.headers();
+        let mut lines: HeaderLines<HeaderValue> = headers.keys().filter_map(|name| headers.get(name).map(|v| (name.as_str().to_owned(), v.clone()))).collect();
+        for actions in &shaping.request {
+            change_headers(&mut lines, actions, |text| HeaderValue::from_str(text).ok());
+        }
+        let last = |name: &str| lines.iter().rev().find(|(line, _)| line.eq_ignore_ascii_case(name)).map(|(_, v)| v.to_str().unwrap_or(NOT_TEXT));
+        match version_of(snap, last("accept-version"), last("x-api-version")) {
+            Some((_, false)) => return PYTHON,
+            found => found.map(|(v, _)| v),
+        }
+    } else {
+        version
+    };
     // A query is taken apart and written again there, and is here: one this side is not certain
     // to read the same is the Python gateway's. (Publishing, the bridge and gRPC send none on.)
     // So is a request that gives twice a header the Python gateway sends on one line of.
@@ -1199,7 +1225,7 @@ fn decide<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, now: u6
         return PYTHON;
     }
     // The version is resolved from the path the request ends up with.
-    let Some((told, stripped)) = told_version(snap, rewritten.as_deref().unwrap_or(asked), version) else { return PYTHON };
+    let Some((told, stripped)) = told_version(snap, rewritten.as_deref().unwrap_or(asked), told_by) else { return PYTHON };
     if let Some(stripped) = stripped.map(str::to_owned) {
         rewritten = Some(stripped);
     }
