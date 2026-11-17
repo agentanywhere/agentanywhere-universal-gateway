@@ -370,6 +370,8 @@ pub struct State {
     pub mqtt: Arc<crate::mqtt::Link>,
     /// What this side presents to the Python gateway to ask it to shape an answer.
     pub token: Option<HeaderValue>,
+    /// What the workers count for this side's own metrics.
+    pub counts: crate::metrics::Counts,
 }
 
 impl State {
@@ -2760,6 +2762,7 @@ fn as_http1_names_it<B>(req: &mut Request<B>) {
 pub async fn handle(w: Arc<Worker>, peer: SocketAddr, mut req: Request<Incoming>) -> Result<Response<Body>, Infallible> {
     let started = Instant::now();
     let st = &*w.shared;
+    st.counts.request(w.index);
     if req.version() == Version::HTTP_2 {
         as_http1_names_it(&mut req);
     }
@@ -3204,10 +3207,14 @@ struct Sent<'a> {
 async fn ask_control(w: &Worker, peer: SocketAddr, req: Request<Body>) -> (Response<Body>, bool) {
     match forward(w, &w.shared.control, peer, req, None, None).await {
         Ok(mut resp) => {
+            w.shared.counts.handed_over(w.index, true);
             let refused = resp.headers_mut().remove("x-dataplane-auth").is_some();
             (resp, refused)
         }
-        Err(_) => (control_unreachable(), false),
+        Err(_) => {
+            w.shared.counts.handed_over(w.index, false);
+            (control_unreachable(), false)
+        }
     }
 }
 

@@ -11,6 +11,7 @@ mod bridge;
 mod breaker;
 mod govern;
 mod limits;
+mod metrics;
 mod mqtt;
 mod proxy;
 mod pyjson;
@@ -44,6 +45,8 @@ struct Args {
     rows_per_second: u32,
     workers: usize,
     access_log: bool,
+    /// Where this side's own metrics are served, when anywhere.
+    metrics: Option<SocketAddr>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -54,6 +57,7 @@ fn parse_args() -> Result<Args, String> {
     let (mut report_ms, mut rows_per_sec) = (1000u64, 1000u32);
     let mut workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
     let mut access_log = false;
+    let mut metrics = None;
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
         if flag == "--access-log" {
@@ -64,6 +68,7 @@ fn parse_args() -> Result<Args, String> {
         match flag.as_str() {
             "--workers" => workers = value()?.parse().map_err(|e| format!("--workers: {e}"))?,
             "--listen" => listen = value()?,
+            "--metrics-listen" => metrics = Some(value()?.parse().map_err(|e| format!("--metrics-listen: {e}"))?),
             "--snapshot" => snapshot = value()?,
             "--backend" => backend = value()?,
             "--control" => control = value()?,
@@ -90,6 +95,7 @@ fn parse_args() -> Result<Args, String> {
         rows_per_second: rows_per_sec,
         workers: workers.max(1),
         access_log,
+        metrics,
     })
 }
 
@@ -270,6 +276,7 @@ fn main() {
         access_log: args.access_log.then(accesslog::AccessLog::start),
         mqtt,
         token: args.token.as_deref().and_then(|t| hyper::header::HeaderValue::from_str(t).ok()),
+        counts: metrics::Counts::new(args.workers),
     });
     state.replace(snap);
     mqtt::start(state.clone(), mqtt_events).unwrap_or_else(|e| fail(format!("cannot start the MQTT thread: {e}")));
@@ -289,6 +296,10 @@ fn main() {
             .unwrap_or_else(|e| fail(format!("cannot start the control thread: {e}")));
     }
 
+    if let Some(addr) = args.metrics {
+        let bound = metrics::start(addr, state.clone()).unwrap_or_else(|e| fail(format!("cannot serve metrics on {addr}: {e}")));
+        eprintln!("dataplane: metrics on http://{bound}/metrics");
+    }
     eprintln!("dataplane: listening on {} with {} workers", args.listen, args.workers);
     let threads: Vec<_> = sockets
         .into_iter()

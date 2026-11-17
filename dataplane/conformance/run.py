@@ -489,7 +489,7 @@ def main() -> int:
         sockets = websocket_backend()
         secure_sockets = websocket_backend(trusted)
         # Chosen last: a port found free is free only until the next server here is given one.
-        bport, gport, dport = free_port(), free_port(), free_port()
+        bport, gport, dport, mport = free_port(), free_port(), free_port(), free_port()
         # Both planes are told to trust the same authority, the way an operator tells them.
         env = {**os.environ, "SSL_CERT_FILE": authority, "SECRET_KEY": secrets.token_urlsafe(48), "ADMIN_TOKEN": admin,
                "DATABASE_URL": f"sqlite+aiosqlite:///{tmp}/g.db", "HTTP_BACKEND_URL": f"http://127.0.0.1:{bport}",
@@ -530,6 +530,7 @@ def main() -> int:
             # staleness limit keep the live scenarios quick.
             procs.append(subprocess.Popen([str(BIN), "--listen", f"127.0.0.1:{dport}", "--control-token", "conformance-token",
                                            "--sync-interval-ms", "200", "--max-staleness-ms", "2000", "--report-interval-ms", "300",
+                                           "--metrics-listen", f"127.0.0.1:{mport}",
                                            "--backend", f"http://127.0.0.1:{bport}", "--control", f"http://127.0.0.1:{gport}"], env=env))
             time.sleep(1.5)
             assert procs[-1].poll() is None, f"the data plane exited at once (code {procs[-1].returncode})"
@@ -3261,6 +3262,29 @@ def main() -> int:
                   a.status_code == b.status_code == 503 and shape(a) == shape(b) and said_by(b) == "python" and not its.published and not its.clients,
                   f"[{a.status_code}/{b.status_code}] {b.text[:80]} clients {its.clients}")
 
+            # The data plane's own metrics, on an address of their own. `/metrics` where callers
+            # come is still the Python gateway's registry.
+            def own_metrics():
+                text = httpx.get(f"http://127.0.0.1:{mport}/metrics", timeout=10).text
+                return {line.split(" ")[0]: float(line.split(" ")[1]) for line in text.splitlines() if line and not line.startswith("#") and "{" not in line}, text
+
+            seen, text = own_metrics()
+            check("the data plane's own metrics: counted, in the Prometheus text format",
+                  seen.get("dataplane_requests_total", 0) > 1000 and seen.get("dataplane_requests_handed_over_total", 0) > 0
+                  and seen["dataplane_requests_total"] == seen["dataplane_requests_served_total"] + seen["dataplane_requests_handed_over_total"]
+                  and seen.get("dataplane_control_link_up") == 1 and seen.get("dataplane_snapshot_fresh") == 1
+                  and 0 <= seen.get("dataplane_snapshot_age_seconds", -1) < 5 and seen.get("dataplane_snapshot_updates_total", 0) > 1
+                  and "# TYPE dataplane_requests_total counter" in text and 'dataplane_build_info{version="' in text,
+                  ", ".join(f"{k}={v:g}" for k, v in sorted(seen.items())))
+            before = seen["dataplane_requests_handed_over_total"]
+            httpx.get(f"{rs}/admin/api-keys", headers=adm, timeout=10)
+            check("the data plane's own metrics: a request handed over is counted as one",
+                  own_metrics()[0]["dataplane_requests_handed_over_total"] == before + 1)
+            m, other = httpx.get(f"{rs}/metrics", timeout=10), httpx.get(f"http://127.0.0.1:{mport}/other", timeout=10)
+            check("the data plane's own metrics: /metrics where callers come is still the Python gateway's",
+                  said_by(m) == "python" and "gateway_requests_total" in m.text and "dataplane_requests_total" not in m.text and other.status_code == 404,
+                  f"[{m.status_code}] by the {said_by(m)}; another path [{other.status_code}]")
+
             # Last: the control plane goes away. The data plane must stop serving natively.
             procs[1].send_signal(signal.SIGTERM)
             procs[1].wait(timeout=15)
@@ -3272,6 +3296,9 @@ def main() -> int:
             b = grpc_call(f"127.0.0.1:{dport}", "unary", "Say", b"hello", (("x-api-key", keys["rs"]["key"]),))
             check("with the control plane down, gRPC calls are refused (there is no one to ask)",
                   (b["code"], b["details"]) == ("UNAVAILABLE", "the gateway is not ready"), f"{b['code']}: {b['details']}")
+            down = own_metrics()[0]
+            check("with the control plane down, the data plane's own metrics say so",
+                  down.get("dataplane_control_link_up") == 0 and down.get("dataplane_snapshot_fresh") == 0, f"link {down.get('dataplane_control_link_up')}, fresh {down.get('dataplane_snapshot_fresh')}")
             check("with the control plane down, the data plane still says it is alive",
                   l.status_code == 200 and said_by(l) == "data plane" and l.json() == {"status": "alive", "pid": procs[2].pid}, f"[{l.status_code}]")
 

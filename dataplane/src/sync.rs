@@ -53,6 +53,12 @@ impl Link {
         !self.down.load(Ordering::Relaxed) && self.fresh()
     }
 
+    /// Milliseconds since the control plane last answered, if it ever has.
+    pub fn age_ms(&self, now_ms: u64) -> Option<u64> {
+        let last = self.last_ok_ms.load(Ordering::Relaxed);
+        (last != 0).then(|| now_ms.saturating_sub(last))
+    }
+
     /// The control plane's answer to `/ready`, while it is known to be answering.
     pub fn readiness(&self) -> Option<Arc<Readiness>> {
         self.up().then(|| self.ready.lock().unwrap().clone()).flatten()
@@ -154,6 +160,7 @@ pub async fn run(state: Arc<State>, token: String, interval: Duration, report_in
                 Delivery::Nothing => {}
                 Delivery::Delivered => reporting = true,
                 Delivery::Failed => {
+                    state.counts.reports_failed.fetch_add(1, Ordering::Relaxed);
                     if reporting {
                         eprintln!("dataplane: report not delivered; counts are kept for the next one");
                         reporting = false;

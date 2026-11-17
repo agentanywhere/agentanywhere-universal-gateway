@@ -546,9 +546,9 @@ here is the reverse of everywhere else: **whatever this side cannot be sure of i
   through it. The Python gateway's client takes a message of any size.
 * **`/ready` can be one sync interval behind** (500 ms by default), or as long as a sync that hangs takes to fail
   (five seconds), because it repeats the Python gateway's last answer instead of asking the database itself.
-* **`/metrics` is still the Python gateway's.** It is the registry for the whole gateway, including everything this
-  side reports to it, so there is one place to scrape. The data plane has no metrics endpoint of its own yet: with the
-  Python gateway down, nothing can be scraped.
+* **`/metrics` on the address callers use is still the Python gateway's.** It is the registry for the whole gateway,
+  including everything this side reports to it, so there is one place to scrape for traffic. The data plane's own
+  health is on an address of its own (below), which can be scraped while the Python gateway is down.
 
 * **A refused credential stays refused for up to ten seconds after the Python gateway would accept it** in one case
   this side cannot see: the gateway was restarted with a new `SECRET_KEY` or OAuth2 state so quickly that no sync
@@ -587,6 +587,16 @@ here is the reverse of everywhere else: **whatever this side cannot be sure of i
   The caller is given the same either way.
 * **An answer to `HEAD` keeps the length the backend stated.** The Python gateway states a length of 0.
 * The `Server` response header differs (uvicorn on one side), and native answers add `X-Served-By`.
+
+## Metrics of its own
+
+With `--metrics-listen 127.0.0.1:9100` the data plane serves `GET /metrics` on that address, in the Prometheus text
+format: `dataplane_requests_total`, `dataplane_requests_served_total` and `dataplane_requests_handed_over_total`
+(how much it answers itself and how much goes to the Python gateway), `dataplane_control_unreachable_total`,
+`dataplane_control_link_up`, `dataplane_snapshot_fresh` (whether it may serve natively), `dataplane_snapshot_age_seconds`,
+`dataplane_snapshot_updates_total`, `dataplane_reports_failed_total`, `dataplane_workers` and `dataplane_build_info`.
+Each worker counts into a shard of its own, on its own cache line, so counting never waits on another core. Keep the
+address private: like the snapshot endpoint, it is for operators.
 
 ## Tests
 
