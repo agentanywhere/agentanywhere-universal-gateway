@@ -244,8 +244,11 @@ class Router:
             if version_manager.strip_prefix_on_proxy and version_target_path:
                 target_path = version_target_path
 
+        # ``Transfer-Encoding`` says how the caller framed its message. The body has been
+        # read whole by now and goes on with its length, so the header does not go on with it.
         filtered_headers = {k: v for k, v in transformed_headers.items()
-                            if not k.lower().startswith("x-gateway-")}
+                            if not k.lower().startswith("x-gateway-")
+                            and k.lower() != "transfer-encoding"}
 
         filtered_headers["X-Forwarded-For"] = transformed_headers.get("X-Forwarded-For", "")
         filtered_headers["X-Protocol"] = protocol.value

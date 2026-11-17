@@ -53,6 +53,11 @@ See [docs/known-limitations.md](docs/known-limitations.md) for the full list.
 
 ### Fixed
 
+- Proxy: a request whose body came without a length (`Transfer-Encoding:
+  chunked`) is sent to the backend with its length and without that header.
+  The caller's `Transfer-Encoding` was passed on beside the `Content-Length`
+  the gateway adds, which is not a valid request: a backend may refuse it, or
+  read where the body ends differently from a proxy in front of it.
 - Database migrations: the Alembic migrations `001` and `002` were replaced by
   one baseline, `0001`, that creates the full current schema. It is safe to
   run on a database the gateway already created at startup, works on SQLite
