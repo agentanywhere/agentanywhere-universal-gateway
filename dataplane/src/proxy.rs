@@ -1197,12 +1197,21 @@ fn decide<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, now: u6
     }
     // The backend is told the version the headers name once the rules have changed them: the
     // Python gateway reads it again from what they left, the last of a name in any case winning.
-    let told_by = if shaping.request.iter().any(|a| a.names("x-api-version") || a.names("accept-version")) {
+    let lines_after = || {
         let headers = req.headers();
         let mut lines: HeaderLines<HeaderValue> = headers.keys().filter_map(|name| headers.get(name).map(|v| (name.as_str().to_owned(), v.clone()))).collect();
         for actions in &shaping.request {
             change_headers(&mut lines, actions, |text| HeaderValue::from_str(text).ok());
         }
+        lines
+    };
+    // A rule that leaves two `Host` lines (one in another spelling beside the caller's) makes a
+    // request the Python gateway's HTTP client refuses to send: that failure is its own to give.
+    if shaping.request.iter().any(|a| a.names("host")) && lines_after().iter().filter(|(name, _)| name.eq_ignore_ascii_case("host")).count() > 1 {
+        return PYTHON;
+    }
+    let told_by = if shaping.request.iter().any(|a| a.names("x-api-version") || a.names("accept-version")) {
+        let lines = lines_after();
         let last = |name: &str| lines.iter().rev().find(|(line, _)| line.eq_ignore_ascii_case(name)).map(|(_, v)| v.to_str().unwrap_or(NOT_TEXT));
         match version_of(snap, last("accept-version"), last("x-api-version")) {
             Some((_, false)) => return PYTHON,
@@ -1396,6 +1405,16 @@ fn announce_upstream(headers: &mut HeaderMap, notices: Option<&Notices>) {
     for (name, value) in notices.iter().flat_map(|n| [("warning", &n.warning), ("sunset", &n.sunset)]) {
         if let Some(value) = value {
             headers.append(name, value.clone());
+        }
+    }
+}
+
+/// Add the headers the Python gateway's HTTP client adds to a request that carries none of that
+/// name, in any spelling (httpx merges its defaults in under the request's own).
+fn fill_client_headers(headers: &mut HeaderMap, defaults: &[(HeaderName, HeaderValue)]) {
+    for (name, value) in defaults {
+        if !headers.contains_key(name) {
+            headers.append(name.clone(), value.clone());
         }
     }
 }
@@ -1627,6 +1646,9 @@ pub fn judge_shapes() -> Result<(), String> {
         /// The version the backend is told, and what it announces: `[version, warning, sunset]`.
         #[serde(default)]
         version: Option<(String, Option<String>, Option<String>)>,
+        /// What the Python gateway's HTTP client adds to a request without them.
+        #[serde(default)]
+        client_headers: Vec<(String, String)>,
     }
 
     fn unhex(text: &str) -> Result<Vec<u8>, String> {
@@ -1692,6 +1714,13 @@ pub fn judge_shapes() -> Result<(), String> {
         if let Some(sent) = sent.as_ref().filter(|_| req.extensions().get::<Stamped>().is_none()) {
             stamp_request(req.headers_mut(), sent);
         }
+        // Two `Host` lines are a request the Python gateway's client refuses: its to answer.
+        if req.headers().get_all(HOST).iter().count() > 1 {
+            writeln!(out, "\"ask\"").map_err(|e| e.to_string())?;
+            continue;
+        }
+        let defaults: Vec<(HeaderName, HeaderValue)> = case.client_headers.iter().filter_map(|(n, v)| Some((HeaderName::from_bytes(n.as_bytes()).ok()?, HeaderValue::from_str(v).ok()?))).collect();
+        fill_client_headers(req.headers_mut(), &defaults);
         let mut resp = Response::new(full(Bytes::new()));
         *resp.status_mut() = StatusCode::from_u16(case.status).map_err(|e| e.to_string())?;
         *resp.headers_mut() = map(&case.answer)?;
@@ -1794,6 +1823,8 @@ struct AgentCall<'a> {
     told: Option<&'a str>,
     /// What the version the agent is told announces.
     announced: Option<&'a Notices>,
+    /// What the Python gateway's HTTP client adds to a request without them.
+    client_headers: &'a [(HeaderName, HeaderValue)],
     ip: IpAddr,
     method: &'static str,
     /// How a failure is answered, and whether as a page: the caller is a browser.
@@ -1907,7 +1938,7 @@ fn agent_call<'a, B>(snap: &'a Snapshot, peer: SocketAddr, req: &Request<B>, aft
     };
     // What is asked for must be something this side's HTTP client will send.
     target.parse::<hyper::http::uri::PathAndQuery>().ok()?;
-    Some(AgentCall { backend, target, version, told, announced: snap.api_versions.announced(told), ip, method, failure, html })
+    Some(AgentCall { backend, target, version, told, announced: snap.api_versions.announced(told), client_headers: &snap.client_headers, ip, method, failure, html })
 }
 
 /// The largest request body held here for an agent. It is held whole so that the request can
@@ -1980,6 +2011,7 @@ async fn serve_agent(
         headers.append("x-api-version", v);
     }
     announce_upstream(&mut headers, a.announced);
+    fill_client_headers(&mut headers, a.client_headers);
     headers.append("x-forwarded-for", HeaderValue::from_static(""));
     headers.insert("x-protocol", HeaderValue::from_static("http"));
     if let Ok(v) = HeaderValue::from_str(&t.traceparent) {
@@ -3006,6 +3038,7 @@ pub async fn handle(w: Arc<Worker>, peer: SocketAddr, mut req: Request<Incoming>
                     // gRPC has a client of its own in the Python gateway, which sends every line on.
                     if !grpc {
                         shape_request(&mut req, &n.shaping.request, rewritten, Some(&native));
+                        fill_client_headers(req.headers_mut(), &snap.client_headers);
                     }
                     let answer = match grpc {
                         // Refused by the Python gateway's HTTP client before it connects anywhere.
@@ -3226,7 +3259,8 @@ async fn forward(
     }
     match native {
         Some(sent) => {
-            headers.remove(HOST);
+            // The caller's `Host` goes on, as the Python gateway's client sends the one it is
+            // given; where there is none (a rule took it away) the backend's own is written.
             // Written already, with the rules, where a request's headers were changed by them.
             if !stamped {
                 stamp_request(headers, &sent);
@@ -3704,6 +3738,26 @@ mod tests {
         assert_eq!(under("1", "/api/users").map(|n| n.2), Some(None));
         // One the control plane keeps is still its own.
         assert_eq!(under("3", "/api/users"), None);
+    }
+
+    #[test]
+    fn a_rule_that_leaves_two_host_lines_is_pythons() {
+        let rules = r#","transform_rules":[{"glob":"/api/two/*","methods":[],"native":true,"request":{"set":[["Host","b.example"]]},"response":null},
+            {"glob":"/api/one/*","methods":[],"native":true,"request":{"set":[["host","b.example"]]},"response":null}]"#;
+        let snap = governed(rules, "");
+        let ask = |uri: &str| {
+            let req = Request::builder().uri(uri).header("x-api-key", KEY).header("host", "gw.example").body(()).unwrap();
+            outcome(&snap, &req, 0, false)
+        };
+        assert_eq!(ask("/api/two/1"), "ask");
+        assert_eq!(ask("/api/one/1"), "native");
+        let mut headers = HeaderMap::new();
+        fill_client_headers(&mut headers, &snap.client_headers);
+        assert!(headers.is_empty());
+        let defaults = [(ACCEPT, HeaderValue::from_static("*/*")), (USER_AGENT, HeaderValue::from_static("python-httpx/0.25.2"))];
+        headers.insert(ACCEPT, HeaderValue::from_static("text/csv"));
+        fill_client_headers(&mut headers, &defaults);
+        assert_eq!((headers[ACCEPT].to_str().unwrap(), headers[USER_AGENT].to_str().unwrap()), ("text/csv", "python-httpx/0.25.2"));
     }
 
     #[test]

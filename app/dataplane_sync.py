@@ -279,6 +279,34 @@ _REQUEST_HEADERS_KEPT = frozenset((
     "host", "content-length", "transfer-encoding", "connection", "keep-alive", "upgrade", "te", "trailer", "expect",
     "proxy-authenticate", "proxy-authorization", "proxy-connection", "accept", "accept-encoding", "user-agent",
 ))
+# Headers a request's rules may name when this gateway's HTTP client is httpx's, whose way with
+# them was observed: one given (by the caller or a rule) is sent as given, and of `Accept` and
+# `User-Agent` the client adds its own only when the request carries none of that name. The
+# data plane is told those defaults and does the same.
+_CLIENT_TOLD = frozenset(("host", "accept", "user-agent"))
+_CLIENT_FILLED = ("accept", "user-agent")
+
+
+def _client_headers() -> Optional[list]:
+    """The headers this gateway's HTTP client adds to a request that carries none of that name
+    (`httpx.AsyncClient.headers`), of those the data plane adds too. `None` when the client is
+    not httpx's own, or its defaults could not be written alike on both sides."""
+    try:
+        import httpx
+
+        from app.main import router
+
+        client = router.client
+    except Exception:  # noqa: BLE001 - no router yet: nothing is known of its client
+        return None
+    if not isinstance(client, httpx.AsyncClient):
+        return None
+    filled = [[name, value] for name, value in client.headers.items() if name.lower() in _CLIENT_FILLED]
+    if any(not _HEADER_VALUE.fullmatch(value) for _, value in filled):
+        return None
+    return filled
+
+
 _RESPONSE_HEADERS_KEPT = frozenset((
     "content-type", "content-length", "content-encoding", "transfer-encoding", "connection", "keep-alive", "upgrade",
     "te", "trailer", "proxy-authenticate", "proxy-authorization", "set-cookie", "date", "server", "vary",
@@ -502,7 +530,8 @@ def _rule_actions(rule: Any) -> Optional[Dict[str, Any]]:
         if cfg.template:
             return None
         if side == "request":
-            actions = _header_actions(cfg, _REQUEST_HEADERS_KEPT)
+            kept = _REQUEST_HEADERS_KEPT if _client_headers() is None else _REQUEST_HEADERS_KEPT - _CLIENT_TOLD
+            actions = _header_actions(cfg, kept)
             fields, path = _body_actions(cfg), _path_actions(cfg)
             remove, to_set = cfg.query_remove, cfg.query_set
             if actions is None or fields is None or path is None or not (isinstance(remove, list) and isinstance(to_set, dict)):
@@ -1226,6 +1255,7 @@ async def build_snapshot(db: AsyncSession) -> Dict[str, Any]:
         },
         "upstream_timeout_seconds": float(settings.default_timeout),
         "api_versions": _versions(settings),
+        "client_headers": _client_headers(),
         "backends": _backends(settings),
         "own_paths": None if all_paths_via_python else _own_paths(settings),
         "boundary": _boundary(settings),

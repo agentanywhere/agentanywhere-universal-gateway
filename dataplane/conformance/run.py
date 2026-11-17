@@ -2386,6 +2386,69 @@ def main() -> int:
                 httpx.delete(f"{py}/admin/versions/{version}", headers=adm, params={"hard": "true"}, timeout=10).raise_for_status()
             assert announced("7", **{"x-api-version": "1"}), "removing the versions never reached the data plane"
 
+            # `Host` and the headers the gateway's own HTTP client fills in. The backend is sent the
+            # caller's `Host`, and `Accept` and `User-Agent` are the client's own when the caller
+            # sent none. (The client's `Accept-Encoding` is the Python gateway's alone: it
+            # decompresses what that brings, and the data plane asks for nothing it would not pass on.)
+            backend_host = agent.split("//", 1)[1]
+
+            def bare_get(base, key, path, headers=()):
+                with httpx.Client() as client:
+                    for name in ("accept", "user-agent", "accept-encoding"):
+                        client.headers.pop(name, None)
+                    return client.get(base + path, headers=[*([("X-API-Key", key)] if key else []), *headers], timeout=15)
+
+            def client_same(name, path, headers=(), sees=None, bare=True, key=True):
+                send = bare_get if bare else (lambda base, k, p, h: httpx.get(base + p, headers=[*([("X-API-Key", k)] if k else []), *h], timeout=15))
+                a, b = send(py, keys["py"]["key"] if key else None, path, headers), send(rs, keys["rs"]["key"] if key else None, path, headers)
+                watched = ("host", "accept", "user-agent")
+
+                def seen(r, port):
+                    got = {}
+                    for header, value in r.json()["headers"]:
+                        if header.lower() in watched:
+                            value = {f"127.0.0.1:{port}": "<the gateway>", backend_host: "<the backend>"}.get(value, value)
+                            got.setdefault(header.lower(), []).append(value)
+                    return got
+
+                bad = []
+                if said_by(b) != "data plane":
+                    bad.append(f"answered by the {said_by(b)}")
+                if not a.status_code == b.status_code == 200:
+                    bad.append(f"status {a.status_code} and {b.status_code}")
+                else:
+                    if seen(a, gport) != seen(b, dport):
+                        bad.append(f"the backend saw {seen(a, gport)} from Python and {seen(b, dport)} from the data plane")
+                    for header, want in (sees or {}).items():
+                        if seen(b, dport).get(header) != want:
+                            bad.append(f"the backend saw {header}: {seen(b, dport).get(header)!r}, not {want!r}")
+                check(f"the client's own headers: {name}", not bad, "; ".join(bad) or f"the backend saw {seen(b, dport)}")
+
+            agent_says = f"python-httpx/{httpx.__version__}"
+            client_same("the backend is sent the caller's Host", "/api/routed/plainly/1", bare=False, sees={"host": ["<the gateway>"]})
+            client_same("a caller that sends no Accept or User-Agent: the client's own go on", "/api/routed/plainly/1",
+                        sees={"host": ["<the gateway>"], "accept": ["*/*"], "user-agent": [agent_says]})
+            client_same("a caller's own go on as they came", "/api/routed/plainly/1", headers=[("Accept", "text/csv"), ("user-agent", "curl/8.4")],
+                        sees={"accept": ["text/csv"], "user-agent": ["curl/8.4"]})
+            client_same("an agent is sent the same", "/agents/echo/a", key=False, sees={"host": ["<the gateway>"], "accept": ["*/*"], "user-agent": [agent_says]})
+            made = [post("/admin/transformations", r) for r in (
+                {"name": "name the client's headers", "path_pattern": "/api/routed/clienttold/*", "request_config": {
+                    "headers_set": {"X-Shaped": "yes", "User-Agent": "gateway", "host": "backend.example"}, "headers_remove": ["Accept"]}},
+                {"name": "set a second Host", "path_pattern": "/api/routed/twohosts/*", "request_config": {"headers_set": {"X-Shaped": "yes", "Host": "backend.example"}}},
+                {"name": "take the Host away", "path_pattern": "/api/routed/hostless/*", "request_config": {
+                    "headers_set": {"X-Shaped": "yes"}, "headers_remove": ["host"], "headers_rename": {"Accept": "X-Was-Accept"}}})]
+            assert rules_reached("/api/routed/clienttold/1", "data plane", True), "the rules on the client's headers never reached the data plane"
+            client_same("a rule may set them, and one it takes away is the client's own again", "/api/routed/clienttold/1", headers=[("user-agent", "curl/8.4")],
+                        sees={"host": ["backend.example"], "user-agent": ["curl/8.4", "gateway"], "accept": ["*/*"]})
+            client_same("a rule may take Host away: the backend is then sent its own", "/api/routed/hostless/1", headers=[("Accept", "text/csv")],
+                        sees={"host": ["<the backend>"], "accept": ["*/*"], "user-agent": [agent_says]})
+            a, b = (httpx.get(f"{base}/api/routed/twohosts/1", headers={"X-API-Key": keys[k]["key"]}, timeout=15) for base, k in ((py, "py"), (rs, "rs")))
+            compare("the client's own headers: a rule that leaves two Host lines", a, b)
+            check("the client's own headers: that request is the Python gateway's, whose client refuses it",
+                  said_by(b) == "python" and a.status_code == b.status_code == 502, f"[{a.status_code}/{b.status_code}] by the {said_by(b)}")
+            remove_rules(made)
+            assert rules_reached("/api/routed/clienttold/1", "data plane", False), "removing the rules on the client's headers never reached the data plane"
+
             # Rules this side is not told the actions of: they change an answer's body or the
             # path by expression, fill in a template, or change a header that an HTTP library on
             # the way has a say in.
@@ -2393,7 +2456,7 @@ def main() -> int:
                                  ("rewrites the path by an expression only Python's engine reads", {"request_config": {"headers_set": {"X-Shaped": "yes"}, "path_rewrite": {"pattern": "/kept/(?=\\d)", "replacement": "/kept/n"}}}),
                                  ("rewrites the path by an expression that can match nothing", {"request_config": {"headers_set": {"X-Shaped": "yes"}, "path_rewrite": {"pattern": "(?:/x)*", "replacement": ""}}}),
                                  ("fills in a template", {"request_config": {"headers_set": {"X-Shaped": "yes"}}, "response_config": {"template": "{{ body | tojson }}"}}),
-                                 ("sets the client's name", {"request_config": {"headers_set": {"X-Shaped": "yes", "User-Agent": "gateway"}}}),
+                                 ("asks the backend for another encoding", {"request_config": {"headers_set": {"X-Shaped": "yes", "Accept-Encoding": "identity"}}}),
                                  ("sets the kind of content of an answer", {"request_config": {"headers_set": {"X-Shaped": "yes"}},
                                                                             "response_config": {"headers_set": {"Content-Type": "text/plain"}}}),
                                  ("maps a status to one without a body", {"request_config": {"headers_set": {"X-Shaped": "yes"}},

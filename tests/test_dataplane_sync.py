@@ -1359,15 +1359,16 @@ def test_the_snapshot_says_what_a_rule_does_when_the_data_plane_can_do_the_same(
     for code in ("condition", "transform_request", "transform_response"):
         assert dataplane_sync._rule_actions(TransformationRule(name="r", **{code: lambda *a: None})) is None
     # ...a header an HTTP library on the way has its own say in, on that side...
-    for name in ("Host", "content-length", "User-Agent", "Accept-Encoding", "Accept"):
+    for name in ("content-length", "Accept-Encoding", "Transfer-Encoding", "Connection"):
         for kept in ({"headers_set": {name: "v"}}, {"headers_remove": [name]}, {"headers_rename": {name: "X-A"}}, {"headers_rename": {"X-A": name}}):
             assert actions(request_config=kept) is None, kept
     for name in ("Content-Type", "content-length", "Set-Cookie", "Vary", "X-RateLimit-Limit", "x-tenant-id", "X-Served-By"):
         assert actions(response_config={"headers_set": {name: "v"}}) is None, name
         assert actions(response_config={"headers_remove": [name]}) is None, name
     # ...but not the headers this gateway itself writes after the rules, which the data plane writes as it does.
-    # Nor the version headers, which that side reads again after the rules, as the data plane does.
-    for name in ("X-Forwarded-For", "x-forwarded-for", "X-Protocol", "traceparent", "Traceparent", "x-request-id", "X-Request-ID", "X-API-Version", "accept-version"):
+    # Nor the version headers, which that side reads again after the rules, as the data plane does,
+    # nor those this gateway's own HTTP client has its way with, which the data plane is told of.
+    for name in ("Host", "host", "User-Agent", "Accept", "accept", "X-Forwarded-For", "x-forwarded-for", "X-Protocol", "traceparent", "Traceparent", "x-request-id", "X-Request-ID", "X-API-Version", "accept-version"):
         for told in ({"headers_set": {name: "v"}}, {"headers_remove": [name]}, {"headers_rename": {name: "X-A"}}, {"headers_rename": {"X-A": name}}):
             assert actions(request_config=told) is not None, told
     for name in ("X-Request-ID", "x-response-time", "traceparent", "X-API-Version", "Warning", "sunset", "Deprecation", "Retry-After", "Access-Control-Allow-Origin"):
@@ -1476,3 +1477,20 @@ async def test_a_native_rate_limit_refusal_of_a_token_is_announced_as_our_own_is
         "window": "minute", "path": "/api/users", "count": 2,
     })]
     assert announced["limit_alerts"][0]["api_key_id"] is None
+
+
+
+async def test_the_snapshot_says_what_the_gateways_client_adds_to_a_request(db_session, monkeypatch):
+    """The data plane adds what this gateway's HTTP client adds to a request that carries none of
+    it. With a client that is not httpx's own, nothing is said, and rules on those headers stay here."""
+    import httpx
+
+    from app.main import router
+    from app.transformers import TransformationRule
+
+    assert (await dataplane_sync.build_snapshot(db_session))["client_headers"] == [["accept", "*/*"], ["user-agent", f"python-httpx/{httpx.__version__}"]]
+    rule = TransformationRule.from_dict({"name": "r", "path_pattern": "*", "request_config": {"headers_set": {"User-Agent": "gateway"}}})
+    assert dataplane_sync._rule_actions(rule) is not None
+    monkeypatch.setattr(router, "client", object())
+    assert (await dataplane_sync.build_snapshot(db_session))["client_headers"] is None
+    assert dataplane_sync._rule_actions(rule) is None

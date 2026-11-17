@@ -51,7 +51,7 @@ from starlette.responses import Response  # noqa: E402
 
 from app import routing  # noqa: E402
 from app.routing import repeated_headers, repeated_query  # noqa: E402
-from app.dataplane_sync import _path_actions, _rule_actions  # noqa: E402
+from app.dataplane_sync import _client_headers, _path_actions, _rule_actions  # noqa: E402
 from app.main import answer_from, router  # noqa: E402
 from app.versioning import APIVersion, VersionStatus  # noqa: E402
 from app.transformers import RequestTransformer, ResponseTransformer, TransformConfig, TransformationRule, _apply_path_rewrite, transformation_manager  # noqa: E402
@@ -73,6 +73,9 @@ WORDS = ["1", "two", "", "x-y_z.~", "A1", "10"]
 ODD_WORDS = ["a b", "a&b", "café", "50%", 3]
 # What the gateway tells a backend with a version on its way out, each under one exact spelling.
 ANNOUNCED = ["warning", "Warning", "WARNING", "sunset", "Sunset"]
+# Headers of a request the gateway's HTTP client has its own way with: one given is sent as
+# given, and of `Accept` and `User-Agent` the client adds its own when none is given.
+CLIENT_TOLD = ["host", "Host", "accept", "Accept", "ACCEPT", "user-agent", "User-Agent"]
 # What a caller may write in a query that is not a plain word: escapes (whole, cut short, not
 # text once read), `+`, and the characters a URL keeps for itself.
 ODD_PARTS = ["a+b", "+", "%20", "%7E", "%7e", "%zz", "%", "%4", "%2541", "%25", "%C3%A9", "caf%c3%a9", "a/b", "x;y",
@@ -186,7 +189,7 @@ def a_rule(rng, n):
     rule = {"name": f"rule {n}", "path_pattern": "*"}
     if rng.random() < 0.8:
         rule["request_config"] = {
-            **header_actions(rng, NAMES + ANNOUNCED + ["content-type", "Content-Type"]),
+            **header_actions(rng, NAMES + ANNOUNCED + CLIENT_TOLD + ["content-type", "Content-Type"]),
             **(body_actions(rng) if rng.random() < 0.5 else {}),
             "query_remove": some(rng, lambda: rng.choice(KEYS)),
             "query_set": dict(some(rng, lambda: (rng.choice(KEYS), pick(rng, WORDS, ODD_WORDS)))),
@@ -212,12 +215,14 @@ def an_exchange(rng):
     its server reads them, and some are given more than once; so may an answer's be. Half the
     requests carry a body, with its length and, usually, what it is. A query is plain pairs or
     anything a caller may write."""
-    names = sorted({n.lower() for n in rng.sample(NAMES + ANNOUNCED + ["x-api-version"], rng.randint(0, 8))})
+    names = sorted({n.lower() for n in rng.sample(NAMES + ANNOUNCED + CLIENT_TOLD + ["x-api-version"], rng.randint(0, 8))})
     rng.shuffle(names)
     headers = [[n, rng.choice(VALUES)] for n in names]
-    if names and rng.random() < 0.3:
+    # Any name but `Host`, which a request that gives twice the data plane hands over whole.
+    repeatable = [n for n in names if n != "host"]
+    if repeatable and rng.random() < 0.3:
         for _ in range(rng.randint(1, 3)):
-            headers.insert(rng.randint(0, len(headers)), [rng.choice(names), rng.choice(VALUES)])
+            headers.insert(rng.randint(0, len(headers)), [rng.choice(repeatable), rng.choice(VALUES)])
     body = a_body(rng) if rng.random() < 0.5 else None
     if body is not None:
         headers.append(["content-length", str(len(body))])
@@ -245,7 +250,9 @@ def an_exchange(rng):
             "answer_body": given.hex() if given is not None else None, "status": status,
             # The protocol name the backend is told: the one the router gives a path with no prefix.
             "protocol": router._get_backend_url(path)[1].value,
-            "version": a_version(rng)}
+            "version": a_version(rng),
+            # What the gateway's own HTTP client adds to a request that carries none of that name.
+            "client_headers": _client_headers()}
 
 
 def a_version(rng):
@@ -293,8 +300,15 @@ def python_says(rules, case):
     path = url[len(backend.rstrip("/")):]
     # The trace is the gateway's own, new for each request.
     headers = [(name, "<trace>" if name == "traceparent" else value) for name, value in (headers.items() if isinstance(headers, dict) else headers)]
-    sent = httpx.Request(method, "http://backend:9000/x", headers=headers, params=query, content=content, json=json_payload)
-    sent_headers = [(n, v) for n, v in sent.headers.raw if n.lower() != b"host"]
+    # Sent by the gateway's own client, which merges its defaults in. Two of them are left out of
+    # the comparison: `Connection` (each side's own business with the backend) and the client's
+    # `Accept-Encoding`, which the data plane does not ask for, as it does not decompress.
+    sent = router.client.build_request(method, "http://backend:9000/x", headers=headers, params=query, content=content, json=json_payload)
+    defaulted = dict(router.client.headers)
+    sent_headers = [(n, v) for n, v in sent.headers.raw
+                    if n.lower() != b"connection"
+                    and not (n.lower() == b"host" and v == b"backend:9000")
+                    and not (n.lower() == b"accept-encoding" and v.decode() == defaulted.get("accept-encoding"))]
     body = came if content is None and json_payload is None else sent.read()
 
     lines = [tuple(line) for line in case["answer"]]

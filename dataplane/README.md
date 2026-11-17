@@ -245,7 +245,7 @@ beside the caller's own `x-client`, not in its place. Any other rule is the Pyth
 applies to is handed over: a rule that fills in a template, sets a value in a body that is not plain JSON, or
 rewrites the path by a regular expression of Python's own; one that names a
 header an HTTP library on the way has its own say in, or that the request is read by again after the rules (`Host`,
-`Content-Length`, `User-Agent`, `Accept`, `Accept-Encoding` and the hop-by-hop headers on a request; on an
+`Content-Length`, `Accept-Encoding` and the hop-by-hop headers on a request; on an
 answer `Content-Type`, `Content-Length`, `Set-Cookie`, `Vary`, `Date`, `Server` and the rate-limit and tenant headers); one with a header name or value that is not plain ASCII
 without a space at either end, or a query word of other than unreserved characters; one that maps a status to or from
 one without a body (below 200, 204, 205, 304). gRPC and `POST /mqtt/publish` have handlers of their own there, which
@@ -266,6 +266,13 @@ The query is read and written again on the way, as the Python gateway's HTTP cli
 `?flag=`, `+` becomes `%20`, an escape that need not be one is taken off (`%7E` becomes `~`), and a `?` with nothing
 after it is dropped. A query of plain `key=value` words is sent as it came. An escape that is not UTF-8 text once read is read as the
 Python gateway reads it, as a replacement character (`?q=%ff` reaches the backend as `?q=%EF%BF%BD`).
+
+The backend is sent the caller's `Host`, as the Python gateway's HTTP client sends the one it is given, and is sent
+that client's own `Accept` and `User-Agent` (which the snapshot names) when the request carries none of that name in
+any spelling. A rule may name all three: the backend is sent what the rule leaves, a `Host` it takes away is the
+backend's own address, and an `Accept` or `User-Agent` it takes away is the client's own again. The client's
+`Accept-Encoding` is not sent from here, and a rule that names it is the Python gateway's: that gateway decompresses
+what the header invites, and this side passes an answer on as the backend sent it.
 
 A rule may name `X-API-Version` and `Accept-Version` on a request. The Python gateway reads the version again from
 the headers the rules leave, and so does this side: the backend is told that version (and is sent to its backend, or
@@ -573,6 +580,9 @@ here is the reverse of everywhere else: **whatever this side cannot be sure of i
 * **Tail latency needs dedicated cores** (see Threads). On a machine shared with the load generator and the backend,
   p95 and p99 were worse than the earlier work-stealing build at low concurrency; with pinned cores on Linux they were
   equal or better. No comparison against other gateways has been run yet.
+* **The backend is not asked for a compressed answer from here.** For a caller that sends no `Accept-Encoding`, the
+  Python gateway's HTTP client asks for `gzip, deflate` and decompresses what comes back; this side asks for nothing.
+  The caller is given the same either way.
 * **An answer to `HEAD` keeps the length the backend stated.** The Python gateway states a length of 0.
 * The `Server` response header differs (uvicorn on one side), and native answers add `X-Served-By`.
 

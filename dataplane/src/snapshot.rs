@@ -114,6 +114,9 @@ pub struct Snapshot {
     /// The control plane's revision of this content, sent back as `since` to ask "anything new?".
     pub revision: Option<String>,
     pub api_versions: ApiVersions,
+    /// The headers the Python gateway's HTTP client adds to a request that carries none of that
+    /// name (`Accept`, `User-Agent`), which this side adds too.
+    pub client_headers: Vec<(HeaderName, HeaderValue)>,
     pub rate_limit_enabled: bool,
     pub circuit_breaker: breaker::Config,
     /// How long the backend may take to start answering before the request fails with a 502.
@@ -914,6 +917,8 @@ struct SnapshotFile {
     #[serde(default = "yes")]
     rate_limit_enabled: bool,
     api_versions: Option<VersionsRecord>,
+    #[serde(default)]
+    client_headers: Option<Vec<(String, String)>>,
     revision: Option<String>,
     #[serde(default)]
     unchanged: bool,
@@ -1334,6 +1339,12 @@ impl Snapshot {
             inject_request_id: file.inject_request_id,
             revision: file.revision,
             api_versions,
+            client_headers: file
+                .client_headers
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|(name, value)| Some((HeaderName::from_bytes(name.to_ascii_lowercase().as_bytes()).ok()?, HeaderValue::from_str(&value).ok()?)))
+                .collect(),
             rate_limit_enabled: file.rate_limit_enabled,
             // Without these sections, the gateway's shipped defaults apply.
             circuit_breaker: file
