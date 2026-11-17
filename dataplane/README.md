@@ -264,8 +264,8 @@ a request that gives one of those twice is handed to it.
 
 The query is read and written again on the way, as the Python gateway's HTTP client writes it: `?flag` becomes
 `?flag=`, `+` becomes `%20`, an escape that need not be one is taken off (`%7E` becomes `~`), and a `?` with nothing
-after it is dropped. A query of plain `key=value` words is sent as it came. One with an escape that is not UTF-8 text
-is the Python gateway's to read, and so is the request.
+after it is dropped. A query of plain `key=value` words is sent as it came. An escape that is not UTF-8 text once read is read as the
+Python gateway reads it, as a replacement character (`?q=%ff` reaches the backend as `?q=%EF%BF%BD`).
 
 A rule may name `X-API-Version` and `Accept-Version` on a request. The Python gateway reads the version again from
 the headers the rules leave, and so does this side: the backend is told that version (and is sent to its backend, or
@@ -440,7 +440,7 @@ Python gateway is handed the request when:
 
 * the slug is not registered (the 404 is Python's);
 * the caller asks for a WebSocket;
-* the query has an escape that is not text, a header about the connection is given twice (see "Given more than once"
+* a header about the connection is given twice (see "Given more than once"
   below), or the path after the slug names an API version that is gone;
 * the body is over 1 MiB, or came without a `Content-Length` and is empty;
 * the agent cannot be reached. Nothing was sent, so Python tries, answers in its own way and counts the failure in

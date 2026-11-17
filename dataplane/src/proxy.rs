@@ -4540,9 +4540,9 @@ mod tests {
         assert_eq!(once(&ask("GET", "/api/shaped/1?source=x&source=gw", &[])), "/api/shaped/1?source=x&source=gw");
         assert_eq!(once(&ask("PUT", "/api/users?q=a+b&flag", &[])), "/api/users?q=a%20b&flag=");
         assert_eq!(once(&ask("GET", "/api/users?", &[])), "/api/users");
-        // A query whose escapes are not text is read by the Python gateway alone.
-        assert_eq!(shaped(&ask("GET", "/api/users?q=%ff", &[])), "ask");
-        assert_eq!(shaped(&ask("GET", "/api/shaped/1?q=%ff", &[])), "ask");
+        // A query whose escapes are not text is read with replacement characters, as there.
+        assert_eq!(once(&ask("GET", "/api/users?q=%ff", &[])), "/api/users?q=%EF%BF%BD");
+        assert_eq!(once(&ask("GET", "/api/shaped/1?q=%ff&debug=1", &[])), "/api/shaped/1?q=%EF%BF%BD&source=gw");
         // An answer the Python gateway may stream is passed on there with no rule applied.
         assert!(shaped(&ask("GET", "/api/talk/1", &[])).contains("x-powered=|gateway"));
         let streamed = shaped(&ask("GET", "/api/talk/message:stream", &[]));
@@ -4761,11 +4761,11 @@ mod tests {
     #[test]
     fn an_agent_request_python_would_send_differently_is_left_to_python() {
         let snap = governed(AGENTS, "");
-        for uri in ["/agents/hiring/a?q=%ff", "/agents/hiring/v\u{662}/a"] {
+        for uri in ["/agents/hiring/v\u{662}/a"] {
             assert!(to_agent(&snap, &request("GET", uri)).is_none(), "{uri}");
         }
         // A query is written again as the Python gateway writes the dictionary it read it into.
-        for (query, sent) in [("x=1&x=2", "?x=1&x=2"), ("q=a+b", "?q=a%20b"), ("q=%7E", "?q=~"), ("flag", "?flag="), ("=1", "?=1"), ("a=1&&b=2", "?a=1&b=2"), ("&", "")] {
+        for (query, sent) in [("x=1&x=2", "?x=1&x=2"), ("q=a+b", "?q=a%20b"), ("q=%7E", "?q=~"), ("flag", "?flag="), ("=1", "?=1"), ("a=1&&b=2", "?a=1&b=2"), ("&", ""), ("q=%ff", "?q=%EF%BF%BD")] {
             assert_eq!(to_agent(&snap, &request("GET", &format!("/agents/hiring/a?{query}"))).as_deref(), Some(&*format!("10.0.0.10:8001/a{sent}")), "{query}");
         }
         // A path that names a version tells the agent that one, or none if it is not known.

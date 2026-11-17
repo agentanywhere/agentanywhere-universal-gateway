@@ -1457,7 +1457,8 @@ def main() -> int:
             agent_same("a query key given twice", "GET", "/agents/echo/a?x=1&x=2")
             agent_same("a query that Python rewrites", "GET", "/agents/echo/a?q=a+b&r=%7E")
             agent_same("a header given twice", "GET", "/agents/echo/a", [("Accept", "text/plain"), ("Accept", "application/json")])
-            agent_same("a query whose escapes are not text", "GET", "/agents/echo/a?q=%ff", by="python")
+            agent_same("a query whose escapes are not text is read with replacement characters", "GET", "/agents/echo/a?q=%ff&r=%C3x",
+                       want=lambda r: r.json()["query"] == "q=%EF%BF%BD&r=%EF%BF%BDx")
             # An escaped path is read decoded and written again, as on the way to any backend.
             for what, path, asked in (("a space", "/agents/echo/a%20b", "/a%20b"), ("in the slug", "/agents/ech%6F/x", "/x"),
                                       ("a slash", "/agents/echo/a%2Fb", "/a/b"), ("beyond ASCII", "/agents/echo/caf%C3%A9?q=1", "/caf%C3%A9"),
@@ -2207,7 +2208,8 @@ def main() -> int:
             repeated_same("an escaped parameter is written with the escapes the Python gateway's client uses", "/api/routed/plainly/1?q=a%20b&r=c+d&s=%2F&t=%7e",
                           query="q=a%20b&r=c%20d&s=%2F&t=~")
             repeated_same("an empty query", "/api/routed/plainly/1?", query="")
-            repeated_same("a query whose escapes are not text is the Python gateway's to read", "/api/routed/plainly/1?q=%ff", by="python")
+            repeated_same("a query whose escapes are not text is read with replacement characters", "/api/routed/plainly/1?q=%ff&%80=1&r=%ED%A0%80",
+                          query="q=%EF%BF%BD&%EF%BF%BD=1&r=%EF%BF%BD%EF%BF%BD%EF%BF%BD")
             made = [post("/admin/transformations", {"name": "name what is given twice", "path_pattern": "/api/routed/repeated/*", "request_config": {
                 "headers_rename": {"X-Tag": "X-Label"}, "headers_set": {"X-Shaped": "yes"}, "query_set": {"page": "1"}, "query_remove": ["debug"]}})]
             assert rules_reached("/api/routed/repeated/1", "data plane", True), "the rule on a header given twice never reached the data plane"

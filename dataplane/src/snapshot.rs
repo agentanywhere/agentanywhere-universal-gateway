@@ -436,8 +436,9 @@ pub struct Query {
 /// Read a query as the Python gateway reads it (`request.query_params`, which is `parse_qsl`
 /// keeping blank values): the pieces between `&`, each a name and, after its first `=`, a
 /// value; `+` a space and `%xx` the byte it names, an escape that is not one left as written.
-/// `None` for a query this side is not certain to read the same: one beyond ASCII, or whose
-/// escapes are not UTF-8.
+/// Bytes that are not UTF-8 once unescaped are each read as U+FFFD, as Python's decoder reads
+/// them with `errors="replace"`. `None` for a query beyond ASCII, which this side is not certain
+/// to read the same.
 pub fn read_query(query: &str) -> Option<Query> {
     if !query.is_ascii() {
         return None;
@@ -463,7 +464,7 @@ pub fn read_query(query: &str) -> Option<Query> {
                 }
             }
         }
-        String::from_utf8(out).ok()
+        Some(String::from_utf8_lossy(&out).into_owned())
     }
     let mut all: Vec<(String, Vec<String>)> = Vec::new();
     for piece in query.split('&').filter(|piece| !piece.is_empty()) {
@@ -1373,9 +1374,12 @@ mod tests {
         ] {
             assert_eq!(written(came).as_deref(), Some(sent), "{came}");
         }
-        for came in ["a=%ff", "a=%C3", "caf\u{e9}=1", "%80=1"] {
-            assert_eq!(written(came), None, "{came}");
+        // Bytes that are not UTF-8 are each a replacement character, written in UTF-8.
+        for (came, sent) in [("a=%ff", "a=%EF%BF%BD"), ("a=%C3", "a=%EF%BF%BD"), ("%80=1", "%EF%BF%BD=1"), ("a=%C3x", "a=%EF%BF%BDx"),
+                             ("a=%E2%82", "a=%EF%BF%BD"), ("a=%ED%A0%80", "a=%EF%BF%BD%EF%BF%BD%EF%BF%BD"), ("a=%F0%9F%98", "a=%EF%BF%BD")] {
+            assert_eq!(written(came).as_deref(), Some(sent), "{came}");
         }
+        assert_eq!(written("caf\u{e9}=1"), None);
         // Rules read and change one value to a name. A name given more than once goes on with
         // every value unless a rule changed it; set to the value it held, it was not changed.
         let rule: Actions = serde_json::from_str(r#"{"query_remove":["a b","gone"],"query_set":[["page","1"],["new","x"],["same","2"]]}"#).unwrap();

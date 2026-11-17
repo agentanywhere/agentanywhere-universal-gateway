@@ -78,7 +78,7 @@ ANNOUNCED = ["warning", "Warning", "WARNING", "sunset", "Sunset"]
 ODD_PARTS = ["a+b", "+", "%20", "%7E", "%7e", "%zz", "%", "%4", "%2541", "%25", "%C3%A9", "caf%c3%a9", "a/b", "x;y",
              "a:b@c", "k=v", "=", "~", "a*b", "(1)", "!$'", "a,b", "?", "%00", "%26", "%3D", "a%20b", "%41"]
 # Escapes that are not text once read: the Python gateway reads those alone.
-NOT_TEXT = ["%ff", "%E2%82", "%80"]
+NOT_TEXT = ["%ff", "%E2%82", "%80", "%C3", "%ED%A0%80", "%F0%9F%98", "%C0%AF", "%F4%90%80%80", "%E2%82%AC%ff", "%FE%FF"]
 STATUSES = [200, 201, 202, 301, 400, 401, 404, 409, 500, 502, 503]
 ODD_STATUSES = [204, 304, 99, 700, 0, "502"]
 
@@ -227,7 +227,7 @@ def an_exchange(rng):
     keys = rng.sample(KEYS, rng.randint(0, 4))
     query = "&".join(f"{k}={rng.choice(WORDS)}" for k in keys)
     if rng.random() < 0.4:
-        part = lambda plain: rng.choice(plain) if rng.random() < 0.6 else "".join(rng.choice(NOT_TEXT if rng.random() < 0.02 else ODD_PARTS + plain) for _ in range(rng.randint(1, 3)))
+        part = lambda plain: rng.choice(plain) if rng.random() < 0.6 else "".join(rng.choice(NOT_TEXT if rng.random() < 0.15 else ODD_PARTS + plain) for _ in range(rng.randint(1, 3)))
         pieces = [rng.choice([f"{part(KEYS)}={part(WORDS)}"] * 6 + [part(KEYS), ""]) for _ in range(rng.randint(0, 6))]
         query = "&".join(pieces)
     answer = []
@@ -407,17 +407,11 @@ def main():
     wrong, changed, asked, rewritten, moved, expressed, left, slow, unsure, answered = [], 0, 0, 0, 0, 0, 0, 0, 0, 0
     unread, twice, requeried = 0, 0, 0
     for (described, rules, case), got, line in zip(cases, answers, lines):
-        # A query whose escapes are not text is the only one this side leaves to Python to read.
+        # A query whose escapes are not text is read with replacement characters on both sides.
         try:
             unquote_to_bytes(case["query"].replace("+", " ")).decode("utf-8")
-            readable = True
         except UnicodeDecodeError:
-            readable = False
-        if not readable:
             unread += 1
-            if got not in ("ask", "unready"):
-                wrong.append((described, case, {"query": "left to Python"}, got if isinstance(got, dict) else {"query": got}))
-            continue
         by_expression = any("regex" in (a.get("path") or {}) for a in json.loads(line)["request"])
         if got == "ask" and by_expression and not case["path"].isascii():
             # Beyond ASCII the two engines' classes differ: such a path is rewritten by Python.
@@ -463,16 +457,16 @@ def main():
           f"{answered} with an answer's body written anew; "
           f"{asked} handed over for their body, {left} for a path beyond ASCII, {unsure} answers left for Python to shape; {slow} not compared, Python's engine taking too long; "
           f"{kept} sets of rules kept with Python; "
-          f"{twice} requests gave a header more than once, {requeried} queries were written anew, {unread} queries left for Python to read")
-    if twice < count // 20 or requeried < count // 20 or unread > count // 5:
+          f"{twice} requests gave a header more than once, {requeried} queries were written anew, {unread} of them with escapes that are not text")
+    if twice < count // 20 or requeried < count // 20 or unread < count // 50:
         print("too few requests with a header given twice or a query written anew are being compared")
     if kept > 2 * count:
         print("too many ordinary rules are being kept with Python")
     if asked > count // 20 or rewritten < count // 20:
         print("too few ordinary bodies are being written here")
-    if moved < (count - unread) // 20 or expressed < (count - unread) // 100:
+    if moved < count // 20 or expressed < count // 100:
         print("too few ordinary rewrites are being done here")
-    few = twice < count // 20 or requeried < count // 20 or unread > count // 5 or answered < count // 20 or unsure > count // 10 or slow > count // 100 or asked > count // 20 or rewritten < count // 20 or moved < (count - unread) // 20 or expressed < (count - unread) // 100
+    few = twice < count // 20 or requeried < count // 20 or unread < count // 50 or answered < count // 20 or unsure > count // 10 or slow > count // 100 or asked > count // 20 or rewritten < count // 20 or moved < count // 20 or expressed < count // 100
     alike = rewrites(5 * count, seed)
     sys.exit(1 if wrong or kept > 2 * count or changed < count // 2 or few or not alike else 0)
 
