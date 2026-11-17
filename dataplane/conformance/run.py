@@ -2449,6 +2449,41 @@ def main() -> int:
             remove_rules(made)
             assert rules_reached("/api/routed/clienttold/1", "data plane", False), "removing the rules on the client's headers never reached the data plane"
 
+            # Rules on answer headers the gateway writes after them on both sides alike, or not at all:
+            # `Vary` (a listed origin's page adds `Origin` to the first), `X-Tenant-ID` (a tenant's
+            # key replaces the rule's), and the rate-limit and tenant-quota names nothing writes.
+            wide = {"py": tenant("conf-py-wide", 1000, "conf-py-wide-key"), "rs": tenant("conf-rs-wide", 1000, "conf-rs-wide-key")}
+            assert wait_until(tenant_native(wide["rs"], "conf-rs-wide")), "the second tenant's key never reached the snapshot"
+            made = [post("/admin/transformations", {"name": "name the answer's tenant and limit headers", "path_pattern": "*api/routed/answered/*",
+                                                     "request_config": {"headers_set": {"X-Shaped": "yes"}},
+                                                     "response_config": {"headers_set": {"Vary": "Accept", "X-RateLimit-Limit": "100", "X-Tenant-ID": "the rule's",
+                                                                                         "X-Tenant-Quota-Minute": "1/2"}}})]
+            assert rules_reached("/api/routed/answered/1", "data plane", True), "the rule on the answer's tenant headers never reached the data plane"
+
+            def answered_same(name, pair, headers=(), given=None):
+                a, b = (httpx.get(f"{base}/api/routed/answered/1", headers=[("X-API-Key", pair[k]["key"]), *headers], timeout=15) for base, k in ((py, "py"), (rs, "rs")))
+                told = ("vary", "x-ratelimit-limit", "x-tenant-id", "x-tenant-quota-minute")
+                got = lambda r, side: {h: [v.replace("conf-py-", "conf-").replace("conf-rs-", "conf-") for v in r.headers.get_list(h)] for h in told if h in r.headers}
+                bad = []
+                if said_by(b) != "data plane":
+                    bad.append(f"answered by the {said_by(b)}")
+                if not a.status_code == b.status_code == 200:
+                    bad.append(f"status {a.status_code} and {b.status_code}")
+                elif got(a, "py") != got(b, "rs"):
+                    bad.append(f"the caller was given {got(a, 'py')} by Python and {got(b, 'rs')} by the data plane")
+                for header, want in (given or {}).items():
+                    if got(b, "rs").get(header) != want:
+                        bad.append(f"the caller was given {header}: {got(b, 'rs').get(header)!r}, not {want!r}")
+                check(f"a rule on the answer's tenant and limit headers: {name}", not bad, "; ".join(bad) or str(got(b, "rs")))
+
+            answered_same("a key of no tenant is given the rule's lines", keys,
+                          given={"vary": ["Accept"], "x-ratelimit-limit": ["100"], "x-tenant-id": ["the rule's"], "x-tenant-quota-minute": ["1/2"]})
+            answered_same("a tenant's key is given its tenant's id over the rule's", wide, given={"x-tenant-id": ["conf-wide"], "x-tenant-quota-minute": ["1/2"]})
+            answered_same("a page from a listed origin is given Origin after the rule's Vary", keys, headers=[("Origin", "http://localhost:3001")],
+                          given={"vary": ["Accept, Origin"]})
+            remove_rules(made)
+            assert rules_reached("/api/routed/answered/1", "data plane", False), "removing the rule on the answer's tenant headers never reached the data plane"
+
             # Rules this side is not told the actions of: they change an answer's body or the
             # path by expression, fill in a template, or change a header that an HTTP library on
             # the way has a say in.

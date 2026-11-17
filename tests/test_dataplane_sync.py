@@ -1362,7 +1362,7 @@ def test_the_snapshot_says_what_a_rule_does_when_the_data_plane_can_do_the_same(
     for name in ("content-length", "Accept-Encoding", "Transfer-Encoding", "Connection"):
         for kept in ({"headers_set": {name: "v"}}, {"headers_remove": [name]}, {"headers_rename": {name: "X-A"}}, {"headers_rename": {"X-A": name}}):
             assert actions(request_config=kept) is None, kept
-    for name in ("Content-Type", "content-length", "Set-Cookie", "Vary", "X-RateLimit-Limit", "x-tenant-id", "X-Served-By"):
+    for name in ("Content-Type", "content-length", "Set-Cookie", "Date", "Server", "X-Anomaly-Score", "X-Served-By"):
         assert actions(response_config={"headers_set": {name: "v"}}) is None, name
         assert actions(response_config={"headers_remove": [name]}) is None, name
     # ...but not the headers this gateway itself writes after the rules, which the data plane writes as it does.
@@ -1371,7 +1371,8 @@ def test_the_snapshot_says_what_a_rule_does_when_the_data_plane_can_do_the_same(
     for name in ("Host", "host", "User-Agent", "Accept", "accept", "X-Forwarded-For", "x-forwarded-for", "X-Protocol", "traceparent", "Traceparent", "x-request-id", "X-Request-ID", "X-API-Version", "accept-version"):
         for told in ({"headers_set": {name: "v"}}, {"headers_remove": [name]}, {"headers_rename": {name: "X-A"}}, {"headers_rename": {"X-A": name}}):
             assert actions(request_config=told) is not None, told
-    for name in ("X-Request-ID", "x-response-time", "traceparent", "X-API-Version", "Warning", "sunset", "Deprecation", "Retry-After", "Access-Control-Allow-Origin"):
+    for name in ("X-Request-ID", "x-response-time", "traceparent", "X-API-Version", "Warning", "sunset", "Deprecation", "Retry-After", "Access-Control-Allow-Origin",
+                 "Vary", "X-RateLimit-Limit", "x-tenant-id", "X-Tenant-Quota-Minute"):
         for told in ({"headers_set": {name: "v"}}, {"headers_remove": [name]}, {"headers_rename": {name: "X-A"}}, {"headers_rename": {"X-A": name}}):
             assert actions(response_config=told) is not None, told
     assert actions(request_config={"headers_set": {"Content-Type": "text/plain", "Set-Cookie": "a=b"}}) is not None

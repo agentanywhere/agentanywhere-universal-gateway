@@ -309,10 +309,14 @@ def _client_headers() -> Optional[list]:
 
 _RESPONSE_HEADERS_KEPT = frozenset((
     "content-type", "content-length", "content-encoding", "transfer-encoding", "connection", "keep-alive", "upgrade",
-    "te", "trailer", "proxy-authenticate", "proxy-authorization", "set-cookie", "date", "server", "vary",
+    "te", "trailer", "proxy-authenticate", "proxy-authorization", "set-cookie", "date", "server",
     "x-served-by", "x-dataplane-auth", "x-content-type-options",
 ))
-_RESPONSE_PREFIXES_KEPT = ("x-ratelimit-", "x-tenant-", "x-anomaly-")
+# `X-Anomaly-*` is written by AI scoring here, which does not see what the data plane serves.
+# (`Vary`, `X-Tenant-ID` and the rest are written after the rules on both sides alike: the
+# cross-origin middleware adds `Origin` to the first `Vary`, and a tenant's id replaces a rule's.
+# Nothing here writes `X-RateLimit-*` or the tenant quota headers.)
+_RESPONSE_PREFIXES_KEPT = ("x-anomaly-",)
 # The statuses a rule may turn into one another here: those that carry a body, as every server
 # on the way writes them.
 _STATUS_MAPPED = frozenset(range(200, 600)) - {204, 205, 304}

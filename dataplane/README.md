@@ -246,7 +246,7 @@ applies to is handed over: a rule that fills in a template, sets a value in a bo
 rewrites the path by a regular expression of Python's own; one that names a
 header an HTTP library on the way has its own say in, or that the request is read by again after the rules (`Host`,
 `Content-Length`, `Accept-Encoding` and the hop-by-hop headers on a request; on an
-answer `Content-Type`, `Content-Length`, `Set-Cookie`, `Vary`, `Date`, `Server` and the rate-limit and tenant headers); one with a header name or value that is not plain ASCII
+answer `Content-Type`, `Content-Length`, `Set-Cookie`, `Date`, `Server` and `X-Anomaly-*`); one with a header name or value that is not plain ASCII
 without a space at either end, or a query word of other than unreserved characters; one that maps a status to or from
 one without a body (below 200, 204, 205, 304). gRPC and `POST /mqtt/publish` have handlers of their own there, which
 apply no rule; a rule that matches one keeps it with the Python gateway, as before, and so does a rule that matches
@@ -279,7 +279,9 @@ the headers the rules leave, and so does this side: the backend is told that ver
 refused, if the version says so), while the caller is still told the version its own headers named. On an answer a
 rule may name `Warning`, `Sunset`, `Deprecation`, `Retry-After` and the cross-origin headers: where the gateway
 writes one of those itself (a version on its way out, a page from a listed origin) its own line replaces the rule's,
-and where it does not the rule's stands.
+and where it does not the rule's stands. The same goes for `Vary` (a page from a listed origin has `Origin` added to
+the first `Vary` the rules leave) and `X-Tenant-ID` (a tenant's key has its tenant's id written over the rule's). Nothing
+writes `X-RateLimit-*` or the tenant quota headers, so a rule's lines under those names stand on both sides.
 
 A rule may name the headers the gateway itself writes. On a request those are `X-Forwarded-For`, `X-Protocol`,
 `traceparent` and (with the request-id plugin) `X-Request-ID`. The Python gateway writes them after the rules, into the
