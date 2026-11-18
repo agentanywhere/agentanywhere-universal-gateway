@@ -53,6 +53,17 @@ See [docs/known-limitations.md](docs/known-limitations.md) for the full list.
 
 ### Fixed
 
+- Security: a request whose path decodes to `?`, `#` or a control character
+  (`/api/x%3F/../admin`) is refused with a 400 (`INVALID_PATH`). The key's
+  allowed paths, the policies and the agent edge read the path only up to a
+  decoded `?` or `#`, while the proxy forwarded all of it: the backend was sent
+  `/api/x?/../admin`, with a query no rule had seen, and an agent was asked for
+  less than the caller named.
+- Proxy: a request path that decodes to `?`, `#` or a control character is
+  forwarded with that character escaped, as path data. A caller's
+  `/api/a%3Fadmin=1` reached the backend as `/api/a?admin=1`, a query
+  parameter no rule or check had seen; a `%23` cut the rest of the path off;
+  and a `%0A` made the request fail.
 - Database migrations: the Alembic migrations `001` and `002` were replaced by
   one baseline, `0001`, that creates the full current schema. It is safe to
   run on a database the gateway already created at startup, works on SQLite
