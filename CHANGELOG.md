@@ -53,6 +53,10 @@ See [docs/known-limitations.md](docs/known-limitations.md) for the full list.
 
 ### Fixed
 
+- The start-up banner's documentation link (`DOCUMENTATION_URL`) now defaults
+  to https://docs.agentanywhere.ai/gateway/ instead of the repository's
+  `docs/` folder.
+
 - Database migrations: the Alembic migrations `001` and `002` were replaced by
   one baseline, `0001`, that creates the full current schema. It is safe to
   run on a database the gateway already created at startup, works on SQLite
