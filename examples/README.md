@@ -6,15 +6,16 @@ gateway on `http://localhost:8000`, an API key, and the sample backends from
 [getting-started tutorial](../docs/tutorials/getting-started.md) shows how to
 get all three.
 
-These files were not run for the current documentation. The request shapes
-match the sample backends; your own backends define their own paths and
-bodies.
+The request shapes match the sample backends; your own backends define their
+own paths and bodies. In `basic_usage.py`, the HTTP, MCP and error-handling
+examples were run against the sample backends; the other files were not run
+for the current documentation.
 
 ## Files
 
 | File | Shows | Needs |
 |---|---|---|
-| `basic_usage.py` | MCP, A2A, MQTT, HTTP, GraphQL and gRPC requests with `requests` | `pip install requests`; `export API_KEY=...` |
+| `basic_usage.py` | MCP, A2A, MQTT, HTTP, GraphQL and gRPC requests with `requests`, and the 401 for a request without a key | `pip install requests`; `export API_KEY=...`; `GATEWAY_URL` if the gateway is not on `http://127.0.0.1:8000` |
 | `python_sdk_example.py` | The shape of a client like the one the SDK generator produces (`/admin/sdk/generate/python`) | `pip install requests` |
 | `javascript_example.js` | The same requests from Node.js | `npm install axios ws` |
 
@@ -54,8 +55,15 @@ requests.post(f"{GATEWAY}/a2a/message", headers=HEADERS,
 requests.post(f"{GATEWAY}/mqtt/publish", headers=HEADERS,
               json={"topic": "sensors/temperature", "payload": {"value": 25.5}, "qos": 1})
 
+# HTTP/REST: the sample backend's POST /api/users creates a user (name and email required)
+requests.post(f"{GATEWAY}/api/users", headers=HEADERS,
+              json={"name": "Ada", "email": "ada@example.com"})
+
 # GraphQL
 requests.post(f"{GATEWAY}/graphql", headers=HEADERS, json={"query": "{ hello }"})
+
+# No X-API-Key header: 401 from the gateway, before any backend is called
+requests.post(f"{GATEWAY}/mcp/query", json={"query": "What is the weather?"})
 ```
 
 AG-UI and ACP responses are streamed when you send
