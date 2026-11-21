@@ -133,9 +133,13 @@ If the old container still exists:
 
    ```bash
    docker compose cp ./gateway.db gateway:/app/data/gateway.db
-   docker compose exec -u root gateway chown gateway:gateway /app/data/gateway.db
+   docker compose exec -u root gateway sh -c 'chown gateway:gateway /app/data/gateway.db'
    docker compose restart gateway
    ```
+
+   The container path is inside `sh -c '...'` because Git Bash on Windows
+   rewrites an argument that starts with `/` before Docker sees it; see
+   [Back up and restore](back-up-and-restore.md#back-up-sqlite).
 
 ## Databases built with the old migrations
 
