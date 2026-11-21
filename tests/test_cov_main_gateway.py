@@ -634,6 +634,73 @@ def test_repeated_query_lists_only_keys_given_more_than_once():
     assert _with_repeats({"b": "2"}, None) == {"b": "2"}
     assert repeated_query({"a": "1"}) == {}
 
+# ------------------------------------------------- escaped ?, # and control characters in a path
+@pytest.fixture
+def asked(monkeypatch):
+    """The real router with a fake backend; yields the path and query of each request sent."""
+    from app.transformers import transformation_manager
+
+    seen = []
+
+    def answer(request):
+        seen.append(request.url.raw_path.decode())
+        return httpx.Response(200, json={"ok": True})
+
+    monkeypatch.setattr(main.router, "client", httpx.AsyncClient(transport=httpx.MockTransport(answer)))
+    monkeypatch.setattr(transformation_manager, "rules_by_id", {})
+    return seen
+
+
+@pytest.mark.parametrize("path", ["/mcp/a%3Fadmin=1", "/mcp/x%3F%2F..%2F..%2Fadmin", "/mcp/a%23frag/b", "/mcp/a%09b", "/mcp/a%0Ab", "/mcp/a%7Fb",
+                                  "/admin%3F/api-keys", "/health%23"])
+def test_a_path_that_decodes_to_a_delimiter_is_refused_before_anything_reads_it(gwdb, asked, H, path):
+    r = gwdb.get(path + "?x=1", headers={**H, "X-Request-ID": "rid-p"})
+    assert r.status_code == 400
+    assert r.json()["error"] == "INVALID_PATH" and r.json()["request_id"] == "rid-p"
+    assert asked == []
+
+
+def test_options_and_agents_are_refused_the_same(gw, asked, monkeypatch):
+    monkeypatch.setattr(main, "agent_edge_config", AgentEdgeConfig({"demo": "http://10.0.0.5:9000"}))
+    assert gw.get("/agents/demo/run%3Fadmin=1").status_code == 400
+    assert gw.options("/mcp/a%3Fb").status_code == 400
+    assert asked == []
+
+
+def test_a_path_without_them_is_forwarded_as_before(gwdb, asked, H):
+    for path in ("/mcp/a%20b", "/mcp/caf%C3%A9", "/mcp/~a", "/mcp/a%3Db"):
+        assert gwdb.get(path, headers=H).status_code == 200
+    assert asked == ["/mcp/a%20b", "/mcp/caf%C3%A9", "/mcp/~a", "/mcp/a=b"]
+
+
+def test_breaks_out_of_the_path_names_only_those_characters():
+    from app.main import _breaks_out_of_the_path
+
+    assert not any(_breaks_out_of_the_path(p) for p in ("/a b/caf\u00e9/%41", "/a=b&c;d", "/"))
+    assert all(_breaks_out_of_the_path(p) for p in ("/a?b", "/a#", "/a\tb", "/a\x00", "/a\x7f"))
+
+
+# ------------------------------------------------- a body sent without its length
+def test_a_chunked_body_goes_on_with_its_length_alone(gwdb, monkeypatch, H):
+    """The caller's ``Transfer-Encoding`` is not passed on beside the length the gateway states."""
+    from app.transformers import transformation_manager
+
+    seen = []
+
+    def answer(request):
+        seen.append(({name.decode().lower(): value.decode() for name, value in request.headers.raw}, request.content))
+        return httpx.Response(200, json={"ok": True})
+
+    monkeypatch.setattr(main.router, "client", httpx.AsyncClient(transport=httpx.MockTransport(answer)))
+    monkeypatch.setattr(transformation_manager, "rules_by_id", {})
+    assert gwdb.post("/api/t", headers=H, content=iter([b"plain ", b"words"])).status_code == 200
+    assert gwdb.post("/api/t", headers={**H, "Content-Type": "application/json"}, content=iter([b'{"a":', b" 1}"])).status_code == 200
+    assert gwdb.get("/api/t", headers={**H, "Transfer-Encoding": "chunked"}).status_code == 200
+    for headers, body in seen:
+        assert "transfer-encoding" not in headers
+    assert [(headers.get("content-length"), body) for headers, body in seen[:2]] == [("11", b"plain words"), ("8", b'{"a": 1}')]
+
+
 
 # ------------------------------------------------- repeated header lines
 @pytest.fixture

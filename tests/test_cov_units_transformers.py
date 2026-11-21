@@ -218,3 +218,20 @@ def _rt_with(rule):
     rt = RequestTransformer()
     rt.add_rule(rule)
     return rt
+
+
+def test_field_operations_leave_a_body_that_is_not_an_object():
+    cfg = TransformConfig(body_set={"a": 1}, body_remove=["b"], body_rename={"c": "d"})
+    for body in (b"[1, 2]", b'"text"', b"5", b"true", b"null", b"not json", b""):
+        assert t._apply_body_ops(body, cfg) is body
+    # A template is still filled in from whatever the body holds.
+    assert t._apply_body_ops(b"[1, 2]", TransformConfig(template="{{ body | length }}")) == 2
+
+
+def test_a_value_a_rule_sets_is_not_shared_between_requests():
+    first = TransformConfig(body_set={"meta": {}})
+    second = TransformConfig(body_rename={"user": "meta.user"})
+    body = t._apply_body_ops(t._apply_body_ops(b'{"user": "ana"}', first), second)
+    assert body == {"meta": {"user": "ana"}}
+    assert first.body_set == {"meta": {}}
+    assert t._apply_body_ops(t._apply_body_ops(b"{}", first), second) == {"meta": {}}

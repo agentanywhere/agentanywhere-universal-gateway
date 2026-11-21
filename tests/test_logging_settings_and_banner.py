@@ -210,3 +210,10 @@ def test_banner_backends_row_when_none_configured_and_default_docs_link():
     s = _settings(http_backend_url=None, mcp_backend_url=None, a2a_backend_url=None)
     text = render_banner(s)
     assert "none configured" in text and "docs/README.md" in text
+
+
+def test_the_default_documentation_url_is_the_gateway_docs():
+    """The banner's link is a public page, not the repository's docs folder."""
+    from app.config import Settings
+
+    assert Settings.model_fields["documentation_url"].default == "https://docs.agentanywhere.ai/gateway/"

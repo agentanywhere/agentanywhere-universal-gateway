@@ -45,6 +45,15 @@ def _with_repeats(
             out[key] = list(values)
     return out
 
+def graphql_base(url: str) -> str:
+    """Where GraphQL requests are sent, less the ``/graphql`` their own path supplies.
+
+    ``GRAPHQL_BACKEND_URL`` may name the server or its endpoint: ``http://host:4000`` and
+    ``http://host:4000/graphql`` both send ``/graphql`` to ``http://host:4000/graphql``.
+    """
+    base = url.rstrip("/")
+    return base[: -len("/graphql")] if base.endswith("/graphql") else base
+
 
 # Headers that describe the connection or the message's framing, not the request. Of these the
 # backend is sent one line, as before, however many the caller gave.
@@ -143,7 +152,7 @@ class Router:
         elif path.startswith("/graphql") or path.startswith("/api/graphql"):
             # GraphQL routing
             if settings.graphql_backend_url:
-                return settings.graphql_backend_url, ProtocolType.GRAPHQL
+                return graphql_base(settings.graphql_backend_url), ProtocolType.GRAPHQL
             raise ValueError("GraphQL backend URL not configured")
         elif path.startswith("/api") or path.startswith("/rest") or path.startswith("/http"):
             # HTTP/REST routing
@@ -268,7 +277,12 @@ class Router:
             self.circuit_breakers[backend_url] = cb
     
     def _apply_tier2_path_strip(self, path: str, protocol: ProtocolType) -> str:
-        """Strip /acp or /agui gateway prefixes so ACP/AG-UI servers see spec-native paths."""
+        """Strip /acp or /agui gateway prefixes so ACP/AG-UI servers see spec-native paths.
+
+        A GraphQL path loses only a leading ``/api``: the server is sent ``/graphql`` either way.
+        """
+        if protocol == ProtocolType.GRAPHQL:
+            return path[len("/api"):] if path.startswith("/api/graphql") else path
         if protocol not in (ProtocolType.ACP, ProtocolType.AG_UI):
             return path
         normalized = path if path.startswith("/") else f"/{path}"
@@ -334,8 +348,11 @@ class Router:
             if version_manager.strip_prefix_on_proxy and version_target_path:
                 target_path = version_target_path
 
+        # ``Transfer-Encoding`` says how the caller framed its message. The body has been
+        # read whole by now and goes on with its length, so the header does not go on with it.
         filtered_headers = {k: v for k, v in transformed_headers.items()
-                            if not k.lower().startswith("x-gateway-")}
+                            if not k.lower().startswith("x-gateway-")
+                            and k.lower() != "transfer-encoding"}
 
         filtered_headers["X-Forwarded-For"] = transformed_headers.get("X-Forwarded-For", "")
         filtered_headers["X-Protocol"] = protocol.value
@@ -365,8 +382,14 @@ class Router:
         if transformed_body is not None:
             if isinstance(transformed_body, bytes):
                 content = transformed_body
+            elif isinstance(transformed_body, str) and transformed_body is not body:
+                # Text a rule made of the body (a filled-in template) is sent as that text.
+                content = transformed_body.encode("utf-8")
             else:
                 json_payload = transformed_body
+        if transformed_body is not body:
+            # A rule changed the body, so the length the caller declared is no longer its length.
+            filtered_headers = {k: v for k, v in filtered_headers.items() if k.lower() != "content-length"}
 
         sent_headers = _with_repeated_lines(filtered_headers, repeated_lines)
         return url, sent_headers, transformed_query_params, content, json_payload, backend_url, protocol, timeout
