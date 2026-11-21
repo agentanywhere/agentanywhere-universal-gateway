@@ -14,7 +14,7 @@ import {
   XCircle,
   Zap,
 } from 'lucide-react'
-import { adminApi } from '../api/admin'
+import { adminApi, configString } from '../api/admin'
 import { Card, CardContent } from '../components/ui/Card'
 import { PageHeader } from '../components/ui/PageHeader'
 import { Badge } from '../components/ui/Badge'
@@ -100,12 +100,12 @@ export default function Protocols() {
     if (!route) return { status: 'not-configured' as const, message: 'Not configured' }
 
     const backendUrls: Record<string, string | undefined> = {
-      mcp: config?.mcp_backend_url,
-      a2a: config?.a2a_backend_url,
-      http: config?.http_backend_url,
-      mqtt: config?.mqtt_broker_url,
-      websocket: config?.websocket_backend_url,
-      grpc: config?.grpc_backend_url,
+      mcp: configString(config, 'mcp_backend_url'),
+      a2a: configString(config, 'a2a_backend_url'),
+      http: configString(config, 'http_backend_url'),
+      mqtt: configString(config, 'mqtt_broker_url'),
+      websocket: configString(config, 'websocket_backend_url'),
+      grpc: configString(config, 'grpc_backend_url'),
     }
     const url = backendUrls[id]
     if (!url) return { status: 'not-configured' as const, message: 'Backend not configured' }

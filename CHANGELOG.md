@@ -53,6 +53,10 @@ See [docs/known-limitations.md](docs/known-limitations.md) for the full list.
 
 ### Fixed
 
+- Admin console: the Protocols page no longer reports every backend as "not
+  configured", and the Settings page fills in the backend URLs, environment and
+  log level. `GET /admin/config` groups settings into sections; the console now
+  reads them from there instead of looking for flat fields.
 - `pytest` passes with the `.env` the getting-started tutorial writes:
   `tests/conftest.py` sets an empty `ADMIN_TOKEN` (and
   `ADMIN_ACCEPT_SECRET_KEY=false`) in the environment, which takes precedence
