@@ -104,6 +104,10 @@ See [docs/known-limitations.md](docs/known-limitations.md) for the full list.
 - `admin-ui/src/lib/utils.ts` was never committed (the root `.gitignore`
   ignored every `lib/`), so the console did not type-check or build from a
   clean clone.
+- `tests/test_followup_fixes.py::test_quickstart_script_picks_python_with_requests`
+  copies the helper out of `scripts/quickstart_test.sh` in Python instead of
+  running `sed`, so it no longer crashes on Git for Windows, which puts
+  `bash` on `PATH` but not `sed`.
 
 ### Changed (may need action on upgrade; see docs/how-to/upgrade.md)
 
