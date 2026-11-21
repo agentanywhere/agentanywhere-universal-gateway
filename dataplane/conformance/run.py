@@ -2133,6 +2133,9 @@ def main() -> int:
                     "headers_set": {"X-Request-ID": "theirs", "X-Response-Time": "never", "Traceparent": "nope", "X-API-Version": "9"}}})]
             assert rules_reached("/api/routed/stamped/1", "data plane", True), "the rules on the gateway's own headers never reached the data plane"
             assert rules_reached("/api/routed/unstamped/1", "data plane", True), "the second rule on the gateway's own headers never reached the data plane"
+            # Three rules, made one after another: the data plane may hold the first two and not yet the third.
+            assert wait_until(lambda: shaped(rs, keys["rs"]["key"], "GET", "/api/routed/stamped/1").headers.get("x-backend-request") == "echo"), \
+                "the rule on the gateway's own headers in the answer never reached the data plane"
             stamped_same("a rule may set them: under the gateway's spelling its line is the one, under another it goes beside", "/api/routed/stamped/1",
                          headers=calling, sees={"x-forwarded-for": ["198.51.100.7", "203.0.113.5"], "x-protocol": ["theirs", "http"],
                                                 "traceparent": ["nope", "<trace>"], "x-gateway-note": None, "x-shaped": ["yes"]},
