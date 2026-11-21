@@ -62,6 +62,12 @@ See [docs/known-limitations.md](docs/known-limitations.md) for the full list.
 
 ### Fixed
 
+- Transformations: a rule that sets a header which cannot be written is now
+  refused when it is made (400), instead of failing every request it applies
+  to (502). That is a header name that is not a token, or a value that starts
+  or ends with a space, holds a line break or another control character, or
+  holds characters outside ASCII on a request or outside Latin-1 on an
+  answer.
 - Transformations: a rule that changes a request's body now works. The new
   body was sent with the length the caller declared for the old one, so the
   request never reached the backend and the caller got a 502. Three related
