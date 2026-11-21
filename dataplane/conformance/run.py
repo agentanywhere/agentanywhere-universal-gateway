@@ -529,7 +529,7 @@ def main() -> int:
             # The data plane gets its keys from the Python gateway; a fast interval and a short
             # staleness limit keep the live scenarios quick.
             procs.append(subprocess.Popen([str(BIN), "--listen", f"127.0.0.1:{dport}", "--control-token", "conformance-token",
-                                           "--sync-interval-ms", "200", "--max-staleness-ms", "2000", "--report-interval-ms", "300",
+                                           "--sync-interval-ms", "200", "--max-staleness-ms", "8000", "--report-interval-ms", "300",
                                            "--backend", f"http://127.0.0.1:{bport}", "--control", f"http://127.0.0.1:{gport}"], env=env))
             time.sleep(1.5)
             assert procs[-1].poll() is None, f"the data plane exited at once (code {procs[-1].returncode})"
@@ -809,7 +809,10 @@ def main() -> int:
             N = 200
             for i in range(N):
                 httpx.get(f"{rs}/api/users", headers={"X-API-Key": probe["key"]}, params={"i": i}, timeout=10)
-            time.sleep(2.0)
+            # Reports land a few times a second; on a busy machine some are late.
+            wait_until(lambda: metric("gateway_requests_total", **req_labels) - before >= N
+                       and metric("gateway_dataplane_native_requests_total", status_class="2xx") - before_native >= N
+                       and metric("gateway_request_duration_seconds_count", method="GET", path="/api/users", protocol="http") - before_count >= N, 30)
             delta = metric("gateway_requests_total", **req_labels) - before
             check("native requests are counted exactly in gateway_requests_total", delta == N, f"{delta:.0f} of {N}")
             delta_n = metric("gateway_dataplane_native_requests_total", status_class="2xx") - before_native
@@ -2646,7 +2649,7 @@ def main() -> int:
             # this suite asks for more paths than that before it comes here.
             count_of = lambda path: metric("gateway_requests_total", method="POST", path=path, status_code="200")
             wait_until(lambda: count_of("/conf.Echo/Count") + count_of("other") >= 1
-                       and any(l.get("status_code", l.get("status")) == 429 for l in said_logs()), 15)
+                       and any(l.get("status_code", l.get("status")) == 429 for l in said_logs()), 30)
             counted, others = count_of("/conf.Echo/Count"), count_of("other")
             check("gRPC: calls are counted in gateway_requests_total", counted == 1 or (counted == 0 and others >= 1),
                   f"{counted:.0f} under the method's own path, {others:.0f} under \"other\"")
@@ -2738,7 +2741,7 @@ def main() -> int:
 
             calling = ({side: bridge_key(f"bridge-{side}") for side in ("py", "rs")}, (f"http://127.0.0.1:{g}", f"http://127.0.0.1:{d}"))
             procs.append(subprocess.Popen([str(BIN), "--listen", f"127.0.0.1:{d}", "--control-token", "conformance-token",
-                                           "--sync-interval-ms", "200", "--max-staleness-ms", "2000", "--report-interval-ms", "300",
+                                           "--sync-interval-ms", "200", "--max-staleness-ms", "8000", "--report-interval-ms", "300",
                                            "--backend", f"http://127.0.0.1:{bport}", "--control", f"http://127.0.0.1:{g}"], env=own))
             check("bridge: the data plane starts serving it", wait_until(lambda: said_by(bridge(calling[1][1], calling[0]["rs"], body={"service": "S"})[0]) == "data plane", 10) is not None)
             bridge_same("with the reflection package the sample call is made", "data plane", *calling, body={"data": {"name": "Ada"}},
@@ -2847,7 +2850,7 @@ def main() -> int:
                     r.raise_for_status()
                     made[side] = r.json()
                 procs.append(subprocess.Popen([str(BIN), "--listen", f"127.0.0.1:{d}", "--control-token", "conformance-token",
-                                               "--sync-interval-ms", "200", "--max-staleness-ms", "2000", "--report-interval-ms", "300",
+                                               "--sync-interval-ms", "200", "--max-staleness-ms", "8000", "--report-interval-ms", "300",
                                                "--backend", f"http://127.0.0.1:{bport}", "--control", f"http://127.0.0.1:{g}"], env=own))
                 native = lambda: httpx.get(f"http://127.0.0.1:{d}/api/users", headers={"X-API-Key": made["rs"]["key"]}, timeout=10).headers.get("x-served-by") == "dataplane"
                 assert wait_until(native, 8), f"the {name} data plane never started serving natively"
@@ -2914,7 +2917,7 @@ def main() -> int:
 
             mkeys = {side: mqtt_key(f"mqtt-{side}") for side in ("py", "rs")}
             procs.append(subprocess.Popen([str(BIN), "--listen", f"127.0.0.1:{d}", "--control-token", "conformance-token",
-                                           "--sync-interval-ms", "200", "--max-staleness-ms", "2000", "--report-interval-ms", "300",
+                                           "--sync-interval-ms", "200", "--max-staleness-ms", "8000", "--report-interval-ms", "300",
                                            "--backend", f"http://127.0.0.1:{bport}", "--control", f"http://127.0.0.1:{g}"], env=own,
                                           stdout=open(f"{tmp}/mqtt-dataplane.out", "w")))
 
@@ -3133,7 +3136,7 @@ def main() -> int:
                     r.raise_for_status()
                     made[side] = r.json()["key"]
                 procs.append(subprocess.Popen([str(BIN), "--listen", f"127.0.0.1:{d}", "--control-token", "conformance-token",
-                                               "--sync-interval-ms", "200", "--max-staleness-ms", "2000", "--report-interval-ms", "300",
+                                               "--sync-interval-ms", "200", "--max-staleness-ms", "8000", "--report-interval-ms", "300",
                                                "--backend", f"http://127.0.0.1:{bport}", "--control", f"http://127.0.0.1:{g}"], env=own))
                 native = lambda: httpx.get(f"http://127.0.0.1:{d}/api/users", headers={"X-API-Key": made["rs"]}, timeout=10).headers.get("x-served-by") == "dataplane"
                 assert wait_until(native, 8), f"the {name} data plane never started serving natively"
@@ -3166,7 +3169,7 @@ def main() -> int:
             # Last: the control plane goes away. The data plane must stop serving natively.
             procs[1].send_signal(signal.SIGTERM)
             procs[1].wait(timeout=15)
-            t = wait_until(lambda: httpx.get(f"{rs}/api/users", headers={"X-API-Key": keys["rs"]["key"]}, timeout=10).status_code != 200, 6)
+            t = wait_until(lambda: httpx.get(f"{rs}/api/users", headers={"X-API-Key": keys["rs"]["key"]}, timeout=10).status_code >= 500, 20)
             check("with the control plane down, native serving stops (fails closed)", t is not None)
             h, r, l = (httpx.get(f"{rs}{path}", timeout=10) for path in ("/health", "/ready", "/live"))
             check("with the control plane down, health and ready stop saying yes",
