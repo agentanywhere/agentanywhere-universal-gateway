@@ -62,6 +62,10 @@ See [docs/known-limitations.md](docs/known-limitations.md) for the full list.
 
 ### Fixed
 
+- Proxy: a query that gives a key more than once (`?tag=a&tag=b`) now reaches
+  the backend with every value. Only the last value was sent on before. A
+  transformation rule or plugin that sets, changes or removes such a key
+  still decides what is sent for it.
 - Proxy: a request whose body came without a length (`Transfer-Encoding:
   chunked`) is sent to the backend with its length and without that header.
   The caller's `Transfer-Encoding` was passed on beside the `Content-Length`
