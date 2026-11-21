@@ -1169,7 +1169,8 @@ def main() -> int:
                 check(f"dynamic routes: {name}", not bad, f"[{b.status_code}] by {said_by(b)}" + ("  " + "; ".join(bad) if bad else ""))
                 return a, b
 
-            assert wait_until(lambda: httpx.get(f"{rs}/api/routed/a", headers={"X-API-Key": keys["rs"]["key"]}, timeout=10).headers.get("x-agent") == "echo"), \
+            # The route registered last: once the data plane follows it, it has them all.
+            assert wait_until(lambda: httpx.get(f"{rs}/acp/routed/a", headers={"X-API-Key": keys["rs"]["key"]}, timeout=10).headers.get("x-agent") == "echo"), \
                 "routes never reached the data plane"
             route_same("a routed path goes to the route's backend, as asked", "GET", "/api/routed/a/b?x=1", want=lambda r: r.json()["path"] == "/api/routed/a/b")
             route_same("a body", "POST", "/api/routed/items", content=b'{"a": 1}', want=lambda r: r.json()["body_bytes"] == 8)
