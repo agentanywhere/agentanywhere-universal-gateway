@@ -223,6 +223,20 @@ curl -s -X POST http://127.0.0.1:8000/admin/tenants \
 The values you did not set are the defaults. Only the minute and hour quotas
 are enforced; see [known limitations](../known-limitations.md#settings-that-are-not-enforced-yet).
 
+Now set the quota on the tenant explicitly. On a first run this changes
+nothing. If `acme` is left over from an earlier run (step 8 deletes it), the
+create call above answered 409 with `tenant 'acme' already exists` and kept
+the old quota; this call puts the limit back to 3 a minute:
+
+```bash
+curl -s -X PUT http://127.0.0.1:8000/admin/tenants/acme/quota \
+  -H "Authorization: Bearer $ADMIN" -H "Content-Type: application/json" \
+  -d '{"requests_per_minute": 3}'
+```
+
+It answers with the tenant, as above, with `"requests_per_minute": 3`. Only
+the quota fields you send change; the others keep their values.
+
 Associate the batch job's key with the tenant. The endpoint needs both the id
 and the key itself:
 
