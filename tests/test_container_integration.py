@@ -18,7 +18,9 @@ import pytest
 import requests
 
 BASE_URL = os.getenv("GATEWAY_URL", "http://localhost:8000")
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "admin-test-token-12345678901234567890")
+# tests/conftest.py sets ADMIN_TOKEN to "" for the in-process tests, so an
+# empty value means "not given" here.
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN") or "admin-test-token-12345678901234567890"
 
 # Mark every test in this module as an integration test so it can be selected
 # or excluded with ``pytest -m "integration"`` / ``pytest -m "not integration"``.
