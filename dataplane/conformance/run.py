@@ -1035,10 +1035,24 @@ def main() -> int:
             time.sleep(2.0)
             counted = metric("gateway_requests_total", method="POST", path="/conf.Echo/Count", status_code="200")
             check("gRPC: calls are counted in gateway_requests_total", counted == 1, f"{counted:.0f}")
-            logs = httpx.get(f"{py}/admin/logs", params={"limit": 1000, "path": "/conf.Echo/Say"}, headers=adm, timeout=10).json()["logs"]
-            limited = [l for l in logs if l.get("status_code", l.get("status")) == 429]
+            from collections import Counter
+            say_rows = lambda: httpx.get(f"{py}/admin/logs", params={"limit": 1000, "path": "/conf.Echo/Say"}, headers=adm, timeout=10).json()["logs"]
+            refused_rows = lambda rows: [l for l in rows if l.get("status_code", l.get("status")) == 429]
+            # A refusal's row goes in the data plane's next report. A report the control plane does not
+            # take in time is sent again for its counts, not for its rows: then refuse the key again.
+            again = 0
+            while not refused_rows(say_rows()) and again < 2:
+                again += 1
+                for _ in range(4):
+                    if grpc_call(through, "unary", "Say", b"hi", say_key)["code"] == "RESOURCE_EXHAUSTED":
+                        break
+                wait_until(lambda: refused_rows(say_rows()), 15)
+            logs = say_rows()
+            limited = refused_rows(logs)
+            statuses = dict(sorted(Counter(l.get("status_code", l.get("status")) for l in logs).items()))
             check("gRPC: calls are logged with their key, refusals under the status they stand for",
-                  any(l.get("api_key_id") == keys["rs"]["id"] for l in logs) and len(limited) >= 1, f"{len(logs)} rows, {len(limited)} limited")
+                  any(l.get("api_key_id") == keys["rs"]["id"] for l in logs) and len(limited) >= 1,
+                  f"{len(logs)} rows, {len(limited)} limited, by status {statuses}" + (f", after refusing the key {again} more time(s)" if again else ""))
 
             # The backend goes away: the caller is told so, in gRPC's terms.
             grpc_server.terminate()
