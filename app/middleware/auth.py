@@ -329,7 +329,7 @@ class AuthMiddleware:
 
         if not api_key:
             # No API key — fall back to OAuth2 bearer-token auth.
-            return await self._validate_oauth2_token(request)
+            return await self._governed(request, await self._validate_oauth2_token(request))
 
         validated_key = await self._validate_api_key(api_key, db)
         if not validated_key or not validated_key.is_active:
@@ -337,7 +337,7 @@ class AuthMiddleware:
             # giving up.
             oauth_principal = await self._validate_oauth2_token(request)
             if oauth_principal:
-                return oauth_principal
+                return await self._governed(request, oauth_principal)
 
             request_id = getattr(request.state, "request_id", None)
             raise AuthenticationError(
@@ -458,6 +458,14 @@ class AuthMiddleware:
             return
         _background_tasks.add(task)
         task.add_done_callback(_background_tasks.discard)
+
+    async def _governed(self, request: Request, principal: Optional[APIKey]) -> Optional[APIKey]:
+        """An OAuth2 token's caller goes through the IP rules and policies like a key's. It used
+        to be let in before they were looked at, so a client a deny rule blocked was served
+        as soon as it presented a token."""
+        if principal is not None:
+            await self._enforce_governance(request, principal)
+        return principal
 
     def _enforce_allowed_paths(self, request: Request, principal: APIKey) -> None:
         """Reject a request outside the key's ``allowed_paths`` with 403."""
