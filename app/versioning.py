@@ -8,7 +8,7 @@ deprecated (with a ``Warning`` header), scheduled for sunset (with an
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from app.time_utils import utcnow
 from email.utils import format_datetime
 from enum import Enum
@@ -68,8 +68,22 @@ class APIVersion:
         if self.status == VersionStatus.REMOVED:
             return False
         if self.status == VersionStatus.SUNSET and self.sunset_date:
-            return utcnow() < self.sunset_date
+            return not self.sunset_passed()
         return True
+
+    def sunset_passed(self) -> bool:
+        """True once the sunset date is reached.
+
+        A date given with a UTC offset (``2027-01-01T00:00:00+05:30``, or one
+        ending in ``Z``) is compared as the moment it names. One given without
+        is taken as UTC, as before.
+        """
+        when = self.sunset_date
+        if when is None:
+            return False
+        if when.tzinfo is not None:
+            when = when.astimezone(timezone.utc).replace(tzinfo=None)
+        return utcnow() >= when
 
     def get_warning_header(self) -> Optional[str]:
         """RFC 7234 Warning header for deprecated/sunset versions."""
@@ -237,8 +251,7 @@ class VersionManager:
                 )
             if (
                 api_version.status == VersionStatus.SUNSET
-                and api_version.sunset_date
-                and utcnow() >= api_version.sunset_date
+                and api_version.sunset_passed()
             ):
                 raise VersionUnavailable(
                     api_version.version,

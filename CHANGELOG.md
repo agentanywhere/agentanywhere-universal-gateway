@@ -62,6 +62,10 @@ See [docs/known-limitations.md](docs/known-limitations.md) for the full list.
 
 ### Fixed
 
+- API versions: a sunset date given with a UTC offset (`2027-01-01T00:00:00+00:00`,
+  or one ending in `Z`) now works. Comparing it with the current time raised
+  an error, so the admin call that set the date failed and so did every
+  request under that version.
 - Transformations: a rule that sets a header which cannot be written is now
   refused when it is made (400), instead of failing every request it applies
   to (502). That is a header name that is not a token, or a value that starts
