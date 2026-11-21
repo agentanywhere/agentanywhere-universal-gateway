@@ -26,7 +26,7 @@ report a vulnerability, follow [SECURITY.md](../../SECURITY.md).
 | **API key** (`sk-...`) | Clients of the data plane | Created with `POST /admin/api-keys`; stored as a hash in `api_keys`. |
 | **Admin credential** | Operators, the admin console, the CLI | `ADMIN_TOKEN`. |
 | **OIDC access token** (optional) | Operators signing in through an OpenID Connect provider | Accepted on the admin plane when `IDA_ISSUER` is set. |
-| **OAuth2 access token** (optional) | Clients of the data plane | Issued through `/oauth2/token` from a provider registered with `POST /admin/oauth2/providers`. |
+| **OAuth2 access token** (optional) | Clients of the data plane | Issued through `/oauth2/token` from a provider registered with `POST /admin/oauth2/providers`. The client-credentials grant is given only to a caller that presents that provider's `client_id` and `client_secret` (HTTP Basic or in the body). |
 | **`SECRET_KEY`** | The operator, kept in a secret store | `.env` or the environment. A break-glass credential (see below). |
 
 ## What authenticates what

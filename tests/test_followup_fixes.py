@@ -222,7 +222,7 @@ def test_quickstart_script_picks_python_with_requests():
     surface a Python interpreter that can ``import requests``.
 
     We invoke the bash helper directly in a sub-shell so we don't depend
-    on the gateway being up.
+    on the gateway being up. Needs only bash and the script.
     """
     if shutil.which("bash") is None:  # pragma: no cover
         pytest.skip("bash not available")
@@ -230,25 +230,24 @@ def test_quickstart_script_picks_python_with_requests():
     if not script.exists():  # pragma: no cover
         pytest.skip("quickstart script not present")
 
-    # Source the helper then call it. We rely on `set -e` not being
-    # triggered before the helper definition (it isn't).
-    cmd = (
-        f"source {script.as_posix()}; "
-        "choose_python"
+    # Sourcing the whole script would run the smoke tests against a gateway,
+    # so copy just the helper out of it: from the `choose_python()` line to
+    # the first line that starts with `}`. This is done in Python rather than
+    # with sed, because Git for Windows puts bash on PATH but not sed.
+    lines = script.read_text(encoding="utf-8").splitlines()
+    start = next(
+        (i for i, line in enumerate(lines) if line.startswith("choose_python()")),
+        None,
     )
-    # The script as a whole would `set -e` and run the smoke tests if we
-    # source it. Workaround: extract the helper using sed.
-    extracted = subprocess.check_output(
-        ["sed", "-n", "/^choose_python()/,/^}/p", str(script)],
-        text=True,
-    )
-    assert "choose_python()" in extracted, "helper not found in script"
+    assert start is not None, "helper not found in script"
+    end = next(i for i in range(start, len(lines)) if lines[i].startswith("}"))
+    extracted = "\n".join(lines[start : end + 1]) + "\n"
 
-    # Provide a clean PATH that has the current interpreter so the test
-    # passes both locally and in CI.
+    # Put the current interpreter first on PATH so the helper finds one that
+    # can import requests, locally and in CI.
     interpreter_dir = os.path.dirname(sys.executable)
     env = os.environ.copy()
-    env["PATH"] = f"{interpreter_dir}{os.pathsep}/usr/bin:/bin"
+    env["PATH"] = f"{interpreter_dir}{os.pathsep}{env.get('PATH', '')}"
 
     result = subprocess.run(
         ["bash", "-c", f"{extracted}\nchoose_python"],

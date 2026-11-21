@@ -60,13 +60,12 @@ What each setting routes:
 | `A2A_BACKEND_URL` | `/a2a/*`, `/api/a2a/*` | The full path |
 | `AG_UI_BACKEND_URL` | `/agui/*`, `/api/agui/*` | The path without `/agui` (`POST /agui` arrives as `POST /`) |
 | `ACP_BACKEND_URL` | `/acp/*`, `/api/acp/*` | The path without `/acp` |
-| `GRAPHQL_BACKEND_URL` | `POST /graphql` | A POST to the URL itself |
+| `GRAPHQL_BACKEND_URL` | `/graphql/*`, `/api/graphql/*` | The path without `/api`; the URL may end in `/graphql` or not |
 | `MQTT_BROKER_URL` | `POST /mqtt/publish`, `POST /mqtt/subscribe` | MQTT messages |
 
 Prefixes are checked in this order: `/mcp`, `/a2a`, `/agui`, `/acp`, `/mqtt`,
 `/ws`, `/grpc`, `/graphql`, then `/api`, `/rest`, `/http`. So `/api/mcp/x`
-goes to the MCP backend, and `/api/graphql` goes to the HTTP backend (only
-`/graphql` reaches the GraphQL handler).
+goes to the MCP backend, and `/api/graphql` goes to the GraphQL backend.
 
 **Check:** `GET /admin/routes` lists the static routes with
 `"source": "static"`, and a request through each prefix answers with the
@@ -143,7 +142,7 @@ An unknown slug answers 404 `AGENT_NOT_FOUND`.
 |---|---|---|
 | 502 `BACKEND_ERROR` | The gateway cannot reach the URL. Under Docker, `localhost` is the container, and Compose uses the `DOCKER_*_BACKEND_URL` values. | Use an address the gateway can reach. See [Troubleshoot 401, 403, 404, 502 and 429](troubleshoot-401-502-429.md). |
 | 500 `INTERNAL_ERROR` on `/agui` or `/acp` | `AG_UI_BACKEND_URL` or `ACP_BACKEND_URL` is unset | Set it and restart. |
-| 503 `GraphQL backend not configured` | `GRAPHQL_BACKEND_URL` is unset | Set it and restart. |
+| 503 `GraphQL backend is not configured` | `GRAPHQL_BACKEND_URL` is unset | Set it and restart. |
 | 503 `MQTT broker not connected` | The broker was not up when the gateway started | Start the broker, then restart the gateway. |
 | 404 from the backend for every path | The backend expects a path without the gateway prefix | Use a dynamic route with `rewrite_path`, or serve the prefix in the backend. |
 | A route you added has no effect | `DYNAMIC_ROUTES_ENABLED=false`, or another process has not refreshed yet | Check the setting; wait for the refresh. |

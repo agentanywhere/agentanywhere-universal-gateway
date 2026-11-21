@@ -12,6 +12,7 @@ from app.models import APIKey
 from app.api_key_cache import hash_key
 from app.client_ip import client_ip
 import redis
+from redis.exceptions import RedisError
 import asyncio
 
 settings = get_settings()
@@ -35,6 +36,10 @@ class RateLimiter:
                 )
             except Exception:
                 pass
+        # After a failed Redis call, use the in-memory counters until this
+        # monotonic time, so an absent Redis costs one short timeout per
+        # backoff window instead of one (or two) per request.
+        self._redis_down = (None, 0.0)  # (client, retry-at)
 
         # In-memory fixed-window counters used when Redis is not configured, so
         # rate limiting works out of the box on a single instance. Keyed by
@@ -148,6 +153,18 @@ class RateLimiter:
         except Exception:
             pass  # Don't fail the request if the alert cannot be scheduled
 
+    # Seconds to skip Redis after a failed call (same as the API-key cache).
+    REDIS_RETRY_SECONDS = 30.0
+
+    def _redis_available(self) -> bool:
+        client, retry_at = self._redis_down
+        return bool(self.redis_client) and (
+            client is not self.redis_client or time.monotonic() >= retry_at
+        )
+
+    def _redis_failed(self) -> None:
+        self._redis_down = (self.redis_client, time.monotonic() + self.REDIS_RETRY_SECONDS)
+
     def _identity(self, request: Request, api_key: Optional[APIKey]) -> str:
         # Counters are named after a hash of the key, so Redis never holds a
         # usable credential in its key names.
@@ -160,12 +177,14 @@ class RateLimiter:
 
         Uses Redis when configured; otherwise an in-process fixed-window counter
         so limiting still works on a single instance (previously this path
-        silently allowed every request).
+        silently allowed every request). After a failed Redis call the
+        in-process counter is used for REDIS_RETRY_SECONDS without trying
+        Redis, then Redis is tried again.
         """
         identity = self._identity(request, api_key)
         key = f"rate_limit:{identity}:{window}"
 
-        if not self.redis_client:
+        if not self._redis_available():
             return self._check_limit_memory(key, limit, window)
 
         try:
@@ -178,9 +197,15 @@ class RateLimiter:
             pipe.expire(key, window)
             pipe.execute()
             return True
-        except Exception:
+        except RedisError:
             # Redis is unreachable — fall back to the in-memory limiter rather
-            # than failing open, so a Redis outage does not disable limiting.
+            # than failing open, and stop trying Redis for a while so every
+            # request does not wait for another connection attempt.
+            self._redis_failed()
+            return self._check_limit_memory(key, limit, window)
+        except Exception:
+            # Any other failure (an unexpected value, say): count in memory
+            # for this check rather than failing open.
             return self._check_limit_memory(key, limit, window)
 
     def _check_limit_memory(self, key: str, limit: int, window: int) -> bool:
