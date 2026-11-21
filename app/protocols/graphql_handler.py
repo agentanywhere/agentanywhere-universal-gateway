@@ -7,6 +7,7 @@ import json
 
 logger = structlog.get_logger()
 settings = get_settings()
+from app.adapters.builtin import NoCookieJar
 
 
 class GraphQLHandler:
@@ -15,7 +16,8 @@ class GraphQLHandler:
     def __init__(self, backend_url: str):
         """Initialize GraphQL handler."""
         self.backend_url = backend_url.rstrip('/')
-        self.client = httpx.AsyncClient(timeout=settings.default_timeout)
+        # Shared by every caller: it must not keep the cookies a backend sets (see NoCookieJar).
+        self.client = httpx.AsyncClient(timeout=settings.default_timeout, cookies=NoCookieJar())
         self.schema_cache: Optional[Dict[str, Any]] = None
     
     async def execute_query(

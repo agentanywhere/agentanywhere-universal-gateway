@@ -88,6 +88,9 @@ class RequestLog(BaseModel):
     timestamp: datetime = Field(default_factory=utcnow)
     user_agent: Optional[str] = None
     error: Optional[str] = None
+    # Which protocol carried the request (http, mcp, a2a, ...). Without this field the
+    # middleware's setattr on the model raised and was swallowed, so the column stayed NULL.
+    protocol: Optional[str] = None
 
 
 class HealthStatus(BaseModel):

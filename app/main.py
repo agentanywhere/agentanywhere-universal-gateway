@@ -1207,9 +1207,34 @@ def _rejected_path_label(path: str) -> str:
     return f"/{first}" if first in _REJECTED_PATH_LABEL_PREFIXES else "/other"
 
 
+def _breaks_out_of_the_path(path: str) -> bool:
+    """Whether a decoded request path holds a character that is not path data once it is in a URL.
+
+    A caller's ``/api/x%3F/../admin`` is ``/api/x?/../admin`` once decoded. What reads the URL
+    (``request.url.path``: the key's allowed paths, the policies, the agent edge) stops at that
+    ``?``, while the path forwarded is the whole of it, so the two would not be the same path. A
+    ``#`` does the same, and a control character makes a URL invalid.
+    """
+    return any(c in "?#" or ord(c) < 0x20 or ord(c) == 0x7F for c in path)
+
+
 @app.middleware("http")
 async def auth_middleware_handler(request: Request, call_next):
     """Authentication middleware handler."""
+    # A path that decodes to `?`, `#` or a control character is refused before anything reads it.
+    if _breaks_out_of_the_path(request.scope.get("path", "")):
+        return render_error_response(
+            request,
+            status.HTTP_400_BAD_REQUEST,
+            {
+                "error": "INVALID_PATH",
+                "message": "The request path holds an escaped '?', '#' or control character, which cannot be part of a path.",
+                "request_id": getattr(request.state, "request_id", None),
+                "timestamp": utcnow().isoformat(),
+                "details": {},
+            },
+        )
+
     # Skip auth for OPTIONS requests (CORS preflight)
     if request.method == "OPTIONS":
         return await call_next(request)
@@ -1818,39 +1843,6 @@ async def mqtt_subscribe(request: Request):
         )
 
 
-@app.post("/graphql")
-async def graphql_proxy(request: Request):
-    """GraphQL proxy endpoint."""
-    if not graphql_handler:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="GraphQL backend not configured"
-        )
-    
-    try:
-        body = await request.json()
-        query = body.get("query")
-        variables = body.get("variables")
-        operation_name = body.get("operationName")
-        
-        if not query:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="GraphQL query is required"
-            )
-        
-        result = await graphql_handler.execute_query(query, variables, operation_name)
-        return JSONResponse(content=result)
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error("graphql_proxy_error", error=str(e))
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"GraphQL request failed: {str(e)}"
-        )
-
-
 # ==================== OAuth2 Endpoints ====================
 
 @app.get("/oauth2/authorize")
@@ -1885,6 +1877,24 @@ async def oauth2_authorize(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Failed to generate authorization URL: {str(e)}"
         )
+
+
+def _client_credentials(request: Request, body: Dict[str, Any]):
+    """The client id and secret a token request carries: HTTP Basic first, else the body."""
+    scheme, _, encoded = request.headers.get("authorization", "").partition(" ")
+    if scheme.lower() == "basic" and encoded.strip():
+        try:
+            import base64
+            from urllib.parse import unquote_plus
+
+            client_id, sep, secret = base64.b64decode(encoded.strip(), validate=True).decode("utf-8").partition(":")
+            if sep:
+                return unquote_plus(client_id), unquote_plus(secret)
+        except Exception:  # noqa: BLE001 - not a Basic credential: nothing presented
+            pass
+        return None, None
+    client_id, secret = body.get("client_id"), body.get("client_secret")
+    return (client_id if isinstance(client_id, str) else None, secret if isinstance(secret, str) else None)
 
 
 @app.post("/oauth2/token")
@@ -1940,6 +1950,9 @@ async def oauth2_token(request: Request):
             return JSONResponse(content=token_data)
 
         if grant_type == "client_credentials":
+            # The caller proves who it is with the provider's client credentials (RFC 6749, 2.3.1):
+            # HTTP Basic, or client_id and client_secret in the body.
+            oauth2_manager.authenticate_client(provider, *_client_credentials(request, body))
             scope = body.get("scope")
             scopes = scope.split() if isinstance(scope, str) and scope else None
             token_data = await oauth2_manager.client_credentials(provider, scopes)
@@ -2109,6 +2122,33 @@ _STRIP_RESPONSE_HEADERS = {
 }
 
 
+def _restore_repeated_header_lines(response: Response, upstream_headers, sent_headers) -> None:
+    """Give the caller each line of a header the backend sent more than once.
+
+    Response headers travel through the proxy as a dict, and reading httpx headers
+    as a dict joins lines of the same name with ", ". For ``Set-Cookie`` that loses
+    cookies: a browser reads the joined line as a single cookie, and it cannot be
+    split apart again because a cookie may hold a comma of its own (``Expires``).
+
+    ``sent_headers`` is the dict the response was built from. A header is put back
+    as separate lines only when its value there is still the joined value httpx
+    produced, so a header that a transformation or plugin rewrote or removed stays
+    as that step left it.
+    """
+    lines: dict[str, list[str]] = {}
+    for name, value in upstream_headers.multi_items():
+        lines.setdefault(name.lower(), []).append(value)
+    for name, values in lines.items():
+        if len(values) < 2 or name in _STRIP_RESPONSE_HEADERS:
+            continue
+        sent = [v for k, v in sent_headers.items() if k.lower() == name]
+        if sent != [upstream_headers.get(name)]:
+            continue
+        del response.headers[name]
+        for value in values:
+            response.headers.append(name, value)
+
+
 async def _proxy_agent_route(request: Request, agent_route, request_id: str) -> Response:
     """Proxy an ``/agents/<slug>/...`` request to the per-slug upstream.
 
@@ -2270,35 +2310,8 @@ async def gateway_proxy(request: Request, path: str):
                     request_id=request_id
                 )
             
-            try:
-                data = await request.json()
-                query = data.get("query")
-                variables = data.get("variables")
-                operation_name = data.get("operationName")
-                
-                if not query:
-                    request_id = getattr(request.state, "request_id", None)
-                    raise ValidationError(
-                        message="GraphQL query is required",
-                        field="query",
-                        details={
-                            "hint": "Include a 'query' field in your request body with a valid GraphQL query.",
-                            "example": {"query": "{ hello }"}
-                        },
-                        request_id=request_id
-                    )
-                
-                result = await graphql_handler.execute_query(query, variables, operation_name)
-                return JSONResponse(content=result)
-            except HTTPException:
-                raise
-            except Exception as e:
-                logger.error("graphql_gateway_error", error=str(e), request_id=request_id)
-                raise HTTPException(
-                    status_code=status.HTTP_502_BAD_GATEWAY,
-                    detail=f"GraphQL request failed: {str(e)}"
-                )
-        
+            # Configured: the request goes to the backend as it came, like any other protocol's.
+
         # Get request body
         body = None
         if request.method in ["POST", "PUT", "PATCH"]:
@@ -2434,12 +2447,14 @@ async def gateway_proxy(request: Request, path: str):
                 finally:
                     await upstream.aclose()
 
-            return StreamingResponse(
+            streaming_response = StreamingResponse(
                 _stream_body(),
                 status_code=upstream.status_code,
                 headers=resp_headers,
                 media_type=ct.split(";")[0].strip() if ct else None,
             )
+            _restore_repeated_header_lines(streaming_response, upstream.headers, resp_headers)
+            return streaming_response
 
         # Route request
         response = await router.route_request(
@@ -2601,12 +2616,14 @@ async def gateway_proxy(request: Request, path: str):
             except Exception as exc:
                 logger.warning("plugin_response_transform_failed", error=str(exc))
 
-        return Response(
+        proxied_response = Response(
             content=content,
             status_code=final_status_code,
             headers=response_headers,
             media_type=response.headers.get("content-type", "application/json")
         )
+        _restore_repeated_header_lines(proxied_response, response.headers, response_headers)
+        return proxied_response
     
     except HTTPException:
         raise
