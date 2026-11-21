@@ -2359,7 +2359,7 @@ def main() -> int:
 
             calling = ({side: bridge_key(f"bridge-{side}") for side in ("py", "rs")}, (f"http://127.0.0.1:{g}", f"http://127.0.0.1:{d}"))
             procs.append(subprocess.Popen([str(BIN), "--listen", f"127.0.0.1:{d}", "--control-token", "conformance-token",
-                                           "--sync-interval-ms", "200", "--max-staleness-ms", "2000", "--report-interval-ms", "300",
+                                           "--sync-interval-ms", "200", "--max-staleness-ms", "8000", "--report-interval-ms", "300",
                                            "--backend", f"http://127.0.0.1:{bport}", "--control", f"http://127.0.0.1:{g}"], env=own))
             check("bridge: the data plane starts serving it", wait_until(lambda: said_by(bridge(calling[1][1], calling[0]["rs"], body={"service": "S"})[0]) == "data plane", 10) is not None)
             bridge_same("with the reflection package the sample call is made", "data plane", *calling, body={"data": {"name": "Ada"}},
