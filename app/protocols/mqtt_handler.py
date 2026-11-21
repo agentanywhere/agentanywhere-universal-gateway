@@ -83,8 +83,10 @@ class MQTTHandler:
         else:
             logger.error("mqtt_connection_failed", return_code=rc)
     
-    def _on_disconnect(self, client, userdata, rc):
-        """MQTT disconnection callback."""
+    def _on_disconnect(self, client, userdata, rc, properties=None):
+        """MQTT disconnection callback. An MQTT 5 client passes the properties as well; a callback
+        that does not take them raises inside the client's network thread and ends it, and the
+        client then never reconnects."""
         self.connected = False
         logger.info("mqtt_disconnected", return_code=rc)
     

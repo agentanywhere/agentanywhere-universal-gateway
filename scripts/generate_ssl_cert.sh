@@ -15,8 +15,14 @@ mkdir -p "$SSL_DIR"
 # Generate private key
 openssl genrsa -out "$SSL_DIR/key.pem" 2048
 
-# Generate certificate signing request
-openssl req -new -key "$SSL_DIR/key.pem" -out "$SSL_DIR/csr.pem" \
+# Generate certificate signing request.
+# Git Bash on Windows rewrites an argument that starts with "/" into a Windows
+# path, which turns the subject below into "C:/Program Files/Git/C=US/..." and
+# makes openssl fail. MSYS_NO_PATHCONV (Git for Windows) and
+# MSYS2_ARG_CONV_EXCL (MSYS2) switch that off for this one command; every
+# other shell ignores both variables.
+MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' \
+  openssl req -new -key "$SSL_DIR/key.pem" -out "$SSL_DIR/csr.pem" \
   -subj "/C=US/ST=State/L=City/O=Organization/CN=localhost"
 
 # Generate self-signed certificate
