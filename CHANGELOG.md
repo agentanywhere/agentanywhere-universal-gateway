@@ -92,6 +92,10 @@ See [docs/known-limitations.md](docs/known-limitations.md) for the full list.
 - nginx: `nginx/nginx.conf` is installed as `conf.d/default.conf` (as the main
   `nginx.conf` it did not load), and `/metrics` and `/health/detailed` are
   served to loopback and private addresses only.
+- `scripts/generate_ssl_cert.sh` works in Git Bash on Windows: it turns off
+  Git Bash's path rewriting (`MSYS_NO_PATHCONV=1`) for the `openssl req`
+  call, which had turned the `-subj "/C=US/..."` subject into a Windows path,
+  so only `key.pem` was written and nginx would not start.
 - New `OPS_ENDPOINTS_REQUIRE_ADMIN` (default false) requires the admin
   credential on `/metrics` and `/health/detailed`.
 - CORS: a `"*"` origin now turns credentials off, with a startup warning, and
