@@ -3,8 +3,8 @@
 Two tables would otherwise grow without bound:
 
 * ``request_logs``: nearly every request writes a row. Rows older than
-  ``REQUEST_LOG_RETENTION_DAYS`` (default 30; 0 keeps them forever) are
-  deleted.
+  ``REQUEST_LOG_RETENTION_DAYS`` are deleted. The default, 0, keeps them
+  forever, so an upgrade never deletes logs nobody asked to delete.
 * ``tenant_usage`` per-minute windows: one row per tenant per minute, needed
   only for the current minute's quota check. Rows older than a day are
   deleted; hourly and daily windows are kept.

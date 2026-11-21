@@ -495,7 +495,7 @@ class Settings(BaseSettings):
     # Retention (see app/retention.py): request log rows older than this many
     # days are deleted (0 keeps them forever); pruning runs at start-up and
     # every retention_interval_hours.
-    request_log_retention_days: int = 30
+    request_log_retention_days: int = 0
     retention_interval_hours: int = 24
 
     # Redis

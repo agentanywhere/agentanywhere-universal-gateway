@@ -123,7 +123,7 @@ settings too, so `.env` applies to them; the process environment wins.)
 | `RATE_LIMIT_PER_MINUTE` | `60` | **live.** Limit for principals without their own limit: `SECRET_KEY` used as a key, and OAuth2 tokens. Keys created through the admin API carry their own limits (default 60). |
 | `RATE_LIMIT_PER_HOUR` | `1000` | **live.** As above, per hour. |
 | `RATE_LIMIT_REDIS_URL` | unset | **secret.** Redis URL for rate-limit counters. Unset: counters live in each process's memory. `env.example` sets `redis://localhost:6379/1`. If Redis is unreachable, the gateway falls back to memory. |
-| `REQUEST_LOG_RETENTION_DAYS` | `30` | Request log rows older than this many days are deleted. `0` keeps them forever. Per-minute tenant usage rows older than a day are always deleted; hourly and daily usage and the audit log are kept. |
+| `REQUEST_LOG_RETENTION_DAYS` | `0` | Request log rows older than this many days are deleted. `0` keeps them forever. Per-minute tenant usage rows older than a day are always deleted; hourly and daily usage and the audit log are kept. |
 | `RETENTION_INTERVAL_HOURS` | `24` | Hours between pruning runs. Pruning also runs at start-up. |
 | `REDIS_URL` | `redis://localhost:6379/0` | **secret.** Redis URL for the API-key cache (entries keyed by the key's hash, at most five minutes, dropped when a key is deleted or disabled). |
 | `REDIS_ENABLED` | `true` | Use `REDIS_URL` for the API-key cache. If Redis is unreachable, the cache is skipped. |

@@ -115,7 +115,7 @@ column. These behaviours changed and may need action:
 | `X-Forwarded-For` is ignored unless the connection comes from `TRUSTED_PROXIES` (empty by default). | Behind a proxy, list its address. |
 | `/docs`, `/redoc` and `/openapi.json` answer 404 with `DEBUG=false`. | Use `DEBUG=true` locally. |
 | Rate-limit counters are named after a hash of the key. | Current minute and hour windows start again once. |
-| Request log rows older than 30 days are deleted, at start-up and daily. | Set `REQUEST_LOG_RETENTION_DAYS=0` before upgrading to keep them all, or another number of days. |
+| Per-minute tenant usage rows older than a day are deleted, at start-up and daily. Request logs are kept unless `REQUEST_LOG_RETENTION_DAYS` is set. | To prune request logs, set `REQUEST_LOG_RETENTION_DAYS`. |
 | CORS defaults to the local admin console's origins; `*` turns credentials off. | Set `CORS_ORIGINS`. |
 | Docker Compose keeps SQLite at `/app/data/gateway.db` on the `gateway_data` volume, and ignores `*_BACKEND_URL` from `.env` in favour of `DOCKER_*_BACKEND_URL`. | See the next section, and [Deploy with Docker Compose](deploy-with-docker-compose.md). |
 | GraphQL requests are passed to the backend as they came (method, headers, query string, body) and its answer comes back whole. Before, the gateway sent only `query`, `variables` and `operationName`, without the caller's headers, refused a body without `query` with a 400, and turned every backend error into a 502. | Check that the GraphQL server expects the caller's headers (`X-API-Key`, `Authorization` and cookies now reach it), and that clients handle the server's own error statuses. |

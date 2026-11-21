@@ -210,9 +210,9 @@ See [docs/known-limitations.md](docs/known-limitations.md) for the full list.
 - `allowed_paths` is enforced (403 outside it).
 - `X-Forwarded-For` is ignored unless `TRUSTED_PROXIES` lists the peer.
 - `/docs`, `/redoc`, `/openapi.json` answer 404 with `DEBUG=false`.
-- Request log rows older than `REQUEST_LOG_RETENTION_DAYS` (default 30) are
-  deleted at start-up and daily; `0` keeps them. Per-minute tenant usage rows
-  older than a day are deleted. The audit log is not pruned.
+- New `REQUEST_LOG_RETENTION_DAYS`: request log rows older than that many
+  days are deleted at start-up and daily. The default, `0`, keeps every row,
+  as before. Per-minute tenant usage rows older than a day are deleted. The audit log is not pruned.
 - GraphQL requests are passed through. The gateway used to build a new request
   from `query`, `variables` and `operationName`, so the caller's headers
   (`Authorization` among them), `extensions`, `GET` queries and batched bodies

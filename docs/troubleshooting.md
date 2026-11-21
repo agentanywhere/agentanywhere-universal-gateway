@@ -88,7 +88,7 @@ errors there is a step-by-step guide:
 | `table api_keys has no column named key` or similar | The database was built with the old `001`/`002` migrations | Rebuild it as in [Upgrade the gateway](how-to/upgrade.md#databases-built-with-the-old-migrations). |
 | `no such column` after an upgrade | A release added a column and `alembic upgrade head` was not run | Run `alembic upgrade head`. |
 | `database is locked` | Several processes writing one SQLite file | Use PostgreSQL. |
-| The database keeps growing | `request_logs` holds `REQUEST_LOG_RETENTION_DAYS` of rows (default 30); SQLite does not shrink its file after deletes | Lower `REQUEST_LOG_RETENTION_DAYS`; on SQLite run `VACUUM` to reclaim space. |
+| The database keeps growing | `request_logs` keeps every row unless `REQUEST_LOG_RETENTION_DAYS` is set; SQLite does not shrink its file after deletes | Set or lower `REQUEST_LOG_RETENTION_DAYS`; on SQLite run `VACUUM` to reclaim space. |
 
 ## Metrics and logs
 

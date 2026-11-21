@@ -114,9 +114,9 @@ credentials off and logs `cors_wildcard_credentials_disabled` at start-up.
   plaintext copy until the key is next used, and backups taken before the
   upgrade contain them: protect or destroy those.
 - Keep Redis on a private network with a password.
-- `request_logs` rows older than `REQUEST_LOG_RETENTION_DAYS` (default 30) are
-  deleted automatically. Set it to the period your policy allows; `0` keeps
-  every row. The governance audit log is never pruned.
+- `request_logs` keeps every row unless `REQUEST_LOG_RETENTION_DAYS` is set;
+  rows older than that many days are then deleted automatically. Set it to the
+  period your policy allows. The governance audit log is never pruned.
 
 ## API keys
 

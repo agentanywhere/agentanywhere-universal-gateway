@@ -65,5 +65,5 @@ async def test_only_old_minute_usage_rows_go(db_session):
 
 def test_defaults():
     s = get_settings()
-    assert type(s).model_fields["request_log_retention_days"].default == 30
+    assert type(s).model_fields["request_log_retention_days"].default == 0
     assert type(s).model_fields["retention_interval_hours"].default == 24

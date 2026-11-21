@@ -89,9 +89,9 @@ release.
 
 Requests rejected by the authentication layer (401, 403, 429) are logged too,
 with the error code in `error` (for example `RATE_LIMIT_EXCEEDED`) and the
-key's id in `api_key_id` when the key was recognised. `tenant_id` and
-`protocol` are written as null in this release. Rows older than
-`REQUEST_LOG_RETENTION_DAYS` (default 30) are deleted.
+key's id in `api_key_id` when the key was recognised. `tenant_id` is
+written as null in this release. Rows older than
+`REQUEST_LOG_RETENTION_DAYS` are deleted when it is set (default 0: kept).
 
 ## settings_profiles
 
