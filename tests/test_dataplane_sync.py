@@ -1,3 +1,4 @@
+import sys
 import json
 """The snapshot the Rust data plane reads: what it contains, when a key may be served natively, and who may read it."""
 import hashlib
@@ -1071,10 +1072,16 @@ async def test_the_snapshot_says_which_requests_a_transformation_rule_applies_to
         assert (await listed())[2:] == [{**described, "methods": ["PUT"]}], pattern
         transformation_manager.remove_rule(odd.id)
     # A pattern with no such form: every path stays here.
-    for pattern in ("/api/caf\u00e9/*", "^/api/(?=x)", "^/api/(a)\\1$", "(?i)/api/x$", "^/api/\\s$", "^/a^b", "/a$b$", "^/api/x*+$"):
+    for pattern in ("/api/caf\u00e9/*", "^/api/(?=x)", "^/api/(a)\\1$", "(?i)/api/x$", "^/api/\\s$", "^/a^b", "/a$b$") + (("^/api/x*+$",) if sys.version_info >= (3, 11) else ()):
         odd = rule(pattern)
         assert await listed() is None, pattern
         assert (await dataplane_sync.build_snapshot(db_session))["fallthrough_prefixes"] == ["/"]
+        transformation_manager.remove_rule(odd.id)
+    if sys.version_info < (3, 11):
+        # Before 3.11 `re` cannot read a possessive repeat, so this gateway looks for the
+        # pattern as plain text, and the data plane is told to do the same.
+        odd = rule("^/api/x*+$", ["put"])
+        assert (await listed())[2:] == [{"contains": "^/api/x*+$", "methods": ["PUT"]}]
         transformation_manager.remove_rule(odd.id)
     assert len(await listed()) == 2
 
