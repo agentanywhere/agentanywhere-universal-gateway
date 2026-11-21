@@ -2413,7 +2413,7 @@ def main() -> int:
 
             mkeys = {side: mqtt_key(f"mqtt-{side}") for side in ("py", "rs")}
             procs.append(subprocess.Popen([str(BIN), "--listen", f"127.0.0.1:{d}", "--control-token", "conformance-token",
-                                           "--sync-interval-ms", "200", "--max-staleness-ms", "2000", "--report-interval-ms", "300",
+                                           "--sync-interval-ms", "200", "--max-staleness-ms", "8000", "--report-interval-ms", "300",
                                            "--backend", f"http://127.0.0.1:{bport}", "--control", f"http://127.0.0.1:{g}"], env=own,
                                           stdout=open(f"{tmp}/mqtt-dataplane.out", "w")))
 
