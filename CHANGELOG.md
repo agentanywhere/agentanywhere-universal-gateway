@@ -62,6 +62,11 @@ See [docs/known-limitations.md](docs/known-limitations.md) for the full list.
 
 ### Fixed
 
+- Proxy: a request whose body came without a length (`Transfer-Encoding:
+  chunked`) is sent to the backend with its length and without that header.
+  The caller's `Transfer-Encoding` was passed on beside the `Content-Length`
+  the gateway adds, which is not a valid request: a backend may refuse it, or
+  read where the body ends differently from a proxy in front of it.
 - API versions: a sunset date given with a UTC offset (`2027-01-01T00:00:00+00:00`,
   or one ending in `Z`) now works. Comparing it with the current time raised
   an error, so the admin call that set the date failed and so did every

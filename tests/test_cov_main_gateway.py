@@ -620,3 +620,24 @@ def test_breaks_out_of_the_path_names_only_those_characters():
 
     assert not any(_breaks_out_of_the_path(p) for p in ("/a b/caf\u00e9/%41", "/a=b&c;d", "/"))
     assert all(_breaks_out_of_the_path(p) for p in ("/a?b", "/a#", "/a\tb", "/a\x00", "/a\x7f"))
+
+
+# ------------------------------------------------- a body sent without its length
+def test_a_chunked_body_goes_on_with_its_length_alone(gwdb, monkeypatch, H):
+    """The caller's ``Transfer-Encoding`` is not passed on beside the length the gateway states."""
+    from app.transformers import transformation_manager
+
+    seen = []
+
+    def answer(request):
+        seen.append(({name.decode().lower(): value.decode() for name, value in request.headers.raw}, request.content))
+        return httpx.Response(200, json={"ok": True})
+
+    monkeypatch.setattr(main.router, "client", httpx.AsyncClient(transport=httpx.MockTransport(answer)))
+    monkeypatch.setattr(transformation_manager, "rules_by_id", {})
+    assert gwdb.post("/api/t", headers=H, content=iter([b"plain ", b"words"])).status_code == 200
+    assert gwdb.post("/api/t", headers={**H, "Content-Type": "application/json"}, content=iter([b'{"a":', b" 1}"])).status_code == 200
+    assert gwdb.get("/api/t", headers={**H, "Transfer-Encoding": "chunked"}).status_code == 200
+    for headers, body in seen:
+        assert "transfer-encoding" not in headers
+    assert [(headers.get("content-length"), body) for headers, body in seen[:2]] == [("11", b"plain words"), ("8", b'{"a": 1}')]
