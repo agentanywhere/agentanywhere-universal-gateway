@@ -131,6 +131,13 @@ See [docs/known-limitations.md](docs/known-limitations.md) for the full list.
 - `admin-ui/src/lib/utils.ts` was never committed (the root `.gitignore`
   ignored every `lib/`), so the console did not type-check or build from a
   clean clone.
+- With `REDIS_ENABLED=true` and no Redis listening (the `env.example`
+  defaults), each proxied request waited for several Redis connection
+  attempts, because the rate limiter tried Redis for both the per-minute and
+  the per-hour check before falling back to its in-memory counters. After a
+  failed Redis call the rate limiter now uses the in-memory counters for 30
+  seconds without trying Redis, then tries again, as the API-key cache does
+  (#84).
 - `tests/test_followup_fixes.py::test_quickstart_script_picks_python_with_requests`
   copies the helper out of `scripts/quickstart_test.sh` in Python instead of
   running `sed`, so it no longer crashes on Git for Windows, which puts
