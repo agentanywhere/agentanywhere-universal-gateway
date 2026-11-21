@@ -97,9 +97,10 @@ settings too, so `.env` applies to them; the process environment wins.)
 
 | Variable | Default | Description |
 |---|---|---|
-| `SECRET_KEY` | `change-me-in-production-use-strong-random-key` | **secret.** Break-glass credential: accepted as an API key on the data plane, and as the admin credential (and console password) only while `ADMIN_TOKEN` is empty. A value starting with `change-me` is treated as unset. Signs nothing. See the [security model](../explanation/security-model.md#the-secret_key-break-glass-credential). |
+| `SECRET_KEY` | `change-me-in-production-use-strong-random-key` | **secret.** Break-glass credential: the admin credential (and console password) only while `ADMIN_TOKEN` is empty, and an API key on the data plane only with `ALLOW_SECRET_KEY_API_KEY=true`. A value starting with `change-me` is treated as unset. Signs nothing. See the [security model](../explanation/security-model.md#the-secret_key-break-glass-credential). |
 | `ADMIN_TOKEN` | empty | **secret.** The admin credential (`Authorization: Bearer`) and, when set, the console password. Once set, `SECRET_KEY` no longer opens the admin API. |
 | `ADMIN_ACCEPT_SECRET_KEY` | `false` | `true` accepts `SECRET_KEY` on the admin API even when `ADMIN_TOKEN` is set, as earlier builds did. The placeholder is never accepted. |
+| `ALLOW_SECRET_KEY_API_KEY` | `false` | `true` accepts `SECRET_KEY` as an API key on the data plane, for a fresh install with no keys yet. Every use is counted (`gateway_secret_key_api_key_uses_total`), logged (`secret_key_used_as_api_key`) and written to the governance audit log (`auth.secret_key_as_api_key`). The placeholder is never accepted. |
 | `ADMIN_USERNAME` | `admin` | User name the console's sign-in form expects. |
 | `API_KEY_HEADER` | `X-API-Key` | Header the gateway reads API keys from, before falling back to `Authorization: Bearer`. |
 | `ALGORITHM` | `HS256` | **not read.** Nothing issues or signs tokens yet. |

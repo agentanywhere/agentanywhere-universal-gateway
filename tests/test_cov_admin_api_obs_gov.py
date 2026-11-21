@@ -188,7 +188,7 @@ def test_role_assign_never_exposes_token_and_revoke(client):
 
     audit = client.get("/admin/governance/audit", params={"action": "rbac.role.assign"}, headers=AUTH).json()
     assert audit and audit[0]["resource_type"] == "admin_role"
-    assert audit[0]["actor"] == get_settings().secret_key[-8:]
+    assert audit[0]["actor"] == "secret-key"
 
 
 @pytest.mark.parametrize("payload", [

@@ -24,6 +24,8 @@ admin endpoint surface in ``admin/api.py``.
 """
 from __future__ import annotations
 
+import asyncio
+import weakref
 import fnmatch
 import hashlib
 import ipaddress
@@ -158,9 +160,39 @@ class AuditLog:
     def __init__(self, recent_buffer_size: int = 200) -> None:
         self._recent: Deque[Dict[str, Any]] = deque(maxlen=recent_buffer_size)
         self._last_hash: Optional[str] = None
+        # One lock per event loop: the log is a module-level singleton and
+        # asyncio locks cannot be shared between loops.
+        self._locks: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock]" = (
+            weakref.WeakKeyDictionary()
+        )
+
+    def _lock(self) -> asyncio.Lock:
+        loop = asyncio.get_running_loop()
+        lock = self._locks.get(loop)
+        if lock is None:
+            lock = self._locks[loop] = asyncio.Lock()
+        return lock
 
     async def record(self, db: AsyncSession, entry: AuditEntry) -> Dict[str, Any]:
-        """Persist an audit entry and return its serialised form."""
+        """Persist an audit entry and return its serialised form.
+
+        Serialised: reading the previous hash, inserting the row, committing
+        and remembering the new hash happen under one lock, so concurrent
+        writers (for example several background tasks, each with its own
+        session) cannot chain from the same previous hash and fork the chain.
+        The lock is per process: several workers or instances sharing a
+        database would need the chain serialised in the database itself.
+        """
+        async with self._lock():
+            try:
+                return await self._record_locked(db, entry)
+            except Exception:
+                # Re-read the last persisted hash next time rather than chain
+                # onto a row that may not have been committed.
+                self._last_hash = None
+                raise
+
+    async def _record_locked(self, db: AsyncSession, entry: AuditEntry) -> Dict[str, Any]:
         timestamp = utcnow()
 
         prev_hash = self._last_hash
@@ -196,8 +228,10 @@ class AuditLog:
         )
         db.add(row)
         await db.flush()
-        self._last_hash = entry_hash
         as_dict = self._row_to_dict(row)
+        await db.commit()
+        # Only a committed row may become the link the next entry chains to.
+        self._last_hash = entry_hash
         self._recent.append(as_dict)
         logger.info(
             "audit_recorded",
@@ -208,7 +242,6 @@ class AuditLog:
             if entry.resource_type
             else None,
         )
-        await db.commit()
         return as_dict
 
     async def list(

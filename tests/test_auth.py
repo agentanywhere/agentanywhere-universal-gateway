@@ -84,15 +84,22 @@ async def test_bootstrap_key_requires_configured_secret(db_session, monkeypatch)
     """Break-glass: the configured SECRET_KEY authenticates only when it has
     been changed from the shipped default."""
     middleware = AuthMiddleware()
+    from app.middleware import auth as auth_module
 
-    # A real, non-default secret authenticates as the default bootstrap key.
+    # Off by default: even a real secret is refused on the proxy.
     monkeypatch.setattr(settings, "secret_key", "a-real-strong-secret-value-1234567890")
+    monkeypatch.setattr(auth_module.settings, "secret_key", settings.secret_key)
+    assert await middleware._validate_api_key(settings.secret_key, None) is None
+
+    # When enabled, a real, non-default secret authenticates as the bootstrap key.
+    monkeypatch.setattr(auth_module.settings, "allow_secret_key_api_key", True)
     validated = await middleware._validate_api_key(settings.secret_key, None)
     assert validated is not None
     assert validated.name == "default"
 
-    # The shipped default grants nothing.
+    # The shipped default grants nothing, even when enabled.
     monkeypatch.setattr(settings, "secret_key", "change-me-in-production-use-strong-random-key")
+    monkeypatch.setattr(auth_module.settings, "secret_key", settings.secret_key)
     assert await middleware._validate_api_key(settings.secret_key, None) is None
 
 

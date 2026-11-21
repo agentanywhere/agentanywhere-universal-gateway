@@ -37,6 +37,12 @@ rate_limit_hits = Counter(
     ["client_id"]
 )
 
+# Data-plane requests authenticated with SECRET_KEY (break-glass)
+secret_key_api_key_uses = Counter(
+    "gateway_secret_key_api_key_uses_total",
+    "Proxy requests authenticated with SECRET_KEY instead of an API key",
+)
+
 # Circuit breaker metrics
 circuit_breaker_state = Gauge(
     "gateway_circuit_breaker_state",

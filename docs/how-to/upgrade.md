@@ -110,6 +110,8 @@ column. These behaviours changed and may need action:
 | Change | What to do |
 |---|---|
 | With `ADMIN_TOKEN` set, `SECRET_KEY` no longer authenticates on `/admin/*` (or on `/metrics` and `/health/detailed` with `OPS_ENDPOINTS_REQUIRE_ADMIN=true`). | Give operators and Prometheus `ADMIN_TOKEN`, or set `ADMIN_ACCEPT_SECRET_KEY=true` for the old behaviour. |
+| `SECRET_KEY` is no longer accepted as an API key on the data plane (401). | Create API keys with `POST /admin/api-keys`. For a first boot with no keys, `ALLOW_SECRET_KEY_API_KEY=true` restores it; every use is counted, logged and audited. |
+| Audit entries name the admin principal (`admin-token`, `secret-key` or `sso:<user>`) instead of the last eight characters of the credential. Existing rows keep their old actor. | Update any audit query that filters on `actor`. |
 | Keys are stored as hashes. `GET /admin/api-keys` returns `id` and `key_prefix`, never the key. Existing keys keep working and lose their plaintext copy on first use. | Record new keys when you create them; they cannot be shown again. |
 | `allowed_paths` is enforced: 403 outside it. | Check keys created with it. |
 | `X-Forwarded-For` is ignored unless the connection comes from `TRUSTED_PROXIES` (empty by default). | Behind a proxy, list its address. |

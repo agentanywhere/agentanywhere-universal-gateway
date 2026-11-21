@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from admin.api import verify_admin_token, verify_admin_token_value
 from app import agent_registry
 from app.agent_monitor import agent_monitor
+from app.client_ip import client_ip
 from app.database import get_db
 from app.repositories.agent_registry_repo import AgentRegistryRepository
 
@@ -73,10 +74,10 @@ async def _hot_reload(db: AsyncSession) -> int:
 
 
 def _actor(token: Optional[str]) -> Optional[str]:
-    """A short, non-secret fingerprint of the admin token for audit rows."""
-    if not token:
-        return None
-    return token[-8:]
+    """The authenticated admin principal for audit rows (never a token fragment)."""
+    from admin.api import admin_principal
+
+    return admin_principal(token)
 
 
 async def _audit(
@@ -101,7 +102,7 @@ async def _audit(
                 resource_type="agent",
                 resource_id=slug,
                 request_id=getattr(request.state, "request_id", None),
-                client_ip=getattr(request.client, "host", None) if request.client else None,
+                client_ip=client_ip(request),
                 user_agent=request.headers.get("user-agent"),
                 outcome=outcome,
                 before=before,

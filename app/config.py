@@ -103,6 +103,7 @@ SECTIONS: Dict[str, Sequence[str]] = {
         "admin_token",
         "admin_username",
         "admin_accept_secret_key",
+        "allow_secret_key_api_key",
         "algorithm",
         "access_token_expire_minutes",
         "api_key_header",
@@ -465,6 +466,12 @@ class Settings(BaseSettings):
     # SECRET_KEY is accepted as an admin credential only while ADMIN_TOKEN is
     # empty. true restores the old behaviour of accepting both.
     admin_accept_secret_key: bool = False
+    # Break-glass, off by default: accept SECRET_KEY as an API key on the proxy
+    # (data plane), for bootstrapping before any API key exists. When enabled,
+    # every use is logged as a warning, counted
+    # (gateway_secret_key_api_key_uses_total) and written to the governance
+    # audit log. Create a real API key instead wherever possible.
+    allow_secret_key_api_key: bool = False
     # Not used yet: nothing in this release signs tokens, so ALGORITHM and
     # ACCESS_TOKEN_EXPIRE_MINUTES have no effect.
     algorithm: str = "HS256"

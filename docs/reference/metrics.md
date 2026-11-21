@@ -18,6 +18,7 @@ gateway in process. Label values in the examples are real.
 | `gateway_errors_total` | counter | `error_type`, `protocol` | On 5xx responses produced by the gateway, unhandled exceptions and backend connection failures. |
 | `gateway_red_requests_total` | counter | `method`, `route`, `status_class`, `protocol`, `tenant` | After every request, including rejected ones. |
 | `gateway_rate_limit_hits_total` | counter | `client_id` | On every 429 from the authentication layer (key limit or tenant quota); `client_id` is the key's id. |
+| `gateway_secret_key_api_key_uses_total` | counter | none | On every data-plane request authenticated with `SECRET_KEY` (`ALLOW_SECRET_KEY_API_KEY=true`). |
 | `gateway_red_request_duration_seconds` | histogram (buckets 0.005 to 10 s) | `method`, `route`, `protocol`, `tenant` | As above. |
 | `gateway_red_errors_total` | counter | `method`, `route`, `protocol`, `tenant`, `error_class` | When the status is 500 or above. |
 

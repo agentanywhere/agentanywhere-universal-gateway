@@ -204,6 +204,9 @@ async def test_db_error_falls_through_to_rejection(mw, monkeypatch):
 
 async def test_break_glass_secret_key(mw, monkeypatch):
     monkeypatch.setattr(auth_mod.settings, "secret_key", "real-operator-secret-value-123456")
+    # off by default: the SECRET_KEY is not an API key
+    assert await mw._validate_api_key("real-operator-secret-value-123456", None) is None
+    monkeypatch.setattr(auth_mod.settings, "allow_secret_key_api_key", True)
     p = await mw._validate_api_key("real-operator-secret-value-123456", None)
     assert p.name == "default" and p.id is None
     assert await mw._validate_api_key("real-operator-secret-value-12345X", None) is None
@@ -321,6 +324,7 @@ async def test_authenticate_attaches_active_tenant_only(mw, db_session):
 
 async def test_authenticate_without_db_skips_tenant(mw, monkeypatch):
     monkeypatch.setattr(auth_mod.settings, "secret_key", "real-operator-secret-value-123456")
+    monkeypatch.setattr(auth_mod.settings, "allow_secret_key_api_key", True)
     req = make_request({"X-API-Key": "real-operator-secret-value-123456"})
     p = await mw.authenticate(req, None)
     assert p.name == "default" and not hasattr(req.state, "tenant_id")
