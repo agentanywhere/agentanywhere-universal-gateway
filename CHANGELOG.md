@@ -62,6 +62,9 @@ See [docs/known-limitations.md](docs/known-limitations.md) for the full list.
 
 ### Fixed
 
+- `GET /admin/webhooks`: each row's `event_type` is the event that webhook was
+  registered for. Without an `event_type` filter every row said `all`, which
+  is not an event the gateway sends. The filter still works.
 - Admin console: the Protocols page no longer reports every backend as "not
   configured", and the Settings page fills in the backend URLs, environment and
   log level. `GET /admin/config` groups settings into sections; the console now
