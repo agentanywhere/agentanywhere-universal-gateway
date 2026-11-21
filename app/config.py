@@ -121,6 +121,7 @@ SECTIONS: Dict[str, Sequence[str]] = {
         "rate_limit_per_hour",
         "rate_limit_redis_url",
     ),
+    "retention": ("request_log_retention_days", "retention_interval_hours"),
     "redis": ("redis_url", "redis_enabled"),
     "database": ("database_url",),
     "backends": (
@@ -497,6 +498,12 @@ class Settings(BaseSettings):
     rate_limit_per_minute: int = 60
     rate_limit_per_hour: int = 1000
     rate_limit_redis_url: Optional[str] = None
+
+    # Retention (see app/retention.py): request log rows older than this many
+    # days are deleted (0 keeps them forever); pruning runs at start-up and
+    # every retention_interval_hours.
+    request_log_retention_days: int = 0
+    retention_interval_hours: int = 24
 
     # Redis
     redis_url: str = "redis://localhost:6379/0"

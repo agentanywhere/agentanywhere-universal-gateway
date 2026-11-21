@@ -36,7 +36,7 @@ gateway audited or certified.
 - [ ] `CORS_ORIGINS` lists the exact origins of your front ends, not `*`. ([CORS](#cors))
 - [ ] The database is PostgreSQL, or SQLite on a volume that is backed up. ([Data at rest](#data-at-rest))
 - [ ] Backups taken before the key-hashing upgrade are protected or destroyed. ([Data at rest](#data-at-rest))
-- [ ] `request_logs` is pruned on a schedule. ([Data at rest](#data-at-rest))
+- [ ] `REQUEST_LOG_RETENTION_DAYS` matches how long you may keep request logs. ([Data at rest](#data-at-rest))
 - [ ] Keys have expiry dates and, where useful, `allowed_paths`. ([API keys](#api-keys))
 - [ ] Redis and PostgreSQL are not reachable from outside their network; the Grafana and PostgreSQL passwords are generated values. ([Docker Compose defaults](#docker-compose-defaults))
 - [ ] Sample backends are not running. ([Docker Compose defaults](#docker-compose-defaults))
@@ -115,13 +115,9 @@ credentials off and logs `cors_wildcard_credentials_disabled` at start-up.
   plaintext copy until the key is next used, and backups taken before the
   upgrade contain them: protect or destroy those.
 - Keep Redis on a private network with a password.
-- Prune `request_logs` regularly:
-
-  ```sql
-  DELETE FROM request_logs WHERE timestamp < now() - interval '30 days';
-  ```
-
-  (PostgreSQL syntax; for SQLite use `datetime('now', '-30 days')`.)
+- `request_logs` keeps every row unless `REQUEST_LOG_RETENTION_DAYS` is set;
+  rows older than that many days are then deleted automatically. Set it to the
+  period your policy allows. The governance audit log is never pruned.
 
 ## API keys
 
