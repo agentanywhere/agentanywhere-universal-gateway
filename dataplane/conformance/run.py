@@ -413,6 +413,7 @@ def grpc_call(target, kind, method, request, metadata=(), timeout=10, authority=
 
 
 def main() -> int:
+    sys.stdout.reconfigure(line_buffering=True)  # in order with what the processes write to stderr
     if not BIN.exists():
         print(f"build first: cargo build --release  (in {BIN.parent.parent.parent})")
         return 2
@@ -438,7 +439,12 @@ def main() -> int:
                "WEBSOCKET_BACKEND_URL": sockets, "GRPC_BACKEND_URL": f"127.0.0.1:{grpc_port}",
                "MCP_BACKEND_URL": agents, "A2A_BACKEND_URL": agents, "AG_UI_BACKEND_URL": agents, "ACP_BACKEND_URL": agents,
                "GRAPHQL_BACKEND_URL": f"{agents}/graphql",  # named by its endpoint: `/graphql` is not sent twice
-               "CIRCUIT_BREAKER_TIMEOUT": "2", "DEFAULT_TIMEOUT": "2"}  # short, so the breaker and timeout scenarios can wait them out
+               "CIRCUIT_BREAKER_TIMEOUT": "2", "DEFAULT_TIMEOUT": "2",  # short, so the breaker and timeout scenarios can wait them out
+               # SQLite as one would run it: in its default journal a reader holds writers off and every
+               # commit waits for the disk. On a slow disk a report could then take the control plane
+               # longer than the data plane waits for it (3 s): the data plane sends it again and the
+               # counts in it are applied twice, and the request-log rows in it are not sent again.
+               "SQLITE_JOURNAL_MODE": "WAL", "SQLITE_SYNCHRONOUS": "NORMAL"}
 
         def start_backend():
             return subprocess.Popen([sys.executable, "-c", _BACKEND_RUNNER, str(ROOT / _BACKEND), str(bport)],
@@ -446,9 +452,11 @@ def main() -> int:
 
         try:
             procs.append(start_backend())
+            # What the gateway logs (warnings and errors) is kept, and shown if a check fails.
+            gateway_log = open(os.path.join(tmp, "gateway.log"), "wb")
             procs.append(subprocess.Popen([sys.executable, "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1",
                                            "--port", str(gport), "--log-level", "warning"], cwd=ROOT, env=env,
-                                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+                                          stdout=gateway_log, stderr=subprocess.STDOUT))
             wait_healthy(f"http://127.0.0.1:{bport}/health", procs[0])
             wait_healthy(f"http://127.0.0.1:{gport}/health", procs[1])
 
@@ -686,7 +694,17 @@ def main() -> int:
             owned = {"py": tenant("conf-py-tenant", 3, "conf-py-owned"), "rs": tenant("conf-rs-tenant", 3, "conf-rs-owned")}
             assert wait_until(tenant_native(owned["rs"], "conf-rs-tenant")), "tenant key never reached the snapshot"
             time.sleep(0.6)  # one more sync, so the data plane holds that snapshot
-            pairs = [both("GET", "/api/users", owned) for _ in range(4)]
+            def tenant_used(tid):
+                r = httpx.get(f"{py}/admin/tenants/{tid}/usage", headers=adm, timeout=10)
+                return r.json()["current"]["minute"]["request_count"] if r.status_code == 200 else -1
+
+            # Python counts a tenant's request once it has answered it, in the background: wait for
+            # each count to land before the next request, as requests a moment apart would find it.
+            pairs = []
+            for i in range(4):
+                pairs.append(both("GET", "/api/users", owned))
+                if i < 3:
+                    wait_until(lambda: tenant_used("conf-py-tenant") >= i + 1, 10)
             print("      tenant-quota statuses  python", [x.status_code for x, _ in pairs], " rust", [y.status_code for _, y in pairs])
             check("tenant quota sequence matches", [x.status_code for x, _ in pairs] == [y.status_code for _, y in pairs] == [200, 200, 200, 429])
             same("a tenant's request", *pairs[0])
@@ -705,13 +723,15 @@ def main() -> int:
             time.sleep(0.6)
             hit = lambda base: httpx.get(f"{base}/api/users", headers={"X-API-Key": shared["key"]}, timeout=10)
             first = [hit(py).status_code for _ in range(2)]
+            wait_until(lambda: tenant_used("conf-shared-tenant") >= 2, 10)  # counted by Python, in the background
             time.sleep(1.0)  # the data plane hears what Python served
             second = [hit(rs) for _ in range(3)]
             check("a quota is shared: what Python served counts in the data plane",
                   first == [200, 200] and [r.status_code for r in second] == [200, 200, 429]
                   and all(r.headers.get("x-served-by") == "dataplane" for r in second),
                   f"python {first}, then data plane {[r.status_code for r in second]}")
-            time.sleep(1.5)  # Python hears what the data plane served
+            # Python hears what the data plane served when its next report lands.
+            wait_until(lambda: tenant_used("conf-shared-tenant") >= 4, 10)
             third = hit(py)
             check("a quota is shared: what the data plane served counts in Python", third.status_code == 429, f"[{third.status_code}]")
             usage = httpx.get(f"{py}/admin/tenants/conf-shared-tenant/usage", headers=adm, timeout=10)
@@ -719,6 +739,17 @@ def main() -> int:
                 print("      tenant usage as the product reports it:", json.dumps(usage.json())[:200])
 
             # --- what the data plane served is visible to the product --------------------------------
+            def settled(read, quiet=1.5, seconds=20.0):
+                """What ``read`` gives once it has not changed for ``quiet`` seconds: whatever earlier
+                steps had the data plane report has landed by then (it reports every 0.3 s)."""
+                value, since, end = read(), time.time(), time.time() + seconds
+                while time.time() < end and time.time() - since < quiet:
+                    time.sleep(0.1)
+                    now = read()
+                    if now != value:
+                        value, since = now, time.time()
+                return value
+
             def metric(name, **labels):
                 want = ",".join(f'{k}="{v}"' for k, v in sorted(labels.items()))
                 total = 0.0
@@ -735,9 +766,11 @@ def main() -> int:
             assert wait_until(lambda: served_natively(probe["key"])), "probe key never became native"
             time.sleep(1.5)
             req_labels = dict(method="GET", path="/api/users", status_code="200", protocol="http")
-            before = metric("gateway_requests_total", **req_labels)
-            before_native = metric("gateway_dataplane_native_requests_total", status_class="2xx")
-            before_count = metric("gateway_request_duration_seconds_count", method="GET", path="/api/users", protocol="http")
+            # Reports of earlier steps may still be on their way: start from counts that have stopped moving.
+            before, before_native, before_count = settled(lambda: (
+                metric("gateway_requests_total", **req_labels),
+                metric("gateway_dataplane_native_requests_total", status_class="2xx"),
+                metric("gateway_request_duration_seconds_count", method="GET", path="/api/users", protocol="http")))
             N = 200
             for i in range(N):
                 httpx.get(f"{rs}/api/users", headers={"X-API-Key": probe["key"]}, params={"i": i}, timeout=10)
@@ -1774,10 +1807,24 @@ def main() -> int:
             time.sleep(2.0)
             counted = metric("gateway_requests_total", method="POST", path="/conf.Echo/Count", status_code="200")
             check("gRPC: calls are counted in gateway_requests_total", counted == 1, f"{counted:.0f}")
-            logs = httpx.get(f"{py}/admin/logs", params={"limit": 1000, "path": "/conf.Echo/Say"}, headers=adm, timeout=10).json()["logs"]
-            limited = [l for l in logs if l.get("status_code", l.get("status")) == 429]
+            from collections import Counter
+            say_rows = lambda: httpx.get(f"{py}/admin/logs", params={"limit": 1000, "path": "/conf.Echo/Say"}, headers=adm, timeout=10).json()["logs"]
+            refused_rows = lambda rows: [l for l in rows if l.get("status_code", l.get("status")) == 429]
+            # A refusal's row goes in the data plane's next report. A report the control plane does not
+            # take in time is sent again for its counts, not for its rows: then refuse the key again.
+            again = 0
+            while not refused_rows(say_rows()) and again < 2:
+                again += 1
+                for _ in range(4):
+                    if grpc_call(through, "unary", "Say", b"hi", say_key)["code"] == "RESOURCE_EXHAUSTED":
+                        break
+                wait_until(lambda: refused_rows(say_rows()), 15)
+            logs = say_rows()
+            limited = refused_rows(logs)
+            statuses = dict(sorted(Counter(l.get("status_code", l.get("status")) for l in logs).items()))
             check("gRPC: calls are logged with their key, refusals under the status they stand for",
-                  any(l.get("api_key_id") == keys["rs"]["id"] for l in logs) and len(limited) >= 1, f"{len(logs)} rows, {len(limited)} limited")
+                  any(l.get("api_key_id") == keys["rs"]["id"] for l in logs) and len(limited) >= 1,
+                  f"{len(logs)} rows, {len(limited)} limited, by status {statuses}" + (f", after refusing the key {again} more time(s)" if again else ""))
 
             # The backend goes away: the caller is told so, in gRPC's terms.
             grpc_server.terminate()
@@ -2044,7 +2091,7 @@ def main() -> int:
                         total += float(line.rsplit(" ", 1)[1])
                 return total
 
-            before = counted()
+            before = settled(counted)  # the publishes just before are reported a moment later
             for i in range(5):
                 publish(mrs, mkeys["rs"], {"topic": f"counted/{i}"})
             check("MQTT: what the data plane published is counted by the product as MQTT requests",
@@ -2128,6 +2175,13 @@ def main() -> int:
 
             known = sorted(h for h in gaps if h not in PROMISED)
             print(f"\nheader names present on only one side (known gaps, not failures): {known or 'none'}")
+            if failures:
+                gateway_log.flush()
+                with open(gateway_log.name, errors="replace") as f:
+                    said = [line.rstrip() for line in f if line.strip()]
+                print(f"\nwhat the Python gateway logged ({len(said)} lines, the last 60):")
+                for line in said[-60:]:
+                    print("      " + line[:300])
             print(f"\n{'ALL PASS' if not failures else str(failures) + ' FAILED'}")
             return 1 if failures else 0
         finally:
