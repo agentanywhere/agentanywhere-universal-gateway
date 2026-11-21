@@ -52,7 +52,10 @@ async def test_batched_writes_in_batches_and_flushes_on_stop(session_factory):
     await w.start()
     for i in range(25):
         w.submit(_entry(i), None)
-    await asyncio.sleep(0.3)
+    for _ in range(100):                              # a slow runner can need more than a few flush intervals
+        if w.written + w.failed >= 25:                # the writer's own count: reading the table here would hold its lock
+            break
+        await asyncio.sleep(0.05)
     assert await _count(session_factory) == 25
     for i in range(25, 33):
         w.submit(_entry(i), None)

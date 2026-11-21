@@ -55,9 +55,22 @@ See [docs/known-limitations.md](docs/known-limitations.md) for the full list.
   explanation, with a map in `docs/README.md`.
 - `scripts/check_docs.py`, `scripts/check_env_vars.py` and
   `scripts/generate_http_reference.py --check` run in CI.
+- The two-backends tutorial's tenant step works when re-run: after creating
+  `acme` it sets the quota with `PUT /admin/tenants/acme/quota`, so a tenant
+  left over from an earlier run (whose create answers 409) is put back to 3
+  requests a minute.
 
 ### Fixed
 
+- Admin console: the Protocols page no longer reports every backend as "not
+  configured", and the Settings page fills in the backend URLs, environment and
+  log level. `GET /admin/config` groups settings into sections; the console now
+  reads them from there instead of looking for flat fields.
+- `pytest` passes with the `.env` the getting-started tutorial writes:
+  `tests/conftest.py` sets an empty `ADMIN_TOKEN` (and
+  `ADMIN_ACCEPT_SECRET_KEY=false`) in the environment, which takes precedence
+  over `.env`, so the admin tests' `SECRET_KEY` login is accepted (they
+  answered 401). `docs/how-to/run-the-tests.md` says so.
 - The start-up banner's documentation link (`DOCUMENTATION_URL`) now defaults
   to https://docs.agentanywhere.ai/gateway/ instead of the repository's
   `docs/` folder.
