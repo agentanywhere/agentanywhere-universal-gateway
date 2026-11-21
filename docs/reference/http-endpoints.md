@@ -61,7 +61,7 @@ Totals: 162 operations (one per method and path), of which 135 are under `/admin
 |---|---|---|---|---|
 | GET | `/health` | none |  | Liveness probe — fast, no external calls. |
 | GET | `/health/detailed` | none; admin with `OPS_ENDPOINTS_REQUIRE_ADMIN=true` |  | Detailed health: runs every registered dependency probe. |
-| GET | `/ready` | none |  | Readiness probe — green only if critical dependencies are up. |
+| GET | `/ready` | none |  | Readiness probe: green only if critical dependencies are up. |
 | GET | `/live` | none |  | Liveness probe (for Kubernetes `livenessProbe`). |
 | GET | `/metrics` | none; admin with `OPS_ENDPOINTS_REQUIRE_ADMIN=true` |  | Prometheus metrics endpoint. |
 | GET | `/.well-known/agent-card.json` | none |  | A2A Agent Card discovery (RFC 8615 /.well-known). |
