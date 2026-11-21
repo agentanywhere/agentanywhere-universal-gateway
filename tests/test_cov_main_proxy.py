@@ -423,6 +423,56 @@ def test_oauth2_authorize(gw, monkeypatch):
     assert r.status_code == 400 and "unknown provider" in r.json()["message"]
 
 
+_CLIENT = {"client_id": "the-id", "client_secret": "the secret:1"}
+
+
+def _provider():
+    from app.oauth2 import OAuth2Client
+
+    return OAuth2Client(authorization_endpoint="https://idp/authorize", token_endpoint="https://idp/token", **_CLIENT)
+
+
+def test_the_client_credentials_grant_is_only_for_the_client_itself(gw, monkeypatch):
+    """The gateway used to spend its stored client secret for anyone who named the provider, and
+    hand back a token it then accepted as a credential."""
+    import base64
+
+    om = main.oauth2_manager
+    cc = AsyncMock(return_value={"access_token": "C"})
+    monkeypatch.setattr(om, "client_credentials", cc)
+    monkeypatch.setitem(om.clients, "g", _provider())
+    ask = {"grant_type": "client_credentials", "provider": "g"}
+    basic = lambda text: {"Authorization": "Basic " + base64.b64encode(text.encode()).decode()}
+    for attempt in (
+        {"json": ask},
+        {"json": {**ask, "client_id": "the-id"}},
+        {"json": {**ask, "client_secret": "the secret:1"}},
+        {"json": {**ask, "client_id": "the-id", "client_secret": "wrong"}},
+        {"json": {**ask, "client_id": "other", "client_secret": "the secret:1"}},
+        {"json": {**ask, "client_id": ["the-id"], "client_secret": {"a": 1}}},
+        {"json": ask, "headers": basic("the-id:wrong")},
+        {"json": ask, "headers": basic("the-id")},
+        {"json": ask, "headers": {"Authorization": "Basic not-base64!"}},
+        {"json": ask, "headers": {"Authorization": "Bearer the secret:1"}},
+        # A header that fails is not rescued by the body.
+        {"json": {**ask, **_CLIENT}, "headers": basic("the-id:wrong")},
+        {"json": ask, "headers": basic("the-id:caf\u00e9")},
+    ):
+        r = gw.post("/oauth2/token", **attempt)
+        assert r.status_code == 401 and r.json()["error"] == "invalid_client", attempt
+        assert r.headers["www-authenticate"].startswith("Basic")
+    cc.assert_not_awaited()
+    for attempt in (
+        {"json": {**ask, **_CLIENT}},
+        {"data": {**ask, **_CLIENT}},
+        {"json": ask, "headers": basic("the-id:the secret:1")},
+        {"json": ask, "headers": basic("the-id:the+secret%3A1")},
+    ):
+        assert gw.post("/oauth2/token", **attempt).json() == {"access_token": "C"}, attempt
+    r = gw.post("/oauth2/token", json={**ask, "provider": "nobody", **_CLIENT})
+    assert r.status_code == 404 and r.json()["error"] == "invalid_client"
+
+
 def test_oauth2_token_grants(gw, monkeypatch):
     om = main.oauth2_manager
     code = AsyncMock(return_value={"access_token": "A"})
@@ -434,10 +484,11 @@ def test_oauth2_token_grants(gw, monkeypatch):
     r = gw.post("/oauth2/token", json={"provider": "g", "code": "c", "redirect_uri": "https://a/cb", "state": "s"})
     assert r.json() == {"access_token": "A"}
     code.assert_awaited_with(provider="g", code="c", redirect_uri="https://a/cb", state="s")
-    r = gw.post("/oauth2/token", data={"grant_type": "client_credentials", "provider": "g", "scope": "x y"})
+    monkeypatch.setitem(om.clients, "g", _provider())
+    r = gw.post("/oauth2/token", data={"grant_type": "client_credentials", "provider": "g", "scope": "x y", **_CLIENT})
     assert r.json() == {"access_token": "C"}
     cc.assert_awaited_with("g", ["x", "y"])
-    gw.post("/oauth2/token", json={"grant_type": "client_credentials", "provider": "g"})
+    gw.post("/oauth2/token", json={"grant_type": "client_credentials", "provider": "g"}, auth=("the-id", "the secret:1"))
     cc.assert_awaited_with("g", None)
     r = gw.post("/oauth2/token", json={"grant_type": "refresh_token", "provider": "g", "refresh_token": "rr"})
     assert r.json() == {"access_token": "R"}
@@ -457,7 +508,8 @@ def test_oauth2_token_errors(gw, monkeypatch):
     r = gw.post("/oauth2/token", content=b"\x00garbage", headers={"content-type": "application/octet-stream"})
     assert r.status_code == 400 and r.json()["error"] == "invalid_request"
     monkeypatch.setattr(main.oauth2_manager, "client_credentials", AsyncMock(side_effect=RuntimeError("idp down")))
-    r = gw.post("/oauth2/token", json={"provider": "g", "grant_type": "client_credentials"})
+    monkeypatch.setitem(main.oauth2_manager.clients, "g", _provider())
+    r = gw.post("/oauth2/token", json={"provider": "g", "grant_type": "client_credentials", **_CLIENT})
     assert r.status_code == 400 and r.json()["error"] == "server_error"
 
 

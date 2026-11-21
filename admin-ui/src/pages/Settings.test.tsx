@@ -3,7 +3,8 @@ import { screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { renderWithProviders } from '../test/utils'
 
-vi.mock('../api/admin', () => ({
+vi.mock('../api/admin', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../api/admin')>()),
   adminApi: {
     getConfig: vi.fn(),
     getSupportedProtocols: vi.fn(),
@@ -18,7 +19,7 @@ vi.mock('../api/admin', () => ({
     updateAlertThresholds: vi.fn(),
   },
 }))
-import { adminApi } from '../api/admin'
+import { adminApi, flattenConfig } from '../api/admin'
 import Settings from './Settings'
 
 const api = vi.mocked(adminApi)
@@ -69,6 +70,25 @@ describe('Settings page', () => {
       expect(screen.getByLabelText('MCP backend URL')).toHaveValue('http://mcp:1')
       expect(screen.getByLabelText('Environment')).toHaveValue('staging')
       expect(screen.queryByLabelText('QoS level')).toBeNull()
+    })
+
+    it('fills global config from the sectioned GET /admin/config answer', async () => {
+      api.getConfig.mockResolvedValue(
+        flattenConfig({
+          sections: {
+            application: { environment: 'development' },
+            backends: { mcp_backend_url: 'http://mcp-backend:8001', a2a_backend_url: 'http://a2a-backend:8002' },
+            logging: { log_level: 'DEBUG' },
+          },
+          safe_reload_fields: ['log_level'],
+        })
+      )
+      renderWithProviders(<Settings />)
+      expect(await screen.findByText('MCP Protocol')).toBeInTheDocument()
+      expect(screen.getByLabelText('MCP backend URL')).toHaveValue('http://mcp-backend:8001')
+      expect(screen.getByLabelText('A2A backend URL')).toHaveValue('http://a2a-backend:8002')
+      expect(screen.getByLabelText('Environment')).toHaveValue('development')
+      expect(screen.getByLabelText('Log level')).toHaveValue('DEBUG')
     })
 
     it('switches protocol and reveals protocol-specific fields', async () => {
