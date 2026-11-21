@@ -1,3 +1,4 @@
+import sys
 import json
 """The snapshot the Rust data plane reads: what it contains, when a key may be served natively, and who may read it."""
 import hashlib
@@ -1272,10 +1273,16 @@ async def test_the_snapshot_says_which_requests_a_transformation_rule_applies_to
         assert (await listed())[2:] == [{**described, "methods": ["PUT"]}], pattern
         transformation_manager.remove_rule(odd.id)
     # A pattern with no such form: every path stays here.
-    for pattern in ("/api/caf\u00e9/*", "^/api/(?=x)", "^/api/(a)\\1$", "(?i)/api/x$", "^/api/\\s$", "^/a^b", "/a$b$", "^/api/x*+$"):
+    for pattern in ("/api/caf\u00e9/*", "^/api/(?=x)", "^/api/(a)\\1$", "(?i)/api/x$", "^/api/\\s$", "^/a^b", "/a$b$") + (("^/api/x*+$",) if sys.version_info >= (3, 11) else ()):
         odd = rule(pattern)
         assert await listed() is None, pattern
         assert (await dataplane_sync.build_snapshot(db_session))["fallthrough_prefixes"] == ["/"]
+        transformation_manager.remove_rule(odd.id)
+    if sys.version_info < (3, 11):
+        # Before 3.11 `re` cannot read a possessive repeat, so this gateway looks for the
+        # pattern as plain text, and the data plane is told to do the same.
+        odd = rule("^/api/x*+$", ["put"])
+        assert (await listed())[2:] == [{"contains": "^/api/x*+$", "methods": ["PUT"]}]
         transformation_manager.remove_rule(odd.id)
     assert len(await listed()) == 2
 
@@ -1344,7 +1351,7 @@ def test_the_snapshot_says_what_a_rule_does_when_the_data_plane_can_do_the_same(
         # What can match nothing is replaced in more places by `re.sub`.
         {"pattern": "a*"}, {"pattern": "(?:/a)*"}, {"pattern": "/?$"}, {"pattern": "^/a|"}, {"pattern": "^$"}, {"pattern": "^", "replacement": r"\g<0>"},
         # What only Python's engine reads, or reads its own way.
-        {"pattern": "/(?=a)"}, {"pattern": r"\ba"}, {"pattern": "(?i)/a"}, {"pattern": "(?P<n>/a)"}, {"pattern": r"(/a)\1"}, {"pattern": "/a++"}, {"pattern": "/a$b"},
+        {"pattern": "/(?=a)"}, {"pattern": r"\ba"}, {"pattern": "(?i)/a"}, {"pattern": "(?P<n>/a)"}, {"pattern": r"(/a)\1"}, *([{"pattern": "/a++"}] if sys.version_info >= (3, 11) else []), {"pattern": "/a$b"},
         # A group that can match nothing, repeated: `re` stops at such a turn.
         {"pattern": "(a*)+b", "replacement": r"\1"}, {"pattern": "(?:(a?))*b"}, {"pattern": "(/a|){2}b", "replacement": "x"}, {"pattern": "(?:/{0,2}?[a-c]?)+?c"},
         # Alternatives that each hold a repetition or a group: the engine here takes what they begin with out in front.
