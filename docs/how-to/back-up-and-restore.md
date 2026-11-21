@@ -41,18 +41,30 @@ tool):
 ```bash
 docker compose exec gateway python -c "import sqlite3; s=sqlite3.connect('/app/data/gateway.db'); d=sqlite3.connect('/app/data/backup.db'); s.backup(d); d.close(); s.close()"
 docker compose cp gateway:/app/data/backup.db ./gateway-backup-$(date +%F).db
-docker compose exec gateway rm /app/data/backup.db
+docker compose exec gateway sh -c 'rm /app/data/backup.db'
 ```
+
+> **Git Bash on Windows** rewrites a command-line argument that starts with
+> `/` into a path under the Git installation before Docker sees it, so
+> `docker compose exec gateway rm /app/data/backup.db` would look for a file
+> that does not exist. The commands on this page therefore pass container
+> paths inside `sh -c '...'`, or as part of a longer argument such as
+> `gateway:/app/data/backup.db`, which Git Bash leaves alone. If you type
+> such a command yourself, wrap it the same way or start the line with
+> `MSYS_NO_PATHCONV=1`. Linux, macOS and WSL are unaffected.
 
 The whole volume, with the gateway stopped (Compose prefixes the volume with
 the project name; find it with `docker volume ls | grep gateway_data`):
 
 ```bash
 docker compose stop gateway
-docker run --rm -v <project>_gateway_data:/data -v "$PWD":/backup alpine \
-  tar czf /backup/gateway-data-$(date +%F).tgz -C /data .
+docker run --rm -v <project>_gateway_data:/data alpine \
+  sh -c 'tar czf - -C /data .' > gateway-data-$(date +%F).tgz
 docker compose start gateway
 ```
+
+The archive is written to standard output and saved on the host by the
+shell, so no host folder is mounted into the container.
 
 ## Back up PostgreSQL
 
@@ -72,10 +84,11 @@ docker compose exec -T postgres pg_dump -U gateway_user --format=custom gateway 
 2. Put the database back:
    - SQLite: copy the backup to the path in `DATABASE_URL`. For the Compose
      volume, either extract the archive into it the same way
-     (`tar xzf ... -C /data`), or copy a single file in with
+     (`docker run --rm -i -v <project>_gateway_data:/data alpine sh -c 'tar xzf - -C /data' < gateway-data-<date>.tgz`),
+     or copy a single file in with
      `docker compose cp ./gateway-backup.db gateway:/app/data/gateway.db`
      (this works on the stopped container); after step 4, run
-     `docker compose exec -u root gateway chown gateway:gateway /app/data/gateway.db`
+     `docker compose exec -u root gateway sh -c 'chown gateway:gateway /app/data/gateway.db'`
      and `docker compose restart gateway`.
    - PostgreSQL: `pg_restore --clean --if-exists --dbname=<url> gateway-20261020.dump`.
 3. Restore `.env` or the environment. Use the **same** `SECRET_KEY` and
