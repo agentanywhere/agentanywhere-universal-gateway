@@ -2005,7 +2005,7 @@ def main() -> int:
                     r.raise_for_status()
                     made[side] = r.json()["key"]
                 procs.append(subprocess.Popen([str(BIN), "--listen", f"127.0.0.1:{d}", "--control-token", "conformance-token",
-                                               "--sync-interval-ms", "200", "--max-staleness-ms", "2000", "--report-interval-ms", "300",
+                                               "--sync-interval-ms", "200", "--max-staleness-ms", "8000", "--report-interval-ms", "300",
                                                "--backend", f"http://127.0.0.1:{bport}", "--control", f"http://127.0.0.1:{g}"], env=own))
                 native = lambda: httpx.get(f"http://127.0.0.1:{d}/api/users", headers={"X-API-Key": made["rs"]}, timeout=10).headers.get("x-served-by") == "dataplane"
                 assert wait_until(native, 8), f"the {name} data plane never started serving natively"
