@@ -6,7 +6,10 @@ integration does.
 **Before you start:** Python 3.10, 3.11 or 3.12 with the project's
 dependencies installed (`pip install -r requirements.txt`, which includes
 pytest and its plugins). No server, database or Redis is needed: the tests use
-an in-memory SQLite database and FastAPI's test client.
+an in-memory SQLite database and FastAPI's test client. A `.env` from the
+[getting-started tutorial](../tutorials/getting-started.md) can stay where it
+is: the suite ignores the `ADMIN_TOKEN` in it (see
+[how the tests are organised](#how-the-tests-are-organised)).
 
 ## Steps
 
@@ -68,7 +71,10 @@ failures. `pytest --collect-only -q` prints the current number of tests.
   `test_rate_limit.py`, `test_routing.py`, `test_admin_api.py`,
   `test_tenants.py`, `test_plugins.py`, `test_cli.py` and so on.
 - `tests/conftest.py` sets a non-placeholder `SECRET_KEY` before the app is
-  imported, and provides fixtures: `db_session` (in-memory SQLite with every
+  imported, and an empty `ADMIN_TOKEN` with `ADMIN_ACCEPT_SECRET_KEY=false`
+  unless your shell already sets them. Values in the process environment take
+  precedence over `.env`, so an `ADMIN_TOKEN` written there by the
+  getting-started tutorial does not apply to the tests. It provides fixtures: `db_session` (in-memory SQLite with every
   table), `client` (a `TestClient` whose database dependency is the test
   session), `sample_api_key` and `sample_route`.
 - Admin calls in tests authenticate with `settings.secret_key`.
@@ -99,5 +105,6 @@ request, on Python 3.10, 3.11 and 3.12:
 | `ModuleNotFoundError` | Dependencies not installed, or a different interpreter | Activate the virtual environment; `pip install -r requirements.txt`. |
 | Installation fails on Python 3.13 | Not supported | Use 3.10 to 3.12. |
 | `test_container_integration.py` fails | Something else answers on port 8000 | Set `GATEWAY_URL` to an unused port. |
+| Admin tests fail with 401 and the log says `Invalid admin token` | `ADMIN_TOKEN` is exported in your shell; the suite logs in with `SECRET_KEY`, which is not accepted while `ADMIN_TOKEN` is set (the suite overrides only the `.env` value) | Run `env -u ADMIN_TOKEN pytest`, or `unset ADMIN_TOKEN` first. |
 | `generate_http_reference.py --check` fails | A route changed | Run `python scripts/generate_http_reference.py` and commit the page. |
 | `check_env_vars.py` fails | A setting was added, removed or renamed | Update `docs/reference/configuration.md`. |

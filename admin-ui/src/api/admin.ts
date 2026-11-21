@@ -50,6 +50,29 @@ export interface LogEntry {
   error?: string
 }
 
+// GET /admin/config answers `{ sections: { backends: {...}, logging: {...}, ... },
+// safe_reload_fields: [...] }` (docs/reference/http-api.md). The pages read
+// settings by field name (`mcp_backend_url`, `log_level`), so merge the
+// sections into one flat object. Field names are unique across sections.
+export type GatewayConfig = Record<string, unknown>
+
+export function flattenConfig(data: unknown): GatewayConfig {
+  if (!data || typeof data !== 'object') return {}
+  const { sections, ...rest } = data as { sections?: unknown } & GatewayConfig
+  if (!sections || typeof sections !== 'object') return { ...rest }
+  const flat: GatewayConfig = {}
+  for (const fields of Object.values(sections as Record<string, unknown>)) {
+    if (fields && typeof fields === 'object') Object.assign(flat, fields)
+  }
+  return flat
+}
+
+// A setting as text, or '' when it is unset (null) or not a string.
+export function configString(config: GatewayConfig | undefined, field: string): string {
+  const value = config?.[field]
+  return typeof value === 'string' ? value : ''
+}
+
 export const adminApi = {
   getDashboardStats: async (): Promise<DashboardStats> => {
     const response = await apiClient.get('/admin/dashboard/stats')
@@ -105,9 +128,9 @@ export const adminApi = {
     return response.data
   },
 
-  getConfig: async () => {
+  getConfig: async (): Promise<GatewayConfig> => {
     const response = await apiClient.get('/admin/config')
-    return response.data
+    return flattenConfig(response.data)
   },
 
   getAIInsights: async () => {
