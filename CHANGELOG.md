@@ -46,12 +46,54 @@ See [docs/known-limitations.md](docs/known-limitations.md) for the full list.
 
 ### Documentation
 
+- Container commands in the backup and upgrade how-tos work in Git Bash on
+  Windows: container paths are passed inside `sh -c '...'` (Git Bash rewrote
+  a standalone `/app/...` argument, so `rm` and `chown` failed), and the
+  whole-volume backup streams the archive to the host instead of mounting a
+  host folder.
 - Documentation reorganised into tutorials, how-to guides, reference and
   explanation, with a map in `docs/README.md`.
 - `scripts/check_docs.py`, `scripts/check_env_vars.py` and
   `scripts/generate_http_reference.py --check` run in CI.
+- The two-backends tutorial's tenant step works when re-run: after creating
+  `acme` it sets the quota with `PUT /admin/tenants/acme/quota`, so a tenant
+  left over from an earlier run (whose create answers 409) is put back to 3
+  requests a minute.
 
 ### Fixed
+
+- MQTT: the gateway's client now survives the broker dropping the connection.
+  Before, the first disconnect ended the client's network thread, so it never
+  reconnected: `/mqtt/publish` answered 500 `Failed to publish message` until
+  the gateway was restarted, while still reporting itself connected. Now it
+  answers 503 `MQTT broker not connected` while the broker is away and
+  publishes again once it is back.
+- Security: a request whose path decodes to `?`, `#` or a control character
+  (`/api/x%3F/../admin`) is refused with a 400 (`INVALID_PATH`). The key's
+  allowed paths, the policies and the agent edge read the path only up to a
+  decoded `?` or `#`, while the proxy forwarded all of it: the backend was sent
+  `/api/x?/../admin`, with a query no rule had seen, and an agent was asked for
+  less than the caller named.
+- Proxy: a request path that decodes to `?`, `#` or a control character is
+  forwarded with that character escaped, as path data. A caller's
+  `/api/a%3Fadmin=1` reached the backend as `/api/a?admin=1`, a query
+  parameter no rule or check had seen; a `%23` cut the rest of the path off;
+  and a `%0A` made the request fail.
+- `GET /admin/webhooks`: each row's `event_type` is the event that webhook was
+  registered for. Without an `event_type` filter every row said `all`, which
+  is not an event the gateway sends. The filter still works.
+- Admin console: the Protocols page no longer reports every backend as "not
+  configured", and the Settings page fills in the backend URLs, environment and
+  log level. `GET /admin/config` groups settings into sections; the console now
+  reads them from there instead of looking for flat fields.
+- `pytest` passes with the `.env` the getting-started tutorial writes:
+  `tests/conftest.py` sets an empty `ADMIN_TOKEN` (and
+  `ADMIN_ACCEPT_SECRET_KEY=false`) in the environment, which takes precedence
+  over `.env`, so the admin tests' `SECRET_KEY` login is accepted (they
+  answered 401). `docs/how-to/run-the-tests.md` says so.
+- The start-up banner's documentation link (`DOCUMENTATION_URL`) now defaults
+  to https://docs.agentanywhere.ai/gateway/ instead of the repository's
+  `docs/` folder.
 
 - Database migrations: the Alembic migrations `001` and `002` were replaced by
   one baseline, `0001`, that creates the full current schema. It is safe to
@@ -70,10 +112,19 @@ See [docs/known-limitations.md](docs/known-limitations.md) for the full list.
 - nginx: `nginx/nginx.conf` is installed as `conf.d/default.conf` (as the main
   `nginx.conf` it did not load), and `/metrics` and `/health/detailed` are
   served to loopback and private addresses only.
+- `scripts/generate_ssl_cert.sh` works in Git Bash on Windows: it turns off
+  Git Bash's path rewriting (`MSYS_NO_PATHCONV=1`) for the `openssl req`
+  call, which had turned the `-subj "/C=US/..."` subject into a Windows path,
+  so only `key.pem` was written and nginx would not start.
 - New `OPS_ENDPOINTS_REQUIRE_ADMIN` (default false) requires the admin
   credential on `/metrics` and `/health/detailed`.
 - CORS: a `"*"` origin now turns credentials off, with a startup warning, and
   the default origins are the local admin console's instead of `"*"`.
+- `examples/basic_usage.py`: the HTTP example sends the body the sample HTTP
+  backend accepts (`name` and `email`) instead of one it rejected with 422,
+  and the error-handling example sends no API key, so it shows the 401 its
+  comment describes (it sent `{}` with a valid key and got 422). The gateway
+  address can be set with `GATEWAY_URL` (default `http://127.0.0.1:8000`).
 - Requests rejected by the auth layer (401, 403, 429) now carry
   `X-Request-ID`, have `request_id` in the body, are counted in
   `gateway_requests_total` (path label reduced to its first segment or
@@ -100,6 +151,17 @@ See [docs/known-limitations.md](docs/known-limitations.md) for the full list.
 - `admin-ui/src/lib/utils.ts` was never committed (the root `.gitignore`
   ignored every `lib/`), so the console did not type-check or build from a
   clean clone.
+- With `REDIS_ENABLED=true` and no Redis listening (the `env.example`
+  defaults), each proxied request waited for several Redis connection
+  attempts, because the rate limiter tried Redis for both the per-minute and
+  the per-hour check before falling back to its in-memory counters. After a
+  failed Redis call the rate limiter now uses the in-memory counters for 30
+  seconds without trying Redis, then tries again, as the API-key cache does
+  (#84).
+- `tests/test_followup_fixes.py::test_quickstart_script_picks_python_with_requests`
+  copies the helper out of `scripts/quickstart_test.sh` in Python instead of
+  running `sed`, so it no longer crashes on Git for Windows, which puts
+  `bash` on `PATH` but not `sed`.
 
 ### Changed (may need action on upgrade; see docs/how-to/upgrade.md)
 

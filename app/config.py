@@ -618,7 +618,7 @@ class Settings(BaseSettings):
     analytics_adapter: str = "full"       # full | off
     request_log_sink: str = "database"    # database | null
     # Where the start-up banner points people for help; set it to your own docs site.
-    documentation_url: str = "https://github.com/agentanywhere/agentanywhere-universal-gateway/tree/main/docs"
+    documentation_url: str = "https://docs.agentanywhere.ai/gateway/"
 
     # Metrics
     metrics_enabled: bool = True

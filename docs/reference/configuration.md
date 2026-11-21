@@ -258,7 +258,7 @@ The rate-limit values in this section are **not enforced yet**. They are shown b
 | `ANALYTICS_ADAPTER` | `full` | `full` runs the built-in anomaly detection and usage analytics, `off` runs none, or a `module:attribute` path to your own. `AI_ANALYTICS_ENABLED=false` still turns the per-request call off whichever adapter is chosen. |
 | `REQUEST_LOG_SINK` | `database` | Where request-log entries go: `database` (see `REQUEST_LOG_MODE`), `null` (discard), or a `module:attribute` path to your own. |
 | `AI_ANALYTICS_ENABLED` | `true` | Run the per-request anomaly detection and usage analytics. They run inside the request path and cost several milliseconds of CPU per request; set `false` for throughput. |
-| `DOCUMENTATION_URL` | the project's `docs/` folder on GitHub | The documentation link in the start-up banner. Set it to your own docs site. |
+| `DOCUMENTATION_URL` | `https://docs.agentanywhere.ai/gateway/` | The documentation link in the start-up banner. Set it to your own docs site. |
 
 ## Tracing
 
