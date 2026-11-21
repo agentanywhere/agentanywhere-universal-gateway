@@ -1186,7 +1186,7 @@ def test_the_snapshot_says_what_a_rule_does_when_the_data_plane_can_do_the_same(
         # What can match nothing is replaced in more places by `re.sub`.
         {"pattern": "a*"}, {"pattern": "(?:/a)*"}, {"pattern": "/?$"}, {"pattern": "^/a|"}, {"pattern": "^$"}, {"pattern": "^", "replacement": r"\g<0>"},
         # What only Python's engine reads, or reads its own way.
-        {"pattern": "/(?=a)"}, {"pattern": r"\ba"}, {"pattern": "(?i)/a"}, {"pattern": "(?P<n>/a)"}, {"pattern": r"(/a)\1"}, {"pattern": "/a++"}, {"pattern": "/a$b"},
+        {"pattern": "/(?=a)"}, {"pattern": r"\ba"}, {"pattern": "(?i)/a"}, {"pattern": "(?P<n>/a)"}, {"pattern": r"(/a)\1"}, *([{"pattern": "/a++"}] if sys.version_info >= (3, 11) else []), {"pattern": "/a$b"},
         # A group that can match nothing, repeated: `re` stops at such a turn.
         {"pattern": "(a*)+b", "replacement": r"\1"}, {"pattern": "(?:(a?))*b"}, {"pattern": "(/a|){2}b", "replacement": "x"}, {"pattern": "(?:/{0,2}?[a-c]?)+?c"},
         # Alternatives that each hold a repetition or a group: the engine here takes what they begin with out in front.
