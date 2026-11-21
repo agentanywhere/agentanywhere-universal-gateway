@@ -819,6 +819,13 @@ def main() -> int:
                         value, since = now, time.time()
                 return value
 
+            def reports_failed():
+                """Reports the data plane sent that the control plane did not take (its own metrics)."""
+                for line in httpx.get(f"http://127.0.0.1:{mport}/metrics", timeout=10).text.splitlines():
+                    if line.startswith("dataplane_reports_failed_total "):
+                        return int(float(line.split()[1]))
+                return -1
+
             def metric(name, **labels):
                 want = ",".join(f'{k}="{v}"' for k, v in sorted(labels.items()))
                 total = 0.0
@@ -840,6 +847,7 @@ def main() -> int:
                 metric("gateway_requests_total", **req_labels),
                 metric("gateway_dataplane_native_requests_total", status_class="2xx"),
                 metric("gateway_request_duration_seconds_count", method="GET", path="/api/users", protocol="http")))
+            failed_before = reports_failed()
             N = 200
             for i in range(N):
                 httpx.get(f"{rs}/api/users", headers={"X-API-Key": probe["key"]}, params={"i": i}, timeout=10)
@@ -848,7 +856,9 @@ def main() -> int:
                        and metric("gateway_dataplane_native_requests_total", status_class="2xx") - before_native >= N
                        and metric("gateway_request_duration_seconds_count", method="GET", path="/api/users", protocol="http") - before_count >= N, 30)
             delta = metric("gateway_requests_total", **req_labels) - before
-            check("native requests are counted exactly in gateway_requests_total", delta == N, f"{delta:.0f} of {N}")
+            not_taken = reports_failed() - failed_before
+            check("native requests are counted exactly in gateway_requests_total", delta == N,
+                  f"{delta:.0f} of {N}" + (f"; {not_taken} report(s) not taken by the control plane meanwhile, so sent again" if not_taken else ""))
             delta_n = metric("gateway_dataplane_native_requests_total", status_class="2xx") - before_native
             check("native share is counted in gateway_dataplane_native_requests_total", delta_n == N, f"{delta_n:.0f} of {N}")
             delta_h = metric("gateway_request_duration_seconds_count", method="GET", path="/api/users", protocol="http") - before_count
@@ -2805,7 +2815,8 @@ def main() -> int:
             statuses = dict(sorted(Counter(l.get("status_code", l.get("status")) for l in logs).items()))
             check("gRPC: calls are logged with their key, refusals under the status they stand for",
                   any(l.get("api_key_id") == keys["rs"]["id"] for l in logs) and len(limited) >= 1,
-                  f"{len(logs)} rows, {len(limited)} limited, by status {statuses}" + (f", after refusing the key {again} more time(s)" if again else ""))
+                  f"{len(logs)} rows, {len(limited)} limited, by status {statuses}" + (f", after refusing the key {again} more time(s)" if again else "")
+                  + f"; reports the control plane did not take so far: {reports_failed()}")
 
             # The backend goes away: the caller is told so, in gRPC's terms.
             # --- the JSON bridge under /grpc ----------------------------------------------------------
