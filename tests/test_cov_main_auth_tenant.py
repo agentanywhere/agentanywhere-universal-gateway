@@ -357,6 +357,43 @@ async def test_ip_rule_blocks_authenticated_request(mw, db_session, clean_govern
     assert await mw.authenticate(make_request({"X-API-Key": key}, client="198.51.100.4"), db_session)
 
 
+async def test_an_oauth2_token_goes_through_ip_rules_and_policies_like_a_key(mw, db_session, clean_governance, monkeypatch):
+    """A token's caller used to be let in before the rules were looked at."""
+    stored = SimpleNamespace(token_id="t3", provider="p", scope="", expires_at=utcnow() + timedelta(hours=1))
+
+    async def verify(tok):
+        return stored if tok == "good" else None
+
+    monkeypatch.setattr(auth_mod.oauth2_manager, "verify_access_token", verify)
+    token = {"Authorization": "Bearer good"}
+    clean_governance.ip_rule_engine._rules = [
+        IPRule(id="r9", cidr="203.0.113.0/24", action="deny", scope="global",
+               scope_id=None, description=None, enabled=True)]
+    for headers in (token, {**token, "X-API-Key": "sk-not-a-key"}):
+        with pytest.raises(AuthorizationError) as ei:
+            await mw.authenticate(make_request(headers, client="203.0.113.9"), db_session)
+        assert ei.value.message == "Request blocked by IP rule" and ei.value.details["rule_id"] == "r9"
+        # From an address the rule does not cover, the token is as good as before.
+        assert (await mw.authenticate(make_request(headers, client="198.51.100.4"), db_session)).key == "oauth2:t3"
+    # A token that is not valid is still refused as a credential (401), not by the rule (403).
+    with pytest.raises(AuthenticationError):
+        await mw.authenticate(make_request({"Authorization": "Bearer bad"}, client="203.0.113.9"), db_session)
+
+    clean_governance.ip_rule_engine._rules = []
+    pe = clean_governance.policy_engine
+    pe._cache = [Policy(id="p1", name="no-secrets", conditions=PolicyConditions(path="/secret/*"),
+                        action={"type": "deny", "reason": "nope"})]
+    with pytest.raises(AuthorizationError) as ei:
+        await mw.authenticate(make_request(token, path="/secret/x"), db_session)
+    assert ei.value.message == "nope" and ei.value.details["policy_id"] == "p1"
+    assert await mw.authenticate(make_request(token, path="/open/x"), db_session)
+    pe._cache = [Policy(id="p3", name="slow", conditions=PolicyConditions(),
+                        action={"type": "rate_limit", "requests_per_minute": 5})]
+    req = make_request(token)
+    await mw.authenticate(req, db_session)
+    assert req.state.policy_rate_limit["requests_per_minute"] == 5
+
+
 async def test_policy_deny_and_rate_limit_decision(mw, db_session, clean_governance):
     key, _ = await APIKeyRepository.create(db_session, "pol")
     pe = clean_governance.policy_engine
