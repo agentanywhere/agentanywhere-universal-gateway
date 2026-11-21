@@ -61,11 +61,16 @@ def test_recording_cost_does_not_grow_with_the_number_of_samples():
         large.record(True, 1.0)
 
     def cost(slo: SLO) -> float:
-        start = time.perf_counter()
-        for _ in range(2_000):
-            slo.record(True, 1.0)
-            slo.burn_rate()
-        return time.perf_counter() - start
+        # The best of a few runs: a shared CI runner can stall any single one
+        # for a few hundred milliseconds, which is noise, not cost.
+        best = float("inf")
+        for _ in range(5):
+            start = time.perf_counter()
+            for _ in range(2_000):
+                slo.record(True, 1.0)
+                slo.burn_rate()
+            best = min(best, time.perf_counter() - start)
+        return best
 
     # With a scan per request the loaded SLO is roughly 1000 times slower; allow a wide margin.
     assert cost(large) < cost(small) * 20 + 0.05
