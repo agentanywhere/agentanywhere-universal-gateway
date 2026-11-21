@@ -53,6 +53,11 @@ See [docs/known-limitations.md](docs/known-limitations.md) for the full list.
 
 ### Fixed
 
+- `pytest` passes with the `.env` the getting-started tutorial writes:
+  `tests/conftest.py` sets an empty `ADMIN_TOKEN` (and
+  `ADMIN_ACCEPT_SECRET_KEY=false`) in the environment, which takes precedence
+  over `.env`, so the admin tests' `SECRET_KEY` login is accepted (they
+  answered 401). `docs/how-to/run-the-tests.md` says so.
 - The start-up banner's documentation link (`DOCUMENTATION_URL`) now defaults
   to https://docs.agentanywhere.ai/gateway/ instead of the repository's
   `docs/` folder.
