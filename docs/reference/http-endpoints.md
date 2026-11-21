@@ -22,12 +22,12 @@ The list is generated with `DEBUG=false`, the default. With `DEBUG=true` the
 gateway also serves `/docs`, `/redoc` and `/openapi.json`; otherwise they
 answer 404.
 
-Totals: 160 operations (one per method and path), of which 135 are under `/admin`. 3 admin operations need no credential.
+Totals: 159 operations (one per method and path), of which 135 are under `/admin`. 3 admin operations need no credential.
 
 ## Contents
 
 - [Health, metrics and discovery](#health-metrics-and-discovery) (7)
-- [Data plane](#data-plane) (4)
+- [Data plane](#data-plane) (3)
 - [WebSocket](#websocket) (2)
 - [OAuth2](#oauth2) (6)
 - [Admin: /admin/agents](#admin-adminagents) (11)
@@ -72,7 +72,6 @@ Totals: 160 operations (one per method and path), of which 135 are under `/admin
 |---|---|---|---|---|
 | POST | `/mqtt/publish` | API key |  | Publish message to MQTT topic. |
 | POST | `/mqtt/subscribe` | API key |  | Subscribe to MQTT topic. |
-| POST | `/graphql` | API key |  | GraphQL proxy endpoint. |
 | DELETE, GET, HEAD, OPTIONS, PATCH, POST, PUT | `/{path:path}` | API key (none for OPTIONS) | `path` *path* | Main gateway proxy endpoint. |
 
 ## WebSocket

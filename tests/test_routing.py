@@ -149,6 +149,20 @@ def test_get_backend_url_graphql(router):
         assert protocol == ProtocolType.GRAPHQL
 
 
+@pytest.mark.parametrize("configured, path, sent_to", [
+    ("http://gql:4000", "/graphql", "http://gql:4000/graphql"),
+    ("http://gql:4000/graphql", "/graphql", "http://gql:4000/graphql"),
+    ("http://gql:4000/graphql/", "/api/graphql", "http://gql:4000/graphql"),
+    ("http://gql:4000/v1/graphql", "/graphql", "http://gql:4000/v1/graphql"),
+    ("http://gql:4000/v1/graphql", "/api/graphql/batch", "http://gql:4000/v1/graphql/batch"),
+    ("http://gql:4000", "/graphqlx", "http://gql:4000/graphqlx"),
+])
+def test_graphql_requests_reach_the_endpoint_however_the_backend_is_named(router, configured, path, sent_to):
+    with patch.object(settings, 'graphql_backend_url', configured):
+        url, headers, *_rest = router._prepare_upstream_parts("POST", path, {}, {}, b"{}")
+    assert url == sent_to and headers["X-Protocol"] == "graphql"
+
+
 def test_get_backend_url_graphql_not_configured(router):
     """Test GraphQL routing when not configured."""
     with patch.object(settings, 'graphql_backend_url', None):

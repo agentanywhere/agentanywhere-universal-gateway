@@ -142,7 +142,7 @@ settings too, so `.env` applies to them; the process environment wins.)
 | `AG_UI_BACKEND_URL` | unset | Backend for `/agui/*` and `/api/agui/*` (prefix stripped). Unset: those paths answer 500. |
 | `ACP_BACKEND_URL` | unset | Backend for `/acp/*` and `/api/acp/*` (prefix stripped). Unset: those paths answer 500. |
 | `HTTP_BACKEND_URL` | unset | Backend for `/api/*`, `/rest/*`, `/http/*` and every path with no known prefix. `env.example` sets `http://localhost:8003`. |
-| `GRAPHQL_BACKEND_URL` | unset | Endpoint that `POST /graphql` forwards queries to. `env.example` sets `http://localhost:4000/graphql`; the sample backend is on port 8006. |
+| `GRAPHQL_BACKEND_URL` | unset | GraphQL server, or its endpoint, that requests under `/graphql` are passed on to. `env.example` sets `http://localhost:4000/graphql`; the sample backend is on port 8006. |
 | `MQTT_BROKER_URL` | unset | Broker for `/mqtt/publish` and `/mqtt/subscribe`, for example `mqtt://localhost:1883` (`mqtts://` for TLS). The gateway connects when it starts. |
 | `WEBSOCKET_BACKEND_URL` | unset | Intended backend for `/ws/*`. The route does not work; see the [protocol support matrix](../explanation/protocol-support.md). |
 | `GRPC_BACKEND_URL` | unset | Target for the JSON-to-gRPC bridge, for example `localhost:50051`. The bridge does not work. |

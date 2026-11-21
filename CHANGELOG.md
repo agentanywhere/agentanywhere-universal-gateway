@@ -171,6 +171,14 @@ See [docs/known-limitations.md](docs/known-limitations.md) for the full list.
 - `allowed_paths` is enforced (403 outside it).
 - `X-Forwarded-For` is ignored unless `TRUSTED_PROXIES` lists the peer.
 - `/docs`, `/redoc`, `/openapi.json` answer 404 with `DEBUG=false`.
+- GraphQL requests are passed through. The gateway used to build a new request
+  from `query`, `variables` and `operationName`, so the caller's headers
+  (`Authorization` among them), `extensions`, `GET` queries and batched bodies
+  never reached the server, and every answer that was not a 2xx came back as a
+  502. Now the method, headers, query string and body go to the server as they
+  came and its status, headers and body come back. A body without `query` is
+  no longer refused by the gateway (400); the server answers it. A dynamic
+  route that matches a `/graphql` path now applies, as it does elsewhere.
 
 ### Security
 
