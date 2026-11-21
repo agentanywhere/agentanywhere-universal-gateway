@@ -53,6 +53,10 @@ See [docs/known-limitations.md](docs/known-limitations.md) for the full list.
 
 ### Fixed
 
+- Admin console: the Protocols page no longer reports every backend as "not
+  configured", and the Settings page fills in the backend URLs, environment and
+  log level. `GET /admin/config` groups settings into sections; the console now
+  reads them from there instead of looking for flat fields.
 - The start-up banner's documentation link (`DOCUMENTATION_URL`) now defaults
   to https://docs.agentanywhere.ai/gateway/ instead of the repository's
   `docs/` folder.
