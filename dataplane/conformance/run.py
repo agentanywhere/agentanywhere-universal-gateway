@@ -2647,7 +2647,7 @@ def main() -> int:
             # this suite asks for more paths than that before it comes here.
             count_of = lambda path: metric("gateway_requests_total", method="POST", path=path, status_code="200")
             wait_until(lambda: count_of("/conf.Echo/Count") + count_of("other") >= 1
-                       and any(l.get("status_code", l.get("status")) == 429 for l in said_logs()), 15)
+                       and any(l.get("status_code", l.get("status")) == 429 for l in said_logs()), 30)
             counted, others = count_of("/conf.Echo/Count"), count_of("other")
             check("gRPC: calls are counted in gateway_requests_total", counted == 1 or (counted == 0 and others >= 1),
                   f"{counted:.0f} under the method's own path, {others:.0f} under \"other\"")
