@@ -1,6 +1,8 @@
 """The adapters that ship with the gateway. The first of each list is the default."""
 from __future__ import annotations
 
+import http.cookiejar
+
 import json
 from typing import Any, Dict, Optional
 
@@ -61,11 +63,23 @@ def _orjson_codec(settings: Any) -> JsonCodec:
 
 # --- Upstream clients ----------------------------------------------------------------------
 
+class NoCookieJar(http.cookiejar.CookieJar):
+    """A cookie jar that keeps nothing.
+
+    One HTTP client carries every caller's requests to the backends. With an ordinary jar, a
+    cookie a backend sets in its answer to one caller (a session, say) would be kept and sent on
+    the next callers' requests. A caller's own ``Cookie`` header is forwarded as it came, and the
+    backend's ``Set-Cookie`` reaches the caller; the gateway itself remembers neither."""
+
+    def set_cookie(self, cookie: http.cookiejar.Cookie) -> None:
+        return None
+
+
 @upstream_clients.register("httpx")
 def _httpx_client(settings: Any) -> UpstreamClient:
     import httpx
 
-    return httpx.AsyncClient(timeout=settings.default_timeout)
+    return httpx.AsyncClient(timeout=settings.default_timeout, cookies=NoCookieJar())
 
 
 # --- Analytics -----------------------------------------------------------------------------

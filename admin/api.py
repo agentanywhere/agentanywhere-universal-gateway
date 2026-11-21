@@ -1544,13 +1544,24 @@ async def list_webhooks(
     event_type: Optional[str] = None,
     admin_token: str = Depends(verify_admin_token)
 ):
-    """List all registered webhooks."""
-    webhooks = webhook_manager.list_webhooks(event_type)
+    """List all registered webhooks.
+
+    ``?event_type=`` lists only the webhooks for that event. Each row's
+    ``event_type`` is the event that webhook was registered for.
+    """
+    if event_type:
+        rows = [(event_type, w) for w in webhook_manager.list_webhooks(event_type)]
+    else:
+        rows = [
+            (event, w)
+            for event, hooks in webhook_manager.webhooks.items()
+            for w in hooks
+        ]
     # Remove sensitive data
     return [
         {
             "id": w["id"],
-            "event_type": event_type or "all",
+            "event_type": event,
             "url": w["url"],
             "enabled": w.get("enabled", True),
             "created_at": w.get("created_at"),
@@ -1558,7 +1569,7 @@ async def list_webhooks(
             "last_success": w.get("last_success"),
             "last_failure": w.get("last_failure"),
         }
-        for w in webhooks
+        for event, w in rows
     ]
 
 

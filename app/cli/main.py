@@ -285,7 +285,7 @@ def cmd_plugins_remove(args: argparse.Namespace) -> int:
 def cmd_webhooks_list(args: argparse.Namespace) -> int:
     client = make_client(args)
     data = client.get("/admin/webhooks")
-    render(args, data, columns=["id", "url", "events", "enabled"])
+    render(args, data, columns=["id", "url", "event_type", "enabled"])
     return 0
 
 
