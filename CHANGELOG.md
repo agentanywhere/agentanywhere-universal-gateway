@@ -46,6 +46,11 @@ See [docs/known-limitations.md](docs/known-limitations.md) for the full list.
 
 ### Documentation
 
+- Container commands in the backup and upgrade how-tos work in Git Bash on
+  Windows: container paths are passed inside `sh -c '...'` (Git Bash rewrote
+  a standalone `/app/...` argument, so `rm` and `chown` failed), and the
+  whole-volume backup streams the archive to the host instead of mounting a
+  host folder.
 - Documentation reorganised into tutorials, how-to guides, reference and
   explanation, with a map in `docs/README.md`.
 - `scripts/check_docs.py`, `scripts/check_env_vars.py` and
