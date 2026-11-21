@@ -4,7 +4,7 @@ vi.mock('./client', () => ({
   default: { get: vi.fn(), post: vi.fn(), put: vi.fn(), delete: vi.fn() },
 }))
 import apiClient from './client'
-import { adminApi } from './admin'
+import { adminApi, configString, flattenConfig } from './admin'
 
 const c = apiClient as unknown as Record<'get' | 'post' | 'put' | 'delete', ReturnType<typeof vi.fn>>
 
@@ -45,6 +45,43 @@ describe('adminApi', () => {
     expect(c.get).toHaveBeenCalledWith('/admin/health/detailed')
     await adminApi.getConfig()
     expect(c.get).toHaveBeenCalledWith('/admin/config')
+  })
+
+  it('getConfig flattens the sections GET /admin/config answers with', async () => {
+    c.get.mockResolvedValue({
+      data: {
+        sections: {
+          application: { environment: 'production' },
+          backends: { mcp_backend_url: 'http://mcp:8001', http_backend_url: null },
+          logging: { log_level: 'INFO' },
+        },
+        safe_reload_fields: ['log_level'],
+      },
+    })
+    expect(await adminApi.getConfig()).toEqual({
+      environment: 'production',
+      mcp_backend_url: 'http://mcp:8001',
+      http_backend_url: null,
+      log_level: 'INFO',
+    })
+  })
+
+  it('flattenConfig handles a single section, a flat object and junk', () => {
+    // GET /admin/config?section=backends answers with that section only.
+    expect(flattenConfig({ backends: { mcp_backend_url: 'http://m' } })).toEqual({
+      backends: { mcp_backend_url: 'http://m' },
+    })
+    expect(flattenConfig({ mcp_backend_url: 'http://m' })).toEqual({ mcp_backend_url: 'http://m' })
+    expect(flattenConfig(null)).toEqual({})
+    expect(flattenConfig('x')).toEqual({})
+    expect(flattenConfig({ sections: { a: null, b: { x: 1 } } })).toEqual({ x: 1 })
+  })
+
+  it('configString returns text or an empty string', () => {
+    expect(configString({ a: 'v', b: null, c: 3 }, 'a')).toBe('v')
+    expect(configString({ a: 'v', b: null, c: 3 }, 'b')).toBe('')
+    expect(configString({ a: 'v', b: null, c: 3 }, 'c')).toBe('')
+    expect(configString(undefined, 'a')).toBe('')
   })
 
   it('AI endpoints pass windowed params with defaults', async () => {

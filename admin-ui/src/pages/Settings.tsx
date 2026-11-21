@@ -19,7 +19,7 @@ import {
   Wifi,
   Zap,
 } from 'lucide-react'
-import { adminApi } from '../api/admin'
+import { adminApi, configString } from '../api/admin'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '../components/ui/Card'
 import { PageHeader } from '../components/ui/PageHeader'
 import { Button } from '../components/ui/Button'
@@ -366,16 +366,16 @@ export default function Settings() {
             <CardContent>
               <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
                 <Field label="MCP backend URL">
-                  <Input value={config?.mcp_backend_url || ''} readOnly />
+                  <Input value={configString(config, 'mcp_backend_url')} readOnly />
                 </Field>
                 <Field label="A2A backend URL">
-                  <Input value={config?.a2a_backend_url || ''} readOnly />
+                  <Input value={configString(config, 'a2a_backend_url')} readOnly />
                 </Field>
                 <Field label="Environment">
-                  <Input value={config?.environment || ''} readOnly />
+                  <Input value={configString(config, 'environment')} readOnly />
                 </Field>
                 <Field label="Log level">
-                  <Input value={config?.log_level || ''} readOnly />
+                  <Input value={configString(config, 'log_level')} readOnly />
                 </Field>
               </div>
             </CardContent>
