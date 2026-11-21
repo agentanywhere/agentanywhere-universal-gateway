@@ -53,6 +53,9 @@ See [docs/known-limitations.md](docs/known-limitations.md) for the full list.
 
 ### Fixed
 
+- `GET /admin/webhooks`: each row's `event_type` is the event that webhook was
+  registered for. Without an `event_type` filter every row said `all`, which
+  is not an event the gateway sends. The filter still works.
 - The start-up banner's documentation link (`DOCUMENTATION_URL`) now defaults
   to https://docs.agentanywhere.ai/gateway/ instead of the repository's
   `docs/` folder.
