@@ -10,6 +10,15 @@ from app.tenant import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _clock_holds_still(monkeypatch):
+    """Usage is counted per minute window; two requests either side of a minute boundary
+    would land in two windows. Hold the clock the repository reads still."""
+    import app.repositories.tenant_repo as tenant_repo
+    frozen = tenant_repo.utcnow().replace(second=30, microsecond=0)
+    monkeypatch.setattr(tenant_repo, "utcnow", lambda: frozen)
+
+
 @pytest.fixture
 async def tenant_service(db_session):
     service = TenantService()

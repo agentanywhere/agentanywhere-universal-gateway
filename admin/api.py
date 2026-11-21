@@ -1572,13 +1572,24 @@ async def list_webhooks(
     event_type: Optional[str] = None,
     admin_token: str = Depends(verify_admin_token)
 ):
-    """List all registered webhooks."""
-    webhooks = webhook_manager.list_webhooks(event_type)
+    """List all registered webhooks.
+
+    ``?event_type=`` lists only the webhooks for that event. Each row's
+    ``event_type`` is the event that webhook was registered for.
+    """
+    if event_type:
+        rows = [(event_type, w) for w in webhook_manager.list_webhooks(event_type)]
+    else:
+        rows = [
+            (event, w)
+            for event, hooks in webhook_manager.webhooks.items()
+            for w in hooks
+        ]
     # Remove sensitive data
     return [
         {
             "id": w["id"],
-            "event_type": event_type or "all",
+            "event_type": event,
             "url": w["url"],
             "enabled": w.get("enabled", True),
             "created_at": w.get("created_at"),
@@ -1586,7 +1597,7 @@ async def list_webhooks(
             "last_success": w.get("last_success"),
             "last_failure": w.get("last_failure"),
         }
-        for w in webhooks
+        for event, w in rows
     ]
 
 
@@ -1658,7 +1669,7 @@ async def create_transformation(
           }
         }
     """
-    from app.transformers import transformation_manager
+    from app.transformers import header_problem, transformation_manager
 
     if not payload.get("name"):
         raise HTTPException(
@@ -1670,6 +1681,11 @@ async def create_transformation(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="At least one of 'request_config' or 'response_config' is required",
         )
+
+    # A header that cannot be written would fail every request the rule applies to.
+    problem = header_problem(payload)
+    if problem:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=problem)
 
     rule = transformation_manager.register_from_dict(payload)
     return rule.to_dict()

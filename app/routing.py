@@ -1,5 +1,5 @@
 """Request routing logic."""
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, List, Tuple, Union
 from urllib.parse import urlparse
 from app.config import get_settings
 from app.models import ProtocolType, RouteConfig
@@ -11,6 +11,102 @@ import time
 import asyncio
 
 settings = get_settings()
+
+
+
+def repeated_query(query) -> Dict[str, List[str]]:
+    """The values of every query key the caller gave more than once.
+
+    The proxy path carries the query as a plain dict, which holds one value a
+    key, so ``?tag=a&tag=b`` used to reach the backend as ``?tag=b``. The
+    values are kept here, beside the dict, and put back before sending.
+    """
+    pairs = getattr(query, "multi_items", None)
+    if pairs is None:  # a plain mapping holds one value a key already
+        return {}
+    seen: Dict[str, List[str]] = {}
+    for key, value in pairs():
+        seen.setdefault(key, []).append(value)
+    return {key: values for key, values in seen.items() if len(values) > 1}
+
+
+def _with_repeats(
+    query: Dict[str, Any], repeated: Optional[Dict[str, List[str]]]
+) -> Dict[str, Any]:
+    """Put back the repeated values of each key nothing changed on the way.
+
+    A key a rule or plugin set, changed or removed keeps what that left.
+    """
+    if not repeated:
+        return query
+    out = dict(query)
+    for key, values in repeated.items():
+        if key in out and out[key] == values[-1]:
+            out[key] = list(values)
+    return out
+
+def graphql_base(url: str) -> str:
+    """Where GraphQL requests are sent, less the ``/graphql`` their own path supplies.
+
+    ``GRAPHQL_BACKEND_URL`` may name the server or its endpoint: ``http://host:4000`` and
+    ``http://host:4000/graphql`` both send ``/graphql`` to ``http://host:4000/graphql``.
+    """
+    base = url.rstrip("/")
+    return base[: -len("/graphql")] if base.endswith("/graphql") else base
+
+
+# Headers that describe the connection or the message's framing, not the request. Of these the
+# backend is sent one line, as before, however many the caller gave.
+_ONE_LINE_HEADERS = frozenset({
+    "host", "content-length", "connection", "keep-alive", "transfer-encoding", "upgrade",
+    "te", "trailer", "proxy-authorization", "proxy-authenticate",
+})
+
+
+def repeated_headers(headers, held: int = 0) -> Dict[str, Tuple[str, List[str]]]:
+    """Every line of each header the caller gave more than once.
+
+    The proxy path carries a request's headers as a plain dict, which holds one
+    value a name, so of ``Accept-Language: en`` and ``Accept-Language: hi`` the
+    backend used to be sent one. The lines are kept here, beside the dict, and
+    put back before sending. ``held`` says which line's value the dict holds:
+    the first (``0``, ``dict(request.headers)``) or the last (``-1``, a dict
+    filled line by line).
+    """
+    pairs = getattr(headers, "items", None)
+    if pairs is None or isinstance(headers, dict):  # a plain dict holds one value a name already
+        return {}
+    seen: Dict[str, List[str]] = {}
+    for name, value in pairs():
+        seen.setdefault(name.lower(), []).append(value)
+    return {
+        name: (values[held], values)
+        for name, values in seen.items()
+        if len(values) > 1 and name not in _ONE_LINE_HEADERS
+    }
+
+
+def _with_repeated_lines(
+    headers: Dict[str, str], repeated: Optional[Dict[str, Tuple[str, List[str]]]]
+) -> Union[Dict[str, str], List[Tuple[str, str]]]:
+    """Put back every line of each header nothing changed on the way.
+
+    A header a rule or plugin set, changed or removed keeps what that left, and
+    so does one the gateway writes itself. With nothing to put back the dict is
+    returned as it is.
+    """
+    if not repeated:
+        return headers
+    lines: List[Tuple[str, str]] = []
+    put_back = False
+    for name, value in headers.items():
+        kept = repeated.get(name)
+        if kept is not None and kept[0] == value:
+            lines.extend((name, line) for line in kept[1])
+            put_back = True
+        else:
+            lines.append((name, value))
+    return lines if put_back else headers
 
 
 class Router:
@@ -56,7 +152,7 @@ class Router:
         elif path.startswith("/graphql") or path.startswith("/api/graphql"):
             # GraphQL routing
             if settings.graphql_backend_url:
-                return settings.graphql_backend_url, ProtocolType.GRAPHQL
+                return graphql_base(settings.graphql_backend_url), ProtocolType.GRAPHQL
             raise ValueError("GraphQL backend URL not configured")
         elif path.startswith("/api") or path.startswith("/rest") or path.startswith("/http"):
             # HTTP/REST routing
@@ -181,7 +277,12 @@ class Router:
             self.circuit_breakers[backend_url] = cb
     
     def _apply_tier2_path_strip(self, path: str, protocol: ProtocolType) -> str:
-        """Strip /acp or /agui gateway prefixes so ACP/AG-UI servers see spec-native paths."""
+        """Strip /acp or /agui gateway prefixes so ACP/AG-UI servers see spec-native paths.
+
+        A GraphQL path loses only a leading ``/api``: the server is sent ``/graphql`` either way.
+        """
+        if protocol == ProtocolType.GRAPHQL:
+            return path[len("/api"):] if path.startswith("/api/graphql") else path
         if protocol not in (ProtocolType.ACP, ProtocolType.AG_UI):
             return path
         normalized = path if path.startswith("/") else f"/{path}"
@@ -203,7 +304,9 @@ class Router:
         query_params: Dict[str, Any],
         body: Optional[Any] = None,
         route_config: Optional[RouteConfig] = None,
-    ) -> Tuple[str, Dict[str, str], Dict[str, Any], Optional[bytes], Optional[Any], str, ProtocolType, int]:
+        repeated: Optional[Dict[str, List[str]]] = None,
+        repeated_lines: Optional[Dict[str, Tuple[str, List[str]]]] = None,
+    ) -> Tuple[str, Union[Dict[str, str], List[Tuple[str, str]]], Dict[str, Any], Optional[bytes], Optional[Any], str, ProtocolType, int]:
         if route_config:
             backend_url = route_config.backend_url
             protocol = route_config.protocol
@@ -227,6 +330,7 @@ class Router:
                 body=body,
             )
         )
+        transformed_query_params = _with_repeats(transformed_query_params, repeated)
 
         api_version, version_target_path = version_manager.resolve(
             target_path, transformed_headers
@@ -244,8 +348,11 @@ class Router:
             if version_manager.strip_prefix_on_proxy and version_target_path:
                 target_path = version_target_path
 
+        # ``Transfer-Encoding`` says how the caller framed its message. The body has been
+        # read whole by now and goes on with its length, so the header does not go on with it.
         filtered_headers = {k: v for k, v in transformed_headers.items()
-                            if not k.lower().startswith("x-gateway-")}
+                            if not k.lower().startswith("x-gateway-")
+                            and k.lower() != "transfer-encoding"}
 
         filtered_headers["X-Forwarded-For"] = transformed_headers.get("X-Forwarded-For", "")
         filtered_headers["X-Protocol"] = protocol.value
@@ -275,10 +382,17 @@ class Router:
         if transformed_body is not None:
             if isinstance(transformed_body, bytes):
                 content = transformed_body
+            elif isinstance(transformed_body, str) and transformed_body is not body:
+                # Text a rule made of the body (a filled-in template) is sent as that text.
+                content = transformed_body.encode("utf-8")
             else:
                 json_payload = transformed_body
+        if transformed_body is not body:
+            # A rule changed the body, so the length the caller declared is no longer its length.
+            filtered_headers = {k: v for k, v in filtered_headers.items() if k.lower() != "content-length"}
 
-        return url, filtered_headers, transformed_query_params, content, json_payload, backend_url, protocol, timeout
+        sent_headers = _with_repeated_lines(filtered_headers, repeated_lines)
+        return url, sent_headers, transformed_query_params, content, json_payload, backend_url, protocol, timeout
 
     async def route_request(
         self,
@@ -287,12 +401,14 @@ class Router:
         headers: Dict[str, str],
         query_params: Dict[str, Any],
         body: Optional[Any] = None,
-        route_config: Optional[RouteConfig] = None
+        route_config: Optional[RouteConfig] = None,
+        repeated: Optional[Dict[str, List[str]]] = None,
+        repeated_lines: Optional[Dict[str, Tuple[str, List[str]]]] = None,
     ) -> httpx.Response:
         """Route request to appropriate backend."""
         url, filtered_headers, transformed_query_params, content, json_payload, backend_url, protocol, timeout = (
             self._prepare_upstream_parts(
-                method, path, headers, query_params, body, route_config
+                method, path, headers, query_params, body, route_config, repeated, repeated_lines
             )
         )
         if not self._check_circuit_breaker(backend_url):
@@ -338,11 +454,13 @@ class Router:
         query_params: Dict[str, Any],
         body: Optional[Any] = None,
         route_config: Optional[RouteConfig] = None,
+        repeated: Optional[Dict[str, List[str]]] = None,
+        repeated_lines: Optional[Dict[str, Tuple[str, List[str]]]] = None,
     ) -> httpx.Response:
         """Open a streaming HTTP response; caller must ``await resp.aclose()`` when done."""
         url, filtered_headers, transformed_query_params, content, json_payload, backend_url, protocol, _timeout = (
             self._prepare_upstream_parts(
-                method, path, headers, query_params, body, route_config
+                method, path, headers, query_params, body, route_config, repeated, repeated_lines
             )
         )
         if not self._check_circuit_breaker(backend_url):

@@ -4,8 +4,11 @@ import userEvent from '@testing-library/user-event'
 import { Route, Routes, useLocation } from 'react-router-dom'
 import { renderWithProviders } from '../test/utils'
 
-vi.mock('../api/admin', () => ({ adminApi: { getRoutes: vi.fn(), getConfig: vi.fn() } }))
-import { adminApi } from '../api/admin'
+vi.mock('../api/admin', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../api/admin')>()),
+  adminApi: { getRoutes: vi.fn(), getConfig: vi.fn() },
+}))
+import { adminApi, flattenConfig } from '../api/admin'
 import Protocols from './Protocols'
 
 const api = vi.mocked(adminApi)
@@ -51,6 +54,33 @@ describe('Protocols page', () => {
     expect(await screen.findByText('Active')).toBeInTheDocument()
     expect(screen.getByText('Backend not configured')).toBeInTheDocument()
     expect(screen.getAllByText('Not configured').length).toBe(5)
+  })
+
+  it('reads backend URLs from the sectioned GET /admin/config answer', async () => {
+    api.getRoutes.mockResolvedValue(
+      ['mcp', 'a2a', 'http', 'mqtt', 'websocket', 'grpc'].map((protocol) => ({ protocol, path: `/${protocol}` })) as any
+    )
+    api.getConfig.mockResolvedValue(
+      flattenConfig({
+        sections: {
+          application: { environment: 'development' },
+          backends: {
+            mcp_backend_url: 'http://mcp-backend:8001',
+            a2a_backend_url: 'http://a2a-backend:8002',
+            http_backend_url: 'http://http-backend:8003',
+            mqtt_broker_url: 'mqtt://mqtt-broker:1883',
+            websocket_backend_url: 'ws://ws-backend:8005',
+            grpc_backend_url: 'http://grpc-backend:50051',
+          },
+        },
+        safe_reload_fields: ['log_level'],
+      })
+    )
+    renderPage()
+    expect((await screen.findAllByText('Active')).length).toBe(6)
+    expect(screen.queryByText('Backend not configured')).toBeNull()
+    // Only the "Not configured" stat label remains.
+    expect(screen.getAllByText('Not configured').length).toBe(1)
   })
 
   it('expands a protocol, copies endpoints, and navigates to its test page', async () => {

@@ -124,3 +124,38 @@ class TestVersionManagerLifecycle:
         mgr.strip_prefix_on_proxy = True
         _, p = mgr.resolve("/v1/users/42")
         assert p == "/users/42"
+
+
+class TestSunsetDateWithAnOffset:
+    """A sunset date may name its UTC offset; it is compared as the moment it names."""
+
+    def test_a_date_with_an_offset_still_to_come_keeps_the_version(self):
+        from datetime import datetime, timezone
+
+        vm = VersionManager()
+        vm.register_version("9", status=VersionStatus.SUNSET, sunset_date=datetime(2099, 1, 2, tzinfo=timezone.utc))
+        version, _ = vm.resolve("/x", {"x-api-version": "9"})
+        assert version.version == "9" and version.is_active() and version.to_dict()["is_active"] is True
+
+    def test_a_date_with_an_offset_that_has_passed_ends_it(self):
+        from datetime import datetime, timezone
+
+        vm = VersionManager()
+        vm.register_version("9", status=VersionStatus.SUNSET, sunset_date=datetime(2020, 1, 2, tzinfo=timezone.utc))
+        assert not vm.versions["9"].is_active()
+        with pytest.raises(VersionUnavailable):
+            vm.resolve("/x", {"x-api-version": "9"})
+
+    def test_the_offset_counts(self):
+        from datetime import timezone
+
+        ahead = timezone(timedelta(hours=5, minutes=30))
+        soon = (utcnow() + timedelta(hours=1)).replace(tzinfo=timezone.utc).astimezone(ahead)
+        just_gone = (utcnow() - timedelta(minutes=1)).replace(tzinfo=timezone.utc).astimezone(ahead)
+        assert not APIVersion("9", status=VersionStatus.SUNSET, sunset_date=soon).sunset_passed()
+        assert APIVersion("9", status=VersionStatus.SUNSET, sunset_date=just_gone).sunset_passed()
+
+    def test_a_date_without_an_offset_is_utc_as_before(self):
+        assert not APIVersion("9", status=VersionStatus.SUNSET, sunset_date=utcnow() + timedelta(hours=1)).sunset_passed()
+        assert APIVersion("9", status=VersionStatus.SUNSET, sunset_date=utcnow() - timedelta(hours=1)).sunset_passed()
+        assert not APIVersion("9").sunset_passed()
