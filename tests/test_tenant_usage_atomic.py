@@ -13,7 +13,12 @@ from app.tenant import TenantService
 
 
 @pytest_asyncio.fixture
-async def maker(tmp_path):
+async def maker(tmp_path, monkeypatch):
+    # Hold the clock still: on a slow runner the writes below can straddle a minute boundary,
+    # which rightly opens a second minute window and would read as a duplicate row.
+    import app.repositories.tenant_repo as tenant_repo
+    frozen = tenant_repo.utcnow().replace(second=30, microsecond=0)
+    monkeypatch.setattr(tenant_repo, "utcnow", lambda: frozen)
     # 200 writers share one file; a slow CI runner can need longer than the driver's 5 s lock wait.
     engine = create_async_engine(
         f"sqlite+aiosqlite:///{tmp_path / 'usage.db'}", connect_args={"timeout": 60}
