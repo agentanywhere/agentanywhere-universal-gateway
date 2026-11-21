@@ -352,3 +352,12 @@ def test_cli_returns_error_on_clierror(monkeypatch, capsys):
     assert rc == 1
     err = capsys.readouterr().err
     assert "kaboom" in err
+
+
+def test_cli_webhooks_list_shows_each_rows_event(fake_client, monkeypatch):
+    """The list endpoint has no ``events`` field; each row names its ``event_type``."""
+    seen = {}
+    monkeypatch.setattr(cli_module, "render", lambda args, data, columns=None, **kw: seen.setdefault("columns", columns))
+    assert cli_main(["webhooks", "list"]) == 0
+    assert fake_client[0].calls[0]["path"] == "/admin/webhooks"
+    assert seen["columns"] == ["id", "url", "event_type", "enabled"]
