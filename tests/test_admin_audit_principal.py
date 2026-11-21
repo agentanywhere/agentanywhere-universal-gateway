@@ -6,10 +6,9 @@ live bearer token's signature.
 """
 import time
 
+import jwt
 import pytest
-from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
-from jose import jwk, jwt
 
 from admin.api import admin_principal
 from app import ida_auth
@@ -18,15 +17,7 @@ from app.config import get_settings
 _ISSUER = "https://idp.example.com/realms/test"
 _AUD = "gateway-admin"
 _PRIVATE = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-_PRIVATE_PEM = _PRIVATE.private_bytes(
-    serialization.Encoding.PEM,
-    serialization.PrivateFormat.PKCS8,
-    serialization.NoEncryption(),
-).decode()
-_PUBLIC_PEM = _PRIVATE.public_key().public_bytes(
-    serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
-).decode()
-_JWK = jwk.construct(_PUBLIC_PEM, "RS256").to_dict()
+_JWK = jwt.algorithms.RSAAlgorithm.to_jwk(_PRIVATE.public_key(), as_dict=True)
 _JWK.update({"kid": "k1", "use": "sig", "alg": "RS256"})
 
 
@@ -35,7 +26,7 @@ def _sso_token(**claims):
     body = {"iss": _ISSUER, "aud": _AUD, "iat": now, "exp": now + 300,
             "realm_access": {"roles": ["platform_admin"]}}
     body.update(claims)
-    return jwt.encode(body, _PRIVATE_PEM, algorithm="RS256", headers={"kid": "k1"})
+    return jwt.encode(body, _PRIVATE, algorithm="RS256", headers={"kid": "k1"})
 
 
 @pytest.fixture
@@ -49,7 +40,11 @@ def sso(monkeypatch):
 
 
 def test_principal_for_each_credential(sso, monkeypatch):
-    s = get_settings()
+    # The settings object admin.api holds, which another test's cache_clear()
+    # can leave different from get_settings().
+    import admin.api as admin_api
+
+    s = admin_api.settings
     monkeypatch.setattr(s, "admin_token", "static-admin-token-for-tests-0123456789", raising=False)
     assert admin_principal(None) is None
     assert admin_principal(_sso_token(preferred_username="ops.lead", email="ops@example.com")) == "sso:ops.lead"

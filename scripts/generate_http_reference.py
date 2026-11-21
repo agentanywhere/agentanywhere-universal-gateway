@@ -105,8 +105,17 @@ def _type_name(annotation) -> str:
     return "value"
 
 
+def _required(field) -> bool:
+    """Whether a parameter must be given. Older FastAPI has ``field.required``; newer
+    versions keep it on the pydantic ``field_info``."""
+    if hasattr(field, "required"):
+        return bool(field.required)
+    info = getattr(field, "field_info", None)
+    return bool(info.is_required()) if info is not None and hasattr(info, "is_required") else True
+
+
 def _fmt_default(field) -> str:
-    if getattr(field, "required", True):
+    if _required(field):
         return ""
     default = getattr(field, "default", None)
     if default is None or default == "" or repr(default) == "PydanticUndefined":
@@ -115,7 +124,43 @@ def _fmt_default(field) -> str:
 
 
 def _param_name(field) -> str:
-    return (getattr(field, "alias", None) or field.name) + ("" if field.required else "?")
+    return (getattr(field, "alias", None) or field.name) + ("" if _required(field) else "?")
+
+
+class _Flat:
+    def __init__(self):
+        self.path_params, self.query_params, self.body_params = [], [], []
+
+
+def _flat_dependant(dependant):
+    """The route's parameters with those of its sub-dependencies, each sub-dependency once.
+
+    FastAPI's own ``get_flat_dependant`` does this, but it is internal and newer
+    FastAPI versions no longer have it; this walks the tree the same way.
+    """
+    try:
+        from fastapi.dependencies.utils import get_flat_dependant
+    except ImportError:
+        get_flat_dependant = None
+    if get_flat_dependant is not None:
+        return get_flat_dependant(dependant, skip_repeats=True)
+
+    def key(dep):
+        return getattr(dep, "cache_key", None) or (dep.call, tuple(sorted(getattr(dep, "own_oauth_scopes", None) or ())))
+
+    flat, visited = _Flat(), []
+
+    def walk(dep):
+        visited.append(key(dep))
+        flat.path_params.extend(dep.path_params)
+        flat.query_params.extend(dep.query_params)
+        flat.body_params.extend(dep.body_params)
+        for sub in dep.dependencies:
+            if key(sub) not in visited:
+                walk(sub)
+
+    walk(dependant)
+    return flat
 
 
 def _params(route) -> str:
@@ -124,9 +169,7 @@ def _params(route) -> str:
     Reading the dependant (rather than the OpenAPI schema) keeps the output
     the same across the FastAPI and pydantic versions CI and developers use.
     """
-    from fastapi.dependencies.utils import get_flat_dependant
-
-    flat = get_flat_dependant(route.dependant, skip_repeats=True)
+    flat = _flat_dependant(route.dependant)
     out = []
     for field in flat.path_params:
         out.append(f"`{_param_name(field)}` *path*")
@@ -163,6 +206,21 @@ def _section(path):
     return "Data plane"
 
 
+def _routes(routes):
+    """Every route the app serves, at its full path.
+
+    Older FastAPI copies an included router's routes into the app's list. Newer
+    versions keep the router as one entry and work out its routes, with the
+    prefix and the router's dependencies applied, as "effective" routes.
+    """
+    for route in routes:
+        candidates = getattr(route, "effective_candidates", None)
+        if callable(candidates):
+            yield from _routes(candidates())
+        else:
+            yield route
+
+
 def build() -> str:
     warnings.simplefilter("ignore")
     from fastapi.routing import APIRoute, APIWebSocketRoute
@@ -176,8 +234,8 @@ def build() -> str:
 
     rows = {}
     op_count = [0]
-    for route in app.routes:
-        if isinstance(route, APIRoute):
+    for route in _routes(app.routes):
+        if isinstance(getattr(route, "original_route", route), APIRoute):
             deps = _deps(route.dependant, set())
             path = route.path
             if "verify_admin_token" in deps:
@@ -203,7 +261,7 @@ def build() -> str:
                 ("/openapi.json", "GET, HEAD", "none", "", "OpenAPI schema, served by FastAPI.")
             )
             op_count[0] += 2
-        elif isinstance(route, APIWebSocketRoute):
+        elif isinstance(getattr(route, "original_route", route), APIWebSocketRoute):
             rows.setdefault("WebSocket", []).append(
                 (route.path, "WS", "see note", "", _summary(route.endpoint))
             )

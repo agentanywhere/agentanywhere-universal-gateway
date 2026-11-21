@@ -1,4 +1,4 @@
-"""Unit tests for app.ida_auth (settings stubbed, JWKS fetch and jose mocked)."""
+"""Unit tests for app.ida_auth (settings stubbed, JWKS fetch and PyJWT mocked)."""
 import sys
 import types
 from unittest.mock import MagicMock
@@ -105,17 +105,21 @@ def test_token_roles():
 
 
 @pytest.fixture
-def jose_stub(monkeypatch):
-    from jose.exceptions import JWTError
-    jwt = MagicMock()
-    mod = types.ModuleType("jose")
-    mod.jwt = jwt
-    monkeypatch.setitem(sys.modules, "jose", mod)
-    return jwt, JWTError
+def jwt_stub(monkeypatch):
+    """PyJWT with decode() mocked and key selection bypassed."""
+    import jwt as real
+
+    mod = types.ModuleType("jwt")
+    mod.decode = MagicMock()
+    for name in ("PyJWTError", "InvalidTokenError", "InvalidSignatureError"):
+        setattr(mod, name, getattr(real, name))
+    monkeypatch.setitem(sys.modules, "jwt", mod)
+    monkeypatch.setattr(ida, "_signing_keys", lambda token, jwks: ["key"])
+    return mod, real.InvalidTokenError
 
 
-def test_verify_admin_token_success(cfg, monkeypatch, jose_stub):
-    jwt, _ = jose_stub
+def test_verify_admin_token_success(cfg, monkeypatch, jwt_stub):
+    jwt, _ = jwt_stub
     cfg(ida_issuer="https://x/realms/r", ida_admin_audience="aud")
     monkeypatch.setattr(ida, "_fetch_jwks", lambda: {"keys": []})
     jwt.decode.return_value = {"email": "a@b", "realm_access": {"roles": ["Platform_Admin"]}}
@@ -123,10 +127,11 @@ def test_verify_admin_token_success(cfg, monkeypatch, jose_stub):
     assert claims["email"] == "a@b"
     kw = jwt.decode.call_args.kwargs
     assert kw["audience"] == "aud" and kw["issuer"] == "https://x/realms/r" and kw["algorithms"] == ["RS256"]
+    assert kw["leeway"] == 30
 
 
-def test_verify_admin_token_empty_role_list_denies_everyone(cfg, monkeypatch, jose_stub):
-    jwt, _ = jose_stub
+def test_verify_admin_token_empty_role_list_denies_everyone(cfg, monkeypatch, jwt_stub):
+    jwt, _ = jwt_stub
     cfg(ida_issuer="https://x/realms/r", ida_admin_roles="[]")
     monkeypatch.setattr(ida, "_fetch_jwks", lambda: {"keys": []})
     jwt.decode.return_value = {"email": "a@b", "realm_access": {"roles": ["platform_admin"]}}
@@ -135,11 +140,11 @@ def test_verify_admin_token_empty_role_list_denies_everyone(cfg, monkeypatch, jo
     assert e.value.status_code == 403
 
 
-def test_verify_admin_token_errors(cfg, monkeypatch, jose_stub):
-    jwt, JWTError = jose_stub
+def test_verify_admin_token_errors(cfg, monkeypatch, jwt_stub):
+    jwt, InvalidTokenError = jwt_stub
     cfg(ida_issuer="https://x/realms/r")
     monkeypatch.setattr(ida, "_fetch_jwks", lambda: {})
-    jwt.decode.side_effect = JWTError("expired")
+    jwt.decode.side_effect = InvalidTokenError("expired")
     with pytest.raises(HTTPException) as e:
         ida.verify_admin_token("tok")
     assert e.value.status_code == 401 and "expired" in e.value.detail
@@ -150,8 +155,8 @@ def test_verify_admin_token_errors(cfg, monkeypatch, jose_stub):
     assert e.value.status_code == 401 and e.value.detail == "Invalid token"
 
 
-def test_verify_admin_token_role_denied(cfg, monkeypatch, jose_stub):
-    jwt, _ = jose_stub
+def test_verify_admin_token_role_denied(cfg, monkeypatch, jwt_stub):
+    jwt, _ = jwt_stub
     cfg(ida_issuer="https://x/realms/r")
     monkeypatch.setattr(ida, "_fetch_jwks", lambda: {})
     jwt.decode.return_value = {"preferred_username": "bob", "roles": ["viewer"]}

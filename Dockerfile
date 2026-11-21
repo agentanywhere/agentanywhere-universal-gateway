@@ -23,6 +23,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     wget \
     && rm -rf /var/lib/apt/lists/*
 
+# The runtime never installs packages: drop the base image's pip, setuptools
+# and wheel (and the libraries they vendor), which carry their own advisories.
+RUN python -m pip uninstall -y pip setuptools wheel
+
 # Create non-root user
 RUN useradd -m -u 1000 gateway && \
     chown -R gateway:gateway /app

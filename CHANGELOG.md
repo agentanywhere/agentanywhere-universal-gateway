@@ -223,6 +223,15 @@ See [docs/known-limitations.md](docs/known-limitations.md) for the full list.
 
 ### Security
 
+- Dependencies with known advisories are upgraded (FastAPI, Starlette, anyio,
+  cryptography, Authlib, python-multipart, Jinja2, protobuf, gRPC, requests,
+  httpx, uvicorn, websockets, pydantic); `pip-audit` reports none for
+  `requirements.txt`. Starlette and anyio are now pinned directly.
+- Single sign-on tokens are verified with PyJWT instead of python-jose, which
+  has an advisory with no fix. The verifier picks the signing key by `kid`,
+  accepts RS256 only, checks audience and issuer, and allows 30 seconds of
+  clock skew.
+- The runtime container image no longer contains pip, setuptools or wheel.
 - `SECRET_KEY` is no longer accepted as an API key on the data plane unless
   `ALLOW_SECRET_KEY_API_KEY=true` (off by default). When it is on, every use
   is counted (`gateway_secret_key_api_key_uses_total`), logged and written to
