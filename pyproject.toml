@@ -29,7 +29,7 @@ dynamic = ["dependencies"]
 
 [project.urls]
 Homepage = "https://github.com/agentanywhere/agentanywhere-universal-gateway"
-Documentation = "https://github.com/agentanywhere/agentanywhere-universal-gateway/tree/main/docs"
+Documentation = "https://docs.agentanywhere.ai/gateway/"
 Repository = "https://github.com/agentanywhere/agentanywhere-universal-gateway"
 Issues = "https://github.com/agentanywhere/agentanywhere-universal-gateway/issues"
 Changelog = "https://github.com/agentanywhere/agentanywhere-universal-gateway/blob/main/CHANGELOG.md"

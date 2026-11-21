@@ -130,6 +130,36 @@ def test_documented_rate_limit_response(client, sample_backend):
     assert last.json()["message"] == "Rate limit exceeded: 5 requests per minute"
 
 
+@pytest.mark.parametrize("left_over", [False, True])
+def test_documented_tenant_quota_step_can_be_rerun(client, left_over):
+    """docs/tutorials/two-backends-end-to-end.md step 5: create, then set the
+    quota, leaves `acme` at 3 requests a minute on a first run and when the
+    tenant is left over from an earlier run with a different quota (the create
+    then answers 409 and keeps the old quota)."""
+    admin = {"Authorization": f"Bearer {settings.secret_key}"}
+    create = {"tenant_id": "acme", "name": "Acme Corp", "quota": {"requests_per_minute": 3}}
+    if left_over:
+        old = dict(create, quota={"requests_per_minute": 600})
+        assert client.post("/admin/tenants", json=old, headers=admin).status_code == 200
+
+    created = client.post("/admin/tenants", json=create, headers=admin)
+    if left_over:
+        assert created.status_code == 409
+        assert created.json()["message"] == "tenant 'acme' already exists"
+    else:
+        assert created.status_code == 200, created.text
+
+    quota = client.put(
+        "/admin/tenants/acme/quota", json={"requests_per_minute": 3}, headers=admin
+    )
+    assert quota.status_code == 200, quota.text
+    assert quota.json()["quota"]["requests_per_minute"] == 3
+    assert quota.json()["quota"]["requests_per_hour"] == 10000
+
+    stored = client.get("/admin/tenants/acme", headers=admin).json()
+    assert stored["quota"]["requests_per_minute"] == 3
+
+
 @pytest.mark.parametrize(
     "script",
     ["scripts/check_docs.py", "scripts/check_env_vars.py"],

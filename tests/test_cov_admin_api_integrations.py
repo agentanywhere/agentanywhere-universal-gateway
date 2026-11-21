@@ -112,6 +112,28 @@ def test_webhook_json_body_multiple_events_dedupes_and_flags_unknown(client):
     assert stored["headers"] == {"X-A": "1"} and stored["filters"] == {"path": "/a"}
 
 
+def test_webhook_list_shows_each_rows_registered_event(client):
+    """Issue #93: without a filter every row said ``"event_type": "all"``."""
+    r = client.post(
+        "/admin/webhooks",
+        json={"url": "https://h.test/hook", "events": ["api_key_created", "api_key_revoked"], "secret": "s"},
+        headers=AUTH,
+    )
+    assert r.status_code == 200
+    ids = r.json()["ids"]
+
+    # Other test modules may have left webhooks in the process-wide manager,
+    # so look only at the rows registered here.
+    listing = client.get("/admin/webhooks", headers=AUTH).json()
+    assert all(row["event_type"] != "all" for row in listing)
+    by_id = {row["id"]: row["event_type"] for row in listing if row["id"] in ids}
+    assert by_id == {ids[0]: "api_key_created", ids[1]: "api_key_revoked"}
+
+    filtered = client.get("/admin/webhooks", params={"event_type": "api_key_revoked"}, headers=AUTH).json()
+    assert all(row["event_type"] == "api_key_revoked" for row in filtered)
+    assert ids[1] in {row["id"] for row in filtered} and ids[0] not in {row["id"] for row in filtered}
+
+
 def test_webhook_requires_url_and_event_422(client):
     assert client.post("/admin/webhooks", json={"url": "https://h.test"}, headers=AUTH).status_code == 422
     assert client.post("/admin/webhooks", params={"event_type": "e"}, headers=AUTH).status_code == 422
