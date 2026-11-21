@@ -96,6 +96,11 @@ See [docs/known-limitations.md](docs/known-limitations.md) for the full list.
   credential on `/metrics` and `/health/detailed`.
 - CORS: a `"*"` origin now turns credentials off, with a startup warning, and
   the default origins are the local admin console's instead of `"*"`.
+- `examples/basic_usage.py`: the HTTP example sends the body the sample HTTP
+  backend accepts (`name` and `email`) instead of one it rejected with 422,
+  and the error-handling example sends no API key, so it shows the 401 its
+  comment describes (it sent `{}` with a valid key and got 422). The gateway
+  address can be set with `GATEWAY_URL` (default `http://127.0.0.1:8000`).
 - Requests rejected by the auth layer (401, 403, 429) now carry
   `X-Request-ID`, have `request_id` in the body, are counted in
   `gateway_requests_total` (path label reduced to its first segment or
