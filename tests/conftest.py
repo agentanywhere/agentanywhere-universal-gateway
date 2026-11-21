@@ -7,6 +7,14 @@ import os
 
 os.environ.setdefault("SECRET_KEY", "test-only-secret-key-not-a-placeholder-32b")
 os.environ.setdefault("STARTUP_BANNER", "false")
+# Admin calls in the tests authenticate with SECRET_KEY, which the gateway
+# accepts only while ADMIN_TOKEN is empty. The getting-started tutorial writes
+# an ADMIN_TOKEN into .env, and .env is read here too; an empty value in the
+# process environment takes precedence over the file, so a developer's .env
+# does not turn every admin test into a 401. Tests that need a token set it
+# on the settings object themselves.
+os.environ.setdefault("ADMIN_TOKEN", "")
+os.environ.setdefault("ADMIN_ACCEPT_SECRET_KEY", "false")
 
 import pytest
 import pytest_asyncio

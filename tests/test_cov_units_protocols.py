@@ -312,6 +312,24 @@ def test_mqtt_callbacks_state():
     assert h.connected is False
 
 
+def test_mqtt_survives_the_broker_dropping_the_connection():
+    """The client speaks MQTT 5, and an MQTT 5 client hands the disconnect callback the properties
+    too. Called the way the client's network loop calls it, the callback must not raise: an
+    exception there ends that thread, after which the client never reconnects and every publish
+    fails until the gateway is restarted."""
+    from paho.mqtt import client as paho
+
+    h = mh.MQTTHandler("mqtt://h:1")
+    client = paho.Client(client_id="outage", protocol=paho.MQTTv5)
+    client.on_connect, client.on_disconnect = h._on_connect, h._on_disconnect
+    h.connected = True
+    client._do_on_disconnect(7, None)
+    assert h.connected is False
+    # The reconnect the network loop then makes is announced the usual way.
+    h._on_connect(client, None, {}, 0, None)
+    assert h.connected is True
+
+
 def test_mqtt_on_message_paths():
     h = mh.MQTTHandler("mqtt://h:1")
     got = []
