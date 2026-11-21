@@ -92,6 +92,11 @@ request, on Python 3.10, 3.11 and 3.12:
 
 `make lint` runs steps 1 and 2 locally (install `ruff` first).
 
+A separate `dataplane` job builds and tests the experimental Rust data plane
+and checks it against the Python gateway; see
+[Run the Rust data plane](run-the-data-plane.md#run-its-tests). You do not
+need Rust to run the Python suite.
+
 ## If it did not work
 
 | Symptom | Cause | Fix |

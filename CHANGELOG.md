@@ -46,6 +46,9 @@ See [docs/known-limitations.md](docs/known-limitations.md) for the full list.
 
 ### Documentation
 
+- How-to: run the experimental Rust data plane in front of the gateway. The
+  quick start, the Python install and the Docker image are unchanged and need
+  no Rust.
 - Documentation reorganised into tutorials, how-to guides, reference and
   explanation, with a map in `docs/README.md`.
 - `scripts/check_docs.py`, `scripts/check_env_vars.py` and

@@ -212,6 +212,7 @@ Every how-to is one task with the commands to do it.
 | Move to a new release | [Upgrade the gateway](docs/how-to/upgrade.md) |
 | Fix a 401, 403, 404, 502 or 429 | [Troubleshoot request errors](docs/how-to/troubleshoot-401-502-429.md) |
 | Measure latency and throughput | [Test performance](docs/how-to/performance-testing.md) |
+| Try the experimental Rust data plane in front of it | [Run the Rust data plane](docs/how-to/run-the-data-plane.md) |
 | Run the test suite | [Run the tests](docs/how-to/run-the-tests.md) |
 
 **Learn:** [your first authenticated request](docs/tutorials/getting-started.md),
@@ -281,6 +282,13 @@ prompt-injection pattern filter, and forwarded to `MCP_BACKEND_URL`.
 No. Without Redis, rate-limit counters are kept in memory, which is correct for
 one process; use Redis when you run several processes or replicas. SQLite is
 the default database; the Compose file can start PostgreSQL instead.
+
+### Do I need Rust?
+
+No. The quick start, the Python install and the Docker image run the Python
+gateway alone. The Rust data plane in `dataplane/` is optional and
+experimental; you need the Rust toolchain only to build it. See
+[Run the Rust data plane](docs/how-to/run-the-data-plane.md).
 
 ### Is it ready for production?
 
