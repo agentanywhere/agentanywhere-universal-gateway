@@ -62,6 +62,17 @@ See [docs/known-limitations.md](docs/known-limitations.md) for the full list.
 
 ### Fixed
 
+- Security: a request whose path decodes to `?`, `#` or a control character
+  (`/api/x%3F/../admin`) is refused with a 400 (`INVALID_PATH`). The key's
+  allowed paths, the policies and the agent edge read the path only up to a
+  decoded `?` or `#`, while the proxy forwarded all of it: the backend was sent
+  `/api/x?/../admin`, with a query no rule had seen, and an agent was asked for
+  less than the caller named.
+- Proxy: a request path that decodes to `?`, `#` or a control character is
+  forwarded with that character escaped, as path data. A caller's
+  `/api/a%3Fadmin=1` reached the backend as `/api/a?admin=1`, a query
+  parameter no rule or check had seen; a `%23` cut the rest of the path off;
+  and a `%0A` made the request fail.
 - `GET /admin/webhooks`: each row's `event_type` is the event that webhook was
   registered for. Without an `event_type` filter every row said `all`, which
   is not an event the gateway sends. The filter still works.

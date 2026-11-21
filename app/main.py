@@ -1207,9 +1207,34 @@ def _rejected_path_label(path: str) -> str:
     return f"/{first}" if first in _REJECTED_PATH_LABEL_PREFIXES else "/other"
 
 
+def _breaks_out_of_the_path(path: str) -> bool:
+    """Whether a decoded request path holds a character that is not path data once it is in a URL.
+
+    A caller's ``/api/x%3F/../admin`` is ``/api/x?/../admin`` once decoded. What reads the URL
+    (``request.url.path``: the key's allowed paths, the policies, the agent edge) stops at that
+    ``?``, while the path forwarded is the whole of it, so the two would not be the same path. A
+    ``#`` does the same, and a control character makes a URL invalid.
+    """
+    return any(c in "?#" or ord(c) < 0x20 or ord(c) == 0x7F for c in path)
+
+
 @app.middleware("http")
 async def auth_middleware_handler(request: Request, call_next):
     """Authentication middleware handler."""
+    # A path that decodes to `?`, `#` or a control character is refused before anything reads it.
+    if _breaks_out_of_the_path(request.scope.get("path", "")):
+        return render_error_response(
+            request,
+            status.HTTP_400_BAD_REQUEST,
+            {
+                "error": "INVALID_PATH",
+                "message": "The request path holds an escaped '?', '#' or control character, which cannot be part of a path.",
+                "request_id": getattr(request.state, "request_id", None),
+                "timestamp": utcnow().isoformat(),
+                "details": {},
+            },
+        )
+
     # Skip auth for OPTIONS requests (CORS preflight)
     if request.method == "OPTIONS":
         return await call_next(request)
