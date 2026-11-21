@@ -1163,7 +1163,7 @@ async def logging_middleware(request: Request, call_next):
 
 
 class _NoTransformation(Exception):
-    """Internal: no response transformation rule is registered."""
+    """Internal: no response transformation rule applies to the request."""
 
 
 class _SkipAI(Exception):
@@ -2511,32 +2511,38 @@ async def gateway_proxy(request: Request, path: str):
         # bodies that are not UTF-8), so the upstream status passes through.
         status_code = None
         try:
-            if not transformation_manager.rules_by_id:
-                # No transformation rule is registered, so there is nothing to apply. Parsing the
-                # body and writing it back would change its bytes (spacing, escaping, number
+            rules = (
+                transformation_manager.get_rules_for_path(path, request.method)
+                if transformation_manager.rules_by_id else []
+            )
+            if not rules:
+                # No rule applies to this request, so there is nothing to do. Parsing the body
+                # and writing it back would change its bytes (spacing, escaping, number
                 # formatting) and cost time that grows with its size.
                 raise _NoTransformation()
-            # Try to parse body as JSON for transformation
+            # The body is read only for a rule that can change it. A rule for headers or the
+            # status applies whatever the body is, and leaves its bytes alone.
             body_json = None
-            if content:
+            if content and any(rule.changes_response_body() for rule in rules):
                 try:
                     body_json = json.loads(content.decode('utf-8'))
                 except:
                     body_json = content.decode('utf-8')
-            
+
             transformed_status, transformed_headers, transformed_body = transformation_manager.transform_response(
                 status_code=response.status_code,
                 headers=response_headers,
                 body=body_json,
                 request_context=request_context
             )
-            
-            # Convert transformed body back to bytes if needed
+
+            # Convert transformed body back to bytes if needed. Text that came back as it went in
+            # is the backend's own bytes already (a JSON string, say, keeps its quotes).
             if transformed_body and isinstance(transformed_body, dict):
                 content = json.dumps(transformed_body).encode('utf-8')
-            elif transformed_body and isinstance(transformed_body, str):
+            elif transformed_body and isinstance(transformed_body, str) and transformed_body is not body_json:
                 content = transformed_body.encode('utf-8')
-            
+
             response_headers = transformed_headers
             status_code = transformed_status
         except _NoTransformation:
