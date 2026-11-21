@@ -62,6 +62,12 @@ See [docs/known-limitations.md](docs/known-limitations.md) for the full list.
 
 ### Fixed
 
+- MQTT: the gateway's client now survives the broker dropping the connection.
+  Before, the first disconnect ended the client's network thread, so it never
+  reconnected: `/mqtt/publish` answered 500 `Failed to publish message` until
+  the gateway was restarted, while still reporting itself connected. Now it
+  answers 503 `MQTT broker not connected` while the broker is away and
+  publishes again once it is back.
 - Security: a request whose path decodes to `?`, `#` or a control character
   (`/api/x%3F/../admin`) is refused with a 400 (`INVALID_PATH`). The key's
   allowed paths, the policies and the agent edge read the path only up to a
