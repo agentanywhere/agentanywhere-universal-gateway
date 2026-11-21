@@ -62,6 +62,15 @@ See [docs/known-limitations.md](docs/known-limitations.md) for the full list.
 
 ### Fixed
 
+- Transformations: a rule that changes a request's body now works. The new
+  body was sent with the length the caller declared for the old one, so the
+  request never reached the backend and the caller got a 502. Three related
+  defects are fixed with it: a rule that sets a field no longer fails on a
+  body that is JSON but not an object (such a body is left as it came), text
+  that a template makes of a body is sent as that text rather than as a
+  quoted JSON string, and a value a rule sets is no longer shared between
+  requests, where a later rule could leave one caller's data in it for the
+  next.
 - MQTT: the gateway's client now survives the broker dropping the connection.
   Before, the first disconnect ended the client's network thread, so it never
   reconnected: `/mqtt/publish` answered 500 `Failed to publish message` until

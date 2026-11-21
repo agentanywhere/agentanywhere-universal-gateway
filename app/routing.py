@@ -290,8 +290,14 @@ class Router:
         if transformed_body is not None:
             if isinstance(transformed_body, bytes):
                 content = transformed_body
+            elif isinstance(transformed_body, str) and transformed_body is not body:
+                # Text a rule made of the body (a filled-in template) is sent as that text.
+                content = transformed_body.encode("utf-8")
             else:
                 json_payload = transformed_body
+        if transformed_body is not body:
+            # A rule changed the body, so the length the caller declared is no longer its length.
+            filtered_headers = {k: v for k, v in filtered_headers.items() if k.lower() != "content-length"}
 
         return url, filtered_headers, transformed_query_params, content, json_payload, backend_url, protocol, timeout
 

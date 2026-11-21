@@ -14,6 +14,7 @@ patterns (e.g. ``/api/users/*``) and can be filtered by HTTP method.
 """
 from __future__ import annotations
 
+import copy
 import fnmatch
 import functools
 import json
@@ -284,8 +285,8 @@ def _apply_query_ops(query: Dict[str, Any], cfg: TransformConfig) -> Dict[str, A
 def _apply_body_ops(body: Any, cfg: TransformConfig) -> Any:
     """Apply body operations.
 
-    Operates on JSON dict bodies. If the body cannot be parsed as JSON,
-    it is returned unchanged.
+    The field operations (set, remove, rename) apply to a JSON object. Any other body, JSON or
+    not, is left as it came, unless a template is to be filled in from it.
     """
     parsed = _coerce_body_to_dict(body)
 
@@ -304,18 +305,22 @@ def _apply_body_ops(body: Any, cfg: TransformConfig) -> Any:
                 return body
         return body
 
-    if cfg.body_rename:
-        for old, new in cfg.body_rename.items():
-            val = _get_nested(parsed, old)
-            if val is not None:
-                _remove_nested(parsed, old)
-                _set_nested(parsed, new, val)
-    if cfg.body_remove:
-        for path in cfg.body_remove:
-            _remove_nested(parsed, path)
-    if cfg.body_set:
-        for path, val in cfg.body_set.items():
-            _set_nested(parsed, path, val)
+    if isinstance(parsed, dict):
+        if cfg.body_rename:
+            for old, new in cfg.body_rename.items():
+                val = _get_nested(parsed, old)
+                if val is not None:
+                    _remove_nested(parsed, old)
+                    _set_nested(parsed, new, val)
+        if cfg.body_remove:
+            for path in cfg.body_remove:
+                _remove_nested(parsed, path)
+        if cfg.body_set:
+            for path, val in cfg.body_set.items():
+                # A copy, so that nothing a later operation puts inside it stays in the rule.
+                _set_nested(parsed, path, copy.deepcopy(val))
+    elif not has_template:
+        return body
 
     if has_template:
         try:

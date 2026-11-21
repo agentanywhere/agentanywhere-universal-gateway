@@ -1,4 +1,7 @@
 """Tests for declarative request/response transformations."""
+import pytest
+
+
 from app.transformers import (
     TransformConfig,
     TransformationManager,
@@ -280,3 +283,77 @@ def teardown_module(_):
     """Reset global manager state between test modules to keep things clean."""
     transformation_manager.rules_by_id.clear()
     transformation_manager.rules_by_path.clear()
+
+
+class _Echo:
+    """A backend that answers with the request it was sent."""
+
+    def __enter__(self):
+        import json as _json
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = self.rfile.read(int(self.headers.get("content-length") or 0))
+                seen = {k.lower(): v for k, v in self.headers.items()}
+                out = _json.dumps({"headers": seen, "body": body.decode("utf-8")}).encode()
+                self.send_response(200)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(out)))
+                self.end_headers()
+                self.wfile.write(out)
+
+            def log_message(self, *args):
+                pass
+
+        self.server = HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        return f"http://127.0.0.1:{self.server.server_port}"
+
+    def __exit__(self, *exc):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+@pytest.fixture
+def no_rules():
+    from app.transformers import transformation_manager as manager
+    kept = dict(manager.rules_by_id), dict(manager.rules_by_path)
+    manager.rules_by_id.clear()
+    manager.rules_by_path.clear()
+    yield manager
+    manager.rules_by_id.clear()
+    manager.rules_by_path.clear()
+    manager.rules_by_id.update(kept[0])
+    manager.rules_by_path.update(kept[1])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("config,sent,arrives", [
+    ({"body_set": {"meta.source": "gateway"}}, b'{"a":1}', '{"a": 1, "meta": {"source": "gateway"}}'),
+    ({"body_remove": ["secret"]}, b'{"a":1,"secret":"long enough to matter"}', '{"a": 1}'),
+    ({"template": "hello {{ body.a }}"}, b'{"a":1}', "hello 1"),
+    ({"body_set": {"a": 1}}, b"[1,2]", "[1,2]"),
+    ({"body_set": {"a": 1}}, b"not json", "not json"),
+])
+async def test_a_request_body_a_rule_changes_reaches_the_backend(no_rules, config, sent, arrives):
+    """The body goes out with its own length, not the one the caller declared for the old body."""
+    from app.models import RouteConfig
+    from app.routing import Router
+
+    no_rules.register_from_dict({"name": "r", "path_pattern": "*", "request_config": config})
+    with _Echo() as backend:
+        router = Router()
+        try:
+            response = await router.route_request(
+                "POST", "/x", {"content-length": str(len(sent)), "content-type": "application/json"}, {}, sent,
+                RouteConfig(path="/x", backend_url=backend),
+            )
+        finally:
+            await router.client.aclose()
+    assert response.status_code == 200
+    seen = response.json()
+    assert seen["body"] == arrives
+    assert seen["headers"]["content-length"] == str(len(arrives.encode()))
+    assert seen["headers"]["content-type"] == "application/json"
