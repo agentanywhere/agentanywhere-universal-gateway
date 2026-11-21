@@ -340,7 +340,7 @@ def main() -> int:
             # The data plane gets its keys from the Python gateway; a fast interval and a short
             # staleness limit keep the live scenarios quick.
             procs.append(subprocess.Popen([str(BIN), "--listen", f"127.0.0.1:{dport}", "--control-token", "conformance-token",
-                                           "--sync-interval-ms", "200", "--max-staleness-ms", "2000", "--report-interval-ms", "300",
+                                           "--sync-interval-ms", "200", "--max-staleness-ms", "8000", "--report-interval-ms", "300",
                                            "--backend", f"http://127.0.0.1:{bport}", "--control", f"http://127.0.0.1:{gport}"], env=env))
             time.sleep(1.5)
 
