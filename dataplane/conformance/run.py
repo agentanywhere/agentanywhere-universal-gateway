@@ -2006,7 +2006,7 @@ def main() -> int:
                         total += float(line.rsplit(" ", 1)[1])
                 return total
 
-            before = counted()
+            before = settled(counted)  # the publishes just before are reported a moment later
             for i in range(5):
                 publish(mrs, mkeys["rs"], {"topic": f"counted/{i}"})
             check("MQTT: what the data plane published is counted by the product as MQTT requests",
