@@ -261,6 +261,8 @@ impl std::error::Error for Broken {}
 enum State {
     Calling(ResponseFuture),
     Reading(Incoming),
+    /// Broken off after lines were handed on: one more turn before saying so.
+    Breaking,
     Done,
 }
 
@@ -270,11 +272,32 @@ pub struct Lines {
     buf: BytesMut,
     ready: VecDeque<Bytes>,
     deadline: Pin<Box<tokio::time::Sleep>>,
+    /// Whether a line has been handed on since the body last waited.
+    sent: bool,
 }
 
 impl Lines {
     pub fn new(sent: ResponseFuture) -> Lines {
-        Lines { state: State::Calling(sent), buf: BytesMut::new(), ready: VecDeque::new(), deadline: Box::pin(tokio::time::sleep(Duration::from_secs(STREAM_SECONDS))) }
+        Lines {
+            state: State::Calling(sent),
+            buf: BytesMut::new(),
+            ready: VecDeque::new(),
+            deadline: Box::pin(tokio::time::sleep(Duration::from_secs(STREAM_SECONDS))),
+            sent: false,
+        }
+    }
+
+    /// End the stream in failure. hyper drops the connection on a body's error without writing
+    /// what it still holds, so a line handed on just before would never reach the caller: first
+    /// wait one turn, in which hyper writes it out, as the Python gateway's answer has it.
+    fn broken(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, Broken>>> {
+        if std::mem::take(&mut self.sent) {
+            self.state = State::Breaking;
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+        self.state = State::Done;
+        Poll::Ready(Some(Err(Broken)))
     }
 }
 
@@ -294,22 +317,20 @@ impl hyper::body::Body for Lines {
         let this = self.get_mut();
         loop {
             if let Some(line) = this.ready.pop_front() {
+                this.sent = true;
                 return Poll::Ready(Some(Ok(Frame::data(line))));
             }
-            let broken = |state: &mut State| {
-                *state = State::Done;
-                Poll::Ready(Some(Err(Broken)))
-            };
             match &mut this.state {
                 State::Done => return Poll::Ready(None),
-                _ if this.deadline.as_mut().poll(cx).is_ready() => return broken(&mut this.state),
+                State::Breaking => return this.broken(cx),
+                _ if this.deadline.as_mut().poll(cx).is_ready() => return this.broken(cx),
                 State::Calling(sent) => match std::task::ready!(Pin::new(sent).poll(cx)) {
                     Ok(resp) => match (grpc_answer(&resp), status(resp.headers())) {
                         (Ok(()), None) => this.state = State::Reading(resp.into_body()),
                         (Ok(()), Some(0)) => this.state = State::Done,
-                        _ => return broken(&mut this.state),
+                        _ => return this.broken(cx),
                     },
-                    Err(_) => return broken(&mut this.state),
+                    Err(_) => return this.broken(cx),
                 },
                 State::Reading(body) => match std::task::ready!(Pin::new(body).poll_frame(cx)) {
                     Some(Ok(frame)) => match frame.into_data() {
@@ -317,16 +338,16 @@ impl hyper::body::Body for Lines {
                             this.buf.extend_from_slice(&data);
                             match messages(&mut this.buf) {
                                 Some(found) => this.ready.extend(found.iter().map(|m| line(m))),
-                                None => return broken(&mut this.state),
+                                None => return this.broken(cx),
                             }
                         }
                         Err(frame) => match frame.trailers_ref().and_then(status) {
                             Some(0) if this.buf.is_empty() => this.state = State::Done,
-                            _ => return broken(&mut this.state),
+                            _ => return this.broken(cx),
                         },
                     },
                     // Ended without saying how it went.
-                    _ => return broken(&mut this.state),
+                    _ => return this.broken(cx),
                 },
             }
         }
@@ -372,6 +393,68 @@ pub fn judge_stdin() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A body of frames given beforehand, all ready at once.
+    struct Frames(VecDeque<Frame<Bytes>>);
+
+    impl hyper::body::Body for Frames {
+        type Data = Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+            Poll::Ready(self.get_mut().0.pop_front().map(Ok))
+        }
+    }
+
+    #[test]
+    fn a_stream_that_fails_at_once_still_sends_what_came_before() {
+        use hyper_util::rt::{TokioExecutor, TokioIo};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            // A gRPC server whose stream sends one answer and its failure in the same breath.
+            let backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let at = backend.local_addr().unwrap();
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = backend.accept().await {
+                    let svc = hyper::service::service_fn(|_req| async {
+                        let reply = b"\x0a\x10Hello nobody #0 ";
+                        let mut data = vec![0u8];
+                        data.extend_from_slice(&u32::try_from(reply.len()).unwrap().to_be_bytes());
+                        data.extend_from_slice(reply);
+                        let mut trailers = HeaderMap::new();
+                        trailers.insert("grpc-status", HeaderValue::from_static("14"));
+                        let body = Frames(VecDeque::from([Frame::data(Bytes::from(data)), Frame::trailers(trailers)]));
+                        let mut resp = Response::new(body);
+                        resp.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("application/grpc"));
+                        Ok::<_, std::convert::Infallible>(resp)
+                    });
+                    tokio::spawn(hyper::server::conn::http2::Builder::new(TokioExecutor::new()).serve_connection(TokioIo::new(stream), svc));
+                }
+            });
+            let client = hyper_util::client::legacy::Client::builder(TokioExecutor::new())
+                .http2_only(true)
+                .build_http::<http_body_util::Empty<Bytes>>();
+            // The bridge in front of it, as the data plane serves it.
+            let front = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let front_at = front.local_addr().unwrap();
+            tokio::spawn(async move {
+                let (stream, _) = front.accept().await.unwrap();
+                let svc = hyper::service::service_fn(move |_req| {
+                    let sent = client.request(Request::post(format!("http://{at}/greeter.Greeter/SayManyHellos")).body(http_body_util::Empty::new()).unwrap());
+                    async move { Ok::<_, std::convert::Infallible>(Response::new(Lines::new(sent))) }
+                });
+                let _ = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(stream), svc).await;
+            });
+            let mut caller = tokio::net::TcpStream::connect(front_at).await.unwrap();
+            caller.write_all(b"POST /grpc/call HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n").await.unwrap();
+            let mut got = Vec::new();
+            let _ = tokio::time::timeout(Duration::from_secs(10), caller.read_to_end(&mut got)).await;
+            let got = String::from_utf8_lossy(&got);
+            assert!(got.contains(r#"{"status": "stream_chunk", "message": "Hello nobody #0 "}"#), "{got}");
+            assert!(!got.ends_with("0\r\n\r\n"), "the answer was finished as if nothing went wrong: {got}");
+        });
+    }
 
     fn bridge(reflection: bool, stubs: bool) -> Bridge {
         Bridge { target: "http://127.0.0.1:50051".into(), reflection, stubs, uri: Uri::default() }
