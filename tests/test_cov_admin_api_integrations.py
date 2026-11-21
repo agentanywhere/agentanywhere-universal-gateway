@@ -112,6 +112,28 @@ def test_webhook_json_body_multiple_events_dedupes_and_flags_unknown(client):
     assert stored["headers"] == {"X-A": "1"} and stored["filters"] == {"path": "/a"}
 
 
+def test_webhook_list_shows_each_rows_registered_event(client):
+    """Issue #93: without a filter every row said ``"event_type": "all"``."""
+    r = client.post(
+        "/admin/webhooks",
+        json={"url": "https://h.test/hook", "events": ["api_key_created", "api_key_revoked"], "secret": "s"},
+        headers=AUTH,
+    )
+    assert r.status_code == 200
+    ids = r.json()["ids"]
+
+    # Other test modules may have left webhooks in the process-wide manager,
+    # so look only at the rows registered here.
+    listing = client.get("/admin/webhooks", headers=AUTH).json()
+    assert all(row["event_type"] != "all" for row in listing)
+    by_id = {row["id"]: row["event_type"] for row in listing if row["id"] in ids}
+    assert by_id == {ids[0]: "api_key_created", ids[1]: "api_key_revoked"}
+
+    filtered = client.get("/admin/webhooks", params={"event_type": "api_key_revoked"}, headers=AUTH).json()
+    assert all(row["event_type"] == "api_key_revoked" for row in filtered)
+    assert ids[1] in {row["id"] for row in filtered} and ids[0] not in {row["id"] for row in filtered}
+
+
 def test_webhook_requires_url_and_event_422(client):
     assert client.post("/admin/webhooks", json={"url": "https://h.test"}, headers=AUTH).status_code == 422
     assert client.post("/admin/webhooks", params={"event_type": "e"}, headers=AUTH).status_code == 422
@@ -623,3 +645,33 @@ def test_plugin_reload_registers_builtins_and_honours_overrides(client, tmp_path
 
     r = client.post("/admin/plugins/reload", json={"plugins_disabled": ["request-id"], "plugin_paths": [str(tmp_path)]}, headers=AUTH)
     assert "request-id" not in r.json()["registered"]
+
+
+@pytest.mark.parametrize("side,config", [
+    ("request_config", {"headers_set": {"X-A": "trail "}}),
+    ("request_config", {"headers_set": {"X-A": " lead"}}),
+    ("request_config", {"headers_set": {"X-A": "two\nlines"}}),
+    ("request_config", {"headers_set": {"X-A": "Zürich"}}),
+    ("request_config", {"headers_set": {"X-A": 7}}),
+    ("request_config", {"headers_set": {"bad name": "v"}}),
+    ("request_config", {"headers_set": {"": "v"}}),
+    ("request_config", {"headers_rename": {"X-Old": "X:New"}}),
+    ("request_config", {"headers_set": ["X-A"]}),
+    ("response_config", {"headers_set": {"X-A": "split\r\nSet-Cookie: a=b"}}),
+    ("response_config", {"headers_set": {"X-A": "snow ☃"}}),
+    ("response_config", {"headers_set": {"café": "v"}}),
+])
+def test_a_rule_whose_header_cannot_be_written_is_refused(client, side, config):
+    """Such a rule would fail every request it applies to, so it is not made."""
+    r = client.post("/admin/transformations", json={"name": "r", side: config}, headers=AUTH)
+    assert r.status_code == 400, r.text
+    assert client.get("/admin/transformations", headers=AUTH).json() == []
+
+
+def test_a_rule_with_ordinary_headers_is_made(client):
+    rule = {"name": "r", "request_config": {"headers_set": {"X-A": "two words", "X_b.c~1": "", "X-C": "a\tb"},
+                                            "headers_rename": {"anything at all": "X-New"}, "headers_remove": ["bad name"]},
+            "response_config": {"headers_set": {"X-City": "Zürich"}}}
+    r = client.post("/admin/transformations", json=rule, headers=AUTH)
+    assert r.status_code == 200, r.text
+    assert client.delete(f"/admin/transformations/{r.json()['id']}", headers=AUTH).status_code == 200

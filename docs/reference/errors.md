@@ -32,8 +32,8 @@ page with the same information. `curl`, SDKs and `fetch` with
 
 | Status | `error` | When | What to do |
 |---|---|---|---|
-| 400 | `VALIDATION_ERROR` | A protocol boundary check failed: MCP body too large, not JSON, blocked method or prompt-injection pattern; A2A, ACP or AG-UI body shape; GraphQL body without `query` on the catch-all path. `details` names the field. | Fix the request body, or change the `MCP_BOUNDARY_*` / `*_BOUNDARY_ENABLED` settings. |
-| 400 | `HTTP_ERROR` | An admin or protocol endpoint rejected its input, for example a past `expires_at`, MQTT without `topic`, `/graphql` without `query`. | Read `message`. |
+| 400 | `VALIDATION_ERROR` | A protocol boundary check failed: MCP body too large, not JSON, blocked method or prompt-injection pattern; A2A, ACP or AG-UI body shape. `details` names the field. | Fix the request body, or change the `MCP_BOUNDARY_*` / `*_BOUNDARY_ENABLED` settings. |
+| 400 | `HTTP_ERROR` | An admin or protocol endpoint rejected its input, for example a past `expires_at`, MQTT without `topic`. | Read `message`. |
 | 401 | `AUTHENTICATION_ERROR` | Data plane: `API key required` (no key) or `Invalid or inactive API key...` (unknown, disabled or expired key). | See [Troubleshoot 401, 403, 404, 502 and 429](../how-to/troubleshoot-401-502-429.md). |
 | 401 | `HTTP_ERROR` | Admin plane: `Authentication required` (no bearer token), `Invalid admin token` (including `SECRET_KEY` while `ADMIN_TOKEN` is set), or on sign-in `Invalid username or password`. Also `/metrics` and `/health/detailed` without the admin credential when `OPS_ENDPOINTS_REQUIRE_ADMIN=true`. | Send `Authorization: Bearer <ADMIN_TOKEN>`. |
 | 403 | `AUTHORIZATION_ERROR` | The key's `allowed_paths` does not cover the path (`This API key is not allowed to access this path`; `details` lists the scope), or an IP rule or governance policy denied the request (`details` has the rule or policy id). | Use a key with a wider scope; check `/admin/governance/ip-rules` and `/admin/governance/policies`. |
@@ -47,9 +47,8 @@ page with the same information. `curl`, SDKs and `fetch` with
 | 429 | `RATE_LIMIT_EXCEEDED` | The key's per-minute or per-hour limit, or its tenant's quota, is used up. `Retry-After` is 60 or 3600; tenant errors add `tenant_id` and `quota` to `details`. | Wait, or raise the limit. |
 | 500 | `INTERNAL_ERROR` | An unexpected error, including a request to `/agui`, `/acp`, `/ws` or `/mqtt/...` when that backend is not configured. The cause is in the gateway log as `gateway_error`. | Read the log line with the same `request_id`. |
 | 502 | `BACKEND_ERROR` | The backend could not be reached or did not answer in time (connection refused, DNS failure, connect or read timeout). | See [Troubleshoot 401, 403, 404, 502 and 429](../how-to/troubleshoot-401-502-429.md). |
-| 502 | `HTTP_ERROR` | `GraphQL request failed: ...` | Check `GRAPHQL_BACKEND_URL` and the backend. |
-| 503 | `SERVICE_UNAVAILABLE` | The backend's circuit breaker is open (`Upstream service is temporarily unavailable (circuit open)`), or `/grpc` without `GRPC_BACKEND_URL`. | Wait `CIRCUIT_BREAKER_TIMEOUT` seconds after fixing the backend. |
-| 503 | `HTTP_ERROR` | `MQTT broker not connected`, or `GraphQL backend not configured`. | Start the broker and restart the gateway, or set the URL. |
+| 503 | `SERVICE_UNAVAILABLE` | The backend's circuit breaker is open (`Upstream service is temporarily unavailable (circuit open)`), or `/grpc` or `/graphql` without `GRPC_BACKEND_URL` or `GRAPHQL_BACKEND_URL`. | Wait `CIRCUIT_BREAKER_TIMEOUT` seconds after fixing the backend. |
+| 503 | `HTTP_ERROR` | `MQTT broker not connected`. | Start the broker and restart the gateway. |
 
 A timeout is reported as 502, not 504.
 

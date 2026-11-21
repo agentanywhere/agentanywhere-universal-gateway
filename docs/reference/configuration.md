@@ -144,7 +144,7 @@ settings too, so `.env` applies to them; the process environment wins.)
 | `AG_UI_BACKEND_URL` | unset | Backend for `/agui/*` and `/api/agui/*` (prefix stripped). Unset: those paths answer 500. |
 | `ACP_BACKEND_URL` | unset | Backend for `/acp/*` and `/api/acp/*` (prefix stripped). Unset: those paths answer 500. |
 | `HTTP_BACKEND_URL` | unset | Backend for `/api/*`, `/rest/*`, `/http/*` and every path with no known prefix. `env.example` sets `http://localhost:8003`. |
-| `GRAPHQL_BACKEND_URL` | unset | Endpoint that `POST /graphql` forwards queries to. `env.example` sets `http://localhost:4000/graphql`; the sample backend is on port 8006. |
+| `GRAPHQL_BACKEND_URL` | unset | GraphQL server, or its endpoint, that requests under `/graphql` are passed on to. `env.example` sets `http://localhost:4000/graphql`; the sample backend is on port 8006. |
 | `MQTT_BROKER_URL` | unset | Broker for `/mqtt/publish` and `/mqtt/subscribe`, for example `mqtt://localhost:1883` (`mqtts://` for TLS). The gateway connects when it starts. |
 | `WEBSOCKET_BACKEND_URL` | unset | Intended backend for `/ws/*`. The route does not work; see the [protocol support matrix](../explanation/protocol-support.md). |
 | `GRPC_BACKEND_URL` | unset | Target for the JSON-to-gRPC bridge, for example `localhost:50051`. The bridge does not work. |
@@ -260,7 +260,7 @@ The rate-limit values in this section are **not enforced yet**. They are shown b
 | `ANALYTICS_ADAPTER` | `full` | `full` runs the built-in anomaly detection and usage analytics, `off` runs none, or a `module:attribute` path to your own. `AI_ANALYTICS_ENABLED=false` still turns the per-request call off whichever adapter is chosen. |
 | `REQUEST_LOG_SINK` | `database` | Where request-log entries go: `database` (see `REQUEST_LOG_MODE`), `null` (discard), or a `module:attribute` path to your own. |
 | `AI_ANALYTICS_ENABLED` | `true` | Run the per-request anomaly detection and usage analytics. They run inside the request path and cost several milliseconds of CPU per request; set `false` for throughput. |
-| `DOCUMENTATION_URL` | the project's `docs/` folder on GitHub | The documentation link in the start-up banner. Set it to your own docs site. |
+| `DOCUMENTATION_URL` | `https://docs.agentanywhere.ai/gateway/` | The documentation link in the start-up banner. Set it to your own docs site. |
 
 ## Tracing
 

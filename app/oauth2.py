@@ -185,6 +185,25 @@ class OAuth2Manager:
             )
         return client
 
+    def authenticate_client(self, provider: str, client_id: Optional[str], client_secret: Optional[str]) -> None:
+        """Require the caller of a grant that proves nothing else (client credentials) to present
+        the provider's own client id and secret. Without this, the gateway would spend its stored
+        secret for anyone who names the provider and hand back a token it then accepts."""
+        from app.secure_compare import constant_time_equals
+
+        client = self._require_client(provider)
+        id_ok = constant_time_equals(client_id, client.client_id)
+        secret_ok = constant_time_equals(client_secret, client.client_secret)
+        if not (id_ok and secret_ok):
+            error = OAuth2Error(
+                "invalid_client",
+                "Client authentication failed: send the provider's client_id and client_secret "
+                "(HTTP Basic, or in the request body)",
+                status_code=status.HTTP_401_UNAUTHORIZED,
+            )
+            error.headers = {"WWW-Authenticate": 'Basic realm="oauth2"'}
+            raise error
+
     # --- authorization code flow --------------------------------------
 
     async def get_authorization_url(

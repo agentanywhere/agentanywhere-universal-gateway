@@ -14,6 +14,7 @@ patterns (e.g. ``/api/users/*``) and can be filtered by HTTP method.
 """
 from __future__ import annotations
 
+import copy
 import fnmatch
 import functools
 import json
@@ -213,6 +214,14 @@ class TransformationRule:
                 return False
         return True
 
+    def changes_response_body(self) -> bool:
+        """Whether applying the rule to an answer can change its body (rather than only its
+        headers or status), which is when the body has to be read."""
+        cfg = self.response_config
+        return self.transform_response is not None or (
+            cfg is not None and bool(cfg.body_set or cfg.body_remove or cfg.body_rename or cfg.template)
+        )
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "id": self.id,
@@ -239,6 +248,41 @@ class TransformationRule:
             request_config=TransformConfig.from_dict(req_cfg) if req_cfg else None,
             response_config=TransformConfig.from_dict(resp_cfg) if resp_cfg else None,
         )
+
+
+# A header name is a token (RFC 9110). A value has no control character but a tab, and no space
+# or tab at either end.
+_HEADER_NAME = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
+_HEADER_VALUE = re.compile(r"(?:[^\x00-\x20\x7f](?:[^\x00-\x08\x0a-\x1f\x7f]*[^\x00-\x20\x7f])?)?")
+
+
+def header_problem(data: Dict[str, Any]) -> Optional[str]:
+    """What is wrong with the headers a rule would write, if anything.
+
+    A header that cannot be written fails every request the rule applies to: the request is
+    never sent, or the answer cannot be read. So a rule that names one is refused when it is
+    made. Looked at: the names and values in ``headers_set`` and the new names in
+    ``headers_rename``, on both sides. A request's values must be ASCII, which is all the HTTP
+    client sends; an answer's may also hold the characters of Latin-1.
+    """
+    for side, last in (("request_config", "\x7f"), ("response_config", "\xff")):
+        cfg = data.get(side) or {}
+        if not isinstance(cfg, dict):
+            return f"'{side}' must be an object"
+        to_set, rename = cfg.get("headers_set") or {}, cfg.get("headers_rename") or {}
+        for field_name, held in (("headers_set", to_set), ("headers_rename", rename)):
+            if not isinstance(held, dict):
+                return f"'{side}.{field_name}' must be an object"
+        for name in [*to_set.keys(), *rename.values()]:
+            if not isinstance(name, str) or not _HEADER_NAME.fullmatch(name):
+                return f"{side}: {name!r} is not a valid header name"
+        for name, value in to_set.items():
+            if not isinstance(value, str):
+                return f"{side}: the value of header {name!r} must be a string"
+            if not _HEADER_VALUE.fullmatch(value) or max(value, default="") > last:
+                return (f"{side}: the value of header {name!r} cannot be sent: it must not start or end with a space, "
+                        f"or hold a control character or one outside {'ASCII' if side == 'request_config' else 'Latin-1'}")
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -276,8 +320,8 @@ def _apply_query_ops(query: Dict[str, Any], cfg: TransformConfig) -> Dict[str, A
 def _apply_body_ops(body: Any, cfg: TransformConfig) -> Any:
     """Apply body operations.
 
-    Operates on JSON dict bodies. If the body cannot be parsed as JSON,
-    it is returned unchanged.
+    The field operations (set, remove, rename) apply to a JSON object. Any other body, JSON or
+    not, is left as it came, unless a template is to be filled in from it.
     """
     parsed = _coerce_body_to_dict(body)
 
@@ -296,18 +340,22 @@ def _apply_body_ops(body: Any, cfg: TransformConfig) -> Any:
                 return body
         return body
 
-    if cfg.body_rename:
-        for old, new in cfg.body_rename.items():
-            val = _get_nested(parsed, old)
-            if val is not None:
-                _remove_nested(parsed, old)
-                _set_nested(parsed, new, val)
-    if cfg.body_remove:
-        for path in cfg.body_remove:
-            _remove_nested(parsed, path)
-    if cfg.body_set:
-        for path, val in cfg.body_set.items():
-            _set_nested(parsed, path, val)
+    if isinstance(parsed, dict):
+        if cfg.body_rename:
+            for old, new in cfg.body_rename.items():
+                val = _get_nested(parsed, old)
+                if val is not None:
+                    _remove_nested(parsed, old)
+                    _set_nested(parsed, new, val)
+        if cfg.body_remove:
+            for path in cfg.body_remove:
+                _remove_nested(parsed, path)
+        if cfg.body_set:
+            for path, val in cfg.body_set.items():
+                # A copy, so that nothing a later operation puts inside it stays in the rule.
+                _set_nested(parsed, path, copy.deepcopy(val))
+    elif not has_template:
+        return body
 
     if has_template:
         try:

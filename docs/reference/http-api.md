@@ -160,7 +160,7 @@ Dedicated data-plane endpoints:
 
 | Endpoint | Body | Success response |
 |---|---|---|
-| `POST /graphql` | `{"query": "...", "variables": {...}, "operationName": "..."}` | The backend's GraphQL response. 503 without `GRAPHQL_BACKEND_URL`; 400 without `query`. |
+| `/graphql`, `/api/graphql` (any method) | Whatever the GraphQL server takes; it is passed on unchanged | The backend's own response, status and headers included. 503 without `GRAPHQL_BACKEND_URL`. |
 | `POST /mqtt/publish` | `{"topic": "...", "payload": {...}, "qos": 1}` | `{"status": "published", "topic": "..."}`. 503 when the broker is not connected; 400 without `topic`. |
 | `POST /mqtt/subscribe` | `{"topic": "...", "qos": 1}` | `{"status": "subscribed", "topic": "..."}`. Messages are not returned to the caller. |
 

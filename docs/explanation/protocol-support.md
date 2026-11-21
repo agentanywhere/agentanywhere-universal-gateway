@@ -40,7 +40,7 @@ Python 3.11; they were not repeated for this page.
 | A2A | `/a2a/*`, `/api/a2a/*` | `A2A_BACKEND_URL` | Working (HTTP and SSE) | `tests/test_gateway.py::test_a2a_routing`, `tests/test_tier1_protocols.py`; earlier manual check |
 | AG-UI | `/agui/*`, `/api/agui/*` | `AG_UI_BACKEND_URL` | Working (HTTP and SSE) | `tests/test_tier2_protocols.py`; earlier manual check |
 | ACP | `/acp/*`, `/api/acp/*` | `ACP_BACKEND_URL` | Working (HTTP and SSE) | `tests/test_tier2_protocols.py`; earlier manual check |
-| GraphQL | `POST /graphql` | `GRAPHQL_BACKEND_URL` | Working (queries over HTTP; no subscriptions) | `tests/test_gateway.py::test_graphql_routing`, `tests/test_protocols.py`; earlier manual check |
+| GraphQL | `/graphql`, `/api/graphql` | `GRAPHQL_BACKEND_URL` | Working (requests passed through over HTTP; no subscriptions) | `tests/test_cov_main_proxy.py::test_graphql_passes_the_request_through_as_it_came`, `tests/test_routing.py` |
 | MQTT | `POST /mqtt/publish`, `POST /mqtt/subscribe` | `MQTT_BROKER_URL` | Partial: publish works; subscribe registers a subscription but messages are not delivered to the HTTP caller | `tests/test_protocols.py`; earlier manual check of publish |
 | WebSocket | `/ws/*` | `WEBSOCKET_BACKEND_URL` | Not working | Reproduced for this page: every connection is closed with 1008 |
 | gRPC | `/grpc*`, `/api/grpc*` | `GRPC_BACKEND_URL` | Not working | `tests/test_protocols.py::test_call_unary_does_not_fabricate_success`; earlier manual check |
@@ -98,10 +98,15 @@ Otherwise the response is buffered. Payload checks for both are in
 
 ## GraphQL
 
-`POST /graphql` takes `{"query", "variables", "operationName"}` and posts it
-to `GRAPHQL_BACKEND_URL`. Without a backend it answers 503. `/api/graphql` is
-not handled by the GraphQL handler; it goes to the HTTP backend like any other
-`/api/*` path. The sample GraphQL backend listens on port 8006, but
+A request under `/graphql` or `/api/graphql` goes to the GraphQL backend as it
+came: the caller's method, headers, query string and body are passed on, and
+the backend's status, headers and body come back. The gateway does not read
+the query, so persisted queries, `extensions`, `GET` requests and batched
+bodies reach the server untouched, and a GraphQL error is the server's to
+report. `GRAPHQL_BACKEND_URL` may name the server (`http://host:4000`) or its
+endpoint (`http://host:4000/graphql`); `/graphql` reaches the endpoint either
+way, and `/graphql/x` reaches `/graphql/x` beside it. Without a backend the
+gateway answers 503. Subscriptions over WebSocket are not carried. The sample GraphQL backend listens on port 8006, but
 `env.example` points at port 4000.
 
 ## MQTT
