@@ -39,7 +39,7 @@ in a public issue.
 ## Development setup
 
 You need Python 3.10, 3.11 or 3.12. Docker is only needed for the Compose
-stack, Node.js 20 only for the admin console, Redis and PostgreSQL only if you
+stack, Node.js 22 only for the admin console, Redis and PostgreSQL only if you
 work on those paths.
 
 On Windows, see the note in the [README quick start](README.md#quick-start): use

@@ -155,8 +155,8 @@ OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318/v1/traces
 ## Check that it worked
 
 ```bash
-curl -s http://localhost:8000/ready
-curl -s http://localhost:8000/metrics | grep -c '^gateway_'
+curl -s http://127.0.0.1:8000/ready
+curl -s http://127.0.0.1:8000/metrics | grep -c '^gateway_'
 ```
 
 In Prometheus, `up{job="gateway"}` is 1.

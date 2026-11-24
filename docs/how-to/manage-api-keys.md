@@ -5,7 +5,7 @@ without downtime, and take it away.
 
 **Before you start:** the gateway is running, and you have the admin
 credential in a shell variable: `ADMIN=<your ADMIN_TOKEN>`. Set
-`URL=http://localhost:8000` (or your gateway's address). The admin console's
+`URL=http://127.0.0.1:8000` (or your gateway's address). The admin console's
 API Keys page and the CLI (`agentanywhere-gateway keys ...`) do the same
 things; this page uses `curl`.
 

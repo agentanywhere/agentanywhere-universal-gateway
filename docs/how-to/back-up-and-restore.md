@@ -100,9 +100,9 @@ docker compose exec -T postgres pg_dump -U gateway_user --format=custom gateway 
 ## Check that it worked
 
 ```bash
-curl -s http://localhost:8000/ready
-curl -s http://localhost:8000/admin/tenants -H "Authorization: Bearer $ADMIN"
-curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8000/api/anything -H "X-API-Key: <a key from before the loss>"
+curl -s http://127.0.0.1:8000/ready
+curl -s http://127.0.0.1:8000/admin/tenants -H "Authorization: Bearer $ADMIN"
+curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8000/api/anything -H "X-API-Key: <a key from before the loss>"
 ```
 
 `/ready` answers `"status": "ready"`, your tenants are listed, and the old key

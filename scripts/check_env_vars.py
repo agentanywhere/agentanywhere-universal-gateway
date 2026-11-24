@@ -15,7 +15,9 @@ row between the ``<!-- env-vars:start -->`` and ``<!-- env-vars:end -->``
 markers in ``docs/reference/configuration.md``.
 
 The script fails (exit 1) if a variable is read but not documented, or
-documented but not read. It also prints, for information only, the names in
+documented but not read. It also fails if ``env.example`` sets a variable
+twice, or puts a comment after a value: ``docker run --env-file`` (unlike
+python-dotenv) keeps such a comment as part of the value. It also prints, for information only, the names in
 ``env.example`` that the gateway does not read.
 
 Standard library only. Usage::
@@ -135,6 +137,22 @@ def env_example_names() -> set[str]:
     return names
 
 
+def env_example_problems() -> list[str]:
+    """Lines of env.example that a plain env-file reader would get wrong."""
+    problems, seen = [], {}
+    for number, line in enumerate(ENV_EXAMPLE.read_text(encoding="utf-8").splitlines(), 1):
+        m = re.match(r"^([A-Z][A-Z0-9_]*)=(.*)$", line)
+        if not m:
+            continue
+        name, value = m.groups()
+        if re.search(r"\s#", value):
+            problems.append(f"line {number}: {name} has a comment after its value; put it on the line above")
+        if name in seen:
+            problems.append(f"line {number}: {name} is already set on line {seen[name]}")
+        seen.setdefault(name, number)
+    return problems
+
+
 def main() -> int:
     fields = settings_fields()
     reads = direct_reads()
@@ -165,6 +183,12 @@ def main() -> int:
         print("FAIL: documented in docs/reference/configuration.md but not read by the code:")
         for name in extra:
             print(f"  {name}")
+    problems = env_example_problems()
+    if problems:
+        ok = False
+        print("FAIL: env.example lines that `docker run --env-file` would read differently:")
+        for problem in problems:
+            print(f"  {problem}")
     if ok:
         print("OK: documented environment variables match the code.")
     return 0 if ok else 1
