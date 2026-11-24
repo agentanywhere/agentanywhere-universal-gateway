@@ -12,7 +12,7 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Either, Full};
 use hyper::body::{Body as _, Incoming};
 use hyper::header::{
-    HeaderName, HeaderValue, ACCEPT, ACCESS_CONTROL_ALLOW_CREDENTIALS, ACCESS_CONTROL_ALLOW_ORIGIN, AUTHORIZATION, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE,
+    HeaderName, HeaderValue, ACCEPT, ACCESS_CONTROL_ALLOW_CREDENTIALS, ACCESS_CONTROL_ALLOW_ORIGIN, AUTHORIZATION, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE,
     HOST, ORIGIN, REFERER, UPGRADE, USER_AGENT, VARY,
 };
 use hyper::http::uri::{Authority, Scheme};
@@ -601,8 +601,7 @@ fn decoded(raw: &str) -> Option<Cow<'_, str>> {
 
 /// The path a backend is asked for, given the whole path the Python gateway hands its HTTP
 /// client (the backend's own prefix, then the request's decoded path). That client drops `.` and
-/// `..` segments, then escapes what a path may not hold; a path already made only of safe
-/// characters and whole escapes is left as it is, and otherwise a `%` is escaped too.
+/// `..` segments, then escapes what a path may not hold; a `%` is never escaped.
 fn sent_path(full: &str) -> String {
     let mut kept: Vec<&str> = Vec::new();
     for part in full.split('/') {
@@ -620,15 +619,13 @@ fn sent_path(full: &str) -> String {
     if path.is_empty() {
         return "/".to_owned();
     }
-    let b = path.as_bytes();
-    let whole_escapes = (0..b.len()).all(|i| b[i] != b'%' || (b.get(i + 1).is_some_and(u8::is_ascii_hexdigit) && b.get(i + 2).is_some_and(u8::is_ascii_hexdigit)));
-    if whole_escapes && b.iter().all(|c| path_safe(*c) || *c == b'%') {
-        return path;
-    }
+    // httpx's path percent-encode set (WHATWG's): printable ASCII is kept, `%` included,
+    // except space, `"`, `#`, `<`, `>`, `?`, `` ` ``, `{` and `}`; every other byte is escaped.
+    let kept = |c: u8| (0x21..0x7F).contains(&c) && !b"\"#<>?`{}".contains(&c);
     let mut out = String::with_capacity(path.len() + 8);
-    for c in b {
-        match path_safe(*c) {
-            true => out.push(*c as char),
+    for c in path.bytes() {
+        match kept(c) {
+            true => out.push(c as char),
             false => out.push_str(&format!("%{c:02X}")),
         }
     }
@@ -1425,8 +1422,8 @@ fn fill_client_headers(headers: &mut HeaderMap, defaults: &[(HeaderName, HeaderV
 const RULE_BODY_MAX: u64 = 1 << 20;
 
 /// What rules that change fields make of a request's body, as the Python gateway does it: a body
-/// that is a JSON object is read, changed by each rule in turn and written again in Python's
-/// spelling; any other is left as it came (`Ok(None)`). `Err` for a body this side is not certain
+/// that is a JSON object is read, changed by each rule in turn and written again as httpx writes
+/// a `json=` body; any other is left as it came (`Ok(None)`). `Err` for a body this side is not certain
 /// how Python would read or write, which is then the Python gateway's.
 fn reshape(body: &[u8], rules: &[&Actions]) -> Result<Option<Vec<u8>>, ()> {
     // Not UTF-8 is not JSON to Python either, and nothing is an object that does not open as one.
@@ -1439,8 +1436,9 @@ fn reshape(body: &[u8], rules: &[&Actions]) -> Result<Option<Vec<u8>>, ()> {
             for actions in rules {
                 actions.change_body(&mut object);
             }
+            // Sent as httpx writes `json=`; what it would refuse to write is Python's to answer.
             let mut out = Vec::with_capacity(body.len() + 64);
-            object.dump(&mut out);
+            object.dump_sent(&mut out).ok_or(())?;
             Ok(Some(out))
         }
         _ => Ok(None),
@@ -1763,31 +1761,31 @@ pub fn judge_shapes() -> Result<(), String> {
     Ok(())
 }
 
-/// What the answer to a request from another origin is given, as the Python gateway's CORS
-/// middleware gives it to the answers that pass through it.
+/// What an answer is given by the Python gateway's CORS middleware (Starlette's), which every
+/// answer that is not a preflight passes through.
 #[derive(Debug, PartialEq)]
 struct Granted {
     /// `Access-Control-Allow-Origin: *`.
     any_origin: bool,
     credentials: bool,
-    /// The request's own origin, named back (with `Vary: Origin`): it is on the list, or every
-    /// origin is welcome and the request carries a cookie.
+    /// The request's own origin, named back: it is on the list, or every origin is welcome and
+    /// credentials are allowed.
     named: Option<HeaderValue>,
 }
 
-/// What a request's `Origin` header earns its answer. `Ok(None)`: there is none, and nothing is
-/// added. `Err`: this side cannot tell (no word from the control plane, the header twice or not
-/// text), and the request is the Python gateway's.
+/// What a request's `Origin` header earns its answer. With no `Origin`, only `Vary: Origin`.
+/// `Err`: this side cannot tell (no word from the control plane, the header twice or not text),
+/// and the request is the Python gateway's.
 fn cross_origin(snap: &Snapshot, headers: &HeaderMap) -> Result<Option<Granted>, ()> {
     let mut sent = headers.get_all(ORIGIN).iter();
-    let Some(origin) = sent.next() else { return Ok(None) };
+    let Some(origin) = sent.next() else { return Ok(Some(Granted { any_origin: false, credentials: false, named: None })) };
     let rules = snap.cross_origin.as_ref().ok_or(())?;
     let text = origin.to_str().map_err(|_| ())?;
     if sent.next().is_some() {
         return Err(());
     }
     let named = match rules.any_origin {
-        true => headers.contains_key(COOKIE),
+        true => rules.credentials,
         false => rules.origins.contains(text),
     };
     Ok(Some(Granted { any_origin: rules.any_origin, credentials: rules.credentials, named: named.then(|| origin.clone()) }))
@@ -1805,13 +1803,15 @@ impl Granted {
         }
         if let Some(origin) = &self.named {
             h.insert(ACCESS_CONTROL_ALLOW_ORIGIN, origin.clone());
-            // After the first `Vary` the answer has; any further ones are dropped, as there.
-            let vary = match h.get(VARY).map(|v| v.as_bytes()) {
-                Some(first) => HeaderValue::from_bytes(&[first, b", Origin"].concat()).unwrap_or(HeaderValue::from_static("Origin")),
-                None => HeaderValue::from_static("Origin"),
-            };
-            h.insert(VARY, vary);
         }
+        // Every answer, named or not: the answer's `Vary` lines joined into one, then `Origin`.
+        let mut vary: Vec<u8> = Vec::new();
+        for line in h.get_all(VARY) {
+            vary.extend_from_slice(line.as_bytes());
+            vary.extend_from_slice(b", ");
+        }
+        vary.extend_from_slice(b"Origin");
+        h.insert(VARY, HeaderValue::from_bytes(&vary).unwrap_or(HeaderValue::from_static("Origin")));
     }
 }
 
@@ -3488,12 +3488,14 @@ mod tests {
             ("/api/users", "/api/users"),
             ("/api/a b", "/api/a%20b"),
             ("/api/caf\u{e9}", "/api/caf%C3%A9"),
-            ("/api/a|b", "/api/a%7Cb"),
+            ("/api/a|b", "/api/a|b"),
+            ("/api/a^b\"c<d>e", "/api/a^b%22c%3Cd%3Ee"),
+            ("/api/x{y}`z", "/api/x%7By%7D%60z"),
             ("/api/it's;[1]@:x", "/api/it's;[1]@:x"),
-            // Made only of safe characters and whole escapes: left alone. Otherwise a `%` is escaped too.
+            // A `%` is never escaped, whether or not it starts an escape.
             ("/api/%41", "/api/%41"),
-            ("/api/100%", "/api/100%25"),
-            ("/api/a b%20c", "/api/a%20b%2520c"),
+            ("/api/100%", "/api/100%"),
+            ("/api/a b%20c", "/api/a%20b%20c"),
             ("/api/a/../b", "/api/b"),
             ("/api/./a/.", "/api/a"),
             ("/base/../../x", "/x"),
@@ -4583,7 +4585,7 @@ mod tests {
         assert_eq!(shaped(&ask("POST", "/api/shaped/twice/1", &[])).split(' ').nth(1), Some("202"));
         assert_eq!(shaped(&ask("GET", "/api/shaped/twice/1", &[])).split(' ').nth(1), Some("200"));
         // No rule, a rule that does nothing, and a rule of the Python gateway's.
-        assert_eq!(shaped(&ask("GET", "/api/users?a=b%20c", &[])), "/api/users?a=b%20c 200 etag=|1, 2 set-cookie=|a=1, b=2 x-agent=|echo");
+        assert_eq!(shaped(&ask("GET", "/api/users?a=b%20c", &[])), "/api/users?a=b+c 200 etag=|1, 2 set-cookie=|a=1, b=2 x-agent=|echo");
         assert_eq!(shaped(&ask("GET", "/api/nothing/1", &[])), "/api/nothing/1 200 etag=|1, 2 set-cookie=|a=1, b=2 x-agent=|echo");
         assert_eq!(shaped(&ask("GET", "/api/kept/1", &[])), "ask");
         // Of a header given twice a rule reads the first line, and one no rule changed goes on
@@ -4594,12 +4596,12 @@ mod tests {
         assert!(shaped(&ask("GET", "/api/shaped/1", &[("x-keep", "a"), ("x-keep", "b")])).contains(" x-keep=a, b| "));
         assert!(shaped(&ask("GET", "/api/users", &[("x-keep", "a"), ("x-keep", "b")])).ends_with(" x-keep=a, b|"));
         assert_eq!(shaped(&ask("GET", "/api/users", &[("te", "trailers"), ("te", "gzip")])), "ask");
-        assert_eq!(once(&ask("GET", "/api/shaped/1?q=a+b&debug=1", &[])), "/api/shaped/1?q=a%20b&source=gw");
+        assert_eq!(once(&ask("GET", "/api/shaped/1?q=a+b&debug=1", &[])), "/api/shaped/1?q=a+b&source=gw");
         assert_eq!(once(&ask("GET", "/api/shaped/1?q=1&q=2", &[])), "/api/shaped/1?q=1&q=2&source=gw");
         // The rule sets `source`: set to another value it is the rule's, to the value held it is as it came.
         assert_eq!(once(&ask("GET", "/api/shaped/1?page=1&page=2&source=gw&source=x", &[])), "/api/shaped/1?page=1&page=2&source=gw");
         assert_eq!(once(&ask("GET", "/api/shaped/1?source=x&source=gw", &[])), "/api/shaped/1?source=x&source=gw");
-        assert_eq!(once(&ask("PUT", "/api/users?q=a+b&flag", &[])), "/api/users?q=a%20b&flag=");
+        assert_eq!(once(&ask("PUT", "/api/users?q=a+b&flag", &[])), "/api/users?q=a+b&flag=");
         assert_eq!(once(&ask("GET", "/api/users?", &[])), "/api/users");
         // A query whose escapes are not text is read with replacement characters, as there.
         assert_eq!(once(&ask("GET", "/api/users?q=%ff", &[])), "/api/users?q=%EF%BF%BD");
@@ -4808,8 +4810,8 @@ mod tests {
         // An escaped path is read decoded, slug and all, and the agent is asked for it as the
         // Python gateway's HTTP client writes a path.
         for (uri, asked) in [("/agents/hiring/a%20b", "/a%20b"), ("/agents/hirin%67/a", "/a"), ("/agents/hiring%2Fa", "/a"), ("/agents/hiring/a%2Fb", "/a/b"),
-                             ("/agents/hiring/caf%C3%A9", "/caf%C3%A9"), ("/agents/hiring/a%25b", "/a%25b"), ("/agents/hiring/a%2541", "/a%41"),
-                             ("/agents/hiring/%7Ea%22", "/~a%22"), ("/agents/hiring/a/%2E%2E/b", "/b"), ("/agents/based/x%2F..%2Fy?q=a+b", "/base/y?q=a%20b")] {
+                             ("/agents/hiring/caf%C3%A9", "/caf%C3%A9"), ("/agents/hiring/a%25b", "/a%b"), ("/agents/hiring/a%2541", "/a%41"),
+                             ("/agents/hiring/%7Ea%22", "/~a%22"), ("/agents/hiring/a/%2E%2E/b", "/b"), ("/agents/based/x%2F..%2Fy?q=a+b", "/base/y?q=a+b")] {
             assert_eq!(sent(uri).as_deref(), Some(&*format!("10.0.0.1{}:8001{asked}", if uri.contains("based") { 1 } else { 0 })), "{uri}");
         }
         // One that decodes to what the two sides might not read alike is the Python gateway's.
@@ -4826,7 +4828,7 @@ mod tests {
             assert!(to_agent(&snap, &request("GET", uri)).is_none(), "{uri}");
         }
         // A query is written again as the Python gateway writes the dictionary it read it into.
-        for (query, sent) in [("x=1&x=2", "?x=1&x=2"), ("q=a+b", "?q=a%20b"), ("q=%7E", "?q=~"), ("flag", "?flag="), ("=1", "?=1"), ("a=1&&b=2", "?a=1&b=2"), ("&", ""), ("q=%ff", "?q=%EF%BF%BD")] {
+        for (query, sent) in [("x=1&x=2", "?x=1&x=2"), ("q=a+b", "?q=a+b"), ("q=%7E", "?q=~"), ("flag", "?flag="), ("=1", "?=1"), ("a=1&&b=2", "?a=1&b=2"), ("&", ""), ("q=%ff", "?q=%EF%BF%BD")] {
             assert_eq!(to_agent(&snap, &request("GET", &format!("/agents/hiring/a?{query}"))).as_deref(), Some(&*format!("10.0.0.10:8001/a{sent}")), "{query}");
         }
         // A path that names a version tells the agent that one, or none if it is not known.
@@ -5059,17 +5061,21 @@ mod tests {
     fn an_origin_earns_what_the_cors_middleware_gives_it() {
         let listed = r#"{"any_origin":false,"origins":["https://app.example"],"credentials":true}"#;
         let app = HeaderValue::from_static("https://app.example");
-        assert_eq!(granted(listed, &[]), Ok(None));
+        // No `Origin`: only `Vary: Origin`, whatever the rules.
+        let none = Granted { any_origin: false, credentials: false, named: None };
+        assert_eq!(granted(listed, &[]), Ok(Some(none)));
         assert_eq!(granted(listed, &[("origin", "https://app.example")]), Ok(Some(Granted { any_origin: false, credentials: true, named: Some(app.clone()) })));
         // An origin that is not listed is still told about credentials, and nothing else.
         assert_eq!(granted(listed, &[("origin", "https://APP.example")]), Ok(Some(Granted { any_origin: false, credentials: true, named: None })));
         let any = r#"{"any_origin":true,"origins":[],"credentials":false}"#;
         assert_eq!(granted(any, &[("origin", "https://x.example")]), Ok(Some(Granted { any_origin: true, credentials: false, named: None })));
-        // With a cookie, the star gives way to the origin itself.
+        // A cookie changes nothing; with credentials allowed, the star gives way to the origin itself.
         let x = HeaderValue::from_static("https://x.example");
-        assert_eq!(granted(any, &[("origin", "https://x.example"), ("cookie", "s=1")]), Ok(Some(Granted { any_origin: true, credentials: false, named: Some(x) })));
+        assert_eq!(granted(any, &[("origin", "https://x.example"), ("cookie", "s=1")]), Ok(Some(Granted { any_origin: true, credentials: false, named: None })));
+        let any_with = r#"{"any_origin":true,"origins":[],"credentials":true}"#;
+        assert_eq!(granted(any_with, &[("origin", "https://x.example")]), Ok(Some(Granted { any_origin: true, credentials: true, named: Some(x) })));
         assert_eq!(granted("null", &[("origin", "https://x.example")]), Err(()));
-        assert_eq!(granted("null", &[]), Ok(None));
+        assert_eq!(granted("null", &[]), Ok(Some(Granted { any_origin: false, credentials: false, named: None })));
     }
 
     #[test]
@@ -5088,16 +5094,18 @@ mod tests {
         assert_eq!(headers_of(&named, &[]), ["access-control-allow-credentials: true", "access-control-allow-origin: https://app.example", "vary: Origin"]);
         assert_eq!(
             headers_of(&named, &[("vary", "Accept-Encoding"), ("vary", "Cookie"), ("access-control-allow-origin", "https://backend.example")]),
-            ["access-control-allow-credentials: true", "access-control-allow-origin: https://app.example", "vary: Accept-Encoding, Origin"]
+            ["access-control-allow-credentials: true", "access-control-allow-origin: https://app.example", "vary: Accept-Encoding, Cookie, Origin"]
         );
-        // Not listed: the backend's own answer to the question stands.
+        // Not listed: the backend's own answer to the question stands, and `Origin` is still added to `Vary`.
         let unlisted = Granted { any_origin: false, credentials: true, named: None };
         assert_eq!(
             headers_of(&unlisted, &[("vary", "Accept-Encoding"), ("access-control-allow-origin", "https://backend.example")]),
-            ["access-control-allow-credentials: true", "access-control-allow-origin: https://backend.example", "vary: Accept-Encoding"]
+            ["access-control-allow-credentials: true", "access-control-allow-origin: https://backend.example", "vary: Accept-Encoding, Origin"]
         );
         let any = Granted { any_origin: true, credentials: false, named: None };
-        assert_eq!(headers_of(&any, &[("access-control-allow-origin", "https://backend.example")]), ["access-control-allow-origin: *"]);
+        assert_eq!(headers_of(&any, &[("access-control-allow-origin", "https://backend.example")]), ["access-control-allow-origin: *", "vary: Origin"]);
+        let none = Granted { any_origin: false, credentials: false, named: None };
+        assert_eq!(headers_of(&none, &[("vary", "Accept")]), ["vary: Accept, Origin"]);
     }
 
     #[test]

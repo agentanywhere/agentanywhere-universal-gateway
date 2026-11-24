@@ -498,25 +498,19 @@ pub fn change_query(query: &mut Query, rules: &[&Actions]) {
     }
 }
 
-/// A query as the Python gateway's HTTP client writes the dictionary (`urlencode` in httpx):
-/// `name=value` joined by `&`, a name given more than once with every value where the
-/// dictionary still holds its last (`_with_repeats`). A name or a value of letters, digits,
-/// `-._~` and whole `%xx` escapes is written as it is; in any other, every byte that is not
-/// one of those letters is escaped, `%` too. `None` when no parameter is left: the backend is
-/// then asked with no `?`.
+/// A query as the Python gateway's HTTP client writes the dictionary (httpx's `QueryParams`,
+/// which is `urllib.parse.urlencode`): `name=value` joined by `&`, a name given more than once
+/// with every value where the dictionary still holds its last (`_with_repeats`). Each name and
+/// value is written as `quote_plus` writes it: letters, digits and `-._~` as they are, a space
+/// as `+`, and every other byte escaped, `%` too. `None` when no parameter is left: the backend
+/// is then asked with no `?`.
 pub fn write_query(query: &Query) -> Option<String> {
     fn quoted(text: &str, out: &mut String) {
-        let plain = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~');
-        let bytes = text.as_bytes();
-        let escape = |i: usize| bytes.get(i + 1).is_some_and(u8::is_ascii_hexdigit) && bytes.get(i + 2).is_some_and(u8::is_ascii_hexdigit);
-        if bytes.iter().enumerate().all(|(i, b)| plain(*b) || (*b == b'%' && escape(i))) {
-            out.push_str(text);
-            return;
-        }
-        for b in bytes {
-            match plain(*b) {
-                true => out.push(*b as char),
-                false => out.push_str(&format!("%{b:02X}")),
+        for b in text.bytes() {
+            match b {
+                b if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') => out.push(b as char),
+                b' ' => out.push('+'),
+                b => out.push_str(&format!("%{b:02X}")),
             }
         }
     }
@@ -1377,9 +1371,10 @@ mod tests {
     fn a_query_is_read_and_written_as_the_python_gateway_does() {
         let written = |query: &str| read_query(query).map(|read| write_query(&read).unwrap_or_default());
         for (came, sent) in [
-            ("a=1&b=2&a=3", "a=1&a=3&b=2"), ("flag&b=2", "flag=&b=2"), ("q=a%20b&r=c+d&s=%2F", "q=a%20b&r=c%20d&s=%2F"), ("", ""), ("&&", ""),
+            ("a=1&b=2&a=3", "a=1&a=3&b=2"), ("flag&b=2", "flag=&b=2"), ("q=a%20b&r=c+d&s=%2F", "q=a+b&r=c+d&s=%2F"), ("", ""), ("&&", ""),
             ("a=1&&b", "a=1&b="), ("=x", "=x"), ("a=%zz", "a=%25zz"), ("a=b=c", "a=b%3Dc"), ("a;b=1", "a%3Bb=1"), ("caf%C3%A9=1", "caf%C3%A9=1"),
-            ("a=%2541", "a=%41"), ("a=%2541+", "a=%2541%20"), ("a=%", "a=%25"), ("a=%4", "a=%254"), ("%61=%7e", "a=~"), ("a=x&A=y", "a=x&A=y"),
+            ("a=%2541", "a=%2541"), ("a=%2541+", "a=%2541+"), ("a=%", "a=%25"), ("a=%4", "a=%254"), ("%61=%7e", "a=~"), ("a=x&A=y", "a=x&A=y"),
+            ("a=%2B", "a=%2B"), ("a=%2520", "a=%2520"),
             ("a=1&a", "a=1&a="), ("a=%E2%82%AC", "a=%E2%82%AC"), ("k=a/b?c:d@e", "k=a%2Fb%3Fc%3Ad%40e"), ("a=%00", "a=%00"),
             ("tag=a&one=1&tag=b&tag=a", "tag=a&tag=b&tag=a&one=1"), ("a=1&%61=2", "a=1&a=2"),
         ] {

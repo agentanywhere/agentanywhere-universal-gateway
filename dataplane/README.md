@@ -221,7 +221,7 @@ is found. This side does the same in each case:
 
 * `"stream": true` with `Greeter` and `SayManyHellos`: the call is made (60 seconds at most) and each answer is
   written as a line of JSON (`application/x-ndjson`) when the server sends it. The answer starts at once with status
-  200; if the call fails, it breaks off after the lines already sent, as the Python gateway's does.
+  200; if the call fails, it ends after the lines already sent, as the Python gateway's does.
 * `Greeter` and `SayHello`, where the reflection package and the generated code are there: the call is made (30
   seconds at most) and answered as `{"status":"success","message":...}`; a call that fails is a 502 naming the gRPC
   status.

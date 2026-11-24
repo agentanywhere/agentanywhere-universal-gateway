@@ -1043,11 +1043,11 @@ def main() -> int:
                 ("lower-case escapes", "GET", "/mcp/caf%c3%a9", None, "/mcp/caf%C3%A9"),
                 ("an escaped slash", "GET", "/mcp/a%2Fb", None, "/mcp/a/b"),
                 ("an escaped letter", "GET", "/mcp/%61bc", None, "/mcp/abc"),
-                ("a percent sign", "GET", "/mcp/discount/100%25", None, "/mcp/discount/100%25"),
+                ("a percent sign", "GET", "/mcp/discount/100%25", None, "/mcp/discount/100%"),
                 ("an escape of an escape", "GET", "/mcp/x%2520y", None, "/mcp/x%20y"),
-                ("a % that starts no escape", "GET", "/mcp/50%/off", None, "/mcp/50%25/off"),
+                ("a % that starts no escape", "GET", "/mcp/50%/off", None, "/mcp/50%/off"),
                 ("characters a path may hold unescaped", "GET", "/mcp/it's;[1]@:x,(y)*+=&$!", None, "/mcp/it's;[1]@:x,(y)*+=&$!"),
-                ("characters escaped on the way", "GET", "/mcp/a%7Cb%5Ec%22d%3Ce%3E", None, "/mcp/a%7Cb%5Ec%22d%3Ce%3E"),
+                ("characters escaped on the way", "GET", "/mcp/a%7Cb%5Ec%22d%3Ce%3E", None, "/mcp/a|b^c%22d%3Ce%3E"),
                 ("with a body", "POST", "/mcp/notes/my%20note", {"jsonrpc": "2.0", "id": 1, "method": "ping"}, "/mcp/notes/my%20note"),
                 ("a protocol named with an escape", "GET", "/%6Dcp/sessions/7", None, "/mcp/sessions/7"),
                 ("ACP, whose prefix is taken off", "GET", "/acp/agents/caf%C3%A9", None, "/agents/caf%C3%A9"),
@@ -1509,7 +1509,7 @@ def main() -> int:
             # An escaped path is read decoded and written again, as on the way to any backend.
             for what, path, asked in (("a space", "/agents/echo/a%20b", "/a%20b"), ("in the slug", "/agents/ech%6F/x", "/x"),
                                       ("a slash", "/agents/echo/a%2Fb", "/a/b"), ("beyond ASCII", "/agents/echo/caf%C3%A9?q=1", "/caf%C3%A9"),
-                                      ("a percent sign", "/agents/echo/a%25b", "/a%25b"), ("an escape of an escape", "/agents/echo/a%2541", "/a%41"),
+                                      ("a percent sign", "/agents/echo/a%25b", "/a%b"), ("an escape of an escape", "/agents/echo/a%2541", "/a%41"),
                                       ("what need not be escaped", "/agents/echo/%7Ea", "/~a"), ("under a base path", "/agents/based/a%20b", "/base/a%20b")):
                 agent_same(f"an escaped path: {what}", "GET", path, want=lambda r, asked=asked: r.json()["path"] == asked)
             agent_same("an escaped slug that is not registered", "GET", "/agents/nobod%79/a", by="python", sees=False)
@@ -1749,13 +1749,14 @@ def main() -> int:
             with_key = {"X-API-Key": "{key}"}
             for whose, origin in (("a listed origin", "http://localhost:3001"), ("another origin", "http://elsewhere.example")):
                 listed = whose == "a listed origin"
+                # Starlette adds Origin to every answer's Vary, the origin listed or not.
                 named = (lambda h: h.get("access-control-allow-origin") == origin and h.get("vary") == "Origin") if listed \
-                    else (lambda h: "access-control-allow-origin" not in h and "vary" not in h)
+                    else (lambda h: "access-control-allow-origin" not in h and h.get("vary") == "Origin")
                 from_page(f"{whose}: an API call", origin, "GET", "/api/users", with_key, wants=named)
                 from_page(f"{whose}: with a cookie", origin, "GET", "/api/users", {**with_key, "Cookie": "s=1"}, wants=named)
                 from_page(f"{whose}: with a body", origin, "POST", "/api/users", {**with_key, "Content-Type": "application/json"})
                 from_page(f"{whose}: a backend that varies its answer keeps that", origin, "GET", "/api/routed/vary", with_key,
-                          wants=lambda h: h.get("vary") == ("Accept-Encoding, Origin" if listed else "Accept-Encoding"))
+                          wants=lambda h: h.get("vary") == "Accept-Encoding, Origin")
                 from_page(f"{whose}: a backend with an answer of its own to the question", origin, "GET", "/api/routed/acao", with_key,
                           wants=lambda h: h.get("access-control-allow-origin") == (origin if listed else "http://backend.example"))
                 from_page(f"{whose}: a backend that cannot be reached", origin, "GET", "/api/routed/dead/a", with_key,
@@ -1949,7 +1950,7 @@ def main() -> int:
             exchange_same("and one that gives another header twice is changed here", "GET", "/api/routed/shaped/1", status=201,
                           headers=[("X-Keep", "first"), ("X-Old", "o")], sees={"x-new": "o", "x-shaped": "yes"})
             exchange_same("a query that is not plain words is read, changed and written again", "GET", "/api/routed/shaped/1?q=a+b&debug=1", status=201,
-                          sees={"x-shaped": "yes"}, query="q=a%20b&source=gw&page=1")
+                          sees={"x-shaped": "yes"}, query="q=a+b&source=gw&page=1")
             exchange_same("an answer that is streamed has no rule applied to it, with the request still changed", "GET", "/api/routed/shaped/message:stream/1",
                           sees={"x-shaped": "yes"}, given={"x-powered": None})
             remove_rules(made)
@@ -1967,15 +1968,16 @@ def main() -> int:
             assert rules_reached("/api/routed/bodies/1", "data plane", True), "the rules never reached the data plane"
             json_type = [("Content-Type", "application/json")]
             came = '{"user":"ana","secret":"s","keep":"é😀","deep":{"secret":1,"kept":[1.0,2e3,-0]},"gone":null,"n":7}'.encode()
-            made_of_it = (b'{"keep": "\\u00e9\\ud83d\\ude00", "deep": {"kept": [1.0, 2000.0, 0]}, "gone": null, "n": 1.5, '
-                          b'"meta": {"user": "ana", "source": "gateway"}, "tags": ["a", {"b": null}]}')
+            # Written anew as httpx writes `json=`: no spaces, and characters beyond ASCII as themselves.
+            made_of_it = ('{"keep":"\u00e9\U0001F600","deep":{"kept":[1.0,2000.0,0]},"gone":null,"n":1.5,'
+                          '"meta":{"user":"ana","source":"gateway"},"tags":["a",{"b":null}]}').encode()
             exchange_same("a body's fields are renamed, removed and set, and it is written as Python writes it", "POST", "/api/routed/bodies/1",
                           headers=json_type, content=came, arrives=made_of_it,
                           sees={"x-shaped": "yes", "content-length": str(len(made_of_it)), "content-type": "application/json"})
             exchange_same("a later rule works on what the earlier one left", "PUT", "/api/routed/bodies/twice/1", headers=json_type, content=b'{"user": "ana"}',
-                          arrives=b'{"n": 1.5, "tags": {"first": true}, "about": {"user": "ana", "source": "gateway"}}')
+                          arrives=b'{"n":1.5,"tags":{"first":true},"about":{"user":"ana","source":"gateway"}}')
             exchange_same("a body of another kind is called JSON once it is written anew", "PATCH", "/api/routed/bodies/1", content=b"{}",
-                          arrives=b'{"meta": {"source": "gateway"}, "n": 1.5, "tags": ["a", {"b": null}]}', sees={"content-type": "application/json"})
+                          arrives=b'{"meta":{"source":"gateway"},"n":1.5,"tags":["a",{"b":null}]}', sees={"content-type": "application/json"})
             exchange_same("and keeps the kind the caller gave it", "POST", "/api/routed/bodies/1", headers=[("Content-Type", "text/plain")], content=b"{}",
                           sees={"content-type": "text/plain"})
             for name, body in (("that is a list", b"[1,  2]"), ("that is not JSON", b"user=ana&secret=s"), ("that is not text", b"\xff\xfe\x00{}"),
@@ -1983,8 +1985,12 @@ def main() -> int:
                 exchange_same(f"a body {name} goes on as it came", "POST", "/api/routed/bodies/1", headers=json_type, content=body, arrives=body,
                               sees={"x-shaped": "yes", "content-length": str(len(body))})
             exchange_same("a request without a body is served here", "GET", "/api/routed/bodies/1", sees={"x-shaped": "yes"})
-            for name, body in (("with a number Python writes its own way", b'{"a": 1e400}'), ("nested very deep", b'{"a": ' + b"[" * 80 + b"]" * 80 + b"}"),
-                               ("that is nearly an object", b'{"a": 1,}')):
+            # A number too large for a float reads as infinity, which httpx refuses to write: Python's own 500.
+            a = shaped(py, keys["py"]["key"], "POST", "/api/routed/bodies/1", json_type, content=b'{"a": 1e400}')
+            b = shaped(rs, keys["rs"]["key"], "POST", "/api/routed/bodies/1", json_type, content=b'{"a": 1e400}')
+            check("transformation rules: a body with a number Python writes its own way is Python's to read",
+                  a.status_code == b.status_code == 500 and said_by(b) == "python", f"[{a.status_code} and {b.status_code}] by the {said_by(b)}")
+            for name, body in (("nested very deep", b'{"a": ' + b"[" * 80 + b"]" * 80 + b"}"), ("that is nearly an object", b'{"a": 1,}')):
                 exchange_same(f"a body {name} is Python's to read", "POST", "/api/routed/bodies/1", by="python", headers=json_type, content=body,
                               sees={"x-shaped": "yes"})
             exchange_same("a body of no stated length is read whole and changed like any other", "POST", "/api/routed/bodies/1", headers=json_type,
@@ -2256,7 +2262,7 @@ def main() -> int:
             repeated_same("a parameter given twice reaches the backend with both values, together", "/api/routed/plainly/1?a=1&b=2&a=3", query="a=1&a=3&b=2")
             repeated_same("a parameter without a value is written with an empty one", "/api/routed/plainly/1?flag&b=2", query="flag=&b=2")
             repeated_same("an escaped parameter is written with the escapes the Python gateway's client uses", "/api/routed/plainly/1?q=a%20b&r=c+d&s=%2F&t=%7e",
-                          query="q=a%20b&r=c%20d&s=%2F&t=~")
+                          query="q=a+b&r=c+d&s=%2F&t=~")
             repeated_same("an empty query", "/api/routed/plainly/1?", query="")
             repeated_same("a query whose escapes are not text is read with replacement characters", "/api/routed/plainly/1?q=%ff&%80=1&r=%ED%A0%80",
                           query="q=%EF%BF%BD&%EF%BF%BD=1&r=%EF%BF%BD%EF%BF%BD%EF%BF%BD")
@@ -2274,7 +2280,7 @@ def main() -> int:
             assert rules_reached("/api/routed/repeated/1", "data plane", False), "removing the rule on a header given twice never reached the data plane"
             repeated_same("an agent is sent every line of a header given twice", "/agents/echo/twice", headers=twice, key=False,
                           sees={"x-tag": ["a", "b"], "x-other": ["o"]})
-            repeated_same("and every value of a parameter, its query written again", "/agents/echo/twice?a=1&b=c+d&a=3&flag", key=False, query="a=1&a=3&b=c%20d&flag=")
+            repeated_same("and every value of a parameter, its query written again", "/agents/echo/twice?a=1&b=c+d&a=3&flag", key=False, query="a=1&a=3&b=c+d&flag=")
 
             # A version on its way out. The gateway tells the backend so with the version (`Warning`,
             # `Sunset`), and tells the caller on every answer (those and `Deprecation`), over
@@ -2527,7 +2533,7 @@ def main() -> int:
                 check(f"a rule on the answer's tenant and limit headers: {name}", not bad, "; ".join(bad) or str(got(b, "rs")))
 
             answered_same("a key of no tenant is given the rule's lines", keys,
-                          given={"vary": ["Accept"], "x-ratelimit-limit": ["100"], "x-tenant-id": ["the rule's"], "x-tenant-quota-minute": ["1/2"]})
+                          given={"vary": ["Accept, Origin"], "x-ratelimit-limit": ["100"], "x-tenant-id": ["the rule's"], "x-tenant-quota-minute": ["1/2"]})
             answered_same("a tenant's key is given its tenant's id over the rule's", wide, given={"x-tenant-id": ["conf-wide"], "x-tenant-quota-minute": ["1/2"]})
             answered_same("a page from a listed origin is given Origin after the rule's Vary", keys, headers=[("Origin", "http://localhost:3001")],
                           given={"vary": ["Accept, Origin"]})
@@ -2870,8 +2876,8 @@ def main() -> int:
             bridge_same("a stream without a name greets the world", "data plane", *bare, body=many, want=lambda r, got, *_: got == lines("World"))
             bridge_same("each line is sent when the server sends it, not at the end", "data plane", *bare, body={**many, "data": {"name": "slowly"}},
                         want=lambda r, got, times, broke: got == lines("slowly") and times[-1] - times[0] > 0.5)
-            bridge_same("a stream that fails breaks off after what it had sent", "data plane", *bare, body={**many, "data": {"name": "nobody"}},
-                        want=lambda r, got, times, broke: broke and got == lines("nobody").split(b"\n")[0] + b"\n")
+            bridge_same("a stream that fails ends after what it had sent", "data plane", *bare, body={**many, "data": {"name": "nobody"}},
+                        want=lambda r, got, times, broke: not broke and got == lines("nobody").split(b"\n")[0] + b"\n")
             bridge_same("a stream asked for without `stream` is a single call", "data plane", *bare, body={"service": "Greeter", "method": "SayManyHellos"})
             bridge_same("data that is not an object, in a stream: Python's own failure", "python", *bare, body={**many, "data": [1]})
             bridge_same("a body that is not an object: Python's 500", "python", *bare, body=[1], want=lambda r, *_: r.status_code == 500)
@@ -2919,8 +2925,8 @@ def main() -> int:
             grpc_server.terminate()
             grpc_server.wait(timeout=10)
             bridge_same("with the server down a call is an error", "data plane", *calling, body={"data": {"name": "Ada"}}, want=lambda r, *_: r.status_code >= 500)
-            bridge_same("and a stream breaks off before its first line", "data plane", *bare, body={**many, "data": {"name": "Ada"}},
-                        want=lambda r, got, times, broke: r.status_code == 200 and broke and got == b"")
+            bridge_same("and a stream ends before its first line", "data plane", *bare, body={**many, "data": {"name": "Ada"}},
+                        want=lambda r, got, times, broke: r.status_code == 200 and not broke and got == b"")
             b = grpc_call(through, "unary", "Say", b"hello", rs_key)
             check("gRPC: with the backend down the call is UNAVAILABLE", (b["code"], b["details"]) == ("UNAVAILABLE", "the backend is unavailable"),
                   f"{b['code']}: {b['details']}")

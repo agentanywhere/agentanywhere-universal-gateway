@@ -456,6 +456,48 @@ pub enum Value {
 pub type Path = Vec<Vec<u8>>;
 
 /// A rule's dotted path, split as the Python gateway splits it.
+/// The inside of a string as `json.dumps` writes it with `ensure_ascii=True`, written again as
+/// it writes it with `ensure_ascii=False`: each `\uXXXX` for a character beyond ASCII, or for
+/// U+007F, becomes that character in UTF-8 (a surrogate pair, the one character they name); the
+/// other escapes stay. `None` for a lone surrogate.
+fn unescaped_beyond_ascii(inner: &[u8], out: &mut Vec<u8>) -> Option<()> {
+    let unit = |at: usize| -> Option<u32> {
+        let hex = inner.get(at + 2..at + 6)?;
+        (inner.get(at..at + 2)? == b"\\u").then(|| u32::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()).flatten()
+    };
+    let mut i = 0;
+    while i < inner.len() {
+        if inner[i] != b'\\' {
+            out.push(inner[i]);
+            i += 1;
+            continue;
+        }
+        let Some(code) = unit(i) else {
+            // `\n`, `\"`, `\\` and the like: two bytes, kept.
+            out.extend_from_slice(inner.get(i..i + 2)?);
+            i += 2;
+            continue;
+        };
+        let (character, used) = match code {
+            0xD800..=0xDBFF => match unit(i + 6) {
+                Some(low @ 0xDC00..=0xDFFF) => (char::from_u32(0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00))?, 12),
+                _ => return None,
+            },
+            0xDC00..=0xDFFF => return None,
+            code if code < 0x7F => {
+                out.extend_from_slice(&inner[i..i + 6]);
+                i += 6;
+                continue;
+            }
+            code => (char::from_u32(code)?, 6),
+        };
+        let mut buf = [0u8; 4];
+        out.extend_from_slice(character.encode_utf8(&mut buf).as_bytes());
+        i += used;
+    }
+    Some(())
+}
+
 pub fn path(dotted: &str) -> Path {
     dotted
         .split('.')
@@ -506,6 +548,53 @@ impl Value {
                     value.dump(out);
                 }
                 out.push(b'}');
+            }
+        }
+    }
+
+    /// As httpx writes a request's `json=` body (`json.dumps` with `separators=(",", ":")`,
+    /// `ensure_ascii=False`, `allow_nan=False`): no spaces, and characters beyond ASCII (and
+    /// U+007F) as themselves in UTF-8. `None` for what Python refuses to write that way: `NaN`
+    /// or an infinity, and a lone surrogate, which UTF-8 cannot hold.
+    pub fn dump_sent(&self, out: &mut Vec<u8>) -> Option<()> {
+        match self {
+            Value::Atom(text) => match text.first() {
+                Some(b'"') => {
+                    out.push(b'"');
+                    unescaped_beyond_ascii(&text[1..text.len() - 1], out)?;
+                    out.push(b'"');
+                    Some(())
+                }
+                _ if matches!(text.as_slice(), b"NaN" | b"Infinity" | b"-Infinity") => None,
+                _ => {
+                    out.extend_from_slice(text);
+                    Some(())
+                }
+            },
+            Value::List(items) => {
+                out.push(b'[');
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        out.push(b',');
+                    }
+                    item.dump_sent(out)?;
+                }
+                out.push(b']');
+                Some(())
+            }
+            Value::Object(members) => {
+                out.push(b'{');
+                for (i, (name, value)) in members.iter().enumerate() {
+                    if i > 0 {
+                        out.push(b',');
+                    }
+                    out.push(b'"');
+                    unescaped_beyond_ascii(name, out)?;
+                    out.extend_from_slice(b"\":");
+                    value.dump_sent(out)?;
+                }
+                out.push(b'}');
+                Some(())
             }
         }
     }
@@ -803,6 +892,21 @@ pub fn judge_stdin(subscribing: bool) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_request_body_is_written_as_httpx_writes_json() {
+        let sent = |text: &str| {
+            let mut out = Vec::new();
+            // `None` too for what is not read here at all (`NaN`): that is Python's already.
+            parse(text.as_bytes())?.dump_sent(&mut out).map(|_| String::from_utf8(out).unwrap())
+        };
+        assert_eq!(sent(r#"{"a": 1, "b": [1, 2.5, null, true], "c": {"d": "x"}}"#).as_deref(), Some(r#"{"a":1,"b":[1,2.5,null,true],"c":{"d":"x"}}"#));
+        assert_eq!(sent("{\"caf\u{e9}\": \"\u{e9}\u{2603}\u{1F600}\\n\\\"\\\\/\\u0001\u{7f}\"}").as_deref(), Some("{\"caf\u{e9}\":\"\u{e9}\u{2603}\u{1F600}\\n\\\"\\\\/\\u0001\u{7f}\"}"));
+        assert_eq!(sent(r#"{"a": "😀"}"#).as_deref(), Some("{\"a\":\"\u{1F600}\"}"));
+        assert_eq!(sent(r#"{"a": "\ud800"}"#), None);
+        assert_eq!(sent(r#"{"a": NaN}"#), None);
+        assert_eq!(sent(r#"{"a": -Infinity}"#), None);
+    }
 
     #[test]
     fn a_subscription_is_read_only_when_the_python_gateway_would_make_it() {

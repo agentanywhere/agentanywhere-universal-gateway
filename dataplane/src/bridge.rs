@@ -9,7 +9,7 @@
 //! sample's generated code is), which the snapshot says.
 
 use std::collections::VecDeque;
-use std::fmt;
+use std::convert::Infallible;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -246,23 +246,9 @@ pub async fn hello(sent: ResponseFuture) -> Result<String, u8> {
     tokio::time::timeout(Duration::from_secs(UNARY_SECONDS), whole).await.unwrap_or(Err(4))
 }
 
-/// The stream broke off: the caller's answer ends without being finished, as the Python gateway's does.
-#[derive(Debug)]
-pub struct Broken;
-
-impl fmt::Display for Broken {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("the gRPC stream ended in failure")
-    }
-}
-
-impl std::error::Error for Broken {}
-
 enum State {
     Calling(ResponseFuture),
     Reading(Incoming),
-    /// Broken off after lines were handed on: one more turn before saying so.
-    Breaking,
     Done,
 }
 
@@ -272,8 +258,6 @@ pub struct Lines {
     buf: BytesMut,
     ready: VecDeque<Bytes>,
     deadline: Pin<Box<tokio::time::Sleep>>,
-    /// Whether a line has been handed on since the body last waited.
-    sent: bool,
 }
 
 impl Lines {
@@ -283,21 +267,14 @@ impl Lines {
             buf: BytesMut::new(),
             ready: VecDeque::new(),
             deadline: Box::pin(tokio::time::sleep(Duration::from_secs(STREAM_SECONDS))),
-            sent: false,
         }
     }
 
-    /// End the stream in failure. hyper drops the connection on a body's error without writing
-    /// what it still holds, so a line handed on just before would never reach the caller: first
-    /// wait one turn, in which hyper writes it out, as the Python gateway's answer has it.
-    fn broken(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, Broken>>> {
-        if std::mem::take(&mut self.sent) {
-            self.state = State::Breaking;
-            cx.waker().wake_by_ref();
-            return Poll::Pending;
-        }
+    /// End the stream after a failure. The Python gateway's answer ends there as a finished
+    /// one, after the lines that came before it (Starlette's streaming answer since 1.x).
+    fn broken(&mut self) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
         self.state = State::Done;
-        Poll::Ready(Some(Err(Broken)))
+        Poll::Ready(None)
     }
 }
 
@@ -311,26 +288,24 @@ fn line(message: &str) -> Bytes {
 
 impl hyper::body::Body for Lines {
     type Data = Bytes;
-    type Error = Broken;
+    type Error = Infallible;
 
-    fn poll_frame(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, Broken>>> {
+    fn poll_frame(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
         let this = self.get_mut();
         loop {
             if let Some(line) = this.ready.pop_front() {
-                this.sent = true;
                 return Poll::Ready(Some(Ok(Frame::data(line))));
             }
             match &mut this.state {
                 State::Done => return Poll::Ready(None),
-                State::Breaking => return this.broken(cx),
-                _ if this.deadline.as_mut().poll(cx).is_ready() => return this.broken(cx),
+                _ if this.deadline.as_mut().poll(cx).is_ready() => return this.broken(),
                 State::Calling(sent) => match std::task::ready!(Pin::new(sent).poll(cx)) {
                     Ok(resp) => match (grpc_answer(&resp), status(resp.headers())) {
                         (Ok(()), None) => this.state = State::Reading(resp.into_body()),
                         (Ok(()), Some(0)) => this.state = State::Done,
-                        _ => return this.broken(cx),
+                        _ => return this.broken(),
                     },
-                    Err(_) => return this.broken(cx),
+                    Err(_) => return this.broken(),
                 },
                 State::Reading(body) => match std::task::ready!(Pin::new(body).poll_frame(cx)) {
                     Some(Ok(frame)) => match frame.into_data() {
@@ -338,16 +313,16 @@ impl hyper::body::Body for Lines {
                             this.buf.extend_from_slice(&data);
                             match messages(&mut this.buf) {
                                 Some(found) => this.ready.extend(found.iter().map(|m| line(m))),
-                                None => return this.broken(cx),
+                                None => return this.broken(),
                             }
                         }
                         Err(frame) => match frame.trailers_ref().and_then(status) {
                             Some(0) if this.buf.is_empty() => this.state = State::Done,
-                            _ => return this.broken(cx),
+                            _ => return this.broken(),
                         },
                     },
                     // Ended without saying how it went.
-                    _ => return this.broken(cx),
+                    _ => return this.broken(),
                 },
             }
         }
@@ -407,7 +382,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stream_that_fails_at_once_still_sends_what_came_before() {
+    fn a_stream_that_fails_at_once_sends_what_came_before_and_ends() {
         use hyper_util::rt::{TokioExecutor, TokioIo};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
@@ -452,7 +427,7 @@ mod tests {
             let _ = tokio::time::timeout(Duration::from_secs(10), caller.read_to_end(&mut got)).await;
             let got = String::from_utf8_lossy(&got);
             assert!(got.contains(r#"{"status": "stream_chunk", "message": "Hello nobody #0 "}"#), "{got}");
-            assert!(!got.ends_with("0\r\n\r\n"), "the answer was finished as if nothing went wrong: {got}");
+            assert!(got.ends_with("0\r\n\r\n"), "the answer was not finished, as the Python gateway finishes it: {got}");
         });
     }
 
