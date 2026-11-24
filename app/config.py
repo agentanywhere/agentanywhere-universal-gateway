@@ -445,7 +445,7 @@ class Settings(BaseSettings):
 
     # Application
     app_name: str = "AgentAnywhere Universal Gateway"
-    app_version: str = "1.0.0"
+    app_version: str = "0.9.0"
     debug: bool = False
     environment: str = "production"
 

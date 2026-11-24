@@ -21,15 +21,14 @@ release you are moving to, and have a [backup](back-up-and-restore.md).
 - The project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   and records changes in `CHANGELOG.md` in the
   [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format.
-- The current version is `1.0.0`, marked **Unreleased** in the changelog. No
-  release tag has been published yet.
+- The current version is `0.9.0`, the first release (tag `v0.9.0`).
 - [SECURITY.md](../../SECURITY.md) lists which versions receive security fixes.
-- The version a running gateway reports is `APP_VERSION` (default `1.0.0`),
+- The version a running gateway reports is `APP_VERSION` (default `0.9.0`),
   shown by `/health`. It is a setting, so check the git tag or the image tag
   to know what code is running.
-- Release tags (`v*`) trigger two workflows: `docker-publish.yml` pushes an
-  image to Docker Hub, and `pypi-publish.yml` publishes the package. Neither
-  has run yet.
+- A release tag (`v*`) runs `docker-publish.yml`, which pushes the image to
+  `ghcr.io/agentanywhere/agentanywhere-universal-gateway`. The PyPI package is
+  not published yet (`pypi-publish.yml` runs only by hand).
 
 ## How the schema is managed
 

@@ -1,25 +1,23 @@
 name: Publish to PyPI
 
-# Build and publish the agentanywhere-universal-gateway package on every tag of
-# the form `v*` (e.g. v1.0.0, v1.1.0-rc1). Uses PyPI Trusted Publishing
+# Build and publish the agentanywhere-universal-gateway package when run by hand
+# (Actions → Publish to PyPI → Run workflow). Not on tags yet: the PyPI project and
+# its Trusted Publisher are not set up. Uses PyPI Trusted Publishing
 # (OIDC) — no long-lived API tokens stored in GitHub secrets.
 #
 # One-time setup on PyPI:
 #   1. Reserve the project name `agentanywhere-universal-gateway` on pypi.org.
 #   2. Configure Trusted Publisher with:
-#        owner: shephertz
+#        owner: agentanywhere
 #        repository: agentanywhere-universal-gateway
 #        workflow: pypi-publish.yml
 #        environment: pypi
 #   3. (optional) Same for test.pypi.org with environment `test-pypi` if
 #      you want a dry-run target on `v*-rc*` tags.
 #
-# After setup, publishing is just `git tag v1.0.0 && git push --tags`.
+# Once that is done, add `push: tags: ["v*"]` back under `on:` to publish on each release tag.
 
 on:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
     inputs:
       target:
