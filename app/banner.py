@@ -15,10 +15,11 @@ from urllib.parse import urlsplit
 
 _RULE = "─" * 58
 
-# Protocols the gateway carries end to end, and the two whose routes exist but do
-# not forward yet. Keep in step with docs/explanation/protocol-support.md.
-SUPPORTED_PROTOCOLS = ("HTTP/REST", "MCP", "A2A", "AG-UI", "ACP", "GraphQL", "MQTT")
-UNSUPPORTED_PROTOCOLS = ("WebSocket", "gRPC")
+# Protocols the gateway carries end to end, and gRPC, which only the Rust data plane
+# carries (the Python gateway has its route but does not forward it). Keep in step with
+# docs/explanation/protocol-support.md.
+SUPPORTED_PROTOCOLS = ("HTTP/REST", "MCP", "A2A", "AG-UI", "ACP", "GraphQL", "MQTT", "WebSocket")
+UNSUPPORTED_PROTOCOLS = ("gRPC",)
 CONSOLE_URL = "http://127.0.0.1:3001"
 
 # Backend setting for each protocol, for the "Backends" row. Names only, never URLs.
@@ -126,7 +127,7 @@ def _rows(facts: Dict[str, Any]) -> List[Tuple[str, str]]:
         ("Admin API", _admin_row(facts["admin_credential"])),
         ("Console", f"{facts['console_url']}  (Docker Compose, or: cd admin-ui && npm run dev)"),
         ("Protocols", " · ".join(facts["protocols"])),
-        ("Not yet", " · ".join(facts["protocols_not_yet"]) + " (routes exist, no pass-through)"),
+        ("Not here", " · ".join(facts["protocols_not_yet"]) + " (only through the Rust data plane)"),
         ("Backends", ", ".join(facts["backends"]) or "none configured: set HTTP_BACKEND_URL and the others"),
         ("Storage", f"{facts['database']} database, Redis {'enabled' if facts['redis'] else 'disabled'}"),
         (

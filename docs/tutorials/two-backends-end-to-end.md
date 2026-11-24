@@ -337,7 +337,7 @@ steps 4 and 5.
 ### With the admin console
 
 The console is a React application in `admin-ui/`. To run it against your
-local gateway you need Node.js (the console's Dockerfile builds with Node 20):
+local gateway you need Node.js (the console's Dockerfile builds with Node 22):
 
 ```bash
 cd agentanywhere-universal-gateway/admin-ui

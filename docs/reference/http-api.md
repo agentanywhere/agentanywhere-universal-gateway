@@ -27,7 +27,7 @@ timestamps differ on every run. JSON is indented for reading.
 
 ## Base URL and credentials
 
-The gateway listens on `http://localhost:8000` by default. There is no version
+The gateway listens on `http://127.0.0.1:8000` by default (use `127.0.0.1`: `localhost` may resolve to IPv6 first). There is no version
 prefix.
 
 | Plane | Paths | Send |
@@ -147,13 +147,13 @@ the prefixes.
 Example, with the sample HTTP backend:
 
 ```bash
-curl -s -X POST http://localhost:8000/api/users \
+curl -s -X POST http://127.0.0.1:8000/api/users \
   -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
   -d '{"name": "Ada", "email": "ada@example.com"}'
 ```
 
 ```json
-{"id": "user_1", "name": "Ada", "email": "ada@example.com", "metadata": null, "created_at": "2026-10-20T17:26:25.810109+00:00"}
+{"id":"user_1","name":"Ada","email":"ada@example.com","metadata":null,"created_at":"2026-10-20T17:26:25.810109+00:00"}
 ```
 
 Dedicated data-plane endpoints:
@@ -182,7 +182,7 @@ given.
 | `allowed_paths` | none | Path scope: comma-separated prefixes (or a JSON list in a body), matched on whole segments; an entry ending in `*` is a plain prefix. Requests elsewhere, and paths with `.` or `..` segments, answer 403. Empty means every path. |
 
 ```bash
-curl -s -X POST "http://localhost:8000/admin/api-keys?name=first-key" -H "Authorization: Bearer $ADMIN"
+curl -s -X POST "http://127.0.0.1:8000/admin/api-keys?name=first-key" -H "Authorization: Bearer $ADMIN"
 ```
 
 ```json

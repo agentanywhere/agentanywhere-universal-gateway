@@ -198,8 +198,8 @@ def test_banner_lists_protocols_console_and_documentation():
         http_backend_url="http://h:1", mcp_backend_url="http://m:2", a2a_backend_url=None,
         documentation_url="https://docs.example.com/gw",
     ))
-    assert "HTTP/REST · MCP · A2A · AG-UI · ACP · GraphQL · MQTT" in text
-    assert "WebSocket · gRPC" in text and "no pass-through" in text
+    assert "HTTP/REST · MCP · A2A · AG-UI · ACP · GraphQL · MQTT · WebSocket" in text
+    assert "gRPC (only through the Rust data plane)" in text
     assert "http://127.0.0.1:3001" in text and "npm run dev" in text
     assert "https://docs.example.com/gw" in text
     assert "HTTP/REST, MCP" in text and "A2A," not in text.split("Backends")[1].splitlines()[0]

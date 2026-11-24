@@ -103,7 +103,7 @@ documentation links, and the logging settings. It never shows a secret. Turn it
 off with `STARTUP_BANNER=false`.
 
 **Admin console (optional).** The console is a separate React app; plain
-`uvicorn` does not serve it. In another terminal, with Node 20 (the version the Docker build uses):
+`uvicorn` does not serve it. In another terminal, with Node 22 (the version the Docker build uses):
 
 ```bash
 cd admin-ui && npm ci && npm run dev
@@ -133,25 +133,12 @@ curl -s -X POST http://127.0.0.1:8000/api/users -H "X-API-Key: $API_KEY" \
   -H "Content-Type: application/json" -d '{"name": "Ada", "email": "ada@example.com"}'
 ```
 
-The console is a separate React app; plain `uvicorn` does not serve it. To see
-it, open another terminal (Node 22) and run this from the repository directory,
-the one that contains `admin-ui/`:
-
-```bash
-cd agentanywhere-universal-gateway/admin-ui
-npm ci
-npm run dev
-```
-
-Then open <http://127.0.0.1:3001> and sign in as `admin` with your `ADMIN_TOKEN`.
-The gateway must be running on port 8000: the dev server proxies to it.
-
 ### What you should see
 
 The first request returns the user the backend created:
 
 ```json
-{"id": "user_1", "name": "Ada", "email": "ada@example.com", "metadata": null, "created_at": "2026-10-20T19:29:25.848555+00:00"}
+{"id":"user_1","name":"Ada","email":"ada@example.com","metadata":null,"created_at":"2026-10-20T19:29:25.848555+00:00"}
 ```
 
 Without the `X-API-Key` header the gateway answers `401` and the backend never

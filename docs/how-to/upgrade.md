@@ -95,8 +95,8 @@ points at a disposable database, which CI does not set.
 **Check:**
 
 ```bash
-curl -s http://localhost:8000/health    # "version" is the expected APP_VERSION
-curl -s http://localhost:8000/ready     # "status": "ready"
+curl -s http://127.0.0.1:8000/health    # "version" is the expected APP_VERSION
+curl -s http://127.0.0.1:8000/ready     # "status": "ready"
 ```
 
 and make one request with an existing API key.
