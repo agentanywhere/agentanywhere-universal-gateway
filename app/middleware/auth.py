@@ -18,6 +18,7 @@ from app.client_ip import client_ip as _client_ip
 from sqlalchemy.ext.asyncio import AsyncSession
 import redis
 import json
+import asyncio
 import time
 import structlog
 
@@ -41,6 +42,29 @@ def missing_key_details() -> dict:
 
 def invalid_key_details() -> dict:
     return {"hint": INVALID_KEY_HINT, "documentation": docs_link("authentication")}
+
+
+BREAK_GLASS_AUTH_TYPE = "secret_key_break_glass"
+# At most one audit row (and warning) per client IP and path per window; the
+# next row carries how many uses there were in between. Every use is counted.
+BREAK_GLASS_AUDIT_WINDOW_SECONDS = 60
+_BREAK_GLASS_WINDOWS_MAX = 10_000
+
+# Background audit writes are held here until they finish, so the event loop's
+# weak reference is not the only one (a task can otherwise be collected mid-write).
+_background_tasks: "set[asyncio.Task]" = set()
+
+
+def _now() -> float:
+    """Clock for the audit window (replaceable in tests)."""
+    return time.monotonic()
+
+
+def _audit_session():
+    """Session for break-glass audit rows, committed on their own (replaceable in tests)."""
+    from app.database import AsyncSessionLocal
+
+    return AsyncSessionLocal()
 
 
 def _normalise_scope_path(path: str) -> Optional[str]:
@@ -286,22 +310,26 @@ class AuthMiddleware:
                 pass  # Fall through to legacy validation
 
         # Break-glass bootstrap key: accept the configured SECRET_KEY as an API
-        # key ONLY when it has been changed from the shipped default. This lets a
-        # fresh install authenticate before any DB key exists, without the old
-        # behaviour of trusting *any* value beginning with "sk-" (which allowed
-        # `X-API-Key: sk-anything` to authenticate). A default/unconfigured
+        # key ONLY when it has been changed from the shipped default and
+        # ALLOW_SECRET_KEY_API_KEY is on (it is off by default). This lets a
+        # fresh install authenticate before any DB key exists. Every use is
+        # warned, counted and audited (see authenticate). A default/unconfigured
         # SECRET_KEY grants nothing.
         if (
             settings.secret_key
             and not settings.secret_key.startswith("change-me")
             and constant_time_equals(api_key, settings.secret_key)
         ):
+            if not settings.allow_secret_key_api_key:
+                logger.warning("secret_key_api_key_refused")
+                return None
             return APIKey(
                 key=api_key,
                 name="default",
                 rate_limit_per_minute=settings.rate_limit_per_minute,
                 rate_limit_per_hour=settings.rate_limit_per_hour,
-                is_active=True
+                is_active=True,
+                metadata={"auth_type": BREAK_GLASS_AUTH_TYPE},
             )
 
         return None
@@ -362,6 +390,9 @@ class AuthMiddleware:
             except Exception:
                 pass
 
+        if (validated_key.metadata or {}).get("auth_type") == BREAK_GLASS_AUTH_TYPE:
+            self._record_break_glass_use(request)
+
         # Path scope: a key created with allowed_paths may only reach those.
         self._enforce_allowed_paths(request, validated_key)
 
@@ -369,6 +400,78 @@ class AuthMiddleware:
         await self._enforce_governance(request, validated_key)
 
         return validated_key
+
+    def _record_break_glass_use(self, request: Request) -> None:
+        """Count, warn about and audit a proxy request authenticated with SECRET_KEY."""
+        state = getattr(request, "state", None)
+        headers = getattr(request, "headers", {}) or {}
+        url = getattr(request, "url", None)
+        try:
+            client_ip = _client_ip(request)
+        except Exception:
+            client_ip = None
+        details = {
+            "path": getattr(url, "path", None),
+            "method": getattr(request, "method", None),
+            "client_ip": client_ip,
+            "user_agent": headers.get("user-agent"),
+            "request_id": getattr(state, "request_id", None),
+        }
+        try:
+            from app.metrics import secret_key_api_key_uses
+
+            secret_key_api_key_uses.inc()
+        except Exception:
+            pass
+
+        # One audit row per (client IP, path) per window.
+        windows = self.__dict__.setdefault("_break_glass_windows", {})
+        now = _now()
+        key = (details["client_ip"], details["path"])
+        window = windows.get(key)
+        if window and now - window["start"] < BREAK_GLASS_AUDIT_WINDOW_SECONDS:
+            window["uses"] += 1
+            return
+        uses_between = window["uses"] if window else 0
+        windows[key] = {"start": now, "uses": 0}
+        if len(windows) > _BREAK_GLASS_WINDOWS_MAX:
+            for k in [k for k, w in windows.items() if now - w["start"] >= BREAK_GLASS_AUDIT_WINDOW_SECONDS]:
+                windows.pop(k, None)
+
+        logger.warning("secret_key_used_as_api_key", uses_since_last_entry=uses_between, **details)
+
+        async def _write() -> None:
+            try:
+                from app.governance import AuditEntry, audit_log
+
+                async with _audit_session() as db:
+                    await audit_log.record(
+                        db,
+                        AuditEntry(
+                            action="auth.secret_key_as_api_key",
+                            actor="secret-key",
+                            resource_type="http_request",
+                            resource_id=details["path"],
+                            request_id=details["request_id"],
+                            client_ip=details["client_ip"],
+                            user_agent=details["user_agent"],
+                            metadata={
+                                "method": details["method"],
+                                "uses_since_last_entry": uses_between,
+                                "window_seconds": BREAK_GLASS_AUDIT_WINDOW_SECONDS,
+                            },
+                        ),
+                    )
+                    await db.commit()
+            except Exception as exc:  # noqa: BLE001
+                logger.error("secret_key_audit_failed", error=str(exc))
+
+        try:
+            task = asyncio.get_running_loop().create_task(_write())
+        except RuntimeError:
+            return
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
 
     async def _governed(self, request: Request, principal: Optional[APIKey]) -> Optional[APIKey]:
         """An OAuth2 token's caller goes through the IP rules and policies like a key's. It used

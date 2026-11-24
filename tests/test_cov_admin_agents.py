@@ -408,12 +408,13 @@ async def test_audit_helper_swallows_failures(monkeypatch):
     await mod._audit(None, _Req(), "agent.create", "x-agent", "tok-abcdefgh12345678")
 
 
-def test_actor_fingerprint_never_leaks_full_token():
+def test_actor_is_a_principal_never_a_token_fragment():
     import admin.agents_api as mod
 
     assert mod._actor(None) is None
     assert mod._actor("") is None
-    assert mod._actor("0123456789abcdef") == "89abcdef"
+    assert mod._actor("0123456789abcdef") == "unknown"
+    assert mod._actor(get_settings().secret_key) == "secret-key"
 
 
 @pytest.mark.asyncio
@@ -421,4 +422,4 @@ async def test_repo_row_visible_after_api_create(client, edge, db_session):
     _create(client)
     row = await AgentRegistryRepository.get(db_session, "orders-agent")
     assert row is not None and row.enabled is True
-    assert row.updated_by == get_settings().secret_key[-8:]
+    assert row.updated_by == "secret-key"

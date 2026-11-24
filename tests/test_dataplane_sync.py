@@ -280,7 +280,7 @@ async def test_the_snapshot_names_the_paths_this_gateway_answers_itself(db_sessi
         assert path in own, path
     # Every route but the catch-all is covered, so a route added later is too.
     from app.main import app, gateway_proxy
-    for route in app.routes:
+    for route in dataplane_sync.served_routes(app.routes):
         if getattr(route, "endpoint", None) is not gateway_proxy:
             assert any(route.path.startswith(p) for p in own), route.path
     assert "/" not in own and "" not in own
@@ -419,9 +419,10 @@ async def test_since_the_current_revision_answers_unchanged(db_session, monkeypa
 
 
 def test_the_route_is_registered_and_hidden_from_the_schema():
+    from app.dataplane_sync import served_routes
     from app.main import app
 
-    paths = {r.path for r in app.routes}
+    paths = {r.path for r in served_routes(app.routes)}
     assert "/internal/dataplane/snapshot" in paths
     assert "/internal/dataplane/snapshot" not in app.openapi().get("paths", {})
 
@@ -1194,13 +1195,16 @@ async def test_the_snapshot_says_how_a_request_from_another_origin_is_answered(d
     # A preflight is answered from what the middleware itself holds once set up this way.
     asked = await said(preflight=True)
     assert asked["explicit_origin"] is True and asked["all_headers"] is True and "DELETE" in asked["methods"]
-    assert asked["headers"][0] == ["Vary", "Origin"] and ["Access-Control-Allow-Credentials", "true"] in asked["headers"]
+    # Starlette names more in this Vary in later releases ("Origin, Access-Control-Request-Method, ...").
+    vary, said_vary = asked["headers"][0]
+    assert vary == "Vary" and said_vary.split(",")[0] == "Origin"
+    assert ["Access-Control-Allow-Credentials", "true"] in asked["headers"]
     monkeypatch.setattr(gw, "_cors_options", {"allow_origins": ["*", "http://a.example"], "allow_credentials": False,
                                               "allow_methods": ["GET"], "allow_headers": []})
     assert await said() == {"any_origin": True, "origins": ["http://a.example"], "credentials": False}
     asked = await said(preflight=True)
     assert asked["explicit_origin"] is False and asked["all_headers"] is False and asked["methods"] == ["GET"]
-    assert asked["headers"][0] == ["Access-Control-Allow-Origin", "*"]
+    assert ["Access-Control-Allow-Origin", "*"] in asked["headers"]
     assert asked["allow_headers"] == ["accept", "accept-language", "content-language", "content-type"]
     # An option the data plane does not reproduce: such requests stay with this gateway.
     monkeypatch.setattr(gw, "_cors_options", {"allow_origins": [], "allow_credentials": False, "allow_origin_regex": "https://.*"})

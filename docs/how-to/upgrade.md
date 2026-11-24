@@ -110,11 +110,14 @@ column. These behaviours changed and may need action:
 | Change | What to do |
 |---|---|
 | With `ADMIN_TOKEN` set, `SECRET_KEY` no longer authenticates on `/admin/*` (or on `/metrics` and `/health/detailed` with `OPS_ENDPOINTS_REQUIRE_ADMIN=true`). | Give operators and Prometheus `ADMIN_TOKEN`, or set `ADMIN_ACCEPT_SECRET_KEY=true` for the old behaviour. |
+| `SECRET_KEY` is no longer accepted as an API key on the data plane (401). | Create API keys with `POST /admin/api-keys`. For a first boot with no keys, `ALLOW_SECRET_KEY_API_KEY=true` restores it; every use is counted, logged and audited. |
+| Audit entries name the admin principal (`admin-token`, `secret-key` or `sso:<user>`) instead of the last eight characters of the credential. Existing rows keep their old actor. | Update any audit query that filters on `actor`. |
 | Keys are stored as hashes. `GET /admin/api-keys` returns `id` and `key_prefix`, never the key. Existing keys keep working and lose their plaintext copy on first use. | Record new keys when you create them; they cannot be shown again. |
 | `allowed_paths` is enforced: 403 outside it. | Check keys created with it. |
 | `X-Forwarded-For` is ignored unless the connection comes from `TRUSTED_PROXIES` (empty by default). | Behind a proxy, list its address. |
 | `/docs`, `/redoc` and `/openapi.json` answer 404 with `DEBUG=false`. | Use `DEBUG=true` locally. |
 | Rate-limit counters are named after a hash of the key. | Current minute and hour windows start again once. |
+| Per-minute tenant usage rows older than a day are deleted, at start-up and daily. Request logs are kept unless `REQUEST_LOG_RETENTION_DAYS` is set. | To prune request logs, set `REQUEST_LOG_RETENTION_DAYS`. |
 | CORS defaults to the local admin console's origins; `*` turns credentials off. | Set `CORS_ORIGINS`. |
 | Docker Compose keeps SQLite at `/app/data/gateway.db` on the `gateway_data` volume, and ignores `*_BACKEND_URL` from `.env` in favour of `DOCKER_*_BACKEND_URL`. | See the next section, and [Deploy with Docker Compose](deploy-with-docker-compose.md). |
 | GraphQL requests are passed to the backend as they came (method, headers, query string, body) and its answer comes back whole. Before, the gateway sent only `query`, `variables` and `operationName`, without the caller's headers, refused a body without `query` with a 400, and turned every backend error into a 502. | Check that the GraphQL server expects the caller's headers (`X-API-Key`, `Authorization` and cookies now reach it), and that clients handle the server's own error statuses. |
@@ -134,9 +137,13 @@ If the old container still exists:
 
    ```bash
    docker compose cp ./gateway.db gateway:/app/data/gateway.db
-   docker compose exec -u root gateway chown gateway:gateway /app/data/gateway.db
+   docker compose exec -u root gateway sh -c 'chown gateway:gateway /app/data/gateway.db'
    docker compose restart gateway
    ```
+
+   The container path is inside `sh -c '...'` because Git Bash on Windows
+   rewrites an argument that starts with `/` before Docker sees it; see
+   [Back up and restore](back-up-and-restore.md#back-up-sqlite).
 
 ## Databases built with the old migrations
 

@@ -294,8 +294,7 @@ experimental; you need the Rust toolchain only to build it. See
 
 Version 1.0.0 is not yet released. It has an automated test suite that runs on
 every push, a Dockerfile, a Compose file and an nginx configuration. Some
-settings look like controls but are not enforced yet, and `SECRET_KEY` remains
-a break-glass API key. Read the [known limitations](docs/known-limitations.md)
+settings look like controls but are not enforced yet. Read the [known limitations](docs/known-limitations.md)
 and work through [Secure the gateway for production](docs/how-to/secure-for-production.md)
 before you decide.
 
@@ -319,8 +318,9 @@ More questions are answered in the [FAQ](docs/faq.md).
   every connection, and the gRPC bridge answers `"status": "unsupported"`.
 - **Some settings are not enforced yet:** admin roles, per-protocol rate
   limits, the policy `rate_limit` action and tenant `requests_per_day`.
-- **`SECRET_KEY` is a break-glass credential** accepted as an API key on every
-  data-plane route (and on the admin API while `ADMIN_TOKEN` is empty).
+- **`SECRET_KEY` is a break-glass credential** on the admin API while
+  `ADMIN_TOKEN` is empty. It is refused as an API key unless
+  `ALLOW_SECRET_KEY_API_KEY=true`.
 - **Defaults to review:** `/metrics` and `/health/detailed` need no credential
   unless `OPS_ENDPOINTS_REQUIRE_ADMIN=true`; nginx limits them to private
   addresses, but the Compose file publishes port 8000 directly.

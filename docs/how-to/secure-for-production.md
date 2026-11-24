@@ -36,7 +36,7 @@ gateway audited or certified.
 - [ ] `CORS_ORIGINS` lists the exact origins of your front ends, not `*`. ([CORS](#cors))
 - [ ] The database is PostgreSQL, or SQLite on a volume that is backed up. ([Data at rest](#data-at-rest))
 - [ ] Backups taken before the key-hashing upgrade are protected or destroyed. ([Data at rest](#data-at-rest))
-- [ ] `request_logs` is pruned on a schedule. ([Data at rest](#data-at-rest))
+- [ ] `REQUEST_LOG_RETENTION_DAYS` matches how long you may keep request logs. ([Data at rest](#data-at-rest))
 - [ ] Keys have expiry dates and, where useful, `allowed_paths`. ([API keys](#api-keys))
 - [ ] Redis and PostgreSQL are not reachable from outside their network; the Grafana and PostgreSQL passwords are generated values. ([Docker Compose defaults](#docker-compose-defaults))
 - [ ] Sample backends are not running. ([Docker Compose defaults](#docker-compose-defaults))
@@ -57,8 +57,9 @@ gateway audited or certified.
    unset or `false`.
 
 With `ADMIN_TOKEN` set, operators use `ADMIN_TOKEN` and the admin API refuses
-`SECRET_KEY`. `SECRET_KEY` remains a break-glass API key on the data plane, so
-keep it secret anyway.
+`SECRET_KEY`. Leave `ALLOW_SECRET_KEY_API_KEY` unset or `false`, so that
+`SECRET_KEY` is not an API key on the data plane either, and keep it secret
+anyway.
 
 If `ADMIN_TOKEN` leaks, change it and restart; the console and CLI need to
 sign in again.
@@ -114,13 +115,9 @@ credentials off and logs `cors_wildcard_credentials_disabled` at start-up.
   plaintext copy until the key is next used, and backups taken before the
   upgrade contain them: protect or destroy those.
 - Keep Redis on a private network with a password.
-- Prune `request_logs` regularly:
-
-  ```sql
-  DELETE FROM request_logs WHERE timestamp < now() - interval '30 days';
-  ```
-
-  (PostgreSQL syntax; for SQLite use `datetime('now', '-30 days')`.)
+- `request_logs` keeps every row unless `REQUEST_LOG_RETENTION_DAYS` is set;
+  rows older than that many days are then deleted automatically. Set it to the
+  period your policy allows. The governance audit log is never pruned.
 
 ## API keys
 
@@ -149,7 +146,6 @@ credentials off and logs `cors_wildcard_credentials_disabled` at start-up.
 
 These need code changes. Plan around them:
 
-- `SECRET_KEY` is accepted as an API key on every data-plane route.
 - Admin roles are not enforced yet. Every admin credential has full access.
 - `PROTOCOL_*_RATE_LIMIT_*`, policy `rate_limit` actions and tenant
   `requests_per_day` are not enforced yet.
@@ -167,5 +163,7 @@ curl -s -o /dev/null -w "%{http_code}\n" https://gateway.example.com/docs       
 curl -s -o /dev/null -w "%{http_code}\n" https://gateway.example.com/api/anything       # expect 401
 curl -s -o /dev/null -w "%{http_code}\n" -H "Authorization: Bearer $SECRET_KEY" \
   https://gateway.example.com/admin/tenants                                             # expect 401 with ADMIN_TOKEN set
+curl -s -o /dev/null -w "%{http_code}\n" -H "X-API-Key: $SECRET_KEY" \
+  https://gateway.example.com/api/anything                                              # expect 401
 curl -s -o /dev/null -w "%{http_code}\n" --max-time 5 http://gateway.example.com:8000/health   # expect a timeout or refusal
 ```

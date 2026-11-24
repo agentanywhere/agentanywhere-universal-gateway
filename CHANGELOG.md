@@ -49,18 +49,22 @@ See [docs/known-limitations.md](docs/known-limitations.md) for the full list.
 - How-to: run the experimental Rust data plane in front of the gateway. The
   quick start, the Python install and the Docker image are unchanged and need
   no Rust.
+- Container commands in the backup and upgrade how-tos work in Git Bash on
+  Windows: container paths are passed inside `sh -c '...'` (Git Bash rewrote
+  a standalone `/app/...` argument, so `rm` and `chown` failed), and the
+  whole-volume backup streams the archive to the host instead of mounting a
+  host folder.
 - Documentation reorganised into tutorials, how-to guides, reference and
   explanation, with a map in `docs/README.md`.
 - `scripts/check_docs.py`, `scripts/check_env_vars.py` and
   `scripts/generate_http_reference.py --check` run in CI.
+- The two-backends tutorial's tenant step works when re-run: after creating
+  `acme` it sets the quota with `PUT /admin/tenants/acme/quota`, so a tenant
+  left over from an earlier run (whose create answers 409) is put back to 3
+  requests a minute.
 
 ### Fixed
 
-- Proxy: a request whose body came without a length (`Transfer-Encoding:
-  chunked`) is sent to the backend with its length and without that header.
-  The caller's `Transfer-Encoding` was passed on beside the `Content-Length`
-  the gateway adds, which is not a valid request: a backend may refuse it, or
-  read where the body ends differently from a proxy in front of it.
 - Proxy: a query that gives a key more than once (`?tag=a&tag=b`) now reaches
   the backend with every value. Only the last value was sent on before. A
   transformation rule or plugin that sets, changes or removes such a key
@@ -77,6 +81,21 @@ See [docs/known-limitations.md](docs/known-limitations.md) for the full list.
   likewise.
 - A backend that sets more than one cookie has each `Set-Cookie` line passed on as its own line. They were
   joined into one line by commas, which a browser does not read as cookies.
+- Proxy: a request whose body came without a length (`Transfer-Encoding:
+  chunked`) is sent to the backend with its length and without that header.
+  The caller's `Transfer-Encoding` was passed on beside the `Content-Length`
+  the gateway adds, which is not a valid request: a backend may refuse it, or
+  read where the body ends differently from a proxy in front of it.
+- API versions: a sunset date given with a UTC offset (`2027-01-01T00:00:00+00:00`,
+  or one ending in `Z`) now works. Comparing it with the current time raised
+  an error, so the admin call that set the date failed and so did every
+  request under that version.
+- Transformations: a rule that sets a header which cannot be written is now
+  refused when it is made (400), instead of failing every request it applies
+  to (502). That is a header name that is not a token, or a value that starts
+  or ends with a space, holds a line break or another control character, or
+  holds characters outside ASCII on a request or outside Latin-1 on an
+  answer.
 - Transformations: a rule that changes a request's body now works. The new
   body was sent with the length the caller declared for the old one, so the
   request never reached the backend and the caller got a 502. Three related
@@ -92,6 +111,33 @@ See [docs/known-limitations.md](docs/known-limitations.md) for the full list.
   the gateway was restarted, while still reporting itself connected. Now it
   answers 503 `MQTT broker not connected` while the broker is away and
   publishes again once it is back.
+- Security: a request whose path decodes to `?`, `#` or a control character
+  (`/api/x%3F/../admin`) is refused with a 400 (`INVALID_PATH`). The key's
+  allowed paths, the policies and the agent edge read the path only up to a
+  decoded `?` or `#`, while the proxy forwarded all of it: the backend was sent
+  `/api/x?/../admin`, with a query no rule had seen, and an agent was asked for
+  less than the caller named.
+- Proxy: a request path that decodes to `?`, `#` or a control character is
+  forwarded with that character escaped, as path data. A caller's
+  `/api/a%3Fadmin=1` reached the backend as `/api/a?admin=1`, a query
+  parameter no rule or check had seen; a `%23` cut the rest of the path off;
+  and a `%0A` made the request fail.
+- `GET /admin/webhooks`: each row's `event_type` is the event that webhook was
+  registered for. Without an `event_type` filter every row said `all`, which
+  is not an event the gateway sends. The filter still works.
+- Admin console: the Protocols page no longer reports every backend as "not
+  configured", and the Settings page fills in the backend URLs, environment and
+  log level. `GET /admin/config` groups settings into sections; the console now
+  reads them from there instead of looking for flat fields.
+- `pytest` passes with the `.env` the getting-started tutorial writes:
+  `tests/conftest.py` sets an empty `ADMIN_TOKEN` (and
+  `ADMIN_ACCEPT_SECRET_KEY=false`) in the environment, which takes precedence
+  over `.env`, so the admin tests' `SECRET_KEY` login is accepted (they
+  answered 401). `docs/how-to/run-the-tests.md` says so.
+- The start-up banner's documentation link (`DOCUMENTATION_URL`) now defaults
+  to https://docs.agentanywhere.ai/gateway/ instead of the repository's
+  `docs/` folder.
+
 - Database migrations: the Alembic migrations `001` and `002` were replaced by
   one baseline, `0001`, that creates the full current schema. It is safe to
   run on a database the gateway already created at startup, works on SQLite
@@ -109,10 +155,19 @@ See [docs/known-limitations.md](docs/known-limitations.md) for the full list.
 - nginx: `nginx/nginx.conf` is installed as `conf.d/default.conf` (as the main
   `nginx.conf` it did not load), and `/metrics` and `/health/detailed` are
   served to loopback and private addresses only.
+- `scripts/generate_ssl_cert.sh` works in Git Bash on Windows: it turns off
+  Git Bash's path rewriting (`MSYS_NO_PATHCONV=1`) for the `openssl req`
+  call, which had turned the `-subj "/C=US/..."` subject into a Windows path,
+  so only `key.pem` was written and nginx would not start.
 - New `OPS_ENDPOINTS_REQUIRE_ADMIN` (default false) requires the admin
   credential on `/metrics` and `/health/detailed`.
 - CORS: a `"*"` origin now turns credentials off, with a startup warning, and
   the default origins are the local admin console's instead of `"*"`.
+- `examples/basic_usage.py`: the HTTP example sends the body the sample HTTP
+  backend accepts (`name` and `email`) instead of one it rejected with 422,
+  and the error-handling example sends no API key, so it shows the 401 its
+  comment describes (it sent `{}` with a valid key and got 422). The gateway
+  address can be set with `GATEWAY_URL` (default `http://127.0.0.1:8000`).
 - Requests rejected by the auth layer (401, 403, 429) now carry
   `X-Request-ID`, have `request_id` in the body, are counted in
   `gateway_requests_total` (path label reduced to its first segment or
@@ -144,15 +199,31 @@ See [docs/known-limitations.md](docs/known-limitations.md) for the full list.
   rule had every JSON answer rewritten (other spacing and escaping), a JSON
   string answer lost its quotes, and a rule for headers or the status was
   skipped when the body was not UTF-8 text.
+- With `REDIS_ENABLED=true` and no Redis listening (the `env.example`
+  defaults), each proxied request waited for several Redis connection
+  attempts, because the rate limiter tried Redis for both the per-minute and
+  the per-hour check before falling back to its in-memory counters. After a
+  failed Redis call the rate limiter now uses the in-memory counters for 30
+  seconds without trying Redis, then tries again, as the API-key cache does
+  (#84).
+- `tests/test_followup_fixes.py::test_quickstart_script_picks_python_with_requests`
+  copies the helper out of `scripts/quickstart_test.sh` in Python instead of
+  running `sed`, so it no longer crashes on Git for Windows, which puts
+  `bash` on `PATH` but not `sed`.
 
 ### Changed (may need action on upgrade; see docs/how-to/upgrade.md)
 
+- `SECRET_KEY` on the data plane now gets 401. Create API keys, or set
+  `ALLOW_SECRET_KEY_API_KEY=true` for a first boot with no keys.
 - With `ADMIN_TOKEN` set, `SECRET_KEY` is no longer an admin credential
   (`ADMIN_ACCEPT_SECRET_KEY=true` restores it).
 - `GET /admin/api-keys` no longer returns keys; new keys are shown once.
 - `allowed_paths` is enforced (403 outside it).
 - `X-Forwarded-For` is ignored unless `TRUSTED_PROXIES` lists the peer.
 - `/docs`, `/redoc`, `/openapi.json` answer 404 with `DEBUG=false`.
+- New `REQUEST_LOG_RETENTION_DAYS`: request log rows older than that many
+  days are deleted at start-up and daily. The default, `0`, keeps every row,
+  as before. Per-minute tenant usage rows older than a day are deleted. The audit log is not pruned.
 - GraphQL requests are passed through. The gateway used to build a new request
   from `query`, `variables` and `operationName`, so the caller's headers
   (`Authorization` among them), `extensions`, `GET` queries and batched bodies
@@ -164,6 +235,23 @@ See [docs/known-limitations.md](docs/known-limitations.md) for the full list.
 
 ### Security
 
+- Dependencies with known advisories are upgraded (FastAPI, Starlette, anyio,
+  cryptography, Authlib, python-multipart, Jinja2, protobuf, gRPC, requests,
+  httpx, uvicorn, websockets, pydantic); `pip-audit` reports none for
+  `requirements.txt`. Starlette and anyio are now pinned directly.
+- Single sign-on tokens are verified with PyJWT instead of python-jose, which
+  has an advisory with no fix. The verifier picks the signing key by `kid`,
+  accepts RS256 only, checks audience and issuer, and allows 30 seconds of
+  clock skew.
+- The runtime container image no longer contains pip, setuptools or wheel.
+- `SECRET_KEY` is no longer accepted as an API key on the data plane unless
+  `ALLOW_SECRET_KEY_API_KEY=true` (off by default). When it is on, every use
+  is counted (`gateway_secret_key_api_key_uses_total`), logged and written to
+  the governance audit log.
+- Audit entries name the admin principal (`admin-token`, `secret-key` or
+  `sso:<user>`), never the last characters of the credential.
+- Concurrent writes to the governance audit log can no longer fork its hash
+  chain.
 - The admin API accepts only the configured `ADMIN_TOKEN`, or `SECRET_KEY`
   when it is not the placeholder from `env.example`. There is no default
   admin password, and no credential is accepted because of its prefix or length.

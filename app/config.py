@@ -103,6 +103,7 @@ SECTIONS: Dict[str, Sequence[str]] = {
         "admin_token",
         "admin_username",
         "admin_accept_secret_key",
+        "allow_secret_key_api_key",
         "algorithm",
         "access_token_expire_minutes",
         "api_key_header",
@@ -120,6 +121,7 @@ SECTIONS: Dict[str, Sequence[str]] = {
         "rate_limit_per_hour",
         "rate_limit_redis_url",
     ),
+    "retention": ("request_log_retention_days", "retention_interval_hours"),
     "redis": ("redis_url", "redis_enabled"),
     "database": ("database_url",),
     "backends": (
@@ -465,6 +467,12 @@ class Settings(BaseSettings):
     # SECRET_KEY is accepted as an admin credential only while ADMIN_TOKEN is
     # empty. true restores the old behaviour of accepting both.
     admin_accept_secret_key: bool = False
+    # Break-glass, off by default: accept SECRET_KEY as an API key on the proxy
+    # (data plane), for bootstrapping before any API key exists. When enabled,
+    # every use is logged as a warning, counted
+    # (gateway_secret_key_api_key_uses_total) and written to the governance
+    # audit log. Create a real API key instead wherever possible.
+    allow_secret_key_api_key: bool = False
     # Not used yet: nothing in this release signs tokens, so ALGORITHM and
     # ACCESS_TOKEN_EXPIRE_MINUTES have no effect.
     algorithm: str = "HS256"
@@ -490,6 +498,12 @@ class Settings(BaseSettings):
     rate_limit_per_minute: int = 60
     rate_limit_per_hour: int = 1000
     rate_limit_redis_url: Optional[str] = None
+
+    # Retention (see app/retention.py): request log rows older than this many
+    # days are deleted (0 keeps them forever); pruning runs at start-up and
+    # every retention_interval_hours.
+    request_log_retention_days: int = 0
+    retention_interval_hours: int = 24
 
     # Redis
     redis_url: str = "redis://localhost:6379/0"
@@ -621,7 +635,7 @@ class Settings(BaseSettings):
     analytics_adapter: str = "full"       # full | off
     request_log_sink: str = "database"    # database | null
     # Where the start-up banner points people for help; set it to your own docs site.
-    documentation_url: str = "https://github.com/agentanywhere/agentanywhere-universal-gateway/tree/main/docs"
+    documentation_url: str = "https://docs.agentanywhere.ai/gateway/"
 
     # Metrics
     metrics_enabled: bool = True

@@ -256,6 +256,13 @@ async def lifespan(app: FastAPI):
         except Exception as rr_exc:  # noqa: BLE001
             logger.warning("route_registry_init_failed", error=str(rr_exc))
 
+    # Retention: prune request logs and per-minute usage rows on a schedule.
+    try:
+        from app.retention import retention_loop
+        app.state.retention_task = asyncio.create_task(retention_loop())
+    except Exception as ret_exc:  # noqa: BLE001
+        logger.warning("retention_init_failed", error=str(ret_exc))
+
     # Live agent health/traffic monitor for the console Mission Control board.
     try:
         from app.agent_monitor import agent_monitor
@@ -282,7 +289,7 @@ async def lifespan(app: FastAPI):
     yield
     
     logger.info("gateway_shutting_down")
-    for _task_attr in ("agent_registry_task", "agent_monitor_task"):
+    for _task_attr in ("agent_registry_task", "agent_monitor_task", "retention_task"):
         _task = getattr(app.state, _task_attr, None)
         if _task is not None:
             _task.cancel()
@@ -1230,9 +1237,34 @@ def _rejected_path_label(path: str) -> str:
     return f"/{first}" if first in _REJECTED_PATH_LABEL_PREFIXES else "/other"
 
 
+def _breaks_out_of_the_path(path: str) -> bool:
+    """Whether a decoded request path holds a character that is not path data once it is in a URL.
+
+    A caller's ``/api/x%3F/../admin`` is ``/api/x?/../admin`` once decoded. What reads the URL
+    (``request.url.path``: the key's allowed paths, the policies, the agent edge) stops at that
+    ``?``, while the path forwarded is the whole of it, so the two would not be the same path. A
+    ``#`` does the same, and a control character makes a URL invalid.
+    """
+    return any(c in "?#" or ord(c) < 0x20 or ord(c) == 0x7F for c in path)
+
+
 @app.middleware("http")
 async def auth_middleware_handler(request: Request, call_next):
     """Authentication middleware handler."""
+    # A path that decodes to `?`, `#` or a control character is refused before anything reads it.
+    if _breaks_out_of_the_path(request.scope.get("path", "")):
+        return render_error_response(
+            request,
+            status.HTTP_400_BAD_REQUEST,
+            {
+                "error": "INVALID_PATH",
+                "message": "The request path holds an escaped '?', '#' or control character, which cannot be part of a path.",
+                "request_id": getattr(request.state, "request_id", None),
+                "timestamp": utcnow().isoformat(),
+                "details": {},
+            },
+        )
+
     # Skip auth for OPTIONS requests (CORS preflight)
     if request.method == "OPTIONS":
         return await call_next(request)
@@ -1962,6 +1994,24 @@ async def oauth2_authorize(
         )
 
 
+def _client_credentials(request: Request, body: Dict[str, Any]):
+    """The client id and secret a token request carries: HTTP Basic first, else the body."""
+    scheme, _, encoded = request.headers.get("authorization", "").partition(" ")
+    if scheme.lower() == "basic" and encoded.strip():
+        try:
+            import base64
+            from urllib.parse import unquote_plus
+
+            client_id, sep, secret = base64.b64decode(encoded.strip(), validate=True).decode("utf-8").partition(":")
+            if sep:
+                return unquote_plus(client_id), unquote_plus(secret)
+        except Exception:  # noqa: BLE001 - not a Basic credential: nothing presented
+            pass
+        return None, None
+    client_id, secret = body.get("client_id"), body.get("client_secret")
+    return (client_id if isinstance(client_id, str) else None, secret if isinstance(secret, str) else None)
+
+
 @app.post("/oauth2/token")
 async def oauth2_token(request: Request):
     """OAuth2 token endpoint (RFC 6749, Sections 4.1.3, 4.4, 6).
@@ -2015,6 +2065,9 @@ async def oauth2_token(request: Request):
             return JSONResponse(content=token_data)
 
         if grant_type == "client_credentials":
+            # The caller proves who it is with the provider's client credentials (RFC 6749, 2.3.1):
+            # HTTP Basic, or client_id and client_secret in the body.
+            oauth2_manager.authenticate_client(provider, *_client_credentials(request, body))
             scope = body.get("scope")
             scopes = scope.split() if isinstance(scope, str) and scope else None
             token_data = await oauth2_manager.client_credentials(provider, scopes)
@@ -2182,6 +2235,33 @@ _STRIP_RESPONSE_HEADERS = {
     "content-length",
     "content-encoding",
 }
+
+
+def _restore_repeated_header_lines(response: Response, upstream_headers, sent_headers) -> None:
+    """Give the caller each line of a header the backend sent more than once.
+
+    Response headers travel through the proxy as a dict, and reading httpx headers
+    as a dict joins lines of the same name with ", ". For ``Set-Cookie`` that loses
+    cookies: a browser reads the joined line as a single cookie, and it cannot be
+    split apart again because a cookie may hold a comma of its own (``Expires``).
+
+    ``sent_headers`` is the dict the response was built from. A header is put back
+    as separate lines only when its value there is still the joined value httpx
+    produced, so a header that a transformation or plugin rewrote or removed stays
+    as that step left it.
+    """
+    lines: dict[str, list[str]] = {}
+    for name, value in upstream_headers.multi_items():
+        lines.setdefault(name.lower(), []).append(value)
+    for name, values in lines.items():
+        if len(values) < 2 or name in _STRIP_RESPONSE_HEADERS:
+            continue
+        sent = [v for k, v in sent_headers.items() if k.lower() == name]
+        if sent != [upstream_headers.get(name)]:
+            continue
+        del response.headers[name]
+        for value in values:
+            response.headers.append(name, value)
 
 
 async def _proxy_agent_route(request: Request, agent_route, request_id: str) -> Response:
@@ -2430,24 +2510,8 @@ async def answer_from(response, method: str, path: str, request_headers: Dict[st
         headers=response_headers,
         media_type=response.headers.get("content-type", "application/json")
     )
-    _keep_cookie_lines(answer, response)
+    _restore_repeated_header_lines(answer, response.headers, response_headers)
     return answer
-
-
-def _keep_cookie_lines(answer: Response, upstream) -> None:
-    """Give the caller each ``Set-Cookie`` line of a backend's answer as its own line.
-
-    The answer's headers are read into a dictionary on the way, where the lines of one name
-    are joined by a comma, and cookies joined that way are no longer cookies a browser can
-    read. The lines are put back as they came, unless a rule or a plugin has changed the
-    header since."""
-    cookies = [value for name, value in upstream.headers.raw if name.lower() == b"set-cookie"]
-    if len(cookies) < 2:
-        return
-    lines = answer.raw_headers
-    found = [i for i, (name, _) in enumerate(lines) if name == b"set-cookie"]
-    if len(found) == 1 and lines[found[0]][1] == b", ".join(cookies):
-        lines[found[0]:found[0] + 1] = [(b"set-cookie", cookie) for cookie in cookies]
 
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
@@ -2669,12 +2733,14 @@ async def gateway_proxy(request: Request, path: str):
                 finally:
                     await upstream.aclose()
 
-            return StreamingResponse(
+            streaming_response = StreamingResponse(
                 _stream_body(),
                 status_code=upstream.status_code,
                 headers=resp_headers,
                 media_type=ct.split(";")[0].strip() if ct else None,
             )
+            _restore_repeated_header_lines(streaming_response, upstream.headers, resp_headers)
+            return streaming_response
 
         # Route request
         response = await router.route_request(

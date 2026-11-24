@@ -70,28 +70,20 @@ sample GraphQL backend listens on 8006. (Docker Compose uses the HTTP sample's
 
 ## Credentials and keys
 
-### `SECRET_KEY` is still accepted as an API key on every data-plane route
+### `SECRET_KEY` can be switched on as an API key
 
-**Reproduced.** `SECRET_KEY` (when it is not the `change-me` placeholder) is a
-break-glass credential: it authenticates on every data-plane route with the
-default rate limits, whether or not `ADMIN_TOKEN` is set. On the admin API it
-is accepted only while `ADMIN_TOKEN` is empty, unless
-`ADMIN_ACCEPT_SECRET_KEY=true`. It signs nothing.
+**By design, off by default.** With `ALLOW_SECRET_KEY_API_KEY=true`,
+`SECRET_KEY` (when it is not the `change-me` placeholder) authenticates on
+every data-plane route with the default rate limits, whether or not
+`ADMIN_TOKEN` is set. Each use is counted
+(`gateway_secret_key_api_key_uses_total`), logged and written to the
+governance audit log. On the admin API `SECRET_KEY` is accepted only while
+`ADMIN_TOKEN` is empty, unless `ADMIN_ACCEPT_SECRET_KEY=true`. It signs nothing.
 
-**Workaround.** Keep `SECRET_KEY` in your secret store and give it to no
-client. Set `ADMIN_TOKEN` so that `SECRET_KEY` stops opening the admin API. See
+**Workaround.** Leave `ALLOW_SECRET_KEY_API_KEY` off and create API keys. Keep
+`SECRET_KEY` in your secret store and give it to no client. Set `ADMIN_TOKEN`
+so that `SECRET_KEY` stops opening the admin API. See
 the [security model](explanation/security-model.md#the-secret_key-break-glass-credential).
-
-### Using `SECRET_KEY` as an API key writes it to the logs
-
-**Reproduced.** The log context records `api_key_id` for each request, falling
-back to the key itself when the principal has no database id. For a request
-authenticated with `SECRET_KEY`, the `http_access` line therefore contains
-`"api_key_id": "<SECRET_KEY>"` in clear. (Keys created through the admin API
-are logged by their id.)
-
-**Workaround.** Do not use `SECRET_KEY` as an API key except in an emergency;
-if you did, rotate it and treat the logs as containing it.
 
 ### Keys created by earlier builds stay in plaintext until they are used
 
@@ -182,12 +174,15 @@ shared between processes.
 
 **Workaround.** Re-apply them at start-up from your deployment tooling.
 
-### `request_logs` is never pruned
+### `request_logs` keeps every row by default
 
-Every request, including rejected ones, writes a row. The `protocol` column is
-always null.
+Every request, including rejected ones, writes a row, and nothing is deleted
+unless `REQUEST_LOG_RETENTION_DAYS` is set. With it set, rows older than that
+many days are deleted at start-up and then every `RETENTION_INTERVAL_HOURS`.
+SQLite reuses the freed pages, but the file does not shrink without a `VACUUM`.
 
-**Workaround.** Delete old rows on a schedule.
+**Workaround.** Set `REQUEST_LOG_RETENTION_DAYS` to the number of days you
+need, and export logs first if you must keep them for longer.
 
 ### `docker compose down -v` deletes the database
 

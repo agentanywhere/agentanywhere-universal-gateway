@@ -114,7 +114,7 @@ flowchart TD
 | Step | Code | What it does |
 |---|---|---|
 | Find the key | `AuthMiddleware._get_api_key_from_header` (`app/middleware/auth.py`) | Reads the header named by `API_KEY_HEADER` (default `X-API-Key`), then `Authorization: Bearer`. |
-| Validate the key | `AuthMiddleware._validate_api_key` | Redis cache first (if enabled; keyed by the key's hash), then the database by SHA-256 hash; checks expiry and `is_active`; finally accepts `SECRET_KEY` if it is not the placeholder. |
+| Validate the key | `AuthMiddleware._validate_api_key` | Redis cache first (if enabled; keyed by the key's hash), then the database by SHA-256 hash; checks expiry and `is_active`; finally accepts `SECRET_KEY` if `ALLOW_SECRET_KEY_API_KEY=true` and it is not the placeholder. |
 | Path scope | `path_is_allowed` (`app/middleware/auth.py`) | A key with `allowed_paths` gets 403 for other paths. |
 | Client address | `client_ip` (`app/client_ip.py`) | The connection's address, or `X-Forwarded-For` read from the right when the connection comes from `TRUSTED_PROXIES`. |
 | OAuth2 fallback | `AuthMiddleware._validate_oauth2_token` | A bearer token issued by the gateway's own OAuth2 endpoints is accepted, with the default limits. |

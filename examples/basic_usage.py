@@ -8,7 +8,8 @@ Usage:
     export API_KEY=your-api-key-here
     python examples/basic_usage.py
     
-    # Or edit API_KEY in this file
+    # Or edit API_KEY in this file. GATEWAY_URL (default
+    # http://127.0.0.1:8000) points the examples at another gateway.
 """
 import os
 import requests
@@ -16,7 +17,7 @@ import json
 from typing import Dict, Any
 
 # Gateway configuration
-GATEWAY_URL = "http://localhost:8000"
+GATEWAY_URL = os.getenv("GATEWAY_URL", "http://127.0.0.1:8000")
 API_KEY = os.getenv("API_KEY", "your-api-key-here")  # Set via environment or replace here
 
 
@@ -100,12 +101,16 @@ def example_mqtt_publish():
 
 
 def example_http_request():
-    """Example: Make a standard HTTP/REST request."""
+    """Example: Make a standard HTTP/REST request.
+
+    The sample HTTP backend treats POST /api/users as "create a user"; name
+    and email are required. It answers with the new user and its id.
+    """
     print("\n=== HTTP/REST Request Example ===")
     
     data = {
-        "action": "get_user",
-        "user_id": "user123"
+        "name": "Ada",
+        "email": "ada@example.com"
     }
     
     try:
@@ -165,12 +170,21 @@ def example_get_health():
 
 
 def example_with_error_handling():
-    """Example: Proper error handling."""
+    """Example: Proper error handling.
+
+    The request is sent without an X-API-Key header, so the gateway answers
+    401 before it reaches a backend.
+    """
     print("\n=== Error Handling Example ===")
     
     try:
-        # This will fail without proper API key
-        result = make_request("/mcp/query", method="POST", data={})
+        # No API key: make_request() would add one, so call requests directly.
+        response = requests.post(
+            f"{GATEWAY_URL}/mcp/query",
+            json={"query": "What is the weather today?"},
+        )
+        response.raise_for_status()
+        print(f"Response: {json.dumps(response.json(), indent=2)}")
     except requests.exceptions.HTTPError as e:
         if e.response.status_code == 401:
             print("Authentication failed - check your API key")

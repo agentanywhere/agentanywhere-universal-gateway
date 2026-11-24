@@ -139,6 +139,20 @@ def _versions(settings=None) -> Dict[str, Any]:
     }
 
 
+def served_routes(routes):
+    """Every route the app serves, at its full path.
+
+    Older FastAPI copies an included router's routes into the app's list. Newer versions keep
+    the router as one entry and work out its routes, with the prefix applied, as "effective"
+    routes."""
+    for route in routes:
+        candidates = getattr(route, "effective_candidates", None)
+        if callable(candidates):
+            yield from served_routes(candidates())
+        else:
+            yield route
+
+
 def _own_paths(settings) -> Optional[List[str]]:
     """How the paths this gateway answers itself begin, when every other path with no protocol's
     prefix goes to the HTTP backend (``Router._get_backend_url``). ``None`` when they go elsewhere
@@ -149,7 +163,7 @@ def _own_paths(settings) -> Optional[List[str]]:
 
     # What the authentication middleware lets through or answers by how the path begins.
     own = {"/admin", "/internal/dataplane", "/oauth2", "/agents/", *DOCS_PATHS}
-    for route in app.routes:
+    for route in served_routes(app.routes):
         if getattr(route, "endpoint", None) is gateway_proxy:
             continue
         literal = route.path.split("{", 1)[0]

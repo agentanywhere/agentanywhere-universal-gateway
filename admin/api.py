@@ -168,6 +168,34 @@ def verify_admin_token_value(token: Optional[str]) -> str:
     )
 
 
+def admin_principal(token: Optional[str]) -> Optional[str]:
+    """Who an already-verified admin credential belongs to, for audit records.
+
+    Never a fragment of the credential: a single sign-on token gives
+    ``sso:<preferred_username | email | sub>``; the static admin token gives
+    ``admin-token``; the SECRET_KEY gives ``secret-key``.
+    """
+    if not token:
+        return None
+    from app import ida_auth
+
+    if ida_auth.enabled() and ida_auth.is_ida_token(token):
+        try:
+            import jwt
+
+            # The signature was checked by verify_admin_token; this only reads it.
+            claims = jwt.decode(token, options={"verify_signature": False})
+        except Exception:
+            return "sso:unknown"
+        who = claims.get("preferred_username") or claims.get("email") or claims.get("sub")
+        return f"sso:{who}" if who else "sso:unknown"
+    if settings.admin_token and constant_time_equals(token, settings.admin_token):
+        return "admin-token"
+    if settings.secret_key and constant_time_equals(token, settings.secret_key):
+        return "secret-key"
+    return "unknown"
+
+
 def verify_admin_token(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)):
     """Verify admin authentication token (OIDC SSO, legacy admin token, or SECRET_KEY)."""
     return verify_admin_token_value(credentials.credentials if credentials else None)
@@ -413,7 +441,7 @@ async def create_api_key(
                 event_type="created",
                 api_key_id=db_key.id,
                 api_key_name=name,
-                created_by=admin_token[:8] if admin_token else None
+                created_by=admin_principal(admin_token)
             )
         )
     except Exception:
@@ -1122,7 +1150,7 @@ async def update_config(
     )
 
     try:
-        result = _apply_runtime_changes(payload, actor=admin_token[-8:] if admin_token else None)
+        result = _apply_runtime_changes(payload, actor=admin_principal(admin_token))
     except _ConfigError as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -1544,13 +1572,24 @@ async def list_webhooks(
     event_type: Optional[str] = None,
     admin_token: str = Depends(verify_admin_token)
 ):
-    """List all registered webhooks."""
-    webhooks = webhook_manager.list_webhooks(event_type)
+    """List all registered webhooks.
+
+    ``?event_type=`` lists only the webhooks for that event. Each row's
+    ``event_type`` is the event that webhook was registered for.
+    """
+    if event_type:
+        rows = [(event_type, w) for w in webhook_manager.list_webhooks(event_type)]
+    else:
+        rows = [
+            (event, w)
+            for event, hooks in webhook_manager.webhooks.items()
+            for w in hooks
+        ]
     # Remove sensitive data
     return [
         {
             "id": w["id"],
-            "event_type": event_type or "all",
+            "event_type": event,
             "url": w["url"],
             "enabled": w.get("enabled", True),
             "created_at": w.get("created_at"),
@@ -1558,7 +1597,7 @@ async def list_webhooks(
             "last_success": w.get("last_success"),
             "last_failure": w.get("last_failure"),
         }
-        for w in webhooks
+        for event, w in rows
     ]
 
 
@@ -1630,7 +1669,7 @@ async def create_transformation(
           }
         }
     """
-    from app.transformers import transformation_manager
+    from app.transformers import header_problem, transformation_manager
 
     if not payload.get("name"):
         raise HTTPException(
@@ -1642,6 +1681,11 @@ async def create_transformation(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="At least one of 'request_config' or 'response_config' is required",
         )
+
+    # A header that cannot be written would fail every request the rule applies to.
+    problem = header_problem(payload)
+    if problem:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=problem)
 
     rule = transformation_manager.register_from_dict(payload)
     return rule.to_dict()
@@ -2983,7 +3027,7 @@ async def assign_admin_role(
         db,
         AuditEntry(
             action="rbac.role.assign",
-            actor=admin_token[-8:],
+            actor=admin_principal(admin_token),
             resource_type="admin_role",
             resource_id=row.id,
             after={"name": name, "role": role.value},
@@ -3016,7 +3060,7 @@ async def revoke_admin_role(
         db,
         AuditEntry(
             action="rbac.role.revoke",
-            actor=admin_token[-8:],
+            actor=admin_principal(admin_token),
             resource_type="admin_role",
             resource_id=role_id,
         ),
@@ -3071,7 +3115,7 @@ async def create_governance_policy(
         db,
         AuditEntry(
             action="policy.create",
-            actor=admin_token[-8:],
+            actor=admin_principal(admin_token),
             resource_type="policy",
             resource_id=policy.id,
             after=policy.to_dict(),
@@ -3108,7 +3152,7 @@ async def update_governance_policy(
         db,
         AuditEntry(
             action="policy.update",
-            actor=admin_token[-8:],
+            actor=admin_principal(admin_token),
             resource_type="policy",
             resource_id=policy_id,
             after=updated.to_dict(),
@@ -3135,7 +3179,7 @@ async def delete_governance_policy(
         db,
         AuditEntry(
             action="policy.delete",
-            actor=admin_token[-8:],
+            actor=admin_principal(admin_token),
             resource_type="policy",
             resource_id=policy_id,
         ),
@@ -3184,7 +3228,7 @@ async def create_governance_ip_rule(
         db,
         AuditEntry(
             action="ip_rule.create",
-            actor=admin_token[-8:],
+            actor=admin_principal(admin_token),
             resource_type="ip_rule",
             resource_id=rule.id,
             after=rule.to_dict(),
@@ -3211,7 +3255,7 @@ async def delete_governance_ip_rule(
         db,
         AuditEntry(
             action="ip_rule.delete",
-            actor=admin_token[-8:],
+            actor=admin_principal(admin_token),
             resource_type="ip_rule",
             resource_id=rule_id,
         ),
@@ -3244,7 +3288,7 @@ async def sweep_expired_api_keys(
         db,
         AuditEntry(
             action="api_keys.sweep_expired",
-            actor=admin_token[-8:],
+            actor=admin_principal(admin_token),
             outcome="success",
             metadata={"deactivated_count": count},
         ),

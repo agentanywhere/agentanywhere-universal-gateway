@@ -99,9 +99,10 @@ settings too, so `.env` applies to them; the process environment wins.)
 
 | Variable | Default | Description |
 |---|---|---|
-| `SECRET_KEY` | `change-me-in-production-use-strong-random-key` | **secret.** Break-glass credential: accepted as an API key on the data plane, and as the admin credential (and console password) only while `ADMIN_TOKEN` is empty. A value starting with `change-me` is treated as unset. Signs nothing. See the [security model](../explanation/security-model.md#the-secret_key-break-glass-credential). |
+| `SECRET_KEY` | `change-me-in-production-use-strong-random-key` | **secret.** Break-glass credential: the admin credential (and console password) only while `ADMIN_TOKEN` is empty, and an API key on the data plane only with `ALLOW_SECRET_KEY_API_KEY=true`. A value starting with `change-me` is treated as unset. Signs nothing. See the [security model](../explanation/security-model.md#the-secret_key-break-glass-credential). |
 | `ADMIN_TOKEN` | empty | **secret.** The admin credential (`Authorization: Bearer`) and, when set, the console password. Once set, `SECRET_KEY` no longer opens the admin API. |
 | `ADMIN_ACCEPT_SECRET_KEY` | `false` | `true` accepts `SECRET_KEY` on the admin API even when `ADMIN_TOKEN` is set, as earlier builds did. The placeholder is never accepted. |
+| `ALLOW_SECRET_KEY_API_KEY` | `false` | `true` accepts `SECRET_KEY` as an API key on the data plane, for a fresh install with no keys yet. Every use is counted (`gateway_secret_key_api_key_uses_total`), logged (`secret_key_used_as_api_key`) and written to the governance audit log (`auth.secret_key_as_api_key`). The placeholder is never accepted. |
 | `ADMIN_USERNAME` | `admin` | User name the console's sign-in form expects. |
 | `API_KEY_HEADER` | `X-API-Key` | Header the gateway reads API keys from, before falling back to `Authorization: Bearer`. |
 | `ALGORITHM` | `HS256` | **not read.** Nothing issues or signs tokens yet. |
@@ -125,6 +126,8 @@ settings too, so `.env` applies to them; the process environment wins.)
 | `RATE_LIMIT_PER_MINUTE` | `60` | **live.** Limit for principals without their own limit: `SECRET_KEY` used as a key, and OAuth2 tokens. Keys created through the admin API carry their own limits (default 60). |
 | `RATE_LIMIT_PER_HOUR` | `1000` | **live.** As above, per hour. |
 | `RATE_LIMIT_REDIS_URL` | unset | **secret.** Redis URL for rate-limit counters. Unset: counters live in each process's memory. `env.example` sets `redis://localhost:6379/1`. If Redis is unreachable, the gateway falls back to memory. |
+| `REQUEST_LOG_RETENTION_DAYS` | `0` | Request log rows older than this many days are deleted. `0` keeps them forever. Per-minute tenant usage rows older than a day are always deleted; hourly and daily usage and the audit log are kept. |
+| `RETENTION_INTERVAL_HOURS` | `24` | Hours between pruning runs. Pruning also runs at start-up. |
 | `REDIS_URL` | `redis://localhost:6379/0` | **secret.** Redis URL for the API-key cache (entries keyed by the key's hash, at most five minutes, dropped when a key is deleted or disabled). |
 | `REDIS_ENABLED` | `true` | Use `REDIS_URL` for the API-key cache. If Redis is unreachable, the cache is skipped. |
 | `REDIS_SOCKET_TIMEOUT` | `1.0` | Seconds a Redis call may block. After a failed call the cache is skipped for 30 seconds, so a missing Redis does not slow requests. |
@@ -261,7 +264,7 @@ The rate-limit values in this section are **not enforced yet**. They are shown b
 | `ANALYTICS_ADAPTER` | `full` | `full` runs the built-in anomaly detection and usage analytics, `off` runs none, or a `module:attribute` path to your own. `AI_ANALYTICS_ENABLED=false` still turns the per-request call off whichever adapter is chosen. |
 | `REQUEST_LOG_SINK` | `database` | Where request-log entries go: `database` (see `REQUEST_LOG_MODE`), `null` (discard), or a `module:attribute` path to your own. |
 | `AI_ANALYTICS_ENABLED` | `true` | Run the per-request anomaly detection and usage analytics. They run inside the request path and cost several milliseconds of CPU per request; set `false` for throughput. |
-| `DOCUMENTATION_URL` | the project's `docs/` folder on GitHub | The documentation link in the start-up banner. Set it to your own docs site. |
+| `DOCUMENTATION_URL` | `https://docs.agentanywhere.ai/gateway/` | The documentation link in the start-up banner. Set it to your own docs site. |
 
 ## Tracing
 

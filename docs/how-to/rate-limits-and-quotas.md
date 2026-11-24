@@ -49,7 +49,8 @@ Settings that look like limits but are **not enforced yet**:
    endpoint.
 
 `RATE_LIMIT_PER_MINUTE` and `RATE_LIMIT_PER_HOUR` apply only to principals
-without their own limits: `SECRET_KEY` used as a key, and OAuth2 tokens.
+without their own limits: OAuth2 tokens, and `SECRET_KEY` used as a key
+(`ALLOW_SECRET_KEY_API_KEY=true`).
 `RATE_LIMIT_ENABLED=false` turns per-key limiting off (and can be changed at
 run time with `PUT /admin/config`).
 

@@ -26,14 +26,14 @@ report a vulnerability, follow [SECURITY.md](../../SECURITY.md).
 | **API key** (`sk-...`) | Clients of the data plane | Created with `POST /admin/api-keys`; stored as a hash in `api_keys`. |
 | **Admin credential** | Operators, the admin console, the CLI | `ADMIN_TOKEN`. |
 | **OIDC access token** (optional) | Operators signing in through an OpenID Connect provider | Accepted on the admin plane when `IDA_ISSUER` is set. |
-| **OAuth2 access token** (optional) | Clients of the data plane | Issued through `/oauth2/token` from a provider registered with `POST /admin/oauth2/providers`. |
+| **OAuth2 access token** (optional) | Clients of the data plane | Issued through `/oauth2/token` from a provider registered with `POST /admin/oauth2/providers`. The client-credentials grant is given only to a caller that presents that provider's `client_id` and `client_secret` (HTTP Basic or in the body). |
 | **`SECRET_KEY`** | The operator, kept in a secret store | `.env` or the environment. A break-glass credential (see below). |
 
 ## What authenticates what
 
 | Request | Accepted credentials | Checked by |
 |---|---|---|
-| Data plane (`/mcp/*`, `/api/*`, the catch-all and the others) | An API key in `X-API-Key` (the header name is `API_KEY_HEADER`) or `Authorization: Bearer`; a gateway OAuth2 access token; `SECRET_KEY` if it is not the placeholder; anything an enabled auth-provider plugin accepts. | Authentication middleware |
+| Data plane (`/mcp/*`, `/api/*`, the catch-all and the others) | An API key in `X-API-Key` (the header name is `API_KEY_HEADER`) or `Authorization: Bearer`; a gateway OAuth2 access token; `SECRET_KEY` only with `ALLOW_SECRET_KEY_API_KEY=true` (off by default); anything an enabled auth-provider plugin accepts. | Authentication middleware |
 | Admin plane (`/admin/*`) | `Authorization: Bearer` with `ADMIN_TOKEN`; an OIDC access token if `IDA_ISSUER` is set; `SECRET_KEY` only while `ADMIN_TOKEN` is empty (or always, with `ADMIN_ACCEPT_SECRET_KEY=true`). | `verify_admin_token` on each endpoint |
 | `/metrics` and `/health/detailed` | Nothing by default. With `OPS_ENDPOINTS_REQUIRE_ADMIN=true`, the admin credential, checked the same way. | The endpoints |
 | `/admin/agents/stream` | The admin credential as `?token=` or as a bearer header. | The endpoint itself |
@@ -42,8 +42,9 @@ report a vulnerability, follow [SECURITY.md](../../SECURITY.md).
 | `/oauth2/*`, `/health`, `/live`, `/ready`, discovery documents | Nothing. | |
 
 An API key is never accepted on the admin plane, and `ADMIN_TOKEN` is not
-accepted on the data plane. `SECRET_KEY` is accepted on the data plane always,
-and on the admin plane as described above.
+accepted on the data plane. `SECRET_KEY` is refused on the data plane unless
+`ALLOW_SECRET_KEY_API_KEY=true`, and accepted on the admin plane as described
+above.
 
 Credentials are compared in constant time (`app/secure_compare.py`). A value
 containing non-ASCII characters is rejected with 401.
@@ -113,24 +114,30 @@ the hash.
 settings, but nothing in this release signs anything with it, and those two
 settings are not read. What it does:
 
-1. It is accepted as an API key on every data-plane route, with the default
-   rate limits (`RATE_LIMIT_PER_MINUTE`, `RATE_LIMIT_PER_HOUR`), so that a new
-   installation can make a request before any key exists. This is still true
-   when `ADMIN_TOKEN` is set.
+1. With `ALLOW_SECRET_KEY_API_KEY=true` it is accepted as an API key on every
+   data-plane route, with the default rate limits (`RATE_LIMIT_PER_MINUTE`,
+   `RATE_LIMIT_PER_HOUR`), so that a new installation can make a request
+   before any key exists. The setting is off by default: `SECRET_KEY` on the
+   data plane then gets 401 like any unknown key. While it is on, every such
+   request increments `gateway_secret_key_api_key_uses_total`, and a warning
+   (`secret_key_used_as_api_key`) and a governance audit entry
+   (`auth.secret_key_as_api_key`) are written at most once a minute for each
+   client address and path.
 2. It is the admin credential while `ADMIN_TOKEN` is empty. Once `ADMIN_TOKEN`
    is set, the admin API refuses it, unless `ADMIN_ACCEPT_SECRET_KEY=true`
    (the behaviour of earlier builds).
 
 The placeholder value (anything starting with `change-me`) is refused for
 both. A request authenticated with `SECRET_KEY` as an API key has no key id,
-so the access log records the key itself as `api_key_id`
-([known limitations](../known-limitations.md#using-secret_key-as-an-api-key-writes-it-to-the-logs)). With `ENVIRONMENT=production` and the placeholder, the gateway prints a
+so the access log records a short one-way hash of it (`key-...`) as
+`api_key_id`, never the key. With `ENVIRONMENT=production` and the placeholder, the gateway prints a
 warning to stderr and still starts.
 
 What to do: set `SECRET_KEY` and `ADMIN_TOKEN` to two different random values
 (`python3 scripts/generate_secret_key.py` prints one), give operators
-`ADMIN_TOKEN`, keep `SECRET_KEY` in your secret store, and never give it to a
-client.
+`ADMIN_TOKEN`, keep `SECRET_KEY` in your secret store, never give it to a
+client, and leave `ALLOW_SECRET_KEY_API_KEY` off: create an API key with
+`POST /admin/api-keys` instead.
 
 ## The client address
 

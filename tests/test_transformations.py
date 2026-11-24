@@ -330,9 +330,10 @@ def no_rules():
 
 
 @pytest.mark.asyncio
+# httpx 0.28 writes a JSON body without spaces.
 @pytest.mark.parametrize("config,sent,arrives", [
-    ({"body_set": {"meta.source": "gateway"}}, b'{"a":1}', '{"a": 1, "meta": {"source": "gateway"}}'),
-    ({"body_remove": ["secret"]}, b'{"a":1,"secret":"long enough to matter"}', '{"a": 1}'),
+    ({"body_set": {"meta.source": "gateway"}}, b'{"a":1}', '{"a":1,"meta":{"source":"gateway"}}'),
+    ({"body_remove": ["secret"]}, b'{"a":1,"secret":"long enough to matter"}', '{"a":1}'),
     ({"template": "hello {{ body.a }}"}, b'{"a":1}', "hello 1"),
     ({"body_set": {"a": 1}}, b"[1,2]", "[1,2]"),
     ({"body_set": {"a": 1}}, b"not json", "not json"),
