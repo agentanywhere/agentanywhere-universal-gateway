@@ -27,7 +27,7 @@ is the gateway.
 | **Licence** | Apache-2.0 |
 | **Requirements** | Docker with Compose, or Python 3.10 to 3.12. Redis and PostgreSQL are optional |
 | **Install** | `docker compose --profile backends up -d --build` ([quick start](#quick-start)) |
-| **Status** | Version 1.0.0, not yet released ([changelog](CHANGELOG.md), [known limitations](docs/known-limitations.md)) |
+| **Status** | Version 0.9.0, the first release ([changelog](CHANGELOG.md), [known limitations](docs/known-limitations.md)) |
 | **Maintainer** | [ShepHertz Technologies](https://gateway.agentanywhere.ai/) |
 
 <p align="center">
@@ -77,6 +77,10 @@ If port 8000 is taken, add `PORT=18000` to `.env` and use that port in the
 commands. Published ports listen on `127.0.0.1` only; see
 [Deploy with Docker Compose](docs/how-to/deploy-with-docker-compose.md) before
 you change that.
+
+Each release is also published as an image, so the gateway alone needs no build:
+`docker pull ghcr.io/agentanywhere/agentanywhere-universal-gateway:0.9.0` (or `:latest`).
+It reads the same settings as above (`--env-file .env`) and listens on port 8000.
 
 ### Option B: Python (no Docker)
 
@@ -292,7 +296,7 @@ experimental; you need the Rust toolchain only to build it. See
 
 ### Is it ready for production?
 
-Version 1.0.0 is not yet released. It has an automated test suite that runs on
+Version 0.9.0 is the first release. It has an automated test suite that runs on
 every push, a Dockerfile, a Compose file and an nginx configuration. Some
 settings look like controls but are not enforced yet. Read the [known limitations](docs/known-limitations.md)
 and work through [Secure the gateway for production](docs/how-to/secure-for-production.md)

@@ -4,10 +4,10 @@
 
 | Version | Supported |
 |---------|-----------|
-| 1.0.x   | Yes       |
-| < 1.0   | No        |
+| 0.9.x   | Yes       |
+| < 0.9   | No        |
 
-Version 1.0.0 is not yet released; see the [changelog](CHANGELOG.md).
+Version 0.9.0 is the first release; see the [changelog](CHANGELOG.md).
 
 ## Reporting a vulnerability
 
