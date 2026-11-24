@@ -578,6 +578,112 @@ def test_db_failure_then_auth_crash_is_internal_error(monkeypatch):
         app.dependency_overrides.clear()
 
 
+# ---------------------------------------------------------------- cookies a backend sets
+TWO_COOKIES = [("set-cookie", "session=alice; Path=/; Expires=Wed, 21 Oct 2026 07:28:00 GMT"), ("set-cookie", "csrf=1")]
+
+
+@pytest.fixture
+def no_rules():
+    from app.transformers import transformation_manager as manager
+    kept = dict(manager.rules_by_id), dict(manager.rules_by_path)
+    manager.rules_by_id.clear()
+    manager.rules_by_path.clear()
+    yield manager
+    manager.rules_by_id.clear()
+    manager.rules_by_path.clear()
+    manager.rules_by_id.update(kept[0])
+    manager.rules_by_path.update(kept[1])
+
+
+def test_each_cookie_a_backend_sets_reaches_the_caller_as_its_own_line(gwdb, monkeypatch, key, no_rules):
+    backend(monkeypatch, httpx.Response(200, json={"ok": True}, headers=TWO_COOKIES + [("x-agent", "echo")]))
+    r = gwdb.get("/mcp/t", headers={"X-API-Key": key})
+    assert r.status_code == 200 and r.json() == {"ok": True}
+    assert r.headers.get_list("set-cookie") == [value for _, value in TWO_COOKIES]
+    assert r.headers["x-agent"] == "echo"
+
+
+def test_one_cookie_and_none_are_left_as_they_came(gwdb, monkeypatch, key, no_rules):
+    backend(monkeypatch, httpx.Response(200, json={}, headers=TWO_COOKIES[:1]))
+    assert gwdb.get("/mcp/t", headers={"X-API-Key": key}).headers.get_list("set-cookie") == [TWO_COOKIES[0][1]]
+    backend(monkeypatch, httpx.Response(200, json={}))
+    assert gwdb.get("/mcp/t", headers={"X-API-Key": key}).headers.get_list("set-cookie") == []
+
+
+@pytest.mark.parametrize("config,given", [
+    # A rule that leaves the cookies alone leaves each on its line.
+    ({"headers_set": {"X-Powered": "gateway"}, "body_set": {"seen": True}}, [value for _, value in TWO_COOKIES]),
+    # One that changes them has the last word.
+    ({"headers_set": {"set-cookie": "mine=1"}}, ["mine=1"]),
+    ({"headers_remove": ["Set-Cookie"]}, []),
+    ({"headers_rename": {"Set-Cookie": "X-Was-Cookie"}}, []),
+])
+def test_a_rule_for_answers_and_the_cookies_a_backend_sets(gwdb, monkeypatch, key, no_rules, config, given):
+    no_rules.register_from_dict({"name": "r", "path_pattern": "*", "response_config": config})
+    backend(monkeypatch, httpx.Response(200, json={"ok": True}, headers=TWO_COOKIES))
+    r = gwdb.get("/mcp/t", headers={"X-API-Key": key})
+    assert r.status_code == 200
+    assert r.headers.get_list("set-cookie") == given
+
+
+# ---------------------------------------------------------------- an answer the data plane holds
+import gzip as _gzip  # noqa: E402
+
+ANSWERS = [
+    ("an object", 200, [("content-type", "application/json")], b'{"secret": 1, "kept": "yes"}'),
+    ("compressed", 200, [("content-type", "application/json"), ("content-encoding", "gzip")], _gzip.compress(b'{"secret": 1, "kept": "yes"}')),
+    ("two cookies", 200, TWO_COOKIES + [("x-agent", "echo")], b'{"secret": 1}'),
+    ("not UTF-8", 200, [("content-type", "application/json")], b'{"secret": 1, "name": "caf\xe9"}'),
+    ("a JSON string that spells an object", 200, [], b'"{\\"secret\\": 1, \\"kept\\": 2}"'),
+    ("a list", 200, [("content-type", "application/json")], b"[1, 2]"),
+    ("words, and no word on what they are", 404, [], b"not found"),
+    ("a number JSON does not have", 200, [], b'{"secret": 1, "n": NaN}'),
+    ("nothing", 204, [("x-agent", "echo")], b""),
+    ("a status the rule maps", 500, [("content-type", "application/json"), ("etag", "abc")], b'{"error": "x", "secret": 2}'),
+]
+
+
+@pytest.mark.parametrize("name,status,headers,body", ANSWERS, ids=[a[0] for a in ANSWERS])
+def test_an_answer_shown_by_the_data_plane_is_shaped_as_one_served_here(gwdb, monkeypatch, key, no_rules, name, status, headers, body):
+    """`/internal/dataplane/shape-answer` gives for a backend's answer what a caller of this
+    gateway is given for it: the same status, body and headers."""
+    from app.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "dataplane_token", "s3cret")
+    no_rules.register_from_dict({"name": "r", "path_pattern": "mcp/*", "response_config": {
+        "body_remove": ["secret"], "body_set": {"seen": True}, "headers_set": {"X-Powered": "gateway"}, "headers_remove": ["etag"],
+        "status_map": {"500": 502}}})
+    backend(monkeypatch, httpx.Response(status, headers=headers, content=body))
+    served = gwdb.get("/mcp/t", headers={"X-API-Key": key})
+
+    shown = gwdb.post("/internal/dataplane/shape-answer", content=body, headers=[
+        ("x-dataplane-token", "s3cret"), ("x-answer-status", str(status)), ("x-answer-method", "GET"), ("x-answer-path", "mcp/t"),
+        *[(f"x-answer-h-{i:04}-{n}", v) for i, (n, v) in enumerate(headers)]])
+    assert shown.status_code == 200
+    line, _, shaped = shown.content.partition(b"\n")
+    made = json.loads(line)
+    assert (made["status"], shaped) == (served.status_code, served.content)
+    lines = {}
+    for header, value in made["headers"]:
+        lines.setdefault(header, []).append(value)
+    for header, values in lines.items():
+        assert served.headers.get_list(header) == values, header
+    for header in ("content-type", "content-length", "set-cookie", "x-powered", "etag", "x-agent", "content-encoding"):
+        assert lines.get(header, []) == served.headers.get_list(header), header
+
+
+def test_an_answer_is_shaped_only_for_the_data_plane(gwdb, monkeypatch):
+    from app.config import get_settings
+
+    asked = [("x-answer-status", "200"), ("x-answer-method", "GET"), ("x-answer-path", "mcp/t")]
+    monkeypatch.setattr(get_settings(), "dataplane_token", "s3cret")
+    assert gwdb.post("/internal/dataplane/shape-answer", content=b"{}", headers=asked).status_code in (401, 403)
+    assert gwdb.post("/internal/dataplane/shape-answer", content=b"{}", headers=[("x-dataplane-token", "other"), *asked]).status_code in (401, 403)
+    assert gwdb.post("/internal/dataplane/shape-answer", content=b"{}", headers=[("x-dataplane-token", "s3cret")]).status_code == 400
+    assert gwdb.post("/internal/dataplane/shape-answer", content=b"{}", headers=[("x-dataplane-token", "s3cret"), ("x-answer-status", "two"), *asked[1:]]).status_code == 400
+    assert gwdb.post("/internal/dataplane/shape-answer", content=b"{}", headers=[("x-dataplane-token", "s3cret"), ("x-answer-h-etag", "abc"), *asked]).status_code == 400
+
+
 # ------------------------------------------------- repeated query keys
 @pytest.fixture
 def sent(monkeypatch):

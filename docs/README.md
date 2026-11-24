@@ -30,6 +30,7 @@ bug; please [report it](support.md).
 | [Send events to a webhook](how-to/configure-webhooks.md) | Get notified of rate-limit, circuit breaker and key events. |
 | [Run the tests](how-to/run-the-tests.md) | Run the suite and the documentation checks. |
 | [Test performance](how-to/performance-testing.md) | Measure the gateway's latency and throughput with the load-test suite. |
+| [Run the Rust data plane](how-to/run-the-data-plane.md) | Try the optional, experimental Rust proxy in front of the gateway. Installation is unchanged without it. |
 | [Deploy with Docker Compose](how-to/deploy-with-docker-compose.md) | Run the gateway, Redis, the console and optional services. |
 | [Troubleshoot 401, 403, 404, 502 and 429](how-to/troubleshoot-401-502-429.md) | Fix the most common request errors. |
 

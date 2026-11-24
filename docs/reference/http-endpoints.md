@@ -22,7 +22,7 @@ The list is generated with `DEBUG=false`, the default. With `DEBUG=true` the
 gateway also serves `/docs`, `/redoc` and `/openapi.json`; otherwise they
 answer 404.
 
-Totals: 159 operations (one per method and path), of which 135 are under `/admin`. 3 admin operations need no credential.
+Totals: 162 operations (one per method and path), of which 135 are under `/admin`. 3 admin operations need no credential.
 
 ## Contents
 
@@ -30,6 +30,7 @@ Totals: 159 operations (one per method and path), of which 135 are under `/admin
 - [Data plane](#data-plane) (3)
 - [WebSocket](#websocket) (2)
 - [OAuth2](#oauth2) (6)
+- [Internal](#internal) (3)
 - [Admin: /admin/agents](#admin-adminagents) (11)
 - [Admin: /admin/ai](#admin-adminai) (5)
 - [Admin: /admin/api-keys](#admin-adminapi-keys) (4)
@@ -60,7 +61,7 @@ Totals: 159 operations (one per method and path), of which 135 are under `/admin
 |---|---|---|---|---|
 | GET | `/health` | none |  | Liveness probe — fast, no external calls. |
 | GET | `/health/detailed` | none; admin with `OPS_ENDPOINTS_REQUIRE_ADMIN=true` |  | Detailed health: runs every registered dependency probe. |
-| GET | `/ready` | none |  | Readiness probe — green only if critical dependencies are up. |
+| GET | `/ready` | none |  | Readiness probe: green only if critical dependencies are up. |
 | GET | `/live` | none |  | Liveness probe (for Kubernetes `livenessProbe`). |
 | GET | `/metrics` | none; admin with `OPS_ENDPOINTS_REQUIRE_ADMIN=true` |  | Prometheus metrics endpoint. |
 | GET | `/.well-known/agent-card.json` | none |  | A2A Agent Card discovery (RFC 8615 /.well-known). |
@@ -93,6 +94,14 @@ The HTTP authentication middleware does not run for WebSocket connections. `/ws/
 | POST | `/oauth2/revoke` | none |  | OAuth2 token revocation endpoint (RFC 7009). |
 | GET | `/oauth2/userinfo` | none | `provider` *query*<br>`access_token` *query* | OAuth2 user info endpoint. |
 | GET | `/oauth2/providers` | none |  | List registered OAuth2 providers (public-safe metadata only). |
+
+## Internal
+
+| Method | Path | Credential | Parameters | Summary |
+|---|---|---|---|---|
+| POST | `/internal/dataplane/report` | `X-Dataplane-Token`; 404 unless `DATAPLANE_TOKEN` is set | JSON body: `DataplaneReport` | What the Rust data plane served and saw: counts, log rows, key use and events. |
+| POST | `/internal/dataplane/shape-answer` | `X-Dataplane-Token`; 404 unless `DATAPLANE_TOKEN` is set |  | What a caller is given for a backend's answer the data plane holds and is not certain of changing as this gateway's transformation rules change it: one that is compressed, is not known to be short, or has a body it might read or write differently. |
+| GET | `/internal/dataplane/snapshot` | `X-Dataplane-Token`; 404 unless `DATAPLANE_TOKEN` is set | `since?` *query* | The working set the Rust data plane serves from: key digests, limits and settings. |
 
 ## Admin: /admin/agents
 

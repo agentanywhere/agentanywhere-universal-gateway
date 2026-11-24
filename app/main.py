@@ -34,6 +34,11 @@ from app.exceptions import (
     NotFoundError, InternalServerError
 )
 from app.middleware import AuthMiddleware, RateLimiter
+from app.middleware.auth import INVALID_KEY_MESSAGE, MISSING_KEY_MESSAGE, missing_key_details
+
+# Response header that tells the data plane a 401 was about the credential itself. Set only when
+# DATAPLANE_TOKEN is configured; the data plane removes it before answering the client.
+DATAPLANE_AUTH_HEADER = "X-Dataplane-Auth"
 from app.routing import Router, repeated_headers, repeated_query
 from app.logging_config import (
     setup_logging,
@@ -372,6 +377,8 @@ def _iter_request_db():
 
 # Include admin router
 app.include_router(admin_router)
+from app.dataplane_sync import router as dataplane_router  # noqa: E402
+app.include_router(dataplane_router)
 
 # Agent-edge control plane (DB-backed registry CRUD + hot reload).
 from admin.agents_api import router as agents_admin_router
@@ -555,6 +562,19 @@ def _error_html(status_code: int, data: Dict[str, Any]) -> str:
   {script}
 </body>
 </html>"""
+
+
+INTERNAL_ERROR_MESSAGE = "An unexpected error occurred. Please try again later."
+
+
+def internal_error_data(request_id: Optional[str]) -> Dict[str, Any]:
+    """The body of the 500 for an error nobody handled. It says nothing about the error itself."""
+    return {
+        "error": "INTERNAL_ERROR",
+        "message": INTERNAL_ERROR_MESSAGE,
+        "request_id": request_id,
+        "timestamp": utcnow().isoformat(),
+    }
 
 
 def render_error_response(
@@ -764,12 +784,7 @@ async def general_exception_handler(request: Request, exc: Exception):
     )
     
     # Don't expose internal error details to users
-    response_data = {
-        "error": "INTERNAL_ERROR",
-        "message": "An unexpected error occurred. Please try again later.",
-        "request_id": request_id,
-        "timestamp": utcnow().isoformat(),
-    }
+    response_data = internal_error_data(request_id)
     
     if settings.metrics_enabled:
         metrics.error_count.labels(
@@ -978,6 +993,10 @@ async def logging_middleware(request: Request, call_next):
                 except Exception:  # noqa: BLE001
                     pass
         
+        # Only this gateway's own refusals may carry the note for the data plane: never a backend's answer.
+        if settings.dataplane_token and not auth_rejected and DATAPLANE_AUTH_HEADER in response.headers:
+            del response.headers[DATAPLANE_AUTH_HEADER]
+
         # Add response headers
         response.headers["X-Request-ID"] = request_id
         response.headers["X-Response-Time"] = f"{process_time:.3f}"
@@ -1198,6 +1217,10 @@ def _auth_reject(request: Request, status_code: int, data: Dict[str, Any], heade
         pass
     if not data.get("request_id"):
         data["request_id"] = getattr(request.state, "request_id", None)
+    # Behind the data plane, say which refusals are about the credential itself, so that it can
+    # answer the next request with the same credential without asking (it removes the header).
+    if settings.dataplane_token and status_code == 401 and data.get("message") == INVALID_KEY_MESSAGE:
+        headers = {**(headers or {}), DATAPLANE_AUTH_HEADER: "invalid-key"}
     return render_error_response(request, status_code, data, headers)
 
 
@@ -1311,6 +1334,7 @@ async def auth_middleware_handler(request: Request, call_next):
     }
     if (request.url.path in public_paths or
         request.url.path.startswith("/admin") or
+        request.url.path.startswith("/internal/dataplane") or
         request.url.path.startswith("/oauth2")):
         return await call_next(request)
     
@@ -1413,11 +1437,8 @@ async def auth_middleware_handler(request: Request, call_next):
                             message="API key required"
                         )
                         exc = AuthenticationError(
-                            message="API key required",
-                            details={
-                                "hint": "Include your API key in the X-API-Key header or Authorization header.",
-                                "documentation": docs_link("authentication")
-                            },
+                            message=MISSING_KEY_MESSAGE,
+                            details=missing_key_details(),
                             request_id=request_id
                         )
                         logger.info(
@@ -1512,11 +1533,8 @@ async def auth_middleware_handler(request: Request, call_next):
                     path=request.url.path
                 )
                 raise AuthenticationError(
-                    message="API key required",
-                    details={
-                        "hint": "Include your API key in the X-API-Key header or Authorization header.",
-                        "documentation": docs_link("authentication")
-                    },
+                    message=MISSING_KEY_MESSAGE,
+                    details=missing_key_details(),
                     request_id=request_id
                 )
         except (HTTPException, GatewayException) as e:
@@ -1615,26 +1633,30 @@ async def detailed_health_check(request: Request):
     )
 
 
-@app.get("/ready")
-async def readiness_check():
-    """Readiness probe — green only if critical dependencies are up.
+async def readiness() -> tuple:
+    """What ``/ready`` answers, as ``(status code, body)``.
 
     The database is the only hard requirement; cache / backends /
     exporters being down only flag a degraded state but the gateway
-    can still serve.
+    can still serve. The data plane is given the same answer with every
+    snapshot, so that it can serve ``/ready`` itself.
     """
     from app.observability import dependency_probes
 
     db_result = await dependency_probes.check("database")
     if db_result is None or db_result.status == "unhealthy":
-        return JSONResponse(
-            content={
-                "status": "not_ready",
-                "reason": db_result.message if db_result else "no probe registered",
-            },
-            status_code=503,
-        )
-    return {"status": "ready", "database": db_result.to_dict()}
+        return 503, {
+            "status": "not_ready",
+            "reason": db_result.message if db_result else "no probe registered",
+        }
+    return 200, {"status": "ready", "database": db_result.to_dict()}
+
+
+@app.get("/ready")
+async def readiness_check():
+    """Readiness probe: green only if critical dependencies are up."""
+    status_code, body = await readiness()
+    return JSONResponse(content=body, status_code=status_code)
 
 
 @app.get("/live")
@@ -1691,29 +1713,99 @@ async def websocket_proxy(websocket: WebSocket, path: str):
         await websocket.close(code=1008, reason="Authentication failed")
         return
     
+    # A WebSocket backend (ws:// or wss://) gets the connection itself, frame for frame.
+    backend_url = getattr(websocket_handler, "backend_url", None)
+    if websocket_backend_is_a_websocket(backend_url):
+        await _relay_backend_ws(websocket, backend_url, path)
+        return
+
     # Handle WebSocket connection
     await websocket_handler.handle_connection(websocket, f"/{path}")
 
 
-async def _relay_agent_ws(client_ws: WebSocket, upstream, slug: str):
-    """Bidirectionally relay frames between the browser client and the upstream
-    agent WebSocket until either side closes."""
+def websocket_backend_is_a_websocket(url: Optional[str]) -> bool:
+    """True when ``WEBSOCKET_BACKEND_URL`` names a WebSocket server, which connections are relayed to."""
+    return isinstance(url, str) and url.startswith(("ws://", "wss://"))
+
+
+def websocket_backend_uri(backend_url: str, path: str, query: str) -> str:
+    """Where a ``/ws/<path>`` connection goes: the backend, the rest of the path, and the query
+    without the gateway's own ``api_key``, which is not the backend's to see."""
+    kept = "&".join(p for p in (query or "").split("&") if p and p.split("=", 1)[0] != "api_key")
+    uri = f"{backend_url.rstrip('/')}/{path}"
+    return f"{uri}?{kept}" if kept else uri
+
+
+def _close_code_to_pass_on(code: Optional[int]) -> int:
+    """The close code to give one side when the other closed with ``code``. Codes that say "none
+    was sent" or "the connection dropped" cannot be sent; those become a plain close or an error."""
+    if code is None or code == 1005:
+        return 1000
+    if code in (1006, 1015) or not (1000 <= code <= 4999):
+        return 1011
+    return code
+
+
+async def _relay_backend_ws(client_ws: WebSocket, backend_url: str, path: str):
+    """Relay a ``/ws/<path>`` connection to the WebSocket backend until either side closes.
+
+    The backend is connected first: if it cannot be reached or refuses, the client's handshake is
+    refused. The subprotocol is the one the backend chose, text stays text and binary stays binary,
+    and the close code of whichever side closes first is passed on to the other.
+    """
+    import websockets
+
+    uri = websocket_backend_uri(backend_url, path, websocket_query(client_ws))
+    fwd_headers = {
+        name.title(): client_ws.headers[name] for name in ("authorization", "cookie") if client_ws.headers.get(name)
+    }
+    requested = client_ws.scope.get("subprotocols") or []
+    try:
+        options = {"subprotocols": requested or None, "max_size": None, "open_timeout": 10}
+        try:
+            upstream = await websockets.connect(uri, additional_headers=fwd_headers or None, **options)
+        except TypeError:
+            # websockets < 13 uses `extra_headers`
+            upstream = await websockets.connect(uri, extra_headers=fwd_headers or None, **options)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("ws_backend_connect_failed", upstream=uri.split("?", 1)[0], error=str(exc))
+        await client_ws.close(code=1011)
+        return
+
+    await client_ws.accept(subprotocol=getattr(upstream, "subprotocol", None))
+    try:
+        await _relay_ws(client_ws, upstream)
+    finally:
+        try:
+            await upstream.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+async def _relay_ws(client_ws: WebSocket, upstream):
+    """Pass messages both ways between a caller and the server its connection is relayed to,
+    until either side closes. Text stays text and binary stays binary, and the close code and
+    reason of whichever side closes first are passed on to the other."""
+    from websockets.exceptions import ConnectionClosed
+
     async def client_to_upstream():
+        code, reason = 1000, ""
         try:
             while True:
                 msg = await client_ws.receive()
                 if msg.get("type") == "websocket.disconnect":
+                    code, reason = _close_code_to_pass_on(msg.get("code")), msg.get("reason") or ""
                     break
                 if msg.get("text") is not None:
                     await upstream.send(msg["text"])
                 elif msg.get("bytes") is not None:
                     await upstream.send(msg["bytes"])
-        except Exception:
-            pass
+        except Exception:  # noqa: BLE001
+            code = 1011
         finally:
             try:
-                await upstream.close()
-            except Exception:
+                await upstream.close(code=code, reason=reason)
+            except Exception:  # noqa: BLE001
                 pass
 
     async def upstream_to_client():
@@ -1723,15 +1815,31 @@ async def _relay_agent_ws(client_ws: WebSocket, upstream, slug: str):
                     await client_ws.send_bytes(bytes(message))
                 else:
                     await client_ws.send_text(message)
-        except Exception:
+        except ConnectionClosed:
+            pass
+        except Exception:  # noqa: BLE001
             pass
         finally:
             try:
-                await client_ws.close()
-            except Exception:
+                await client_ws.close(
+                    code=_close_code_to_pass_on(getattr(upstream, "close_code", None)),
+                    reason=getattr(upstream, "close_reason", None) or "",
+                )
+            except Exception:  # noqa: BLE001
                 pass
 
     await asyncio.gather(client_to_upstream(), upstream_to_client())
+
+
+def websocket_query(websocket: WebSocket) -> str:
+    """The query string of a WebSocket handshake, as it was sent."""
+    return (websocket.scope.get("query_string") or b"").decode("latin-1")
+
+
+async def _relay_agent_ws(client_ws: WebSocket, upstream, slug: str):
+    """Relay between the caller and the upstream agent's WebSocket until either side closes,
+    passing on the close code of whichever closes first, as for ``/ws``."""
+    await _relay_ws(client_ws, upstream)
 
 
 @app.websocket("/agents/{full_path:path}")
@@ -2201,11 +2309,12 @@ async def _proxy_agent_route(request: Request, agent_route, request_id: str) -> 
         repeated=repeated_query(request.query_params),
         repeated_lines=repeated_headers(request.headers, held=-1),
     )
-    resp_headers = {
-        k: v for k, v in upstream.headers.items()
+    # Every header line as the agent sent it: an agent that sets two cookies sends two
+    # ``Set-Cookie`` lines, and joined into one they are no longer two cookies.
+    resp_headers = [
+        (k, v) for k, v in upstream.headers.multi_items()
         if k.lower() not in _STRIP_RESPONSE_HEADERS
-    }
-    ct = upstream.headers.get("content-type")
+    ]
     # Feed the live Mission Control board (time-to-first-byte from the upstream).
     try:
         from app.agent_monitor import agent_monitor
@@ -2231,12 +2340,178 @@ async def _proxy_agent_route(request: Request, agent_route, request_id: str) -> 
         finally:
             await upstream.aclose()
 
-    return StreamingResponse(
-        _agent_stream_body(),
-        status_code=upstream.status_code,
-        headers=resp_headers,
-        media_type=ct.split(";")[0].strip() if ct else None,
+    response = StreamingResponse(_agent_stream_body(), status_code=upstream.status_code)
+    for name, value in resp_headers:
+        response.headers.append(name, value)
+    return response
+
+
+async def answer_from(response, method: str, path: str, request_headers: Dict[str, str], request_id, request: Optional[Request] = None) -> Response:
+    """The answer a caller is given for a backend's answer: its headers without those of the
+    connection, its body as read, and both as the transformation rules that apply (to ``path``,
+    the request's own without its leading slash) leave them. With the ``request`` itself, the
+    plugins that change answers are run too.
+
+    The data plane asks for this through ``/internal/dataplane/shape-answer`` when it holds an
+    answer whose body it is not certain of changing as this does."""
+    # Create response
+    response_headers = dict(response.headers)
+    logger.debug("response_headers_original", headers=dict(response_headers), request_id=request_id)
+
+    # Remove hop-by-hop headers, Content-Length (recomputed) and Content-Encoding
+    # (httpx already decoded the body — see _STRIP_RESPONSE_HEADERS).
+    response_headers = {k: v for k, v in response_headers.items()
+                      if k.lower() not in _STRIP_RESPONSE_HEADERS}
+    logger.debug("response_headers_after_hop_by_hop", headers=dict(response_headers), request_id=request_id)
+
+    # Get response body
+    # httpx.Response.aread() is the async method to read content as bytes
+    # We must use aread() in async context for AsyncClient responses
+    try:
+        content = await response.aread()
+        logger.debug("response_content_read", content_length=len(content), request_id=request_id)
+    except AttributeError:
+        # Fallback: if aread() doesn't exist, try .content property
+        try:
+            content = response.content
+            logger.debug("response_content_read_fallback_content", content_length=len(content), request_id=request_id)
+        except Exception as e:
+            logger.error("response_read_error", error=str(e), request_id=request_id)
+            content = b""
+    except Exception as e:
+        logger.error("response_read_error", error=str(e), request_id=request_id)
+        # Final fallback: try to get text and encode
+        try:
+            content = response.text.encode('utf-8')
+            logger.debug("response_content_read_fallback_text", content_length=len(content), request_id=request_id)
+        except:
+            content = b""
+
+    # Apply response transformations
+    from app.transformers import transformation_manager
+    request_context = {
+        "method": method,
+        "path": path,
+        "headers": request_headers,
+    }
+
+    # Stays None when transformation is skipped or fails (including binary
+    # bodies that are not UTF-8), so the upstream status passes through.
+    status_code = None
+    try:
+        rules = (
+            transformation_manager.get_rules_for_path(path, method)
+            if transformation_manager.rules_by_id else []
+        )
+        if not rules:
+            # No rule applies to this request, so there is nothing to do. Parsing the body
+            # and writing it back would change its bytes (spacing, escaping, number
+            # formatting) and cost time that grows with its size.
+            raise _NoTransformation()
+        # The body is read only for a rule that can change it. A rule for headers or the
+        # status applies whatever the body is, and leaves its bytes alone.
+        body_json = None
+        if content and any(rule.changes_response_body() for rule in rules):
+            try:
+                body_json = json.loads(content.decode('utf-8'))
+            except:
+                body_json = content.decode('utf-8')
+
+        transformed_status, transformed_headers, transformed_body = transformation_manager.transform_response(
+            status_code=response.status_code,
+            headers=response_headers,
+            body=body_json,
+            request_context=request_context
+        )
+
+        # Convert transformed body back to bytes if needed. Text that came back as it went in
+        # is the backend's own bytes already (a JSON string, say, keeps its quotes).
+        if transformed_body and isinstance(transformed_body, dict):
+            content = json.dumps(transformed_body).encode('utf-8')
+        elif transformed_body and isinstance(transformed_body, str) and transformed_body is not body_json:
+            content = transformed_body.encode('utf-8')
+
+        response_headers = transformed_headers
+        status_code = transformed_status
+    except _NoTransformation:
+        pass
+    except Exception as e:
+        logger.warning("response_transformation_error", error=str(e))
+
+    # Ensure content is bytes
+    if isinstance(content, str):
+        content = content.encode('utf-8')
+    elif content is None:
+        content = b""
+
+    # Double-check Content-Length removal (case-insensitive)
+    # Starlette will calculate it automatically based on actual content length
+    original_headers_count = len(response_headers)
+    response_headers = {k: v for k, v in response_headers.items() 
+                      if k.lower() != "content-length"}
+    if len(response_headers) < original_headers_count:
+        logger.info("content_length_removed_final", 
+                   removed_count=original_headers_count - len(response_headers),
+                   request_id=request_id)
+
+    # Log final headers before creating Response (for debugging)
+    content_length_in_headers = any(k.lower() == "content-length" for k in response_headers.keys())
+    logger.info("response_final_preparation", 
+                content_length_bytes=len(content),
+                status_code=status_code if status_code else response.status_code,
+                headers_count=len(response_headers),
+                headers_keys=list(response_headers.keys())[:10],  # First 10 keys
+                content_length_in_headers=content_length_in_headers,
+                request_id=request_id)
+
+    if content_length_in_headers:
+        logger.error("content_length_still_present", 
+                    headers=dict(response_headers),
+                    request_id=request_id)
+        # Force remove one more time
+        response_headers = {k: v for k, v in response_headers.items() 
+                          if k.lower() != "content-length"}
+
+    # Use status_code from transformation or original response
+    final_status_code = status_code if status_code else response.status_code
+
+    # Plugin: response transformations
+    if settings.plugins_enabled and request is not None:
+        try:
+            resp_ctx = PluginContext(
+                method=method,
+                path=f"/{path}",
+                headers=dict(response_headers),
+                body=content,
+                status_code=final_status_code,
+                request_id=request_id,
+                api_key=getattr(getattr(request.state, "api_key", None), "key", None),
+                tenant_id=getattr(request.state, "tenant_id", None),
+            )
+            resp_ctx = plugin_registry.transform_response(resp_ctx)
+            response_headers = dict(resp_ctx.headers)
+            if resp_ctx.body is not None:
+                if isinstance(resp_ctx.body, (bytes, bytearray)):
+                    content = bytes(resp_ctx.body)
+                elif isinstance(resp_ctx.body, str):
+                    content = resp_ctx.body.encode("utf-8")
+                elif isinstance(resp_ctx.body, dict):
+                    content = json.dumps(resp_ctx.body).encode("utf-8")
+            if resp_ctx.status_code:
+                final_status_code = resp_ctx.status_code
+            response_headers = {k: v for k, v in response_headers.items() if k.lower() != "content-length"}
+            plugin_registry.run_hook("response_post", resp_ctx)
+        except Exception as exc:
+            logger.warning("plugin_response_transform_failed", error=str(exc))
+
+    answer = Response(
+        content=content,
+        status_code=final_status_code,
+        headers=response_headers,
+        media_type=response.headers.get("content-type", "application/json")
     )
+    _restore_repeated_header_lines(answer, response.headers, response_headers)
+    return answer
 
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
@@ -2479,164 +2754,7 @@ async def gateway_proxy(request: Request, path: str):
             repeated_lines=repeated_headers(request.headers),
         )
         
-        # Create response
-        response_headers = dict(response.headers)
-        logger.debug("response_headers_original", headers=dict(response_headers), request_id=request_id)
-        
-        # Remove hop-by-hop headers, Content-Length (recomputed) and Content-Encoding
-        # (httpx already decoded the body — see _STRIP_RESPONSE_HEADERS).
-        response_headers = {k: v for k, v in response_headers.items()
-                          if k.lower() not in _STRIP_RESPONSE_HEADERS}
-        logger.debug("response_headers_after_hop_by_hop", headers=dict(response_headers), request_id=request_id)
-        
-        # Get response body
-        # httpx.Response.aread() is the async method to read content as bytes
-        # We must use aread() in async context for AsyncClient responses
-        try:
-            content = await response.aread()
-            logger.debug("response_content_read", content_length=len(content), request_id=request_id)
-        except AttributeError:
-            # Fallback: if aread() doesn't exist, try .content property
-            try:
-                content = response.content
-                logger.debug("response_content_read_fallback_content", content_length=len(content), request_id=request_id)
-            except Exception as e:
-                logger.error("response_read_error", error=str(e), request_id=request_id)
-                content = b""
-        except Exception as e:
-            logger.error("response_read_error", error=str(e), request_id=request_id)
-            # Final fallback: try to get text and encode
-            try:
-                content = response.text.encode('utf-8')
-                logger.debug("response_content_read_fallback_text", content_length=len(content), request_id=request_id)
-            except:
-                content = b""
-        
-        # Apply response transformations
-        from app.transformers import transformation_manager
-        request_context = {
-            "method": request.method,
-            "path": path,
-            "headers": dict(request.headers),
-        }
-        
-        # Stays None when transformation is skipped or fails (including binary
-        # bodies that are not UTF-8), so the upstream status passes through.
-        status_code = None
-        try:
-            rules = (
-                transformation_manager.get_rules_for_path(path, request.method)
-                if transformation_manager.rules_by_id else []
-            )
-            if not rules:
-                # No rule applies to this request, so there is nothing to do. Parsing the body
-                # and writing it back would change its bytes (spacing, escaping, number
-                # formatting) and cost time that grows with its size.
-                raise _NoTransformation()
-            # The body is read only for a rule that can change it. A rule for headers or the
-            # status applies whatever the body is, and leaves its bytes alone.
-            body_json = None
-            if content and any(rule.changes_response_body() for rule in rules):
-                try:
-                    body_json = json.loads(content.decode('utf-8'))
-                except:
-                    body_json = content.decode('utf-8')
-
-            transformed_status, transformed_headers, transformed_body = transformation_manager.transform_response(
-                status_code=response.status_code,
-                headers=response_headers,
-                body=body_json,
-                request_context=request_context
-            )
-
-            # Convert transformed body back to bytes if needed. Text that came back as it went in
-            # is the backend's own bytes already (a JSON string, say, keeps its quotes).
-            if transformed_body and isinstance(transformed_body, dict):
-                content = json.dumps(transformed_body).encode('utf-8')
-            elif transformed_body and isinstance(transformed_body, str) and transformed_body is not body_json:
-                content = transformed_body.encode('utf-8')
-
-            response_headers = transformed_headers
-            status_code = transformed_status
-        except _NoTransformation:
-            pass
-        except Exception as e:
-            logger.warning("response_transformation_error", error=str(e))
-        
-        # Ensure content is bytes
-        if isinstance(content, str):
-            content = content.encode('utf-8')
-        elif content is None:
-            content = b""
-        
-        # Double-check Content-Length removal (case-insensitive)
-        # Starlette will calculate it automatically based on actual content length
-        original_headers_count = len(response_headers)
-        response_headers = {k: v for k, v in response_headers.items() 
-                          if k.lower() != "content-length"}
-        if len(response_headers) < original_headers_count:
-            logger.info("content_length_removed_final", 
-                       removed_count=original_headers_count - len(response_headers),
-                       request_id=request_id)
-        
-        # Log final headers before creating Response (for debugging)
-        content_length_in_headers = any(k.lower() == "content-length" for k in response_headers.keys())
-        logger.info("response_final_preparation", 
-                    content_length_bytes=len(content),
-                    status_code=status_code if status_code else response.status_code,
-                    headers_count=len(response_headers),
-                    headers_keys=list(response_headers.keys())[:10],  # First 10 keys
-                    content_length_in_headers=content_length_in_headers,
-                    request_id=request_id)
-        
-        if content_length_in_headers:
-            logger.error("content_length_still_present", 
-                        headers=dict(response_headers),
-                        request_id=request_id)
-            # Force remove one more time
-            response_headers = {k: v for k, v in response_headers.items() 
-                              if k.lower() != "content-length"}
-        
-        # Use status_code from transformation or original response
-        final_status_code = status_code if status_code else response.status_code
-
-        # Plugin: response transformations
-        if settings.plugins_enabled:
-            try:
-                resp_ctx = PluginContext(
-                    method=request.method,
-                    path=f"/{path}",
-                    headers=dict(response_headers),
-                    body=content,
-                    status_code=final_status_code,
-                    request_id=request_id,
-                    api_key=getattr(getattr(request.state, "api_key", None), "key", None),
-                    tenant_id=getattr(request.state, "tenant_id", None),
-                )
-                resp_ctx = plugin_registry.transform_response(resp_ctx)
-                response_headers = dict(resp_ctx.headers)
-                if resp_ctx.body is not None:
-                    if isinstance(resp_ctx.body, (bytes, bytearray)):
-                        content = bytes(resp_ctx.body)
-                    elif isinstance(resp_ctx.body, str):
-                        content = resp_ctx.body.encode("utf-8")
-                    elif isinstance(resp_ctx.body, dict):
-                        content = json.dumps(resp_ctx.body).encode("utf-8")
-                if resp_ctx.status_code:
-                    final_status_code = resp_ctx.status_code
-                response_headers = {k: v for k, v in response_headers.items() if k.lower() != "content-length"}
-                plugin_registry.run_hook("response_post", resp_ctx)
-            except Exception as exc:
-                logger.warning("plugin_response_transform_failed", error=str(exc))
-
-        proxied_response = Response(
-            content=content,
-            status_code=final_status_code,
-            headers=response_headers,
-            media_type=response.headers.get("content-type", "application/json")
-        )
-        _restore_repeated_header_lines(proxied_response, response.headers, response_headers)
-        return proxied_response
+        return await answer_from(response, request.method, path, dict(request.headers), request_id, request)
     
     except HTTPException:
         raise

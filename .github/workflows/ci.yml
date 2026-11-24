@@ -68,3 +68,39 @@ jobs:
       - run: npm ci --no-audit --no-fund
       - name: Type-check and build
         run: npm run build
+
+  dataplane:
+    # Experimental Rust data plane: unit tests, then the same scenarios against the Python
+    # gateway and the data plane in front of it (dataplane/conformance/run.py).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Rust unit tests
+        working-directory: dataplane
+        run: cargo test --locked
+      - name: Build
+        working-directory: dataplane
+        run: cargo build --release --locked
+      - name: Conformance against the Python gateway
+        run: python dataplane/conformance/run.py
+      - name: Body checks against the Python functions
+        run: python dataplane/conformance/boundary.py
+      - name: MQTT publishing against the Python handler
+        run: python dataplane/conformance/publish.py
+      - name: Transformation rule patterns against the Python matcher
+        run: python dataplane/conformance/patterns.py
+      - name: Escaped paths against the server and client the Python gateway uses
+        run: python dataplane/conformance/paths.py
+      - name: Preflight answers against the CORS middleware
+        run: python dataplane/conformance/preflight.py
+      - name: Applied transformation rules against the Python gateway's own rule code
+        run: python dataplane/conformance/shapes.py

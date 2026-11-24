@@ -167,3 +167,19 @@ def test_proxy_forwards_body_and_status(monkeypatch):
     resp = _run(main._proxy_agent_route(req, _route(req.url.path), "req-2"))
     assert resp.status_code == 201
     assert _run(_collect(resp)) == b'{"code":"x"}'
+
+
+def test_proxy_keeps_each_set_cookie_line_apart(monkeypatch):
+    """An agent that sets two cookies sends two ``Set-Cookie`` lines. Joined into one with a comma
+    they read as a single cookie, so each must reach the caller on a line of its own."""
+
+    async def fake_start_stream(**kwargs):
+        return _FakeUpstream(200, b"{}", [("content-type", "application/json; charset=utf-8"),
+                                         ("set-cookie", "session=alice; Path=/"), ("set-cookie", "csrf=1")])
+
+    monkeypatch.setattr(main.router, "start_upstream_stream", AsyncMock(side_effect=fake_start_stream))
+    route = AgentEdgeConfig(routes={"hiring": "http://10.0.0.10:8001"}).resolve("/agents/hiring/login")
+    req = _FakeRequest("GET", "/agents/hiring/login", {})
+    resp = _run(main._proxy_agent_route(req, route, "rid-1"))
+    assert resp.headers.getlist("set-cookie") == ["session=alice; Path=/", "csrf=1"]
+    assert resp.headers.getlist("content-type") == ["application/json; charset=utf-8"]

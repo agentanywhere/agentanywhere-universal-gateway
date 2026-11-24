@@ -92,6 +92,7 @@ nav:
       - "Upgrade the gateway": how-to/upgrade.md
       - "Troubleshoot request errors": how-to/troubleshoot-401-502-429.md
       - "Test performance": how-to/performance-testing.md
+      - "Run the Rust data plane (experimental)": how-to/run-the-data-plane.md
       - "Run the tests": how-to/run-the-tests.md
   - Reference:
       - "Configuration": reference/configuration.md

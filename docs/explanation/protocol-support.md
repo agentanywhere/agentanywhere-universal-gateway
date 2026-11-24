@@ -42,8 +42,8 @@ Python 3.11; they were not repeated for this page.
 | ACP | `/acp/*`, `/api/acp/*` | `ACP_BACKEND_URL` | Working (HTTP and SSE) | `tests/test_tier2_protocols.py`; earlier manual check |
 | GraphQL | `/graphql`, `/api/graphql` | `GRAPHQL_BACKEND_URL` | Working (requests passed through over HTTP; no subscriptions) | `tests/test_cov_main_proxy.py::test_graphql_passes_the_request_through_as_it_came`, `tests/test_routing.py` |
 | MQTT | `POST /mqtt/publish`, `POST /mqtt/subscribe` | `MQTT_BROKER_URL` | Partial: publish works; subscribe registers a subscription but messages are not delivered to the HTTP caller | `tests/test_protocols.py`; earlier manual check of publish |
-| WebSocket | `/ws/*` | `WEBSOCKET_BACKEND_URL` | Not working | Reproduced for this page: every connection is closed with 1008 |
-| gRPC | `/grpc*`, `/api/grpc*` | `GRPC_BACKEND_URL` | Not working | `tests/test_protocols.py::test_call_unary_does_not_fabricate_success`; earlier manual check |
+| WebSocket | `/ws/*` | `WEBSOCKET_BACKEND_URL` (a `ws://` or `wss://` address) | Working, with an API key; governance by key scope, IP rules and policies, no rate limit or quota | `tests/test_cov_main_proxy.py`, `dataplane/conformance/run.py` |
+| gRPC | Any gRPC method (`/package.Service/Method`), through the Rust data plane only | `GRPC_BACKEND_URL` (`host:port`) | Working through the experimental data plane (`dataplane/`), with an API key; not working in the Python gateway on its own | `dataplane/conformance/run.py`; `tests/test_protocols.py::test_call_unary_does_not_fabricate_success` |
 | Agent edge | `/agents/<slug>/*` (HTTP and WebSocket) | `AGENT_EDGE_ENABLED`, `AGENT_ROUTES_JSON`, or `/admin/agents` | Working, without gateway credentials (off by default) | `tests/test_agent_edge_proxy.py`, `tests/test_agent_routes.py` |
 | Plugin protocols | Any prefix a `ProtocolPlugin` claims | Plugin | Working (request and response, no streaming) | `tests/test_plugins.py` |
 
@@ -121,13 +121,26 @@ log as `mqtt_message_received`.
 
 ## WebSocket
 
-`/ws/{path}` is meant to authenticate an API key from `?api_key=` or
-`X-API-Key` and relay frames to `WEBSOCKET_BACKEND_URL`. It closes every
-connection: with no key, code 1008 `API key required`; with a valid key, code
-1008 `Authentication failed`, because the route passes a stand-in request
-object without `state` to the authentication code. If `WEBSOCKET_BACKEND_URL`
-is unset, it closes with 1003. Use the agent edge, or connect to the backend
-directly.
+`/ws/{path}` relays a WebSocket connection to the server at
+`WEBSOCKET_BACKEND_URL`, which must be a `ws://` or `wss://` address. The
+caller gives an API key in `X-API-Key` or in `?api_key=`. The key's path
+scope, IP rules and policies apply to the handshake; rate limits and tenant
+quotas do not, and connections are not written to the request log.
+
+* The backend is asked for `<backend>/{path}` with the caller's query, without
+  `api_key`. It is sent the caller's `Authorization` and `Cookie` headers and
+  the subprotocols offered, never the gateway's key.
+* The backend is connected first. If it cannot be reached or refuses, the
+  caller's handshake is refused with 403; so is a handshake without a working
+  key.
+* Text stays text and binary stays binary. The subprotocol is the one the
+  backend chose. When either side closes, its close code and reason are passed
+  to the other.
+
+With an `http://` or `https://` address the old handler is used instead: it
+accepts the connection and sends back text that is not JSON, and nothing else.
+That is not a relay; use a `ws://` address. If `WEBSOCKET_BACKEND_URL` is
+unset, connections are closed with 1003.
 
 ## gRPC
 
@@ -137,7 +150,21 @@ bridge (`app/protocols/grpc_handler.py`) that takes
 (`grpc_reflection`, which is not in `requirements.txt`) or the sample
 `greeter_pb2` modules. With the stock requirements it answers HTTP 200 with
 `"status": "unsupported"`. It is not a gRPC proxy: gRPC clients cannot connect
-to the gateway.
+to the Python gateway, which does not speak HTTP/2.
+
+With the Rust data plane in front (`dataplane/`, experimental), gRPC clients
+connect to the data plane and their calls are relayed to `GRPC_BACKEND_URL`
+when that is a plain `host:port`. Connections are HTTP/2 without TLS on both
+sides. Unary calls and all three kinds of stream are carried, with the
+backend's status, message and trailers. Every call needs an API key, sent as
+`x-api-key` metadata (or whatever `API_KEY_HEADER` names) or as
+`authorization: Bearer <key>`; the backend is not sent it. A key's allowed
+paths are matched against the method path, so `/package.Service` limits a key
+to one service. IP rules, policies, rate limits, tenant quotas and the circuit
+breaker apply as they do to HTTP. A refusal is a gRPC status: `UNAUTHENTICATED`
+without a working key, `PERMISSION_DENIED` when a rule refuses,
+`RESOURCE_EXHAUSTED` over a limit, `UNAVAILABLE` when the backend cannot be
+reached. See `dataplane/README.md` for the limits.
 
 ## Agent edge
 

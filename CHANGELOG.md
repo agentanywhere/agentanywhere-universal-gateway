@@ -46,6 +46,9 @@ See [docs/known-limitations.md](docs/known-limitations.md) for the full list.
 
 ### Documentation
 
+- How-to: run the experimental Rust data plane in front of the gateway. The
+  quick start, the Python install and the Docker image are unchanged and need
+  no Rust.
 - Container commands in the backup and upgrade how-tos work in Git Bash on
   Windows: container paths are passed inside `sh -c '...'` (Git Bash rewrote
   a standalone `/app/...` argument, so `rm` and `chown` failed), and the
@@ -72,6 +75,12 @@ See [docs/known-limitations.md](docs/known-limitations.md) for the full list.
   or plugin still sees one value and, if it sets, changes or removes the
   header, decides what is sent for it. `Host`, `Content-Length` and the
   hop-by-hop headers are sent on one line, as before.
+- Agent edge: a WebSocket relayed to an agent (`/agents/<slug>/...`) now passes
+  on the close code and reason of whichever side closes first, as `/ws` does.
+  The caller was told 1000 whatever the agent closed with, and the agent
+  likewise.
+- A backend that sets more than one cookie has each `Set-Cookie` line passed on as its own line. They were
+  joined into one line by commas, which a browser does not read as cookies.
 - Proxy: a request whose body came without a length (`Transfer-Encoding:
   chunked`) is sent to the backend with its length and without that header.
   The caller's `Transfer-Encoding` was passed on beside the `Content-Length`

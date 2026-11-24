@@ -13,6 +13,15 @@ import asyncio
 settings = get_settings()
 
 
+def graphql_base(url: str) -> str:
+    """Where GraphQL requests are sent, less the ``/graphql`` their own path supplies.
+
+    ``GRAPHQL_BACKEND_URL`` may name the server or its endpoint: ``http://host:4000`` and
+    ``http://host:4000/graphql`` both send ``/graphql`` to ``http://host:4000/graphql``.
+    """
+    base = url.rstrip("/")
+    return base[: -len("/graphql")] if base.endswith("/graphql") else base
+
 
 def repeated_query(query) -> Dict[str, List[str]]:
     """The values of every query key the caller gave more than once.
@@ -44,15 +53,6 @@ def _with_repeats(
         if key in out and out[key] == values[-1]:
             out[key] = list(values)
     return out
-
-def graphql_base(url: str) -> str:
-    """Where GraphQL requests are sent, less the ``/graphql`` their own path supplies.
-
-    ``GRAPHQL_BACKEND_URL`` may name the server or its endpoint: ``http://host:4000`` and
-    ``http://host:4000/graphql`` both send ``/graphql`` to ``http://host:4000/graphql``.
-    """
-    base = url.rstrip("/")
-    return base[: -len("/graphql")] if base.endswith("/graphql") else base
 
 
 # Headers that describe the connection or the message's framing, not the request. Of these the

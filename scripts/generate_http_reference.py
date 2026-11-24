@@ -203,6 +203,8 @@ def _section(path):
         return "OAuth2"
     if path in PUBLIC_DATA_PLANE or path.startswith("/.well-known"):
         return "Health, metrics and discovery"
+    if path.startswith("/internal/"):
+        return "Internal"
     return "Data plane"
 
 
@@ -250,6 +252,8 @@ def build() -> str:
             params = _params(route)
             if path == "/{path:path}":
                 auth = "API key (none for OPTIONS)"
+            elif path.startswith("/internal/dataplane"):
+                auth = "`X-Dataplane-Token`; 404 unless `DATAPLANE_TOKEN` is set"
             elif path in ("/metrics", "/health/detailed"):
                 auth = "none; admin with `OPS_ENDPOINTS_REQUIRE_ADMIN=true`"
             rows.setdefault(_section(path), []).append(
@@ -267,7 +271,7 @@ def build() -> str:
             )
             op_count[0] += 1
 
-    order = ["Health, metrics and discovery", "Data plane", "WebSocket", "OAuth2"]
+    order = ["Health, metrics and discovery", "Data plane", "WebSocket", "OAuth2", "Internal"]
     order += sorted(k for k in rows if k.startswith("Admin"))
     total = op_count[0]
     admin_total = sum(len(r[1].split(", ")) for k, v in rows.items() if k.startswith("Admin") for r in v)

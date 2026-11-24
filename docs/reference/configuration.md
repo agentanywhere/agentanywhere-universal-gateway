@@ -92,6 +92,8 @@ settings too, so `.env` applies to them; the process environment wins.)
 | `WORKERS` | `4` | Worker processes, used only by `python -m app.main` with `ENVIRONMENT=production`. The container image runs one process. |
 | `GATEWAY_URL_BASE` | unset | Public base URL of the gateway, used in generated SDKs and the A2A Agent Card. Unset: built from `HOST` and `PORT`. |
 | `CONFIG_FILE` | unset | **env only.** Path to a JSON, YAML or TOML settings file. A file that cannot be read prints a warning and is ignored. |
+| `SSL_CERT_FILE` | unset | **env only.** A file of certificates to trust when a backend is behind TLS, read by the TLS libraries and by the data plane. The data plane relays to a `wss://` WebSocket backend only when this is set for both it and the gateway. |
+| `SSL_CERT_DIR` | unset | **env only.** A directory of certificates to trust, read by the TLS libraries. With it set, the data plane speaks no TLS to backends and leaves them to the gateway. |
 
 ## Credentials
 
@@ -147,8 +149,8 @@ settings too, so `.env` applies to them; the process environment wins.)
 | `HTTP_BACKEND_URL` | unset | Backend for `/api/*`, `/rest/*`, `/http/*` and every path with no known prefix. `env.example` sets `http://localhost:8003`. |
 | `GRAPHQL_BACKEND_URL` | unset | GraphQL server, or its endpoint, that requests under `/graphql` are passed on to. `env.example` sets `http://localhost:4000/graphql`; the sample backend is on port 8006. |
 | `MQTT_BROKER_URL` | unset | Broker for `/mqtt/publish` and `/mqtt/subscribe`, for example `mqtt://localhost:1883` (`mqtts://` for TLS). The gateway connects when it starts. |
-| `WEBSOCKET_BACKEND_URL` | unset | Intended backend for `/ws/*`. The route does not work; see the [protocol support matrix](../explanation/protocol-support.md). |
-| `GRPC_BACKEND_URL` | unset | Target for the JSON-to-gRPC bridge, for example `localhost:50051`. The bridge does not work. |
+| `WEBSOCKET_BACKEND_URL` | unset | The WebSocket server `/ws/*` connections are relayed to. Give a `ws://` or `wss://` address; see the [protocol support matrix](../explanation/protocol-support.md). |
+| `GRPC_BACKEND_URL` | unset | The gRPC server, as `host:port`, for example `localhost:50051`. The Rust data plane relays gRPC calls to it; the Python gateway's own JSON-to-gRPC bridge does not work. See the [protocol support matrix](../explanation/protocol-support.md). |
 | `DEFAULT_TIMEOUT` | `30` | Seconds the gateway waits for a buffered backend response. Also the timeout of agent-edge requests. |
 
 These values are for a gateway running directly on a machine. Under the
@@ -256,6 +258,7 @@ The rate-limit values in this section are **not enforced yet**. They are shown b
 | `SQLITE_SYNCHRONOUS` | unset | SQLite only: `OFF`, `NORMAL`, `FULL` or `EXTRA`. Unset keeps SQLite's default (`FULL`). `NORMAL` with `WAL` is the usual pairing; a power loss can then lose the last commits but not corrupt the file. |
 | `SQLITE_BUSY_TIMEOUT_MS` | `0` | SQLite only: how long a connection waits for a lock, in milliseconds. `0` keeps the driver's default of five seconds. |
 | `API_KEY_LOCAL_CACHE_TTL_SECONDS` | `0` (off) | Seconds a validated API key, and the tenant it belongs to, stay cached in each worker's memory when Redis is not used. While cached, authenticating a request needs no database read or write. A key revoked or changed through another worker can still be accepted here until the entry expires; changes made through the same worker take effect at once. |
+| `DATAPLANE_TOKEN` | unset | Shared secret for the experimental Rust data plane (`dataplane/`). When set, `GET /internal/dataplane/snapshot` serves the data plane its keys (SHA-256 digests only) and limits, and requires this value in `X-Dataplane-Token`. Unset switches the endpoint off. Serve it only on an internal port. |
 | `JSON_CODEC` | `stdlib` | Serialiser for response bodies: `stdlib`, or `orjson` (much faster; needs `pip install orjson`; `NaN` and infinity become `null` instead of raising). Applies to responses FastAPI builds from a handler's return value. A `module:attribute` path loads your own; see [Adapters](../explanation/adapters.md). |
 | `UPSTREAM_CLIENT` | `httpx` | The client that forwards requests to backends. `httpx`, or a `module:attribute` path to a factory returning an object with the same `request`, `build_request`, `send` and `aclose` methods. |
 | `ANALYTICS_ADAPTER` | `full` | `full` runs the built-in anomaly detection and usage analytics, `off` runs none, or a `module:attribute` path to your own. `AI_ANALYTICS_ENABLED=false` still turns the per-request call off whichever adapter is chosen. |
