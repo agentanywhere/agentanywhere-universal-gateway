@@ -191,15 +191,19 @@ Backups: [Back up and restore](back-up-and-restore.md). `make up`,
 
 ## Without Compose: one container or Kubernetes
 
-The image from the root `Dockerfile` runs on its own:
+Each release is published as an image for `linux/amd64` and `linux/arm64`,
+built from the root `Dockerfile`, and runs on its own:
 
 ```bash
-docker build -t agentanywhere-universal-gateway .
 docker run -d --name gateway -p 8000:8000 --env-file .env \
   -v gateway_data:/app/data \
   -e DATABASE_URL=sqlite+aiosqlite:////app/data/gateway.db \
-  agentanywhere-universal-gateway
+  ghcr.io/agentanywhere/agentanywhere-universal-gateway:0.9.0
 ```
+
+Pin a version (`0.9.0`, or `0.9` for its fixes) rather than `latest`. To run
+code that is not released yet, build the image yourself with
+`docker build -t agentanywhere-universal-gateway .` and use that name instead.
 
 It runs one `uvicorn` process as user `gateway` (uid 1000), listens on 8000,
 has a `HEALTHCHECK` on `/health`, and creates `/app/data` owned by that user
