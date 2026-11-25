@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-11-25
+
+### Added
+
+- The README has a "How it compares" section and an animated tour of the
+  console.
+
 ### Changed
 
 - The admin console uses the AgentAnywhere Sovereign theme: dark by default
@@ -22,6 +29,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Hovering a bar chart drew a light grey band that glared on the dark theme.
+- The README, known limitations, overview and troubleshooting pages still said
+  WebSocket pass-through did not work. `/ws/*` has relayed connections to a
+  `ws://` or `wss://` backend since 0.9.0, and gRPC works through the Rust
+  data plane; the pages now say so, with what is still missing.
 
 - The image's `HEALTHCHECK` always failed, so `docker run` showed the gateway as
   `unhealthy`: it sent HEAD (`wget --spider`) to a GET-only `/health`, at
@@ -311,4 +322,6 @@ See [docs/known-limitations.md](docs/known-limitations.md) for the full list.
   chooses. `nginx/nginx.conf` now overwrites the header with `$remote_addr`.
 
 
-[1.0.0]: https://github.com/agentanywhere/agentanywhere-universal-gateway/releases/tag/v1.0.0
+[Unreleased]: https://github.com/agentanywhere/agentanywhere-universal-gateway/compare/v0.9.1...HEAD
+[0.9.1]: https://github.com/agentanywhere/agentanywhere-universal-gateway/compare/v0.9.0...v0.9.1
+[0.9.0]: https://github.com/agentanywhere/agentanywhere-universal-gateway/releases/tag/v0.9.0

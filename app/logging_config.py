@@ -170,7 +170,7 @@ class LoggingConfig:
     level: str = "INFO"
     format: str = "json"  # "json" | "text" | "auto"
     service_name: str = "agentanywhere-gateway"
-    service_version: str = "0.9.0"
+    service_version: str = "0.9.1"
     environment: str = "production"
     redact_keys: Set[str] = field(default_factory=lambda: set(DEFAULT_REDACT_KEYS))
     redact_patterns: List[str] = field(default_factory=lambda: list(DEFAULT_REDACT_PATTERNS))

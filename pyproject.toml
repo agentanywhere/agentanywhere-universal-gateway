@@ -9,7 +9,7 @@ build-backend = "setuptools.build_meta"
 # is `agentanywhere-universal-gateway`; the shorter `agentanywhere-gateway`,
 # `agent-universal-gateway`, and `mcp-gateway` names are kept as CLI aliases below.
 name = "agentanywhere-universal-gateway"
-version = "0.9.0"
+version = "0.9.1"
 description = "API gateway for agent and application traffic: one authentication, rate-limiting and logging layer in front of MCP, A2A, AG-UI, ACP, HTTP/REST, GraphQL and MQTT backends."
 readme = "README.md"
 requires-python = ">=3.10,<3.13"

@@ -22,12 +22,12 @@ is the gateway.
 |---|---|
 | **What it is** | A self-hosted AI agent gateway: a reverse proxy that understands agent protocols |
 | **What it does** | API keys (stored as hashes), per-key and per-tenant limits, path-prefix routing, circuit breakers, protocol checks, metrics, logs and traces |
-| **Protocols** | MCP (Model Context Protocol), A2A (Agent2Agent), AG-UI, ACP, HTTP/REST, GraphQL, MQTT. WebSocket and gRPC pass-through are [not working yet](#what-it-does-not-do) |
-| **Admin console** | React app: dashboard, API keys, routes, request logs, protocols, settings ([screenshots](#see-your-gateway)) |
+| **Protocols** | MCP (Model Context Protocol), A2A (Agent2Agent), AG-UI, ACP, HTTP/REST, GraphQL, MQTT and WebSocket; gRPC through the optional [Rust data plane](#do-i-need-rust) |
+| **Admin console** | React app: dashboard, API keys, routes, request logs, protocols, settings ([tour and screenshots](#see-your-gateway)) |
 | **Licence** | Apache-2.0 |
 | **Requirements** | Docker with Compose, or Python 3.10 to 3.12. Redis and PostgreSQL are optional |
 | **Install** | `docker compose --profile backends up -d --build` ([quick start](#quick-start)) |
-| **Status** | Version 0.9.0, the first release ([changelog](CHANGELOG.md), [known limitations](docs/known-limitations.md)) |
+| **Status** | Version 0.9.1, an early release ([changelog](CHANGELOG.md), [known limitations](docs/known-limitations.md)) |
 | **Maintainer** | [ShepHertz Technologies](https://gateway.agentanywhere.ai/) |
 
 <p align="center">
@@ -79,7 +79,7 @@ commands. Published ports listen on `127.0.0.1` only; see
 you change that.
 
 Each release is also published as an image, so the gateway alone needs no build:
-`docker pull ghcr.io/agentanywhere/agentanywhere-universal-gateway:0.9.0` (or `:latest`).
+`docker pull ghcr.io/agentanywhere/agentanywhere-universal-gateway:0.9.1` (or `:latest`).
 It reads the same settings as above (`--env-file .env`, with `ADMIN_TOKEN` set)
 and serves the API on port 8000; the console is not in that image. See
 [Without Compose](docs/how-to/deploy-with-docker-compose.md#without-compose-one-container-or-kubernetes)
@@ -172,7 +172,7 @@ error rate; every API key; every route and its backend; and a live tail of the
 request log. It is served at <http://127.0.0.1:3001> with Docker Compose, or by
 `npm run dev` in `admin-ui/`.
 
-![Dashboard of the AgentAnywhere Universal Gateway admin console: requests, errors, average latency, requests per minute, rate-limit hits and error rate, with live request-flow and error charts](docs/img/console/dashboard.png)
+![A 20-second tour of the admin console: the animated sign-in page with agent protocols flowing through the gateway, then the dashboard with live request counts, latency and charts, the request log tailing MCP and HTTP traffic, and the API keys page](docs/img/console/tour.gif)
 
 | | |
 |---|---|
@@ -240,6 +240,41 @@ The full list is the [documentation map](docs/README.md).
 What works for each protocol is in the
 [protocol support matrix](docs/explanation/protocol-support.md).
 
+## How it compares
+
+Most gateways for AI traffic grew out of something else: an LLM proxy that
+added MCP, or an API gateway that added AI plugins. This one started from the
+agent protocols. What sets it apart:
+
+- **Nine protocols behind one set of keys, limits and policies.** MCP, A2A,
+  AG-UI, ACP, HTTP/REST, GraphQL, MQTT, WebSocket and gRPC go through the same
+  API keys, tenant quotas, IP rules, policies and request log. An agent that
+  calls an MCP tool, publishes to an MQTT topic and streams AG-UI events to a
+  browser is governed in one place.
+- **A Rust data plane that cannot drift from the Python gateway.** The
+  optional data plane in `dataplane/` serves requests natively (HTTP/1, HTTP/2,
+  gRPC, WebSocket relays, MQTT publish) and hands anything it cannot reproduce
+  exactly to the Python gateway behind it. Each kind of request was moved to
+  Rust only once a differential conformance suite, hundreds of scenarios run
+  against both planes on every push, showed the same answers. It is
+  experimental.
+- **Self-hosted and Apache-2.0,** with the admin console, command-line tool and
+  Compose file in the same repository. There is no paid tier in this code.
+
+Pick something else when it fits better:
+
+- **Mostly calls to LLM providers** (model routing, spend tracking, prompt
+  caching): an LLM proxy such as LiteLLM does more there.
+- **An existing API gateway estate** (Kong, Envoy, a cloud gateway): its AI or
+  MCP plugins may be enough, and you keep one control plane.
+- **MCP and A2A only, with an Envoy-style configuration model:**
+  [agentgateway](https://agentgateway.dev/) is also open source and written in
+  Rust.
+
+The gateway does not publish performance figures yet;
+[Test performance](docs/how-to/performance-testing.md) shows how to measure your
+own set-up.
+
 ---
 
 ## Frequently asked questions
@@ -261,8 +296,9 @@ route. It is built to be put in front of agent and tool services.
 ### Which protocols does it support?
 
 MCP (HTTP transport), A2A (HTTP and Server-Sent Events), AG-UI, ACP,
-HTTP/REST, GraphQL and MQTT. The WebSocket route closes every connection and
-the gRPC bridge answers `"status": "unsupported"`. Details and the tests behind
+HTTP/REST, GraphQL, MQTT and WebSocket (relayed to a `ws://` or `wss://`
+backend). gRPC is carried by the optional Rust data plane only; the Python
+gateway on its own cannot accept gRPC clients. Details and the tests behind
 each row are in the [protocol support matrix](docs/explanation/protocol-support.md).
 
 ### Does it support the Model Context Protocol (MCP)?
@@ -286,7 +322,7 @@ experimental; you need the Rust toolchain only to build it. See
 
 ### Is it ready for production?
 
-Version 0.9.0 is the first release. It has an automated test suite that runs on
+Version 0.9.1 is an early release. It has an automated test suite that runs on
 every push, a Dockerfile, a Compose file and an nginx configuration. Some
 settings look like controls but are not enforced yet. Read the [known limitations](docs/known-limitations.md)
 and work through [Secure the gateway for production](docs/how-to/secure-for-production.md)
@@ -308,8 +344,9 @@ More questions are answered in the [FAQ](docs/faq.md).
 
 ## What it does not do
 
-- **WebSocket and gRPC pass-through do not work.** The WebSocket route closes
-  every connection, and the gRPC bridge answers `"status": "unsupported"`.
+- **gRPC needs the Rust data plane,** which is experimental. The Python
+  gateway alone cannot accept gRPC clients. WebSocket connections are not
+  rate limited or written to the request log.
 - **Some settings are not enforced yet:** admin roles, per-protocol rate
   limits, the policy `rate_limit` action and tenant `requests_per_day`.
 - **`SECRET_KEY` is a break-glass credential** on the admin API while
@@ -328,8 +365,9 @@ Every item, with its workaround: [known limitations](docs/known-limitations.md).
 
 - **For** teams that run several agent or API services and want one place to
   issue keys, apply limits and watch traffic, without changing the services.
-- **Not for** anyone who needs WebSocket or gRPC pass-through, role-based
-  admin access, per-protocol rate limits or published performance figures.
+- **Not for** anyone who needs gRPC without running the experimental Rust
+  data plane, role-based admin access, per-protocol rate limits or published
+  performance figures.
 
 ## Contributing, support and security
 

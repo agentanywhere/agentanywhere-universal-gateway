@@ -64,7 +64,7 @@ errors there is a step-by-step guide:
 | WebSocket handshake refused with 403 | No working API key, or the backend at `WEBSOCKET_BACKEND_URL` could not be reached or refused | Send `X-API-Key` or `?api_key=`; check the backend address and that it is up. |
 | WebSocket opens but nothing comes back | `WEBSOCKET_BACKEND_URL` is an `http://` address | Give the backend's `ws://` or `wss://` address. |
 | WebSocket closes with 1003 | `WEBSOCKET_BACKEND_URL` is not set | Set it. |
-| `/grpc` answers 200 with `"status": "unsupported"` | The gRPC bridge does not work | Call the gRPC service directly. |
+| `/grpc` answers 200 with `"status": "unsupported"` | The JSON-to-gRPC bridge is a sample and the Python gateway cannot carry gRPC | Run the [Rust data plane](how-to/run-the-data-plane.md), which relays gRPC calls, or call the service directly. |
 | 503 `MQTT broker not connected` | The broker was down when the gateway started | Start the broker, restart the gateway. |
 | `/mqtt/subscribe` succeeds but no messages arrive | Messages are only logged | Subscribe to the broker directly. |
 | GraphQL answers 502 with the sample backend | `env.example` points at port 4000; the sample is on 8006 | `GRAPHQL_BACKEND_URL=http://localhost:8006/graphql`. |

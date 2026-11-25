@@ -56,7 +56,7 @@ It also has settings that look like controls but are not enforced yet (admin
 roles, per-protocol rate limits). Read the
 [known limitations](known-limitations.md) and work through
 [Secure the gateway for production](how-to/secure-for-production.md), then
-decide. Version 0.9.0 is the first release.
+decide. Version 0.9.1 is an early release.
 
 ## Do I need Redis?
 

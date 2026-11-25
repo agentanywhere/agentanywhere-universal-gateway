@@ -23,7 +23,8 @@ the gateway container itself.
 | One backend per protocol | [Per-protocol settings](#per-protocol-settings) |
 | Several backends for the same protocol, or a path that should go somewhere else | [Dynamic routes](#dynamic-routes) |
 | A browser application or agent with its own authentication, under `/agents/<slug>/` | [The agent edge](#the-agent-edge) |
-| WebSocket or gRPC pass-through | Not possible as shipped; see the [protocol support matrix](../explanation/protocol-support.md) |
+| WebSocket pass-through | Set `WEBSOCKET_BACKEND_URL` to a `ws://` or `wss://` address; see the [protocol support matrix](../explanation/protocol-support.md#websocket) |
+| gRPC pass-through | Through the experimental [Rust data plane](run-the-data-plane.md) only, with `GRPC_BACKEND_URL` |
 
 ## Per-protocol settings
 

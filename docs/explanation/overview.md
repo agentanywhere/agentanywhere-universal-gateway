@@ -36,7 +36,8 @@ It is licensed under Apache-2.0. Copyright ShepHertz Technologies Pvt. Ltd.
 - Anyone who needs a gateway they can expose to the internet without reading
   the [known limitations](../known-limitations.md) first. Several settings that look like controls (admin roles,
   per-protocol limits) are not enforced yet.
-- Anyone who needs WebSocket or gRPC pass-through. Neither works.
+- Anyone who needs gRPC without the experimental Rust data plane. The Python
+  gateway on its own cannot accept gRPC clients.
 - Anyone who needs a high-throughput edge proxy. The gateway buffers most
   responses in Python, writes a database row per request and has no published
   performance figures.

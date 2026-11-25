@@ -31,26 +31,28 @@ lists the behaviour changes that may need action.
 The full status of each protocol is in the
 [protocol support matrix](explanation/protocol-support.md).
 
-### WebSocket pass-through does not work
+### WebSocket connections are not rate limited or logged
 
-**Reproduced.** `/ws/{path}` closes every connection. Without a key it closes
-with code 1008 and reason `API key required`; with a valid key it closes with
-1008 and `Authentication failed`. The WebSocket examples in `examples/` and the
-console's protocol test page do not work.
+`/ws/{path}` relays connections to a `ws://` or `wss://` backend with an API
+key, and applies the key's path scope, IP rules and policies to the handshake.
+Rate limits and tenant quotas do not apply, and connections are not written to
+the request log. With an `http://` address in `WEBSOCKET_BACKEND_URL` the old
+handler answers instead, and it is not a relay.
 
-**Workaround.** Connect clients to the WebSocket backend directly, or use the
-agent edge (`/agents/<slug>/...`), which relays WebSocket frames but applies no
-gateway credential. See [Configure routes and backends](how-to/configure-routes-and-backends.md#the-agent-edge).
+**Workaround.** Limit connections at the backend, and use a `ws://` or
+`wss://` address. See the [protocol support matrix](explanation/protocol-support.md#websocket).
 
-### gRPC pass-through does not work
+### gRPC needs the Rust data plane
 
-The JSON-to-gRPC bridge under `/grpc` tries server reflection with a package
-that is not in `requirements.txt`, and only knows the sample `Greeter` service
-otherwise. With the stock requirements it answers HTTP 200 with
-`"status": "unsupported"`. gRPC clients cannot connect to the gateway.
+The Python gateway has no HTTP/2 listener, so gRPC clients cannot connect to it.
+The experimental [Rust data plane](how-to/run-the-data-plane.md) accepts gRPC
+calls and relays them to `GRPC_BACKEND_URL` with an API key. The
+JSON-to-gRPC bridge under `/grpc` in the Python gateway only knows the sample
+`Greeter` service, and without the gRPC reflection package (not in
+`requirements.txt`) it answers HTTP 200 with `"status": "unsupported"`.
 
-**Workaround.** Call the gRPC service directly, or put an HTTP facade in front
-of it and route to that.
+**Workaround.** Run the data plane in front of the gateway, or call the gRPC
+service directly.
 
 ### The MQTT client connects once, at start-up
 
