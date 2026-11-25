@@ -8,9 +8,11 @@ export default {
   theme: {
     extend: {
       fontFamily: {
-        sans: ['"IBM Plex Sans"', 'ui-sans-serif', 'system-ui', 'sans-serif'],
-        display: ['"Space Grotesk"', '"IBM Plex Sans"', 'ui-sans-serif', 'sans-serif'],
-        mono: ['"IBM Plex Mono"', 'ui-monospace', 'SFMono-Regular', 'Menlo', 'monospace'],
+        // Sovereign type: Calibri body, Cambria display, Consolas code. Carlito and
+        // Caladea are their metric-compatible open fallbacks (loaded in index.html).
+        sans: ['Calibri', 'Carlito', 'ui-sans-serif', 'system-ui', 'sans-serif'],
+        display: ['Cambria', 'Caladea', 'Georgia', '"Times New Roman"', 'serif'],
+        mono: ['Consolas', 'ui-monospace', 'SFMono-Regular', 'Menlo', 'monospace'],
       },
       animation: {
         'fade-in': 'fadeIn 0.45s cubic-bezier(0.22, 1, 0.36, 1)',
@@ -18,6 +20,9 @@ export default {
         'scale-in': 'scaleIn 0.28s cubic-bezier(0.22, 1, 0.36, 1)',
         'shimmer': 'shimmer 2s linear infinite',
         'rise': 'rise 0.6s cubic-bezier(0.22, 1, 0.36, 1)',
+        'spin-slow': 'spin 60s linear infinite',
+        'spin-slower': 'spin 110s linear infinite reverse',
+        'core-pulse': 'corePulse 4s ease-in-out infinite',
       },
       keyframes: {
         fadeIn: {
@@ -35,6 +40,10 @@ export default {
         shimmer: {
           '0%': { backgroundPosition: '-1000px 0' },
           '100%': { backgroundPosition: '1000px 0' },
+        },
+        corePulse: {
+          '0%, 100%': { opacity: '0.55', transform: 'scale(1)' },
+          '50%': { opacity: '1', transform: 'scale(1.06)' },
         },
         rise: {
           '0%': { opacity: '0', transform: 'translateY(16px)' },
@@ -60,16 +69,6 @@ export default {
         primary: {
           DEFAULT: 'hsl(var(--primary))',
           foreground: 'hsl(var(--primary-foreground))',
-          50: '#f0fdfa',
-          100: '#ccfbf1',
-          200: '#99f6e4',
-          300: '#5eead4',
-          400: '#2dd4bf',
-          500: '#14b8a6',
-          600: '#0d9488',
-          700: '#0f766e',
-          800: '#115e59',
-          900: '#134e4a',
         },
         secondary: {
           DEFAULT: 'hsl(var(--secondary))',
@@ -91,18 +90,27 @@ export default {
         input: 'hsl(var(--input))',
         ring: 'hsl(var(--ring))',
         sidebar: 'hsl(var(--sidebar))',
-        dark: {
-          bg: '#0a0e14',
-          card: '#10161f',
-          cardHover: '#141c28',
-          border: '#243044',
-          text: '#e5e7eb',
-          textMuted: '#94a3b8',
+        brand: {
+          cyan: '#2CC7FE',
+          blue: '#3B82F6',
+          deep: '#2563EB',
+          violet: '#6729F4',
+          saffron: '#FF9933',
+          live: '#10B981',
+        },
+        sovereign: {
+          bg: '#0A0E14',
+          card: '#14202E',
+          border: '#26344A',
+          ink: '#F4F1EA',
+          body: '#B8C0CA',
+          muted: '#8B95A1',
         },
       },
       boxShadow: {
-        soft: '0 1px 2px hsl(222 44% 8% / 0.04), 0 8px 24px hsl(222 44% 8% / 0.04)',
-        panel: '0 1px 0 hsl(0 0% 100% / 0.04) inset, 0 12px 40px hsl(222 44% 8% / 0.08)',
+        soft: '0 1px 2px hsl(216 33% 6% / 0.05), 0 8px 24px hsl(216 33% 6% / 0.05)',
+        panel: '0 1px 0 hsl(0 0% 100% / 0.04) inset, 0 12px 40px hsl(216 33% 4% / 0.12)',
+        glow: '0 0 0 1px hsl(196 99% 58% / 0.25), 0 12px 48px hsl(217 91% 60% / 0.25)',
         dark: '0 8px 24px rgba(0, 0, 0, 0.28)',
         'dark-lg': '0 16px 40px rgba(0, 0, 0, 0.4)',
       },

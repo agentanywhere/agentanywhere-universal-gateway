@@ -53,19 +53,19 @@ const tooltipStyles = {
 }
 
 const PROTOCOL_DEMO = [
-  { name: 'MCP', value: 35, color: '#0ea5e9' },
-  { name: 'A2A', value: 20, color: '#10b981' },
-  { name: 'HTTP/REST', value: 25, color: '#8b5cf6' },
-  { name: 'MQTT', value: 12, color: '#f59e0b' },
-  { name: 'WebSocket', value: 5, color: '#ec4899' },
-  { name: 'gRPC', value: 3, color: '#6366f1' },
+  { name: 'MCP', value: 35, color: '#2CC7FE' },
+  { name: 'A2A', value: 20, color: '#10B981' },
+  { name: 'HTTP/REST', value: 25, color: '#6729F4' },
+  { name: 'MQTT', value: 12, color: '#FF9933' },
+  { name: 'WebSocket', value: 5, color: '#3B82F6' },
+  { name: 'gRPC', value: 3, color: '#8B95A1' },
 ]
 
 const STATUS_DEMO = [
-  { name: '2xx', value: 85, count: 8500, color: '#10b981' },
-  { name: '3xx', value: 5, count: 500, color: '#3b82f6' },
-  { name: '4xx', value: 7, count: 700, color: '#f59e0b' },
-  { name: '5xx', value: 3, count: 300, color: '#ef4444' },
+  { name: '2xx', value: 85, count: 8500, color: '#10B981' },
+  { name: '3xx', value: 5, count: 500, color: '#3B82F6' },
+  { name: '4xx', value: 7, count: 700, color: '#FF9933' },
+  { name: '5xx', value: 3, count: 300, color: '#EF4444' },
 ]
 
 const ENDPOINTS_DEMO = [
@@ -491,10 +491,10 @@ function PerformanceLineDemo() {
             <YAxis stroke="hsl(var(--muted-foreground))" tick={{ fontSize: 11 }} width={36} tickLine={false} />
             <Tooltip {...tooltipStyles} />
             <Legend wrapperStyle={{ fontSize: 12 }} />
-            <Line type="monotone" dataKey="mcp" stroke="#0ea5e9" strokeWidth={2} name="MCP" dot={false} />
-            <Line type="monotone" dataKey="a2a" stroke="#10b981" strokeWidth={2} name="A2A" dot={false} />
-            <Line type="monotone" dataKey="http" stroke="#8b5cf6" strokeWidth={2} name="HTTP" dot={false} />
-            <Line type="monotone" dataKey="mqtt" stroke="#f59e0b" strokeWidth={2} name="MQTT" dot={false} />
+            <Line type="monotone" dataKey="mcp" stroke="#2CC7FE" strokeWidth={2} name="MCP" dot={false} />
+            <Line type="monotone" dataKey="a2a" stroke="#10B981" strokeWidth={2} name="A2A" dot={false} />
+            <Line type="monotone" dataKey="http" stroke="#6729F4" strokeWidth={2} name="HTTP" dot={false} />
+            <Line type="monotone" dataKey="mqtt" stroke="#FF9933" strokeWidth={2} name="MQTT" dot={false} />
           </LineChart>
         </ResponsiveContainer>
       </CardContent>

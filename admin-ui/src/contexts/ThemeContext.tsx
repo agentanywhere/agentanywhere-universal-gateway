@@ -13,11 +13,10 @@ const ThemeContext = createContext<ThemeContextType | undefined>(undefined)
 export function ThemeProvider({ children }: { children: React.ReactNode }) {
   const [theme, setThemeState] = useState<Theme>(() => {
     if (typeof window !== 'undefined') {
-      const saved = localStorage.getItem('theme') as Theme
-      if (saved) return saved
-      return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
+      // Sovereign Dark is the brand default; a saved choice wins.
+      return localStorage.getItem('theme') === 'light' ? 'light' : 'dark'
     }
-    return 'light'
+    return 'dark'
   })
 
   useEffect(() => {

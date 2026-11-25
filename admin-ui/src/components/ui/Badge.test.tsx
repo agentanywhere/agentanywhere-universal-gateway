@@ -12,7 +12,7 @@ describe('Badge', () => {
     ['success', 'emerald'],
     ['warning', 'amber'],
     ['danger', 'red'],
-    ['info', 'teal'],
+    ['info', 'brand-cyan'],
     ['primary', 'bg-primary/10'],
     ['muted', 'bg-muted'],
   ] as const)('applies %s variant styles', (variant, token) => {
