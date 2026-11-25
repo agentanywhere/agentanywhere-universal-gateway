@@ -80,7 +80,10 @@ you change that.
 
 Each release is also published as an image, so the gateway alone needs no build:
 `docker pull ghcr.io/agentanywhere/agentanywhere-universal-gateway:0.9.0` (or `:latest`).
-It reads the same settings as above (`--env-file .env`) and listens on port 8000.
+It reads the same settings as above (`--env-file .env`, with `ADMIN_TOKEN` set)
+and serves the API on port 8000; the console is not in that image. See
+[Without Compose](docs/how-to/deploy-with-docker-compose.md#without-compose-one-container-or-kubernetes)
+for the full command.
 
 ### Option B: Python (no Docker)
 

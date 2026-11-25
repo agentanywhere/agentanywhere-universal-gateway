@@ -12,6 +12,9 @@ export default defineConfig({
     },
   },
   server: {
+    // 127.0.0.1 so the URLs in the docs work: on macOS "localhost" makes Vite
+    // listen on ::1 only, and http://127.0.0.1:3001 would not connect.
+    host: '127.0.0.1',
     port: 3001,
     proxy: {
       '^/admin(/|$)': {

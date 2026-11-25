@@ -60,9 +60,11 @@ USER gateway
 # Expose port
 EXPOSE 8000
 
-# Health check
+# Health check. GET, not wget --spider: --spider sends HEAD, and /health is
+# GET-only. 127.0.0.1, not localhost: localhost resolves to ::1 in the image,
+# and uvicorn listens on IPv4 only.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD wget --no-verbose --tries=1 --spider http://localhost:8000/health || exit 1
+    CMD wget --no-verbose --tries=1 -O /dev/null http://127.0.0.1:8000/health || exit 1
 
 # Run application
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
