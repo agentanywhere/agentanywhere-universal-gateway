@@ -51,7 +51,7 @@ function Sparkline({ points, color }: { points: number[]; color: string }) {
 function AgentCard({ a }: { a: BoardAgent }) {
   const up = a.status === 'up'
   const down = a.status === 'down'
-  const accent = up ? '#10b981' : down ? '#ef4444' : '#64748b'
+  const accent = up ? '#10B981' : down ? '#EF4444' : '#8B95A1'
   return (
     <div
       className={cn(

@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { ArrowRight, Lock, Shield, User, Zap } from 'lucide-react'
+import GatewayHero from '../components/GatewayHero'
 import { useAuth } from '../contexts/AuthContext'
 import { adminApi } from '../api/admin'
 import { idaEnabled, idaLogin } from '../ida'
@@ -83,57 +84,58 @@ export default function Login() {
 
   return (
     <div className="relative min-h-screen overflow-hidden bg-background text-foreground">
-      <div
-        aria-hidden="true"
-        className="pointer-events-none absolute inset-0 -z-10"
-        style={{
-          backgroundImage:
-            'radial-gradient(72rem 40rem at 78% -18%, hsl(173 72% 36% / 0.18), transparent 58%), radial-gradient(48rem 28rem at -8% 100%, hsl(210 40% 30% / 0.12), transparent 55%)',
-        }}
-      />
-      <div
-        aria-hidden="true"
-        className="mesh-grid absolute inset-0 -z-10 opacity-60 [mask-image:radial-gradient(ellipse_at_center,black_25%,transparent_72%)]"
-      />
+      <div className="grid min-h-screen grid-cols-1 lg:grid-cols-[1.25fr_1fr]">
+        {/* The hero is always Sovereign Dark, whatever the console theme. */}
+        <section className="dark relative isolate flex flex-col overflow-hidden border-b border-[#26344A] bg-[#0A0E14] px-6 pb-8 pt-8 text-foreground sm:px-10 lg:min-h-screen lg:border-b-0 lg:border-r lg:px-14 lg:py-10">
+          <div
+            aria-hidden="true"
+            className="pointer-events-none absolute inset-0 -z-10"
+            style={{
+              backgroundImage:
+                'radial-gradient(60rem 36rem at 70% 40%, rgba(45,99,246,0.16), transparent 60%), radial-gradient(40rem 30rem at 0% 100%, rgba(103,41,244,0.14), transparent 60%), radial-gradient(36rem 24rem at 10% 0%, rgba(44,199,254,0.10), transparent 60%)',
+            }}
+          />
 
-      <div className="mx-auto grid min-h-screen max-w-6xl grid-cols-1 lg:grid-cols-[1.15fr_0.85fr]">
-        <section className="relative flex flex-col justify-between px-6 py-10 sm:px-10 lg:px-14 lg:py-14">
           <div className="flex items-center gap-3 animate-fade-in">
-            <div className="brand-mark shadow-soft">
+            <div className="brand-mark shadow-glow">
               <Zap className="relative z-10 h-4 w-4 text-white" strokeWidth={2.4} />
             </div>
-            <span className="font-mono text-[11px] font-medium uppercase tracking-[0.2em] text-muted-foreground">
-              Console
-            </span>
-          </div>
-
-          <div className="max-w-xl space-y-6 py-16 animate-rise lg:py-0">
-            <h1 className="font-display text-5xl font-semibold leading-[0.95] tracking-tight text-foreground sm:text-6xl lg:text-7xl">
-              AgentAnywhere
-            </h1>
-            <p className="max-w-md text-base leading-relaxed text-muted-foreground sm:text-lg">
-              Universal Gateway control plane for routing, observability, and agent health across the platform.
-            </p>
-            <div className="flex flex-wrap gap-x-6 gap-y-2 font-mono text-[11px] uppercase tracking-[0.14em] text-muted-foreground/90">
-              <span>MCP · A2A · HTTP</span>
-              <span>MQTT · gRPC · WS</span>
+            <div className="leading-tight">
+              <div className="font-display text-[17px] font-semibold text-foreground">AgentAnywhere</div>
+              <div className="font-mono text-[10px] uppercase tracking-[0.22em] text-muted-foreground">
+                Universal Gateway
+              </div>
             </div>
           </div>
 
-          <p className="hidden text-xs text-muted-foreground lg:block">
-            Platform operators · routes, metrics, and agent health
-          </p>
+          <div className="relative mx-auto my-2 flex w-full max-w-[44rem] flex-1 items-center justify-center animate-scale-in">
+            <GatewayHero className="h-auto max-h-[30vh] w-full sm:max-h-[44vh] lg:max-h-[58vh]" />
+          </div>
+
+          <div className="max-w-xl space-y-4 animate-rise">
+            <p className="eyebrow hidden sm:block">Admin console</p>
+            <h1 className="font-display text-2xl font-semibold leading-[1.1] text-foreground sm:text-5xl sm:leading-[1.05]">
+              Every agent protocol.{' '}
+              <span className="text-signature">One gateway.</span>
+            </h1>
+            <p className="hidden max-w-lg text-base leading-relaxed text-sovereign-body sm:block sm:text-lg">
+              Authenticate, rate-limit and route MCP, A2A, AG-UI, ACP, HTTP, GraphQL and MQTT
+              traffic, and watch it live from here.
+            </p>
+          </div>
         </section>
 
-        <section className="flex items-center justify-center px-6 py-10 sm:px-10 lg:px-12">
+        <section className="relative flex items-center justify-center px-5 py-8 sm:px-10 sm:py-12 lg:px-12">
           <div className="w-full max-w-md animate-slide-up">
-            <div className="surface-panel rounded-xl p-6 shadow-panel sm:p-8">
-              <div className="mb-6 space-y-1.5">
-                <h2 className="font-display text-xl font-semibold tracking-tight text-foreground">
+            <div className="relative rounded-2xl bg-gradient-to-br from-brand-cyan/50 via-brand-blue/30 to-brand-violet/50 p-px shadow-panel">
+            <div className="rounded-[15px] bg-card p-6 sm:p-9">
+              <div className="mb-7 space-y-2">
+                <p className="eyebrow">Secure access</p>
+                <h2 className="font-display text-3xl font-semibold text-foreground">
                   Sign in
                 </h2>
                 <p className="text-sm text-muted-foreground">
-                  Access the gateway admin console
+                  Operators only. Every sign-in is checked by the gateway.
                 </p>
               </div>
 
@@ -209,12 +211,13 @@ export default function Login() {
                       leftIcon={<Lock className="h-4 w-4" />}
                       value={password}
                       onChange={(e) => setPassword(e.target.value)}
-                      placeholder="ADMIN_TOKEN or SECRET_KEY"
+                      placeholder="ADMIN_TOKEN"
                     />
-                    <p className="text-xs text-muted-foreground">
+                    <p className="text-xs leading-relaxed text-muted-foreground">
                       There is no default password. Use the gateway&apos;s{' '}
-                      <code className="font-mono">ADMIN_TOKEN</code>, or its{' '}
-                      <code className="font-mono">SECRET_KEY</code> if no admin token is set.
+                      <code className="font-mono text-foreground/80">ADMIN_TOKEN</code>.{' '}
+                      <code className="font-mono text-foreground/80">SECRET_KEY</code> works only
+                      while no admin token is set, and never as the example placeholder.
                     </p>
                   </div>
                   {error && (
@@ -237,9 +240,10 @@ export default function Login() {
                 </form>
               )}
             </div>
+            </div>
 
-            <p className="mt-6 text-center text-xs text-muted-foreground lg:hidden">
-              Platform operators · routes, metrics, and agent health
+            <p className="mt-6 text-center font-mono text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
+              Apache-2.0 · open source
             </p>
           </div>
         </section>

@@ -10,7 +10,7 @@ const toneStyles: Record<Tone, string> = {
   success: 'text-emerald-600 dark:text-emerald-400',
   warning: 'text-amber-600 dark:text-amber-400',
   danger: 'text-red-600 dark:text-red-400',
-  info: 'text-teal-600 dark:text-teal-400',
+  info: 'text-sky-700 dark:text-brand-cyan',
 }
 
 export interface StatProps {

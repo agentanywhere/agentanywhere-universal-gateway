@@ -178,7 +178,7 @@ request log. It is served at <http://127.0.0.1:3001> with Docker Compose, or by
 |---|---|
 | ![API keys page: each key with its name, masked value, per-minute and per-hour limits, status and a deactivate button](docs/img/console/api-keys.png) | ![Routes page: each path prefix with its protocol, backend, timeout, authentication and status](docs/img/console/routes.png) |
 | **API keys.** Create, deactivate and delete keys; each shows its limits. The full key is shown once, when you create it. | **Routes.** Every path prefix, the protocol it carries and the backend it goes to. |
-| ![Request logs page: a live tail of requests with time, method, path, status, latency and client address, with 401 and 429 responses highlighted](docs/img/console/logs.png) | ![Sign-in page of the admin console](docs/img/console/login.png) |
+| ![Request logs page: a live tail of requests with time, method, path, status, latency and client address; a rate-limited 429 response stands out in amber](docs/img/console/logs.png) | ![Sign-in page of the admin console: an animated view of agent protocols flowing through the gateway, beside the sign-in form](docs/img/console/login.png) |
 | **Request logs.** A live tail with filters; refused (`401`) and limited (`429`) requests stand out. | **Sign-in.** Use `ADMIN_TOKEN`. There is no default password. |
 
 It also has pages for agents, mission control, analytics, AI insights, reports,

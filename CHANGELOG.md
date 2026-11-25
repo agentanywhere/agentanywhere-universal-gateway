@@ -7,7 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The admin console uses the AgentAnywhere Sovereign theme: dark by default
+  (a saved light choice still wins), cyan, blue and violet accents, Cambria
+  headings and Calibri body text (with the open Caladea and Carlito as
+  fallbacks).
+- The sign-in page opens with an animated view of agent protocols flowing
+  through the gateway. It is plain SVG and is drawn still for viewers who
+  prefer reduced motion.
+- The sign-in hint no longer suggests that `SECRET_KEY` works when an
+  `ADMIN_TOKEN` is set, and the README screenshots show the new look.
+
 ### Fixed
+
+- Hovering a bar chart drew a light grey band that glared on the dark theme.
 
 - The image's `HEALTHCHECK` always failed, so `docker run` showed the gateway as
   `unhealthy`: it sent HEAD (`wget --spider`) to a GET-only `/health`, at

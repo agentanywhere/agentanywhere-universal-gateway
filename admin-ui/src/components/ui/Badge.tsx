@@ -9,7 +9,7 @@ const variantStyles: Record<Variant, string> = {
   success: 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border-emerald-500/20',
   warning: 'bg-amber-500/10 text-amber-700 dark:text-amber-400 border-amber-500/20',
   danger: 'bg-red-500/10 text-red-700 dark:text-red-400 border-red-500/20',
-  info: 'bg-teal-500/10 text-teal-700 dark:text-teal-400 border-teal-500/20',
+  info: 'bg-brand-cyan/10 text-sky-700 dark:text-brand-cyan border-brand-cyan/25',
   muted: 'bg-muted text-muted-foreground border-border/80',
 }
 
@@ -36,7 +36,7 @@ export function Badge({ className, variant = 'default', dot, children, ...props 
             variant === 'success' && 'animate-pulse bg-emerald-500',
             variant === 'warning' && 'bg-amber-500',
             variant === 'danger' && 'bg-red-500',
-            variant === 'info' && 'bg-teal-500',
+            variant === 'info' && 'bg-brand-cyan',
             variant === 'primary' && 'bg-primary',
             (variant === 'default' || variant === 'muted') && 'bg-muted-foreground/60'
           )}

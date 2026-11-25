@@ -41,18 +41,19 @@ describe('ThemeContext', () => {
     expect(document.documentElement).toHaveClass('dark')
   })
 
-  it('falls back to the system preference', () => {
-    setSystemDark(true)
+  it('defaults to Sovereign Dark, even when the system prefers light', () => {
+    setSystemDark(false)
     render(
       <ThemeProvider>
         <Probe />
       </ThemeProvider>
     )
     expect(screen.getByTestId('theme')).toHaveTextContent('dark')
+    expect(document.documentElement).toHaveClass('dark')
   })
 
-  it('falls back to light when the system prefers light', () => {
-    setSystemDark(false)
+  it('keeps a saved light choice', () => {
+    localStorage.setItem('theme', 'light')
     render(
       <ThemeProvider>
         <Probe />
@@ -70,18 +71,18 @@ describe('ThemeContext', () => {
       </ThemeProvider>
     )
     await userEvent.click(screen.getByText('toggle'))
-    expect(screen.getByTestId('theme')).toHaveTextContent('dark')
-    expect(document.documentElement).toHaveClass('dark')
-    expect(document.documentElement).not.toHaveClass('light')
-    expect(localStorage.getItem('theme')).toBe('dark')
-    await userEvent.click(screen.getByText('toggle'))
+    expect(screen.getByTestId('theme')).toHaveTextContent('light')
+    expect(document.documentElement).toHaveClass('light')
+    expect(document.documentElement).not.toHaveClass('dark')
     expect(localStorage.getItem('theme')).toBe('light')
+    await userEvent.click(screen.getByText('toggle'))
+    expect(localStorage.getItem('theme')).toBe('dark')
   })
 
   it('setTheme sets an explicit theme', async () => {
     setSystemDark(false)
     const { result } = renderHook(() => useTheme(), { wrapper: ThemeProvider })
-    act(() => result.current.setTheme('dark'))
-    expect(result.current.theme).toBe('dark')
+    act(() => result.current.setTheme('light'))
+    expect(result.current.theme).toBe('light')
   })
 })
