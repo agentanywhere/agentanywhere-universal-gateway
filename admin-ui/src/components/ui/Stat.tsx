@@ -64,7 +64,7 @@ export function Stat({
           {isLoading ? (
             <div className="h-8 w-24 animate-pulse rounded-md bg-muted" />
           ) : (
-            <p className="font-display text-[1.75rem] font-semibold leading-none tracking-tight text-foreground tabular-nums">
+            <p className="whitespace-nowrap font-display text-[1.375rem] font-semibold leading-none tracking-tight text-foreground tabular-nums sm:text-[1.75rem]">
               {value}
             </p>
           )}

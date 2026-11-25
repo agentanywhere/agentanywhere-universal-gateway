@@ -1,4 +1,5 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
+import { useMediaQuery } from '../hooks/useMediaQuery'
 
 /**
  * The sign-in page's hero: agent protocols around the gateway, with requests
@@ -12,6 +13,10 @@ const PROTOCOLS = ['MCP', 'A2A', 'AG-UI', 'ACP', 'HTTP', 'GraphQL', 'MQTT', 'Web
 const SIZE = 800
 const C = SIZE / 2
 const ORBIT = 296
+// Below lg the hero is drawn small, so labels are scaled up and the orbit
+// pulled in to keep them readable and inside the frame.
+const COMPACT_LABEL_SCALE = 1.7
+const COMPACT_ORBIT = 268
 const CORE = 62
 
 function usePrefersReducedMotion(): boolean {
@@ -39,14 +44,14 @@ interface Node {
   dur: number
 }
 
-function buildNodes(): Node[] {
+function buildNodes(orbit: number, inset: number): Node[] {
   return PROTOCOLS.map((name, i) => {
     const a = (i / PROTOCOLS.length) * Math.PI * 2 - Math.PI / 2
-    const x = C + ORBIT * Math.cos(a)
-    const y = C + ORBIT * Math.sin(a)
+    const x = C + orbit * Math.cos(a)
+    const y = C + orbit * Math.sin(a)
     // Edge points: just inside the pill, and on the core's rim.
-    const ex = C + (ORBIT - 40) * Math.cos(a)
-    const ey = C + (ORBIT - 40) * Math.sin(a)
+    const ex = C + (orbit - inset) * Math.cos(a)
+    const ey = C + (orbit - inset) * Math.sin(a)
     const cx = C + (CORE + 6) * Math.cos(a)
     const cy = C + (CORE + 6) * Math.sin(a)
     // Bend each lane a little, alternately, so the flows read as streams.
@@ -66,8 +71,6 @@ function buildNodes(): Node[] {
   })
 }
 
-const NODES = buildNodes()
-
 function hexagon(r: number): string {
   return Array.from({ length: 6 }, (_, k) => {
     const a = (Math.PI / 3) * k - Math.PI / 2
@@ -77,6 +80,10 @@ function hexagon(r: number): string {
 
 export default function GatewayHero({ className }: { className?: string }) {
   const reduced = usePrefersReducedMotion()
+  const compact = useMediaQuery('(max-width: 1023px)')
+  const k = compact ? COMPACT_LABEL_SCALE : 1
+  const orbit = compact ? COMPACT_ORBIT : ORBIT
+  const NODES = useMemo(() => buildNodes(orbit, 40 * k), [orbit, k])
 
   return (
     <svg
@@ -131,7 +138,7 @@ export default function GatewayHero({ className }: { className?: string }) {
       <circle cx={C} cy={C} r={260} fill="url(#gh-halo)" />
 
       {/* Orbit and slow rings. */}
-      <circle cx={C} cy={C} r={ORBIT} fill="none" stroke="#26344A" strokeDasharray="2 10" strokeLinecap="round" />
+      <circle cx={C} cy={C} r={orbit} fill="none" stroke="#26344A" strokeDasharray="2 10" strokeLinecap="round" />
       <g className={reduced ? undefined : 'animate-spin-slow'} style={{ transformOrigin: `${C}px ${C}px` }}>
         <circle cx={C} cy={C} r={168} fill="none" stroke="url(#gh-sig)" strokeOpacity="0.55" strokeDasharray="1 14" strokeWidth="2" strokeLinecap="round" />
         <circle cx={C} cy={C - 168} r="4" fill="#2CC7FE" filter="url(#gh-glow)" />
@@ -189,22 +196,22 @@ export default function GatewayHero({ className }: { className?: string }) {
 
       {/* Protocol pills. */}
       {NODES.map((n) => {
-        const w = Math.max(70, n.name.length * 11.5 + 38)
+        const w = Math.max(70, n.name.length * 11.5 + 38) * k
         return (
           <g key={n.name} transform={`translate(${n.x.toFixed(1)} ${n.y.toFixed(1)})`}>
-            <rect x={-w / 2} y={-21} width={w} height={42} rx={21} fill="#14202E" stroke="#26344A" />
-            <circle cx={-w / 2 + 17} cy={0} r={3.5} fill="#10B981">
+            <rect x={-w / 2} y={-21 * k} width={w} height={42 * k} rx={21 * k} fill="#14202E" stroke="#26344A" strokeWidth={k} />
+            <circle cx={-w / 2 + 17 * k} cy={0} r={3.5 * k} fill="#10B981">
               {!reduced && (
                 <animate attributeName="opacity" values="1;0.35;1" dur="2.4s" begin={`${n.delay}s`} repeatCount="indefinite" />
               )}
             </circle>
             <text
-              x={8}
+              x={8 * k}
               y={1}
               textAnchor="middle"
               dominantBaseline="middle"
               fill="#F4F1EA"
-              fontSize="19"
+              fontSize={19 * k}
               fontFamily="Consolas, ui-monospace, SFMono-Regular, Menlo, monospace"
               letterSpacing="0.04em"
             >
