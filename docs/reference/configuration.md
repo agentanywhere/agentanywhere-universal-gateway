@@ -84,7 +84,7 @@ settings too, so `.env` applies to them; the process environment wins.)
 | Variable | Default | Description |
 |---|---|---|
 | `APP_NAME` | `AgentAnywhere Universal Gateway` | Title of the OpenAPI schema and `service.name` in logs. |
-| `APP_VERSION` | `0.9.0` | Version reported by `/health`, `/health/detailed` and the OpenAPI schema. |
+| `APP_VERSION` | `0.9.1` | Version reported by `/health`, `/health/detailed` and the OpenAPI schema. |
 | `ENVIRONMENT` | `production` | Free text, lower-cased. With `production` and a placeholder `SECRET_KEY`, a warning is printed at start-up. Also used in log fields and to choose `https` for generated SDKs. |
 | `DEBUG` | `false` | When `true`, serves `/docs`, `/redoc` and `/openapi.json`, and echoes SQL statements. With `false`, those three paths answer 404 from the gateway. |
 | `HOST` | `0.0.0.0` | Bind address, used only when the gateway is started with `python -m app.main`. `uvicorn` on the command line takes `--host` instead. |

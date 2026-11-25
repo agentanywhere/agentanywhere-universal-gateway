@@ -211,7 +211,7 @@ does the same.) Then start it:
 docker run -d --name gateway -p 8000:8000 --env-file .env \
   -v gateway_data:/app/data \
   -e DATABASE_URL=sqlite+aiosqlite:////app/data/gateway.db \
-  ghcr.io/agentanywhere/agentanywhere-universal-gateway:0.9.0
+  ghcr.io/agentanywhere/agentanywhere-universal-gateway:0.9.1
 ```
 
 Check it with `curl -s http://127.0.0.1:8000/health`, and call the admin API
@@ -223,7 +223,7 @@ Compose as above. `docker run` reads `.env` only when it creates the container:
 after editing `.env`, run `docker rm -f gateway` and start it again (the
 `gateway_data` volume keeps the database).
 
-Pin a version (`0.9.0`, or `0.9` for its fixes) rather than `latest`. To run
+Pin a version (`0.9.1`, or `0.9` for its fixes) rather than `latest`. To run
 code that is not released yet, build the image yourself with
 `docker build -t agentanywhere-universal-gateway .` and use that name instead.
 

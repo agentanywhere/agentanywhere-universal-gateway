@@ -92,7 +92,7 @@ flowchart TD
     route -- "/admin/*" --> admin["Admin API"]
     route -- "anything else" --> proxy["Catch-all proxy"]
     proxy --> grpc{"Path starts with grpc?"}
-    grpc -- "yes" --> grpcbridge["JSON-to-gRPC bridge (not working)"]
+    grpc -- "yes" --> grpcbridge["JSON-to-gRPC bridge (sample only)"]
     grpc -- "no" --> boundary["Protocol boundary checks: MCP, A2A, ACP, AG-UI"]
     boundary -- "invalid payload" --> r400["400 VALIDATION_ERROR"]
     boundary --> pplugin{"Protocol plugin claims the path?"}

@@ -7,7 +7,7 @@
 | 0.9.x   | Yes       |
 | < 0.9   | No        |
 
-Version 0.9.0 is the first release; see the [changelog](CHANGELOG.md).
+The current version is 0.9.1; see the [changelog](CHANGELOG.md).
 
 ## Reporting a vulnerability
 
