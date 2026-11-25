@@ -5,6 +5,19 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- The image's `HEALTHCHECK` always failed, so `docker run` showed the gateway as
+  `unhealthy`: it sent HEAD (`wget --spider`) to a GET-only `/health`, at
+  `localhost`, which resolves to `::1` where uvicorn does not listen. It now
+  sends GET to `127.0.0.1`. Compose already used GET and was not affected.
+- The console's dev server listened on `::1` only on macOS, so the documented
+  <http://127.0.0.1:3001> did not connect. It now listens on `127.0.0.1`.
+- The single-container guide now says to set `ADMIN_TOKEN` and `SECRET_KEY`
+  first, that the image serves the API only, and where the console runs.
+
 ## [0.9.0] - 2026-11-24
 
 First public release, under the Apache License 2.0.

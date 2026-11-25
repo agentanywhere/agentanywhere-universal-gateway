@@ -64,7 +64,7 @@ services:
     healthcheck:
       # wget --spider sends HEAD; /health is registered as GET-only and would
       # fall through to the catch-all proxy. Use GET instead.
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "-O", "/dev/null", "http://localhost:8000/health"]
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "-O", "/dev/null", "http://127.0.0.1:8000/health"]
       interval: 30s
       timeout: 10s
       retries: 3

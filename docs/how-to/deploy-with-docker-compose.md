@@ -192,7 +192,20 @@ Backups: [Back up and restore](back-up-and-restore.md). `make up`,
 ## Without Compose: one container or Kubernetes
 
 Each release is published as an image for `linux/amd64` and `linux/arm64`,
-built from the root `Dockerfile`, and runs on its own:
+built from the root `Dockerfile`, and runs on its own. It needs a `.env` with
+your own secrets: `env.example` leaves `ADMIN_TOKEN` empty and `SECRET_KEY` as
+a placeholder, and the placeholder never opens the admin API. Without a clone of
+the repository:
+
+```bash
+mkdir -p gateway && cd gateway
+curl -fsSL -o .env https://raw.githubusercontent.com/agentanywhere/agentanywhere-universal-gateway/main/env.example
+sed -i.bak -e "s|^SECRET_KEY=.*|SECRET_KEY=$(openssl rand -hex 32)|" \
+  -e "s|^ADMIN_TOKEN=.*|ADMIN_TOKEN=$(openssl rand -hex 24)|" .env
+```
+
+(In a clone, `python3 scripts/generate_secret_key.py --update-env --admin-token`
+does the same.) Then start it:
 
 ```bash
 docker run -d --name gateway -p 8000:8000 --env-file .env \
@@ -200,6 +213,15 @@ docker run -d --name gateway -p 8000:8000 --env-file .env \
   -e DATABASE_URL=sqlite+aiosqlite:////app/data/gateway.db \
   ghcr.io/agentanywhere/agentanywhere-universal-gateway:0.9.0
 ```
+
+Check it with `curl -s http://127.0.0.1:8000/health`, and call the admin API
+with `Authorization: Bearer <ADMIN_TOKEN>`. Port 8000 is the API only: a browser
+there gets `401 API key required`. The image does not contain the console. To
+sign in to it, run it from a clone with `cd admin-ui && npm ci && npm run dev`
+(it proxies to `127.0.0.1:8000`) and open <http://127.0.0.1:3001>, or use
+Compose as above. `docker run` reads `.env` only when it creates the container:
+after editing `.env`, run `docker rm -f gateway` and start it again (the
+`gateway_data` volume keeps the database).
 
 Pin a version (`0.9.0`, or `0.9` for its fixes) rather than `latest`. To run
 code that is not released yet, build the image yourself with
@@ -228,7 +250,8 @@ there is more than one replica
 | Keys gone after an update | The volume was deleted, or `.env` sets a relative SQLite `DATABASE_URL` | Restore a backup; delete the line. |
 | `postgres` or `grafana` exits at once | Its password is empty or a placeholder | Set `POSTGRES_PASSWORD` or `GRAFANA_ADMIN_PASSWORD`. |
 | `port is already allocated` | Something on the host uses 8000, 3001, 6379 (or 80, 443, 5432, 3000, 9090, 8001 to 8003, 8080, 1883, 9001, 50051 with profiles) | Stop it, or change the left side of the port mapping. `PORT` in `.env` changes the gateway's host port. |
-| The console's sign-in fails | Wrong password, or the gateway is not healthy | The password is `ADMIN_TOKEN` (or `SECRET_KEY` if `ADMIN_TOKEN` is empty). Check `docker compose logs gateway`. |
+| The console's sign-in fails | Wrong password, no admin credential set, or the gateway is not healthy | The password is `ADMIN_TOKEN`. `SECRET_KEY` works only while `ADMIN_TOKEN` is empty, and never while it is the `env.example` placeholder, so with an untouched `.env` nothing signs in. Check `docker compose logs gateway`. |
+| `401 API key required` in the browser | You opened port 8000, which is the API | Open the console on port 3001 instead. |
 | `ports are not available: exposing port TCP 127.0.0.1:6379 ... Only one usage of each socket address` (Windows wording) | A Redis or Memurai already runs on the host and holds 6379 | Find it: `netstat -ano \| grep ":6379 "` in Git Bash (the last column is the process id), or `Get-NetTCPConnection -LocalPort 6379` in PowerShell. Stop that service (on Windows this needs an administrator prompt), or change the left side of the `redis` port mapping in `docker-compose.yml` to, for example, `127.0.0.1:6380:6379`. `PORT` in `.env` only changes the gateway's host port, not Redis's. The gateway reaches Redis inside the Compose network, so it is unaffected by the host port. |
 | `/ready` answers 503 | The database is not reachable | Check `DATABASE_URL` and `docker compose ps postgres`. |
 | 503 `MQTT broker not connected` | The broker started after the gateway | `docker compose restart gateway`. |
