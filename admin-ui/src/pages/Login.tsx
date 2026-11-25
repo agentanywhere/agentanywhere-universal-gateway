@@ -109,7 +109,7 @@ export default function Login() {
           </div>
 
           <div className="relative mx-auto my-2 flex w-full max-w-[44rem] flex-1 items-center justify-center animate-scale-in">
-            <GatewayHero className="h-auto max-h-[30vh] w-full sm:max-h-[44vh] lg:max-h-[58vh]" />
+            <GatewayHero className="h-auto max-h-[30vh] w-full sm:max-h-[34vh] lg:max-h-[58vh]" />
           </div>
 
           <div className="max-w-xl space-y-4 animate-rise">
