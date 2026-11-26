@@ -91,3 +91,5 @@ nginx/ssl/
 # Output of python -m perf.suite
 perf-report.md
 perf.json
+*.db-wal
+*.db-shm
