@@ -97,8 +97,8 @@ PostgreSQL if you want to compare databases), and send load at a constant rate w
 | Configuration | What it is |
 |---|---|
 | `nodb` | request-log writes off (`REQUEST_LOG_MODE=off`); the ceiling with no persistence on the request path |
-| `sqlite` | SQLite with its defaults, one write per request |
-| `sqlite-wal` | SQLite with `SQLITE_JOURNAL_MODE=WAL`, `SQLITE_SYNCHRONOUS=NORMAL`, `SQLITE_BUSY_TIMEOUT_MS=5000` |
+| `sqlite` | SQLite with its own defaults (`DELETE`, `FULL`), one write per request: the behaviour before 0.9.2 |
+| `sqlite-wal` | SQLite with `SQLITE_JOURNAL_MODE=WAL`, `SQLITE_SYNCHRONOUS=NORMAL`, `SQLITE_BUSY_TIMEOUT_MS=5000` (the defaults since 0.9.2) |
 | `postgres` | PostgreSQL, one write per request |
 | any of these plus `-batched` | the same, with `REQUEST_LOG_MODE=batched` (rows written in batches by one task) |
 

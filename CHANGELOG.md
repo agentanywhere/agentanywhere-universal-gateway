@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The gateway no longer writes to the database on every request by default, which
+  made the database the bottleneck (SQLite above all):
+  - a key's `last_used_at` is written at most once a minute
+    (`API_KEY_LAST_USED_INTERVAL_SECONDS`, default 60; it was written and
+    committed on every request);
+  - request-log rows are written in batches (`REQUEST_LOG_MODE=batched`; it was
+    `inline`, one transaction per request);
+  - SQLite uses `WAL` with `synchronous=NORMAL` and a five-second busy timeout
+    (it used SQLite's own `DELETE` and `FULL`: a disk sync per commit).
+  Each old behaviour is one setting away; see
+  [Upgrade the gateway](docs/how-to/upgrade.md#behaviour-changes-in-this-release).
+
 ## [0.9.1] - 2026-11-25
 
 ### Added

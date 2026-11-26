@@ -46,7 +46,13 @@ def captured_logs():
     async def fake_create(session, log, api_key_id=None):
         rows.append({"log": log, "api_key_id": api_key_id})
 
-    with patch("app.repositories.log_repo.LogRepository.create", side_effect=fake_create):
+    async def fake_create_many(session, batch):
+        # REQUEST_LOG_MODE=batched (the default) writes rows in batches.
+        for log, api_key_id in batch:
+            rows.append({"log": log, "api_key_id": api_key_id})
+
+    with patch("app.repositories.log_repo.LogRepository.create", side_effect=fake_create), \
+            patch("app.repositories.log_repo.LogRepository.create_many", side_effect=fake_create_many):
         yield rows
 
 

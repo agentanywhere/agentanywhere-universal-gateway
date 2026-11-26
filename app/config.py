@@ -609,9 +609,9 @@ class Settings(BaseSettings):
     # Access logs with a status at or above this are never sampled out.
     log_sample_always_status_ge: int = 400
     startup_banner: bool = True
-    # Where request-log rows go: inline (one write per request, the default), batched
-    # (bounded queue, one transaction per batch) or off. See app/request_log_writer.py.
-    request_log_mode: str = "inline"
+    # Where request-log rows go: batched (the default: bounded queue, one transaction per
+    # batch), inline (one write per request) or off. See app/request_log_writer.py.
+    request_log_mode: str = "batched"
     request_log_batch_size: int = 200
     request_log_flush_interval: float = 0.25
     request_log_queue_size: int = 20000
@@ -619,12 +619,15 @@ class Settings(BaseSettings):
     # While cached, a request needs no database read or write for authentication; a key that is
     # revoked through another worker can still be accepted here until the entry expires.
     api_key_local_cache_ttl_seconds: float = 0.0
+    # A key's last-used time is written at most once per this many seconds (0 = on every use).
+    api_key_last_used_interval_seconds: float = 60.0
     # Per-request anomaly detection and usage analytics (scikit-learn, run in the request path).
     ai_analytics_enabled: bool = True
-    # SQLite only, applied to every new connection. Empty keeps SQLite's own default.
-    sqlite_journal_mode: str = ""      # for example WAL
-    sqlite_synchronous: str = ""       # for example NORMAL
-    sqlite_busy_timeout_ms: int = 0    # 0 keeps the driver's default (5 seconds)
+    # SQLite only, applied to every new connection. Empty keeps SQLite's own default
+    # (DELETE, FULL): one disk sync per commit.
+    sqlite_journal_mode: str = "WAL"
+    sqlite_synchronous: str = "NORMAL"
+    sqlite_busy_timeout_ms: int = 5000  # 0 keeps the driver's default (5 seconds)
     # Swappable parts of the request path (see app/adapters/__init__.py). Each takes a built-in
     # name or a "module:attribute" path to a factory that receives the settings.
     # Shared secret the Rust data plane presents to read its snapshot from /internal/dataplane.

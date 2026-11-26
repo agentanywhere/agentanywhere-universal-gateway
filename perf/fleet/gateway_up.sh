@@ -23,7 +23,7 @@ export REQUEST_LOG_MODE=inline
 [[ $CONFIG == *-batched ]] && export REQUEST_LOG_MODE=batched
 [[ $base == nodb ]] && export REQUEST_LOG_MODE=off
 case $base in
-  nodb|sqlite) DB=sqlite ;;
+  nodb|sqlite) DB=sqlite; export SQLITE_JOURNAL_MODE=DELETE SQLITE_SYNCHRONOUS=FULL SQLITE_BUSY_TIMEOUT_MS=0 ;;
   sqlite-wal)  DB=sqlite; export SQLITE_JOURNAL_MODE=WAL SQLITE_SYNCHRONOUS=NORMAL SQLITE_BUSY_TIMEOUT_MS=5000 ;;
   postgres)    DB=postgres ;;
   *) echo "unknown CONFIG $CONFIG" >&2; exit 2 ;;
