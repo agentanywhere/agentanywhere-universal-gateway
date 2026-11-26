@@ -2,12 +2,12 @@
 
 ``REQUEST_LOG_MODE`` chooses:
 
-* ``inline``  (default, the previous behaviour) one task per request opens its own
-  session, inserts one row and commits. Nothing bounds the number of waiting tasks.
-* ``batched`` rows go into a bounded in-memory queue and one background task writes
+* ``batched`` (default) rows go into a bounded in-memory queue and one background task writes
   them in batches, one transaction per batch. When the queue is full the newest row is
   dropped and counted, so a slow database cannot grow memory without limit or slow
   requests down. A crash can lose the rows still in the queue.
+* ``inline``  one task per request opens its own session, inserts one row and commits.
+  Nothing bounds the number of waiting tasks. The default before 0.9.2.
 * ``off``     no rows are written (the dashboard's log views stay empty).
 """
 from __future__ import annotations
@@ -160,7 +160,7 @@ class RequestLogWriter:
 
 def writer_from_settings(settings: Any) -> RequestLogWriter:
     return RequestLogWriter(
-        mode=str(getattr(settings, "request_log_mode", "inline")).lower(),
+        mode=str(getattr(settings, "request_log_mode", "batched")).lower(),
         batch_size=getattr(settings, "request_log_batch_size", 200),
         flush_interval=getattr(settings, "request_log_flush_interval", 0.25),
         queue_size=getattr(settings, "request_log_queue_size", 20000),

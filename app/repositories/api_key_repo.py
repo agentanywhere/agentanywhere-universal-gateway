@@ -110,8 +110,16 @@ class APIKeyRepository:
 
         The caller has just matched the key by its hash, so dropping the
         plaintext copy loses nothing. The display prefix is kept first.
+
+        ``last_used_at`` is written at most once per
+        ``API_KEY_LAST_USED_INTERVAL_SECONDS`` for a key (0 writes on every use):
+        a write and commit on every request made the database the bottleneck,
+        SQLite above all. A legacy row is migrated on its first use regardless.
         """
-        values = {"last_used_at": utcnow()}
+        now = utcnow()
+        if not db_key.key and APIKeyRepository._used_recently(db_key.last_used_at, now):
+            return
+        values = {"last_used_at": now}
         if db_key.key:
             meta = dict(db_key.key_metadata or {})
             meta.setdefault(_PREFIX_META, APIKeyRepository.display_prefix(db_key.key))
@@ -128,6 +136,20 @@ class APIKeyRepository:
                 setattr(db_key, field, value)
             except Exception:
                 pass
+
+    @staticmethod
+    def _used_recently(last_used: Optional[datetime], now: datetime) -> bool:
+        """True when ``last_used`` is within the last-used interval before ``now``."""
+        from app.config import get_settings
+
+        interval = float(getattr(get_settings(), "api_key_last_used_interval_seconds", 0) or 0)
+        if interval <= 0 or last_used is None:
+            return False
+        if (last_used.tzinfo is None) != (now.tzinfo is None):
+            # SQLite hands back naive datetimes; compare both as naive UTC.
+            last_used, now = last_used.replace(tzinfo=None), now.replace(tzinfo=None)
+        age = (now - last_used).total_seconds()
+        return 0 <= age < interval
 
     @staticmethod
     async def toggle_active(db: AsyncSession, key_id: str) -> Optional[APIKeyModel]:

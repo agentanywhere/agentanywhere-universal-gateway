@@ -318,3 +318,48 @@ async def test_log_pagination(db_session):
     assert total2 == total  # Total should be same
 
 
+
+
+@pytest.mark.asyncio
+async def test_mark_used_writes_last_used_at_most_once_per_interval(db_session, sample_api_key, monkeypatch):
+    """A busy key is not written on every request: one write per interval is enough."""
+    from app.config import get_settings
+    monkeypatch.setattr(get_settings(), "api_key_last_used_interval_seconds", 60.0)
+    _, db_key = sample_api_key
+    await APIKeyRepository.mark_used(db_session, db_key)
+    first = (await APIKeyRepository.get_by_id(db_session, db_key.id)).last_used_at
+    assert first is not None
+
+    writes = []
+    real_execute = db_session.execute
+
+    async def counting_execute(*a, **kw):
+        writes.append(a[0])
+        return await real_execute(*a, **kw)
+
+    monkeypatch.setattr(db_session, "execute", counting_execute)
+    await APIKeyRepository.mark_used(db_session, db_key)
+    assert writes == []                       # within the interval: nothing written
+
+    db_key.last_used_at = first - timedelta(seconds=61)
+    await APIKeyRepository.mark_used(db_session, db_key)
+    assert len(writes) == 1                   # interval passed: written again
+
+
+@pytest.mark.asyncio
+async def test_mark_used_interval_zero_writes_every_use(db_session, sample_api_key, monkeypatch):
+    from app.config import get_settings
+    monkeypatch.setattr(get_settings(), "api_key_last_used_interval_seconds", 0)
+    _, db_key = sample_api_key
+    await APIKeyRepository.mark_used(db_session, db_key)
+    first = db_key.last_used_at
+    await APIKeyRepository.mark_used(db_session, db_key)
+    assert db_key.last_used_at >= first and db_key.last_used_at is not None
+
+
+def test_used_recently_compares_naive_and_aware_times():
+    from datetime import timezone
+    now = utcnow()
+    assert APIKeyRepository._used_recently(now.replace(tzinfo=timezone.utc) - timedelta(seconds=5), now) is True
+    assert APIKeyRepository._used_recently(None, now) is False
+    assert APIKeyRepository._used_recently(now + timedelta(seconds=5), now) is False   # clock skew: write

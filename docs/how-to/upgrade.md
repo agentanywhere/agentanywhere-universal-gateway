@@ -121,6 +121,9 @@ column. These behaviours changed and may need action:
 | Docker Compose keeps SQLite at `/app/data/gateway.db` on the `gateway_data` volume, and ignores `*_BACKEND_URL` from `.env` in favour of `DOCKER_*_BACKEND_URL`. | See the next section, and [Deploy with Docker Compose](deploy-with-docker-compose.md). |
 | GraphQL requests are passed to the backend as they came (method, headers, query string, body) and its answer comes back whole. Before, the gateway sent only `query`, `variables` and `operationName`, without the caller's headers, refused a body without `query` with a 400, and turned every backend error into a 502. | Check that the GraphQL server expects the caller's headers (`X-API-Key`, `Authorization` and cookies now reach it), and that clients handle the server's own error statuses. |
 | The `postgres` and `grafana` services refuse to start without `POSTGRES_PASSWORD` and `GRAFANA_ADMIN_PASSWORD`. | Set them in `.env`. |
+| From 0.9.2, request-log rows are written in batches (`REQUEST_LOG_MODE=batched`), so a row can appear up to a quarter of a second after its request, and rows still queued are lost if the process is killed. | For the old one-write-per-request behaviour, set `REQUEST_LOG_MODE=inline`. |
+| From 0.9.2, SQLite runs in `WAL` mode with `synchronous=NORMAL`, keeping `gateway.db-wal` and `gateway.db-shm` beside the database. A power loss can lose the last commits but not corrupt the file. | Back up all three files together, keep the database on a local disk, or set `SQLITE_JOURNAL_MODE=` and `SQLITE_SYNCHRONOUS=` (empty) for SQLite's own defaults. |
+| From 0.9.2, a key's `last_used_at` is written at most once a minute. | Set `API_KEY_LAST_USED_INTERVAL_SECONDS=0` to write it on every request. |
 
 ## Moving the Compose database to the volume
 

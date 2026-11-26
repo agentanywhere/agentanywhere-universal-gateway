@@ -298,3 +298,13 @@ async def test_stop_on_a_full_queue_falls_back_to_cancel_and_drain(session_facto
     w._queue.put_nowait((_entry(2), None))
     await w.stop()
     assert await _count(session_factory) == 3
+
+
+def test_defaults_avoid_a_database_commit_per_request():
+    """Shipped defaults: batched request log, SQLite in WAL with NORMAL sync, key use throttled."""
+    from app.config import Settings
+    s = Settings(_env_file=None)
+    assert s.request_log_mode == "batched"
+    assert (s.sqlite_journal_mode, s.sqlite_synchronous, s.sqlite_busy_timeout_ms) == ("WAL", "NORMAL", 5000)
+    assert s.api_key_last_used_interval_seconds == 60.0
+    assert writer_from_settings(SimpleNamespace()).mode == "batched"
