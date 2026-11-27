@@ -15,6 +15,7 @@ from starlette.exceptions import HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+from app.analytics_queue import queue_from_settings
 from app.config import cors_middleware_options, get_settings
 from app.banner import announce_startup, banner_facts
 from app.logging_config import setup_logging
@@ -81,6 +82,8 @@ router = Router(client=adapters.upstream)
 from app.agent_routes import AgentEdgeConfig
 agent_edge_config = AgentEdgeConfig.from_settings(settings)
 ai_service = adapters.analytics
+# Scoring runs off the request path unless AI_ANALYTICS_MODE=inline (see app/analytics_queue.py).
+analytics_queue = queue_from_settings(ai_service, settings)
 
 # Initialize protocol handlers
 mqtt_handler = None
@@ -110,6 +113,8 @@ async def lifespan(app: FastAPI):
     logger.info("database_initialized")
     await request_log_writer.start()
     logger.info("request_log_writer_started", mode=request_log_writer.mode)
+    if settings.ai_analytics_enabled:
+        await analytics_queue.start()
 
     try:
         from app.database import AsyncSessionLocal
@@ -323,6 +328,7 @@ async def lifespan(app: FastAPI):
         grpc_handler.close()
     if graphql_handler:
         await graphql_handler.close()
+    await analytics_queue.stop()
     await request_log_writer.stop()
     logger.info(
         "request_log_writer_stopped",
@@ -898,7 +904,12 @@ async def logging_middleware(request: Request, call_next):
             }
             if hasattr(request.state, "api_key") and request.state.api_key:
                 request_data["client_id"] = safe_key_label(request.state.api_key)
-            
+
+            if not analytics_queue.inline:
+                # Scored later, in a batch, so the response is not held up.
+                request_data.pop("api_key", None)   # the label above is all scoring needs
+                analytics_queue.submit(request_data)
+                raise _SkipAI()
             ai_result = ai_service.process_request(request_data)
             
             # Add AI insights to response headers

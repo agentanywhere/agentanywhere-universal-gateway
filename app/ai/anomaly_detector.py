@@ -199,6 +199,51 @@ class AnomalyDetector:
             logger.warning("anomaly_detection_error", error=str(e), error_type=type(e).__name__)
             return False, 0.0
     
+    def detect_anomalies(self, batch: List[Dict]) -> List[Tuple[bool, float]]:
+        """``detect_anomaly`` for many requests with one model call.
+
+        IsolationForest's ``predict`` is ``score_samples - offset_ < 0``, so one
+        ``score_samples`` over the batch gives both answers ``detect_anomaly``
+        gives for each request, at the cost of about one call instead of two
+        per request.
+        """
+        nothing = [(False, 0.0)] * len(batch)
+        if not batch:
+            return []
+        if not self.is_trained:
+            if len(self.feature_history) < self.window_size:
+                return nothing
+            try:
+                self.train()
+            except Exception as e:
+                logger.warning("anomaly_detector_training_failed", error=str(e))
+                return nothing
+            if not self.is_trained:
+                return nothing
+        try:
+            if not hasattr(self.scaler, 'mean_') or self.scaler.mean_ is None:
+                logger.warning("anomaly_detector_scaler_not_fitted")
+                return nothing
+            features = np.vstack([self._extract_features(r) for r in batch])
+            scores = self.model.score_samples(self.scaler.transform(features))
+            decisions = scores - self.model.offset_
+            results: List[Tuple[bool, float]] = []
+            for request_data, row, score, decision in zip(batch, features, scores, decisions):
+                normalized_score = max(-1.0, min(1.0, -float(score) / 10.0))
+                is_anomaly = bool(decision < 0)
+                if is_anomaly:
+                    logger.warning(
+                        "anomaly_detected",
+                        path=request_data.get("path"),
+                        score=normalized_score,
+                        features=row.tolist(),
+                    )
+                results.append((is_anomaly, normalized_score))
+            return results
+        except Exception as e:
+            logger.warning("anomaly_detection_error", error=str(e), error_type=type(e).__name__)
+            return nothing
+
     def get_anomaly_summary(self, window_minutes: int = 60) -> Dict:
         """Get summary of anomalies in the last window."""
         cutoff = utcnow() - timedelta(minutes=window_minutes)

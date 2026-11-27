@@ -1,5 +1,5 @@
 """AI service integration for the gateway."""
-from typing import Dict
+from typing import Dict, List
 from app.ai.anomaly_detector import AnomalyDetector
 from app.ai.intelligent_rate_limiter import IntelligentRateLimiter
 from app.ai.scaling_recommender import ScalingRecommender
@@ -34,14 +34,22 @@ class AIService:
     
     def process_request(self, request_data: Dict):
         """Process a request through all AI systems."""
+        is_anomaly, anomaly_score = self.anomaly_detector.detect_anomaly(request_data)
+        return self._after_detection(request_data, is_anomaly, anomaly_score)
+
+    def process_batch(self, batch: List[Dict]) -> List[Dict]:
+        """``process_request`` for many requests, scoring them with one model call."""
+        results = self.anomaly_detector.detect_anomalies(batch)
+        return [self._after_detection(d, a, s) for d, (a, s) in zip(batch, results)]
+
+    def _after_detection(self, request_data: Dict, is_anomaly: bool, anomaly_score: float) -> Dict:
+        """Everything after anomaly detection: alerts, history, rate limits, cost, forecasts."""
         client_id = request_data.get("client_id") or request_data.get("api_key", "unknown")
         # Ensure client_id is a string and safe to slice
         if not isinstance(client_id, str):
             client_id = str(client_id) if client_id else "unknown"
         endpoint = request_data.get("path", "unknown")
-        
-        # Anomaly detection
-        is_anomaly, anomaly_score = self.anomaly_detector.detect_anomaly(request_data)
+
         if is_anomaly:
             logger.warning(
                 "anomaly_detected",

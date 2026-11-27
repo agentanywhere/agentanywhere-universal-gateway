@@ -264,7 +264,11 @@ The rate-limit values in this section are **not enforced yet**. They are shown b
 | `UPSTREAM_CLIENT` | `httpx` | The client that forwards requests to backends. `httpx`, or a `module:attribute` path to a factory returning an object with the same `request`, `build_request`, `send` and `aclose` methods. |
 | `ANALYTICS_ADAPTER` | `full` | `full` runs the built-in anomaly detection and usage analytics, `off` runs none, or a `module:attribute` path to your own. `AI_ANALYTICS_ENABLED=false` still turns the per-request call off whichever adapter is chosen. |
 | `REQUEST_LOG_SINK` | `database` | Where request-log entries go: `database` (see `REQUEST_LOG_MODE`), `null` (discard), or a `module:attribute` path to your own. |
-| `AI_ANALYTICS_ENABLED` | `true` | Run the per-request anomaly detection and usage analytics. They run inside the request path and cost several milliseconds of CPU per request; set `false` for throughput. |
+| `AI_ANALYTICS_ENABLED` | `true` | Run the anomaly detection and usage analytics. With `AI_ANALYTICS_MODE=background` (the default) they run off the request path; set `false` to save their CPU. |
+| `AI_ANALYTICS_MODE` | `background` | `background`: each request's facts are queued and a background task scores them in batches (one model call per batch), so scoring never holds up a response; anomaly logs, webhooks, alerts and the AI pages work as before, and a full queue drops its oldest entry. `inline`: scored before the response is sent (the behaviour before 0.9.2), which adds `X-Anomaly-Detected` and `X-Anomaly-Score` to an anomalous response at a cost of milliseconds of CPU per request. |
+| `AI_ANALYTICS_BATCH_SIZE` | `500` | `background` mode: most requests scored per batch. |
+| `AI_ANALYTICS_FLUSH_INTERVAL` | `0.25` | `background` mode: seconds between batches. |
+| `AI_ANALYTICS_QUEUE_SIZE` | `10000` | `background` mode: requests held for scoring before the oldest are dropped. |
 | `DOCUMENTATION_URL` | `https://docs.agentanywhere.ai/gateway/` | The documentation link in the start-up banner. Set it to your own docs site. |
 
 ## Tracing
