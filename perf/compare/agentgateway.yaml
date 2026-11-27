@@ -1,0 +1,24 @@
+# agentgateway (standalone) as a reverse proxy that requires one static API key in
+# X-API-Key. Filled in by target_up.sh (@KEY@, @BACKEND_HOSTPORT@, @THREADS@).
+config:
+  workerThreads: @THREADS@
+  adminAddr: "off"
+  statsAddr: "off"
+  logging:
+    level: warn
+gateways:
+  bench:
+    port: 8000
+    protocol: HTTP
+    apiKey:
+      mode: strict
+      keys:
+      - key: "@KEY@"
+      location:
+        header:
+          name: x-api-key
+routes:
+- name: backend
+  gateways: [bench]
+  backends:
+  - host: "@BACKEND_HOSTPORT@"

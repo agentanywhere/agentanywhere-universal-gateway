@@ -1,0 +1,13 @@
+# LiteLLM proxy forwarding /api/* to the benchmark backend through a pass-through
+# endpoint, with the master key checked on every request (auth: true; no database).
+# Filled in by target_up.sh (@BACKEND@). The master key comes from LITELLM_MASTER_KEY.
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  pass_through_endpoints:
+    - path: "/api"
+      target: "@BACKEND@/api"
+      include_subpath: true
+      auth: true
+litellm_settings:
+  set_verbose: False
+  json_logs: true
