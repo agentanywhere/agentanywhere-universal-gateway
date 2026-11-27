@@ -591,6 +591,8 @@ def test_oauth2_userinfo_and_providers(gw, monkeypatch):
 
 # ====================================================================== logging middleware outputs
 def test_anomaly_headers_and_ai_failure(gwdb, monkeypatch, H):
+    """AI_ANALYTICS_MODE=inline scores before the response and reports anomalies in headers."""
+    monkeypatch.setattr(main.analytics_queue, "mode", "inline")
     backend(monkeypatch, jresp())
     monkeypatch.setattr(main.ai_service, "process_request", lambda d: {"is_anomaly": True, "anomaly_score": 0.93})
     r = gwdb.get("/api/x", headers=H)
@@ -605,8 +607,25 @@ def test_anomaly_headers_and_ai_failure(gwdb, monkeypatch, H):
 def test_rejected_requests_are_not_fed_to_ai(gw, monkeypatch):
     spy = MagicMock(return_value={})
     monkeypatch.setattr(main.ai_service, "process_request", spy)
+    submitted = MagicMock()
+    monkeypatch.setattr(main.analytics_queue, "submit", submitted)
     assert gw.get("/mcp/t").status_code == 401
     spy.assert_not_called()
+    submitted.assert_not_called()
+
+
+def test_background_mode_queues_the_request_and_adds_no_anomaly_headers(gwdb, monkeypatch, H):
+    """The default: scoring happens later, in a batch, so the response is not held up."""
+    monkeypatch.setattr(main.analytics_queue, "mode", "background")
+    spy = MagicMock(return_value={"is_anomaly": True, "anomaly_score": 0.9})
+    monkeypatch.setattr(main.ai_service, "process_request", spy)
+    queued = []
+    monkeypatch.setattr(main.analytics_queue, "submit", queued.append)
+    backend(monkeypatch, jresp())
+    r = gwdb.get("/api/x", headers=H)
+    assert r.status_code == 200 and "X-Anomaly-Detected" not in r.headers
+    spy.assert_not_called()
+    assert len(queued) == 1 and queued[0]["path"] == "/api/x" and "api_key" not in queued[0]
 
 
 def test_api_version_headers_for_deprecated_version(gwdb, monkeypatch, H):

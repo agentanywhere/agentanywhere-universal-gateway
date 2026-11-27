@@ -18,6 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `inline`, one transaction per request);
   - SQLite uses `WAL` with `synchronous=NORMAL` and a five-second busy timeout
     (it used SQLite's own `DELETE` and `FULL`: a disk sync per commit).
+- Anomaly scoring no longer runs in the request path by default. Requests are
+  queued and scored in batches by a background task (`AI_ANALYTICS_MODE=background`),
+  one model call per batch instead of two per request; logs, webhooks, alerts
+  and the AI pages are unchanged. Responses no longer carry `X-Anomaly-Detected`
+  or `X-Anomaly-Score` unless `AI_ANALYTICS_MODE=inline`.
   Each old behaviour is one setting away; see
   [Upgrade the gateway](docs/how-to/upgrade.md#behaviour-changes-in-this-release).
 

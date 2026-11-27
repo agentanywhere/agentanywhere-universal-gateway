@@ -213,6 +213,7 @@ def test_ai_analytics_can_be_switched_off(client, monkeypatch):
     import app.main as main
 
     seen = []
+    monkeypatch.setattr(main.analytics_queue, "mode", "inline")
     monkeypatch.setattr(main.ai_service, "process_request", lambda data: seen.append(data) or {})
     monkeypatch.setattr(main.settings, "ai_analytics_enabled", False)
     client.get("/health")

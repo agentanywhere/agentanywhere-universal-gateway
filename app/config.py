@@ -621,8 +621,14 @@ class Settings(BaseSettings):
     api_key_local_cache_ttl_seconds: float = 0.0
     # A key's last-used time is written at most once per this many seconds (0 = on every use).
     api_key_last_used_interval_seconds: float = 60.0
-    # Per-request anomaly detection and usage analytics (scikit-learn, run in the request path).
+    # Anomaly detection and usage analytics (scikit-learn).
     ai_analytics_enabled: bool = True
+    # background (the default): scored in batches by a background task, off the request path;
+    # inline: scored before the response is sent, adding X-Anomaly-* headers to it.
+    ai_analytics_mode: str = "background"
+    ai_analytics_batch_size: int = 500
+    ai_analytics_flush_interval: float = 0.25
+    ai_analytics_queue_size: int = 10000
     # SQLite only, applied to every new connection. Empty keeps SQLite's own default
     # (DELETE, FULL): one disk sync per commit.
     sqlite_journal_mode: str = "WAL"

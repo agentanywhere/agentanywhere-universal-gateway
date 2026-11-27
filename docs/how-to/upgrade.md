@@ -124,6 +124,7 @@ column. These behaviours changed and may need action:
 | From 0.9.2, request-log rows are written in batches (`REQUEST_LOG_MODE=batched`), so a row can appear up to a quarter of a second after its request, and rows still queued are lost if the process is killed. | For the old one-write-per-request behaviour, set `REQUEST_LOG_MODE=inline`. |
 | From 0.9.2, SQLite runs in `WAL` mode with `synchronous=NORMAL`, keeping `gateway.db-wal` and `gateway.db-shm` beside the database. A power loss can lose the last commits but not corrupt the file. | Back up all three files together, keep the database on a local disk, or set `SQLITE_JOURNAL_MODE=` and `SQLITE_SYNCHRONOUS=` (empty) for SQLite's own defaults. |
 | From 0.9.2, a key's `last_used_at` is written at most once a minute. | Set `API_KEY_LAST_USED_INTERVAL_SECONDS=0` to write it on every request. |
+| From 0.9.2, anomaly scoring runs in batches off the request path (`AI_ANALYTICS_MODE=background`), so responses no longer carry `X-Anomaly-Detected` or `X-Anomaly-Score`. Anomaly logs, webhooks and alerts still fire, a fraction of a second later. | If a client reads those headers, set `AI_ANALYTICS_MODE=inline`. |
 
 ## Moving the Compose database to the volume
 
