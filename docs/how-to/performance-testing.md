@@ -106,6 +106,14 @@ Run each rate for at least 45 seconds and discard the first 10, repeat a cell th
 backend baseline: if the backend itself slows down at a rate, the gateway figure at that rate is not the
 gateway's. Near the point where a configuration stops coping, results vary from run to run.
 
+## Compare with other gateways
+
+`perf/compare/` runs this gateway, agentgateway, the LiteLLM proxy and a plain nginx
+reverse proxy on the same fleet, pinned to the same cores, each requiring an API key, and
+finds the highest rate each one sustains. Its
+[README](https://github.com/agentanywhere/agentanywhere-universal-gateway/blob/main/perf/compare/README.md)
+gives the rules and how to run it.
+
 ## Read the results fairly
 
 - The load generator, the gateway and the backend share one machine in the
